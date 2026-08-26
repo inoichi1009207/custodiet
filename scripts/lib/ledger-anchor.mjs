@@ -1,8 +1,20 @@
 // ledger-anchor.mjs —— **外部锚**(D51 姿态 B,2026-08-26 用户亲签「我被雷劈了机器也跑得下去」)
 //
-// 干什么:把三份链账的「前缀指纹」定期快照到 **agent 仓外**的用户目录;verify 时比对——
-// 快照点之前的任何改写/插行/删行/截断 ⇒ 必红;快照点之后的追加 ⇒ 合法(append-only 语义)。
-// 这补上文件内前向链在结构上防不了的那半(完整尾删/整链重算)。先例=CT 的「日志外比对树头」形:
+// 干什么:把三份链账的「前缀指纹」定期快照到 **agent 仓外**的用户目录(同机同用户的家目录,
+// 见诚实边界①——「仓外」不等于「够不到」);verify 时比对。
+//
+// ⚠️ **担保句的限定词必须跟着走**(2026-08-26 grill:recon A1 审出:摘要层加了限定,
+//   而三份公开文档都写着「以头注为准」,本处却留着上一版的未限定原话
+//   ⇒ 限定词只拦住了不较真的读者。判词原话:「不是措辞问题,是权威指向指错了地方」):
+//   · 快照点**之前**的改写/插行/删行/截断 ⇒ 红,**前提是**锚文件自身未被同身份进程改写、
+//     且 verify 确实被运行过(两条都不自动成立,见①与失效条件②)。
+//   · 快照点**之后**的追加 ⇒ 合法(append-only 语义)。
+//   · 因此本件补的是「**锚点之前**的完整尾删/整链重算」那半,**不是**尾删问题整体。
+//   · ⚠️ 窟窿比「整段删除」宽(A3 审出,判据在 L~128 的 `buf.length < snap.bytes`):
+//     只要当前长度**仍 ≥ 快照长度**且前缀一致就判 OK ⇒ 快照后追加 10 行、只删末 3 行
+//     同样检不出,不必「整段砍掉、长度正好退回快照值」。而 ledger-chain 对尾部删行
+//     剩下的链仍自洽 ⇒ 两件都不覆盖。别把这个洞说窄。
+// 先例=CT 的「日志外比对树头」形:
 //   RFC 6962 §7.3 写明日志可「presenting two different, conflicting views of the Merkle Tree at
 //   different times and/or to different parties」——内部 Merkle 自洽挡不住;而该违例
 //   「is detected by global gossiping, i.e., everyone auditing logs comparing their versions of
@@ -39,14 +51,20 @@
 //   node --no-warnings scripts/lib/ledger-anchor.mjs install-task    # 装 OS 级每日任务(schtasks)
 //   node --no-warnings scripts/lib/ledger-anchor.mjs --self-test
 // 退出码:0=过 1=违例/无锚 2=用法错
-// 触发层:snapshot=OS 计划任务(agent 会话外);verify=session-triage 开工面第三行(接线另处)。
+// 触发层:snapshot=OS 计划任务(agent 会话外)。
+//   verify 的唤醒面**因仓而异,本件自己不接线**:
+//     · 源项目(KliniK)接在 `scripts/session-triage.mjs` 的开工面;
+//     · **custodiet 等拷贝仓没有 session-triage,也没有任何其他唤醒面** ⇒ 拷走后须自行接一个,
+//       否则下面的 STALE 看门狗没有唤醒者(= 闸在仓里但不在跑)。
+//   ⚠️ 本段原写作「本仓的唤醒面是…」——`本仓` 在移植后是**假指代**(grill:recon A2 审出:
+//     custodiet 正是本段所说的「没有 session-triage 的仓」,而头注却以第一人称说它接好了)。
+//     凡随仓走的文件,自指词都会漂;写仓名不写「本仓」。
 // 失效条件:①升 C 档(异机/CI 树头)⇒ 本件降为本地缓存,复议;②计划任务连续 14 天无新快照
 //   且无人察觉 ⇒ 「必然执行」名存实亡。
 //   ⚠️ 两个数不是一回事,别读混(grill:recon 108 点破):**48h** 是代码里的 STALE 告警阈值
 //   (L~118,`ageH > 48` ⇒ OK-STALE 且 ok=false);**14 天**是上面那条失效条件的复议期。
-//   且看门狗**只在有人跑 verify 时才响** —— 本仓的唤醒面是 session-triage 开工面第三行;
-//   凡把本件拷进**没有 session-triage 的仓**,该看门狗就没有唤醒者,失效条件永不可能触发,
-//   等于「闸在仓里但不在跑」。拷贝方必须自行接一个定期唤醒面。
+//   且看门狗**只在有人跑 verify 时才响**,唤醒面因仓而异(见上面「触发层」那段),
+//   没有唤醒面的仓里,失效条件②永不可能触发,等于「闸在仓里但不在跑」。
 // CALIBRATED=false。
 
 import fs from "node:fs";
