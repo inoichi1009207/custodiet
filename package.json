@@ -1,0 +1,22 @@
+{
+  "name": "custodiet",
+  "version": "0.1.0",
+  "description": "Machine-checkable accountability gates for Claude Code agents — catches \"done\" that never happened.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "gate:self-test": "node --no-warnings scripts/hook-stop-closure.mjs --self-test && node --no-warnings scripts/lib/gate-ctx.mjs --self-test && node --no-warnings scripts/lib/gate-registry.mjs --self-test && node --no-warnings scripts/lib/gate-carriers.mjs --self-test && node --no-warnings scripts/lib/gate-slice.mjs --self-test && node --no-warnings scripts/lib/gate-cmd.mjs --self-test && node --no-warnings scripts/coverage-check.mjs --self-test && node --no-warnings scripts/coverage-check.mjs --ctx-consumers && node --no-warnings scripts/lib/ledger-chain.mjs --self-test",
+    "gate:accept": "npm run gate:self-test && node --no-warnings scripts/gate-migrate-check.mjs",
+    "gate:coverage": "node --no-warnings scripts/coverage-check.mjs --cmd \"npm run gate:self-test\" scripts/hook-stop-closure.mjs scripts/lib/gate-ctx.mjs scripts/lib/gate-registry.mjs scripts/lib/gate-carriers.mjs scripts/lib/gate-slice.mjs",
+    "gate:branches": "node --no-warnings scripts/coverage-check.mjs --branches scripts/lib/gate-rules.mjs",
+    "gate:lint": "eslint scripts/lib/*.mjs scripts/hook-stop-closure.mjs scripts/gate-migrate-check.mjs scripts/coverage-check.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9",
+    "eslint": "^10",
+    "eslint-plugin-redos-detector": "^3.1.2"
+  }
+}

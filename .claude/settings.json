@@ -1,0 +1,16 @@
+{
+  "$comment": "接线示例:把收尾闸挂上 Stop hook。整个系统只有这一个必需的接线点。",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node --no-warnings scripts/hook-stop-closure.mjs",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

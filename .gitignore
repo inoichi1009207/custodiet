@@ -1,0 +1,9 @@
+# 闸的持久面(运行时台账,按机器演化,不入仓)
+.claude/.batch-goal.json
+.claude/.batch-goal.jsonl
+.claude/.gate-heartbeat.log
+.claude/.gate-alerts.jsonl
+.claude/.gate-fp-ledger.jsonl
+.claude/.p-ledger.json
+.claude/.hook-payload-keys.log
+node_modules/
