@@ -2,8 +2,20 @@
 //
 // 干什么:把三份链账的「前缀指纹」定期快照到 **agent 仓外**的用户目录;verify 时比对——
 // 快照点之前的任何改写/插行/删行/截断 ⇒ 必红;快照点之后的追加 ⇒ 合法(append-only 语义)。
-// 这补上文件内前向链在结构上防不了的那半(完整尾删/整链重算),先例=CT/Rekor 的
-// 「外部持有树头」形(2026-08-26 WebSearch 取证:truncation attack 的业界修法即外部锚)。
+// 这补上文件内前向链在结构上防不了的那半(完整尾删/整链重算)。先例=CT 的「日志外比对树头」形:
+//   RFC 6962 §7.3 写明日志可「presenting two different, conflicting views of the Merkle Tree at
+//   different times and/or to different parties」——内部 Merkle 自洽挡不住;而该违例
+//   「is detected by global gossiping, i.e., everyone auditing logs comparing their versions of
+//   the latest Signed Tree Heads」——检出靠**日志之外**的比对。这就是本件在做的事。
+//   出处 https://www.rfc-editor.org/rfc/rfc6962(§7.3、§5),2026-08-26 取页,
+//   三条引语经 fetch-quote-check 逐字命中各 1 处。
+//   **三档标注**:「单份树头不足以自证」= 文档未记载(该 RFC 未直陈此句,不得写成它说了)。
+//   旧头注「WebSearch 取证 / Rekor / 业界修法即外部锚」三项均无真取页支撑,本次删除。
+//   ⚠️ **反类比要一并读(grill:recon 108 审出,采纳)**:CT 那套之所以成立,承重前提是
+//   树头由**另一方**持有并跨信任域 gossip 比对;本件的锚在**同机同用户**——
+//   先例里唯一让它成立的那个属性,本件恰恰没有。故 CT 只作**形状**参照,不作强度背书;
+//   拿到那个强度要升 D51 的 C 档(异机/CI 收树头)。引先例而不写这句 = 拿跨方设计的
+//   信誉给同方部署背书。
 //
 // **诚实边界(头注钉死,不许产品文案放大;后四条系 codex 108 四眼补齐)**:
 //   ① 同一台机、同一 OS 用户下,「agent 不可写」是**软边界**——提高伪造成本、留取证面,
@@ -29,7 +41,12 @@
 // 退出码:0=过 1=违例/无锚 2=用法错
 // 触发层:snapshot=OS 计划任务(agent 会话外);verify=session-triage 开工面第三行(接线另处)。
 // 失效条件:①升 C 档(异机/CI 树头)⇒ 本件降为本地缓存,复议;②计划任务连续 14 天无新快照
-//   且无人察觉 ⇒ 「必然执行」名存实亡,verify 的 STALE 告警就是它的看门狗。
+//   且无人察觉 ⇒ 「必然执行」名存实亡。
+//   ⚠️ 两个数不是一回事,别读混(grill:recon 108 点破):**48h** 是代码里的 STALE 告警阈值
+//   (L~118,`ageH > 48` ⇒ OK-STALE 且 ok=false);**14 天**是上面那条失效条件的复议期。
+//   且看门狗**只在有人跑 verify 时才响** —— 本仓的唤醒面是 session-triage 开工面第三行;
+//   凡把本件拷进**没有 session-triage 的仓**,该看门狗就没有唤醒者,失效条件永不可能触发,
+//   等于「闸在仓里但不在跑」。拷贝方必须自行接一个定期唤醒面。
 // CALIBRATED=false。
 
 import fs from "node:fs";
