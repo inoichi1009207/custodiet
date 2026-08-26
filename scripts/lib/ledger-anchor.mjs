@@ -5,10 +5,16 @@
 // 这补上文件内前向链在结构上防不了的那半(完整尾删/整链重算),先例=CT/Rekor 的
 // 「外部持有树头」形(2026-08-26 WebSearch 取证:truncation attack 的业界修法即外部锚)。
 //
-// **诚实边界(头注钉死,不许产品文案放大)**:
-//   同一台机、同一 OS 用户下,「agent 不可写」是**软边界**——提高伪造成本、保证事后取证面,
-//   不是硬隔离(能以你的身份跑任意命令的进程也能动锚)。硬隔离=异机/CI 收树头(D51 的 C 档)。
-//   快照间隙内的「写了又擦」检不出(间隙=计划任务周期,默认每日)。
+// **诚实边界(头注钉死,不许产品文案放大;后四条系 codex 108 四眼补齐)**:
+//   ① 同一台机、同一 OS 用户下,「agent 不可写」是**软边界**——提高伪造成本、留取证面,
+//     不是硬隔离(能以你的身份跑任意命令的进程也能改锚;锚自身无认证无链)。
+//     硬隔离=异机/CI 收树头(D51 的 C 档)。
+//   ② 快照间隙内的「写了又擦」检不出(间隙=计划任务周期,默认每日)。
+//   ③ 最新锚点**之后**的后缀不受任何约束——锚证明的是「锚点前未动」,不证明「只追加过」
+//     (后缀的行级完整性归 ledger-chain 的链验,两件合用才是全貌)。
+//   ④ snapshot **先验后锚**:对旧锚 verify 未过 ⇒ 拒绝重锚、落 violation 行、退出 1——
+//     没有这一条,每日任务会把篡改「合法化」(codex 108 复现的洗白环,已堵)。
+//   ⑤ session-triage 的 ANCHOR 行是提示面(不进 verdict);机器判据=本件 verify 的退出码。
 //
 // 快照行:{ts, file, bytes, sha256, lastH, lines} —— sha256=快照时**全文件字节**的摘要;
 // verify:当前文件 size≥bytes 且 前 bytes 字节的 sha256 与记录一致 ⇒ 前缀完好;否则红。
@@ -42,17 +48,33 @@ export const LEDGERS = [
 ];
 
 const repoRootOf = () => path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+/** 仓键=basename+全路径短哈希——两个同名仓不再共享锚文件/计划任务(codex 108 逮到的碰撞面)。 */
+export const repoKeyOf = (repoRoot) =>
+  path.basename(repoRoot) + "-" + sha256(path.resolve(repoRoot)).slice(0, 8);
 export const anchorFileFor = (repoRoot) =>
-  path.join(os.homedir(), ".custodiet", "anchor", path.basename(repoRoot) + ".jsonl");
+  path.join(os.homedir(), ".custodiet", "anchor", repoKeyOf(repoRoot) + ".jsonl");
 
-/** 快照三账当前前缀指纹,追加进锚文件。返回快照行数组。 */
+/** 快照三账当前前缀指纹。**先验后锚**(codex 108 高优先级洞):旧锚 verify 未过 ⇒
+ *  拒绝重锚、落 violation 行、返回 {refused:true}——否则每日任务会把篡改合法化。
+ *  返回 {rows, skipped, refused, violations}。 */
 export function snapshot(repoRoot = repoRootOf(), anchorFile = anchorFileFor(repoRoot)) {
   fs.mkdirSync(path.dirname(anchorFile), { recursive: true });
-  const rows = [];
+  // 先验:锚文件已存在时,当前状态必须过旧锚(首锚除外——没有旧锚可验)
+  if (fs.existsSync(anchorFile)) {
+    const pre = verify(repoRoot, anchorFile);
+    const hard = pre.results.filter((r) => !r.status.startsWith("OK") && r.status !== "NO-ANCHOR");
+    // NO-ANCHOR(某账首次出现)不拒——新账进锚正是本次快照的活;其余违例一律拒锚
+    if (hard.length) {
+      fs.appendFileSync(anchorFile, JSON.stringify({ ts: new Date().toISOString(),
+        kind: "refused-snapshot", reasons: hard.map((r) => `${r.file}:${r.status}`) }) + "\n");
+      return { rows: [], skipped: [], refused: true, violations: hard };
+    }
+  }
+  const rows = [], skipped = [];
   for (const rel of LEDGERS) {
     const p = path.join(repoRoot, rel);
     let buf;
-    try { buf = fs.readFileSync(p); } catch { continue; }        // 账不在 ⇒ 不锚(它建立后自然进下次快照)
+    try { buf = fs.readFileSync(p); } catch { skipped.push(rel); continue; }   // 账不在:跳过但**必须出声**(CLI 侧)
     const text = buf.toString("utf8");
     let lastH = null;
     for (const line of text.split("\n")) { const m = H_RE.exec(line.trim()); if (m) lastH = m[1]; }
@@ -61,8 +83,12 @@ export function snapshot(repoRoot = repoRootOf(), anchorFile = anchorFileFor(rep
     rows.push(row);
     fs.appendFileSync(anchorFile, JSON.stringify(row) + "\n");
   }
-  return rows;
+  return { rows, skipped, refused: false, violations: [] };
 }
+
+/** 锚行自身的合法性(codex 108:语义合法、判据有毒的行——bytes:0/空 sha/坏 ts——不许放行)。 */
+const validSnap = (r) => Number.isInteger(r.bytes) && r.bytes > 0 &&
+  /^[0-9a-f]{64}$/.test(String(r.sha256 || "")) && Number.isFinite(Date.parse(r.ts));
 
 /** 对着**最后一次**快照验前缀。返回 {ok, results:[{file,status,detail}]}。 */
 export function verify(repoRoot = repoRootOf(), anchorFile = anchorFileFor(repoRoot)) {
@@ -76,6 +102,9 @@ export function verify(repoRoot = repoRootOf(), anchorFile = anchorFileFor(repoR
   for (const rel of LEDGERS) {
     const snap = last[rel];
     if (!snap) { results.push({ file: rel, status: "NO-ANCHOR", detail: "无该账快照" }); ok = false; continue; }
+    if (!validSnap(snap)) {                        // 有毒锚行 ≠ 无锚:显式定性,fail-closed
+      results.push({ file: rel, status: "ANCHOR-POISONED", detail: "锚行字段非法(bytes/sha256/ts)——锚被动过或写坏,不得当有效锚用" }); ok = false; continue;
+    }
     let buf;
     try { buf = fs.readFileSync(path.join(repoRoot, rel)); }
     catch { results.push({ file: rel, status: "MISSING", detail: "账文件消失而锚记得它存在过" }); ok = false; continue; }
@@ -107,6 +136,20 @@ function selfTest() {
   chk("无锚 ⇒ NO-ANCHOR 红(fail-closed)", verify(repo, anchor).ok, false);
   snapshot(repo, anchor);
   chk("快照后 verify 过", verify(repo, anchor).ok, true);
+  // **洗白环必须堵死**(codex 108 高优先级洞的回归钉):篡改 → 再 snapshot ⇒ 拒锚且 verify 仍红
+  { const buf = fs.readFileSync(led, "utf8");
+    fs.writeFileSync(led, buf.replace('"a":1', '"a":8'));
+    const s2 = snapshot(repo, anchor);
+    chk("篡改后再快照 ⇒ 拒锚(refused)", s2.refused, true);
+    chk("拒锚后 verify **仍红**(篡改没被每日任务洗白)", verify(repo, anchor).ok, false);
+    fs.writeFileSync(led, buf); }
+  // 有毒锚行 ⇒ ANCHOR-POISONED 红(语义合法、判据有毒的行不放行)
+  { const good = fs.readFileSync(anchor, "utf8");
+    fs.appendFileSync(anchor, JSON.stringify({ ts: "坏", file: LEDGERS[0], bytes: 0, sha256: "", lastH: null, lines: 0 }) + "\n");
+    chk("有毒锚行 ⇒ ANCHOR-POISONED 红", verify(repo, anchor).results[0].status, "ANCHOR-POISONED");
+    fs.writeFileSync(anchor, good); }
+  chk("同名仓不同路径 ⇒ 仓键不同(锚/任务不碰撞)",
+    repoKeyOf(path.join(dir, "x", "same")) === repoKeyOf(path.join(dir, "y", "same")), false);
   fs.appendFileSync(led, '{"a":2,"h":"' + "b".repeat(64) + '"}\n');
   chk("快照点后追加 ⇒ 仍过(append-only 合法)", verify(repo, anchor).ok, true);
   { const buf = fs.readFileSync(led, "utf8"); fs.writeFileSync(led, buf.replace('"a":1', '"a":9'));
@@ -138,9 +181,14 @@ if (IS_MAIN) {
   const cmd = process.argv[2];
   if (cmd === "--self-test") process.exit(selfTest() ? 0 : 1);
   if (cmd === "snapshot") {
-    const rows = snapshot();
-    console.log(`已快照 ${rows.length} 账 → ${anchorFileFor(repoRootOf())}`);
-    process.exit(0);
+    const r = snapshot();
+    if (r.refused) {
+      console.error(`拒绝重锚:当前台账过不了旧锚(${r.violations.map((v) => `${v.file}:${v.status}`).join(" ")})——先查明再谈重锚,violation 行已落`);
+      process.exit(1);
+    }
+    if (r.skipped.length) console.error(`⚠ 跳过 ${r.skipped.length} 账(读不到):${r.skipped.join(", ")}`);
+    console.log(`已快照 ${r.rows.length} 账 → ${anchorFileFor(repoRootOf())}`);
+    process.exit(r.rows.length ? 0 : 1);           // 零账快照不是成功(codex 108:静默 0 账退出 0 已堵)
   }
   if (cmd === "verify") {
     const v = verify();
@@ -154,8 +202,9 @@ if (IS_MAIN) {
     const script = fileURLToPath(import.meta.url);
     const tr = `"${node}" --no-warnings "${script}" snapshot`;
     execFileSync("schtasks", ["/Create", "/F", "/SC", "DAILY", "/ST", "05:33",
-      "/TN", "custodiet-anchor-" + path.basename(repoRootOf()), "/TR", tr], { stdio: "inherit" });
-    console.log("已装每日 05:33 计划任务(每用户级,agent 会话外执行)");
+      "/TN", "custodiet-anchor-" + repoKeyOf(repoRootOf()), "/TR", tr], { stdio: "inherit" });
+    console.log("已装每日 05:33 计划任务(每用户级,agent 会话外执行;任务名带仓键防同名仓覆盖;" +
+      "node/仓路径固化——移动仓或换 node 安装位后须重跑本命令)");
     process.exit(0);
   }
   console.error("用法: snapshot | verify | install-task | --self-test");
