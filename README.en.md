@@ -4,7 +4,7 @@
 
 A Stop-hook rule engine that audits the agent's turn **after it claims to be finished**: did the things it *said* actually *happen* on the tool-call record? Zero dependencies, pure Node, every rule mutation-tested, and the gate itself is gated.
 
-**Fastest onboarding: point your agent at this repo.** "Read custodiet, build us one" — the playbook ([`docs/playbook.md`](docs/playbook.md)) was written to be followed by an agent in the first place: every step ships the artifact shape, an executable checkpoint, and the incident that paid for it. The only human step is signing your own acceptance rules.
+**Fastest onboarding: point your agent at this repo.** "Read custodiet, build us one" — the playbook ([`docs/playbook.md`](docs/playbook.md)) was written to be followed by an agent in the first place: every build step ships the artifact shape, an executable checkpoint, and the incident that paid for it. The only human step is signing your own acceptance rules.
 
 <p>
 <img src="assets/catch-saying-not-doing.jpg" alt="The gate catches the agent describing work instead of doing it" width="640">
@@ -78,7 +78,7 @@ Escape hatches exist per blocking rule (`STOP_CLOSURE_BLOCK_<id>=0`) and are the
 
 - [guardrails-ai](https://github.com/guardrails-ai/guardrails) / [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails) validate **what the model says** (content). We audit **whether what it said it did actually happened** (conduct).
 - [tdd-guard](https://github.com/nizos/tdd-guard) / [probity](https://github.com/nizos/probity) gate **each write** for process compliance (and probity also reads transcripts). We gate **the whole turn's claims** at Stop time. Complementary; run both.
-- Claude Code ships a built-in `/goal` (goal tracking) — but it is a **built-in slash command the model cannot invoke; only the user can type it** (tested 2026-08-19). So the official goal mechanism can never join the agent's own closure loop: the agent can't arm its own acceptance criteria, and nothing machine-checks them at Stop time. `batch-goal --arm/--clear` is the in-repo equivalent built precisely for that: arming is the agent's opening move, the verdict check is the Stop gate's mechanical move, and the human only looks when they want to.
+- Claude Code ships a built-in `/goal` (goal tracking) — but it is a **built-in slash command the model cannot invoke; only the user can type it** (tested 2026-08-19). So the official goal mechanism can never join the agent's own closure loop: the agent can't arm its own acceptance criteria — and the official Stop-time evaluation is an LLM judge (a session-level prompt hook), i.e. exactly the AUROC-≤0.65 class from above, not a deterministic predicate. `batch-goal --arm/--clear` is the in-repo equivalent built precisely for that: arming is the agent's opening move, the verdict check is the Stop gate's mechanical move, and the human only looks when they want to.
 - Per our survey, the combination here — promise-vs-action comparison + mutation-tested acceptance + expiring debt ledger — was **not observed** in existing open source. (Survey date 2026-08-25; that's an observation, not a proof of absence.)
 
 ## FAQ

@@ -7,7 +7,7 @@
 > [English version →](README.en.md)
 
 **最快的用法:把本仓直接丢给你的 agent 读。**「读完 custodiet,给我们仓也建一套」——
-作业本([`docs/playbook.md`](docs/playbook.md))本来就是写给 agent 照抄的,每步带产物形状、
+作业本([`docs/playbook.md`](docs/playbook.md))本来就是写给 agent 照抄的,每个建造步带产物形状、
 可执行检查点和当初踩坑的事故记录;人只需要做一件事:签下你自己的验收规则。
 
 <p>
@@ -79,7 +79,7 @@ node --no-warnings scripts/batch-goal.mjs --clear
 
 - [guardrails-ai](https://github.com/guardrails-ai/guardrails) / [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails) 校验**模型说出来的内容**;我们审计**它说做过的事有没有真的发生**。内容闸 vs 言行一致闸。
 - [tdd-guard](https://github.com/nizos/tdd-guard) / [probity](https://github.com/nizos/probity) 闸**每次写入**的流程合规(probity 也读 transcript);我们在 Stop 时刻闸**整轮的言行**。互补,可以同时跑。
-- Claude Code 官方自带 `/goal`(目标追踪)——但它是**内建 slash command,模型自己调不了,只有用户能敲**(2026-08-19 实测)。这意味着官方目标机制无法进入 agent 的自我闭环:agent 没法自己立验收条件、也没法在收尾被机器对照。`batch-goal --arm/--clear` 就是为此存在的仓内等价物——立条件是 agent 的开工动作,对照是 Stop 闸的机器动作,人只在想看的时候看。
+- Claude Code 官方自带 `/goal`(目标追踪)——但它是**内建 slash command,模型自己调不了,只有用户能敲**(2026-08-19 实测)。这意味着官方目标机制无法进入 agent 的自我闭环:agent 没法自己立验收条件;而它的收尾评估走的是 LLM 裁判(session 级 prompt hook)——正是上文 AUROC ≤0.65 的那类,不是机器判据。`batch-goal --arm/--clear` 就是为此存在的仓内等价物——立条件是 agent 的开工动作,对照是 Stop 闸的机器动作,人只在想看的时候看。
 - 按本次调研(2026-08-25),「承诺-行动比对 + 变异测试验收 + 到期债台账」的组合在开源里**未观测到**同类——这是观测陈述,不是不存在证明。
 
 ## FAQ
