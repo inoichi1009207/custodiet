@@ -1,6 +1,6 @@
 # custodiet
 
-> **Quis custodiet ipsos custodes?——谁来看守看守者?**
+> **Quis custodiet ipsos custodes?——谁来看守看守者?**\
 > 给 Claude Code 编码代理装的机器问责闸:逮住那些**从未发生过的「已完成」**。
 > 而且,闸自己也被闸。
 >
