@@ -2,7 +2,8 @@
 
 ## 0.1.0 — 2026-08-26
 
-首个公开暂存版。引擎(结构化 ctx / 声明式规则 / 变异验收台)、台账完整性链
+首个公开暂存版。Stop 闸本体(hook-stop-closure,`.claude/settings.json` 单点接线)、
+引擎(结构化 ctx / 声明式规则 / 变异验收台)、台账完整性链
 (ledger-chain:hash 链 + SIGN-CHECK 呈签尾标)、批级完成条件(batch-goal)、
 建闸作业本、示例宪法、中英双 README。
 
