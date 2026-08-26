@@ -8,6 +8,7 @@
 // 里逐条指名「这正是要修的那个 bug」,不得默认接受。
 
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -241,7 +242,7 @@ const realCtx = (entries) => buildCtx(entries, {
 /** 旧实现里到底有几项 —— 从源码数,不写死(见 CUTOVER 第①条的注释)。 */
 function legacyRuleCount() {
   try {
-    const src = fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "hook-stop-closure.mjs"), "utf8");
+    const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(new URL(import.meta.url))), "hook-stop-closure.mjs"), "utf8");
     return new Set([...src.matchAll(/id:\s*"([A-Z]\d?)"/g)].map((m) => m[1])).size;
   } catch { return Infinity; }   // 数不出来 ⇒ 判据不成立 ⇒ NO-GO(fail-closed)
 }

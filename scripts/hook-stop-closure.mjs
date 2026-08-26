@@ -51,6 +51,7 @@
 //          {"decision":"block","reason":"..."} —— Stop hook 的阻断形态。
 
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 
 // ── 阻断项开关:四项**默认阻断**。
@@ -1815,7 +1816,7 @@ function selfTest() {
   {
     let src = "";
     try {
-      src = fs.readFileSync(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"), "utf8");
+      src = fs.readFileSync(fileURLToPath(new URL(import.meta.url)), "utf8");
     } catch { /* 读不到自己 ⇒ 下面按未检查处理 */ }
     if (!src) {
       console.log("SKIP  零件契约:读不到本文件源码 —— **未检查**,不作通过");
@@ -2114,7 +2115,7 @@ else {
 //   锚定失败按原 cwd 跑(fail-open:锚不上不该让闸崩)。CLI 模式(--audit/--fp 等)不锚——
 //   用户传的相对路径以他的 cwd 为准。
 try {
-  process.chdir(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+  process.chdir(fileURLToPath(new URL("..", import.meta.url)));
 } catch { /* 锚定失败按原 cwd 跑 */ }
 let payload = "";
 try { payload = fs.readFileSync(0, "utf8"); } catch {}
