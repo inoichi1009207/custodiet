@@ -153,9 +153,9 @@ if (IS_MAIN) {
     const node = process.execPath;
     const script = fileURLToPath(import.meta.url);
     const tr = `"${node}" --no-warnings "${script}" snapshot`;
-    execFileSync("schtasks", ["/Create", "/F", "/SC", "DAILY", "/ST", "03:33",
+    execFileSync("schtasks", ["/Create", "/F", "/SC", "DAILY", "/ST", "05:33",
       "/TN", "custodiet-anchor-" + path.basename(repoRootOf()), "/TR", tr], { stdio: "inherit" });
-    console.log("已装每日 03:33 计划任务(每用户级,agent 会话外执行)");
+    console.log("已装每日 05:33 计划任务(每用户级,agent 会话外执行)");
     process.exit(0);
   }
   console.error("用法: snapshot | verify | install-task | --self-test");
