@@ -1469,6 +1469,27 @@ const RULE_K = {
   },
 };
 
+/** K0 的关账/未武装判定尾段(共享零件):真 detect 与簿记豁免的两支变异共用,
+ *  保证变异体消息逐字一致、只 differ 豁免那一行(G 项验收台教训)。 */
+function k0Core(ctx) {
+  const g = ctx.batchGoal;
+  if (g?.cleared && g.closedCount > 0 && properClose(ctx) && !ranArm(ctx)) {
+    const done = confirmedConditions(ctx.text);
+    let win = null;
+    try { win = ctx.window(); } catch { win = null; }
+    if (win) for (const n of confirmedConditions(win.text)) done.add(n);
+    const covers = (set, n) => { for (let i = 1; i <= n; i++) if (!set.has(i)) return false; return true; };
+    if (covers(done, g.closedCount)) return [];        // 正常关账,放行
+  }
+  if (g?.cleared && properClose(ctx) && !(g.closedCount > 0)) {
+    return ["**关账证据取不到**(台账末行不是本批的 clear 行,或读不出)"];
+  }
+  return [g?.cleared ? "已结清后又动工作面(= 新批未武装)" : "从未武装"];
+}
+/** 簿记面判定(共享):写面仅触债务台账。 */
+const k0Bookkeeping = (ctx) => ctx.writes.length &&
+  ctx.writes.every((w) => /docs\/gate-debts\.md$/.test(String(w).replace(/\\/g, "/")));
+
 const RULE_K0 = {
   id: "K0",
   blocking: (ctx) => ctx.didCommit(),
@@ -1484,6 +1505,12 @@ const RULE_K0 = {
     //   我第一版写成了后者,于是「改了个文件但没往里写字」判为没动工作面。
     //   两个名字差一个字母而语义完全不同,迁移时值得每次确认一遍。
     if (!ctx.writes.length && !ctx.didCommit()) return []; // 没动工作面 ⇒ 不管
+    // ⚠️ **债表簿记豁免**(2026-08-26,批 106;fp 台账「批间补救」形态四犯的兑现修法):
+    //   本轮写面**仅**触 docs/gate-debts.md(债务台账)⇒ 不算未武装动工——
+    //   给已发生的事登记欠账正是验收机制自身的簿记,逼它开新批=纯 arm/clear churn
+    //   (08-23 两笔 claimed_fp + 08-26 两撞,四犯)。边界:任何其他路径混入写面即照拦
+    //   (「顺手把修法也做了」不属簿记);零写面纯提交不豁免(commit 内容无从核,fail-closed)。
+    if (k0Bookkeeping(ctx)) return [];
     // ⚠️ 「已结清」**不等于**此后无需武装。旧实现 cleared ⇒ K 与 K0 双双不跑,
     //   而 `--clear` 正是每批收尾动作 ⇒ 此后每批都在「零验收标准且无闸」下提交,
     //   静默到有人重新 --arm 为止(grill:edge-cases 与 codex 055 独立同时报出)。
@@ -1495,27 +1522,9 @@ const RULE_K0 = {
     //   ⇒ 整族静默,而「零对照关账」与「逐条对照后关账」的输出**逐字节相同**。
     //   裁决取「本轮 ∪ 批窗口」——逐条对照通常写在关账**前一轮**。
     // `!ranArm(ctx)`:同一轮既武装又结清 ⇒ 关账证据是现造的,不认(见 ranArm 头注)。
-    if (g?.cleared && g.closedCount > 0 && properClose(ctx) && !ranArm(ctx)) {
-      const done = confirmedConditions(ctx.text);
-      let win = null;
-      try { win = ctx.window(); } catch { win = null; }
-      if (win) for (const n of confirmedConditions(win.text)) done.add(n);
-      // ⚠️ **逐一验 1..N,不能只数个数**（2026-08-20 codex「你没问到的」第一条）。
-      //   原式 `done.size >= closedCount` 只数**不同编号的个数**，不核对编号集合 ⇒
-      //   三条条件的批用「条件98/99/100：达成」就能放行。实测坐实。
-      //   这是我**今天亲手造的** fail-open，而且它就藏在一个 `>=` 里。
-      const covers = (set, n) => { for (let i = 1; i <= n; i++) if (!set.has(i)) return false; return true; };
-      if (covers(done, g.closedCount)) return [];        // 正常关账,放行
-    }
-    // ⚠️ **拦对了但说错原因,比没拦更浪费时间**(grill:edge-cases E8)。
-    //   末行损坏 / 文件为空 / 并发 append 交错 / 上次 --arm 因 CAS 冲突退出
-    //   (journal 先写、状态后抛 ⇒ 末行是 arm 而盘上是 cleared)/ 双清 ——
-    //   五种都让 `closedCount=0` ⇒ K0 命中,而原措辞说「新批未武装」,
-    //   于是排障者会去 `--arm` 一个新批,而真问题是**台账坏了**。
-    if (g?.cleared && properClose(ctx) && !(g.closedCount > 0)) {
-      return ["**关账证据取不到**(台账末行不是本批的 clear 行,或读不出)"];
-    }
-    return [g?.cleared ? "已结清后又动工作面(= 新批未武装)" : "从未武装"];
+    // 判定尾段(逐一验 1..N / 「关账证据取不到」单列措辞)已抽 k0Core——
+    // 与簿记豁免的两支变异共用,保证变异只 differ 目标行;史注随零件上移。
+    return k0Core(ctx);
   },
   // ⚠️ **豁免必须要求「真有过一个带条件的批,且它现在关了」**(grill:architecture P1,实测)。
   //   原写法只问 `properClose`(本轮 `--clear` 在最后一次写之后),不问有没有批 ⇒
@@ -1590,6 +1599,24 @@ const RULE_K0 = {
       if (g && !g.cleared && Array.isArray(g.conditions) && g.conditions.length) return [];
       return ["从未武装"];
     } }) },
+    // 分支④:簿记豁免撤销(还原 2026-08-26 之前)⇒ 债表登记轮照拦,churn 复活。证人=neg 簿记条
+    { name: "撤销债表簿记豁免", apply: (r) => ({ ...r, detect: (ctx) => {
+      const g = ctx.batchGoal;
+      const armed = g && !g.cleared && Array.isArray(g.conditions) && g.conditions.length > 0;
+      if (armed) return [];
+      if (!ctx.writes.length && !ctx.didCommit()) return [];
+      return k0Core(ctx);
+    } }) },
+    // 分支⑤:簿记豁免放宽到全部 docs ⇒ 「顺手改法典也算簿记」——fail-open 那侧。证人=pos 混入条
+    { name: "簿记豁免放宽到任意 docs", apply: (r) => ({ ...r, detect: (ctx) => {
+      const g = ctx.batchGoal;
+      const armed = g && !g.cleared && Array.isArray(g.conditions) && g.conditions.length > 0;
+      if (armed) return [];
+      if (!ctx.writes.length && !ctx.didCommit()) return [];
+      if (ctx.writes.length &&
+          ctx.writes.every((w) => /docs\//.test(String(w).replace(/\\/g, "/")))) return [];
+      return k0Core(ctx);
+    } }) },
   ],
   cases: {
     pos: [
@@ -1612,6 +1639,10 @@ const RULE_K0 = {
       // 旧形状保留:`{conditions:[…], cleared:true}` 真实系统不产生,但它是
       // 「去掉 closedCount」那条变异的证人(grill E11 指出这是唯一证人,已知薄弱)。
       { text: "接着改。", write: "scripts/x.mjs", batchGoal: { batch: "099", conditions: ["甲"], cleared: true } },
+      // **簿记豁免不外溢**(杀分支⑤「放宽到任意 docs」):写的是法典不是债表 ⇒ 照拦。
+      //   「顺手把修法也做了」不属簿记——豁免面就债表一个文件,寸步不让。
+      { text: "登记之余顺手改了条法,提交。", write: "docs/laws/collab.md", commit: true,
+        batchGoal: { cleared: true, batch: "105", closedConditions: ["甲"] } },
     ],
     neg: [
       // 纯问答,没动工作面
@@ -1626,6 +1657,10 @@ const RULE_K0 = {
       { text: "条件1: 达成。条件2: 达成。关账。", write: "scripts/x.mjs",
         bash: "node --no-warnings scripts/batch-goal.mjs --clear",
         batchGoal: { cleared: true, batch: "072", closedConditions: ["甲", "乙"] } },
+      // **债表簿记豁免**(2026-08-26,批 106;fp「批间补救」四犯的兑现修法;杀分支④):
+      //   结清后给已发生的事在 docs/gate-debts.md 登记一笔并提交 ⇒ 不算未武装动工。
+      { text: "把这笔实斑登进债表,提交。", write: "docs/gate-debts.md", commit: true,
+        batchGoal: { cleared: true, batch: "105", closedConditions: ["甲"] } },
     ],
   },
 };
