@@ -10,26 +10,23 @@
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import os from "node:os";
 import path from "node:path";
 // ⚠️ `diffAgainstLegacy` 会比 `block`,而原实现只比排序后的 id 字符串——
 //   把 Q 从阻断改成提示,它照样显示「一致」(codex 060 §4.2 判出,采纳)。
 //   会比 block 的比对器一直躺在注册表里没被调用。
-import { validateRules, runRules, diffAgainstLegacy } from "./lib/gate-registry.mjs";
+import { validateRules, runRules } from "./lib/gate-registry.mjs";
 import { buildCtx } from "./lib/gate-ctx.mjs";
 import { RULES } from "./lib/gate-rules.mjs";
 // ⚠️ 别删:DIVERGENCE_DIR.P 的成因谓词用。缺它 ⇒ 谓词 ReferenceError ⇒ 被 fail-closed 的
 //   catch 吞成「不放行」⇒ 42 条全报未指名——与四个 RULE_P 候选当年**同一个病**,
 //   且同样是 eslint no-undef 一跑就报,我改完没跑(第二次)。
-import { CARRIER_SURFACE } from "./lib/gate-carriers.mjs";
+import { CARRIER_SURFACE, normPath } from "./lib/gate-carriers.mjs";
 // 切边界的**唯一实现**,独立成模块以便复现探针直接 import(见该文件头注)
-import { sliceBoundaries } from "./lib/gate-slice.mjs";
 // ⚠️ `lastTurn` 必须两边共用。旧 `run()` 内部先切到最后一个回合再判,
 //   而我最初把整片 40 行喂给 buildCtx ⇒ **两边看的输入面不同**,
 //   比出 25/122 的「分歧」里大半是这个搭错的台子造出来的假分歧
 //   (形态:旧=[] 新=[D],新引擎在旧的看不到的文本上响)。
 //   并行 diff 的价值正在于此:它逮的是**我的迁移错误**,不是规则错误。
-import { run as legacyRun, lastTurn } from "./hook-stop-closure.mjs";
 
 // 已知且**刻意**的行为分歧:key=规则 id,value=为什么。
 // 空表示「该条应当与旧实现完全等价」。
@@ -72,7 +69,7 @@ const DIVERGENCE_DIR = { G: "both", B: "new-only", C: "new-only", N: "new-only",
         //   任一在场而新没响 ⇒ **真回归,不放行**。
         const _P = RULES.find((r) => r.id === "P")._p;
         const ev2 = p.ctx.bashCmds.some((c) => { try { return _P.isCarrierCommitCmd(c); } catch { return false; } });
-        const ev1 = (p.ctx.writes || []).some((w) => CARRIER_SURFACE.test(String(w).replace(/\\/g, "/")));
+        const ev1 = (p.ctx.writes || []).some((w) => CARRIER_SURFACE.test(normPath(w)));  // D63
         if (ev1 || ev2) return false;
         // 两证据俱缺 ⇒ 旧的触发只可能来自**松共现**:它的视野(toolRawText:入参∪结果∪正文)里
         //   「git commit」与承重路径**各自出现在任何地方**就算——一条执行闸脚本的命令 +
@@ -82,7 +79,7 @@ const DIVERGENCE_DIR = { G: "both", B: "new-only", C: "new-only", N: "new-only",
         //   —— 该解析器自有配对夹具守着(引号暂存 pos / -m 提及 neg),链条写明。
         //   松共现连**旧视野**里都找不到 ⇒ 成因不明 ⇒ 不放行。
         const face = JSON.stringify(p.entries).replace(/\\\\/g, "/");
-        return /git\s+[\s\S]{0,40}commit/.test(face) && CARRIER_SURFACE.test(face);
+        return /git\s+[\s\S]{0,40}commit/.test(face) && CARRIER_SURFACE.test(normPath(face));  // D63
       }
       return false;                                   // 两侧同现的纯阻断翻转不走本表
     } catch { return false; }                          // 谓词崩 ⇒ 不放行(fail-closed)
@@ -104,7 +101,9 @@ const DIVERGENCE_DIR = { G: "both", B: "new-only", C: "new-only", N: "new-only",
 //   `didCommit()` 分支:提交命令是 `git -C …`/`git -c …` 形态,旧正则
 //   `/git\s+commit/` 咬不上 ⇒ 旧提示;新式在动作面认出真提交 ⇒ 新阻断。
 //   **抽样 2/13 定性没能逮住我自己的归因错,全量分类才逮住** —— 这就是谓词版的立法动机。
-const EXPECTED_BLOCK_CHANGE = {
+// 惰性史料(§3–§6 退役残留,全文已归档 docs/archive/gate-migrate-check-retired.md):
+// 保留供人读,`_` 前缀是 lint 面的「已知不用」声明,不是「以后会用」。
+const _EXPECTED_BLOCK_CHANGE = {
   K: {
     allow: {
       // 旧 rawText 假阳(读到提及 git commit 的文档即升阻断)⇒ 新降级。无条件放行:
@@ -234,14 +233,15 @@ const REAL_BATCH_GOAL = (() => {
   try { return JSON.parse(fs.readFileSync(".claude/.batch-goal.json", "utf8")); }
   catch { return null; }        // 文件不在 ⇒ null(= 真没武装),两边同样看到 null
 })();
-const realCtx = (entries) => buildCtx(entries, {
+const _realCtx = (entries) => buildCtx(entries, {
   ...(REAL_TRACKED ? { tracked: REAL_TRACKED } : {}),
   batchGoal: REAL_BATCH_GOAL,
 });
 
 /** 旧实现里到底有几项 —— 从源码数,不写死(见 CUTOVER 第①条的注释)。 */
-function legacyRuleCount() {
+function _legacyRuleCount() {
   try {
+    // F6:用 fileURLToPath,不用 pathname——后者保留百分号编码,带空格/中文的仓路径会算错。
     const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(new URL(import.meta.url))), "hook-stop-closure.mjs"), "utf8");
     return new Set([...src.matchAll(/id:\s*"([A-Z]\d?)"/g)].map((m) => m[1])).size;
   } catch { return Infinity; }   // 数不出来 ⇒ 判据不成立 ⇒ NO-GO(fail-closed)
@@ -318,7 +318,7 @@ const mkEntries = (c) => {
 //   `batchGoal` 尤其:不转发的话 K 的全部用例都在「无批次状态」下跑,
 //   而 K 在那个状态下**按设计就是不响**,于是正例全灭而看起来像判据写错了。
 // ── 窗口内动作的夹具通道 ────────────────────────────────────────────────────
-//   立此函数的理由(2026-08-20,**第七次**同族失败,由 oracle 跑 P 项时撞出):
+//   立此函数的理由(2026-08-20,**第七次**同族失败,由 xros 跑 P 项时撞出):
 //   `prior` 原先只拼得出 text / Write / Skill 三种块。而 P 数的是**窗口里**
 //   有没有真的跑过 codex(Bash)、子代理(Agent)、联网(WebSearch)——
 //   于是「真调用在窗口里发生过」这件事**在夹具里根本写不出来**,
@@ -421,6 +421,132 @@ for (const r of RULES) {
     const f = runRules([r], mkCtx(c));
     say(f.length === 0, `${r.id} 反例应放行:${c.text.slice(0, 24)}…`);
   }
+  // ── 出路自证(批 117):消息里印的每条出路,接在**本规则自己的正例**后面必须放行。
+  //   立法动机=本批一天撞到七次「闸承诺的出路,判据不认」。根因是出路清单与判据
+  //   两处各写一遍;现在消息由 `escapes` 渲染,这里再把每条出路真的走一遍
+  //   ⇒ **说的和做的一漂就红**,不必等下一个人撞上去。
+  //   天花板:只证「消息里印的那条能过」,不证同义变体也能过——后者靠 cases.neg
+  //   里的自然变体(D69 那类),两者互补不互替。
+  for (const e of r.escapes || []) {
+    // ⚠️ 四眼(codex 117 乙1)逮到三条,这里修其中两条:
+    //   ①**原来只测 `pos[0]`** ⇒ 一条规则若有多个触发分支,某条出路可能只对第一个正例有效,
+    //     对其余正例仍失败而没人知道。改为**逐个正例都跑**。
+    //   ②**非文本字段是覆盖不是合并**(`{...base, ...sample}`):若正例靠 `bash`/`agent`
+    //     触发,而 sample 恰好也带同名字段,触发条件会被**抹掉** ⇒ 测试假绿
+    //     (「放行了」其实是因为压根没触发)。修法=每条出路先跑一次**对照探针**:
+    //     把 sample 的字段合并进去、但**不加出路文本**,此时必须**仍然命中**;
+    //     不命中就说明这次绿色不含信息,直接判红。
+    //   ③(未修)`say` 与 `sample` **无语义绑定**——没有任何机器判据保证样例演示的
+    //     就是它标注的那条出路。四眼给了实例:S 的「自己定」曾挂着一个 ⏸ 样例
+    //     (走的是另一条合法停工路线),照样绿。已修那一例,但**机制层的洞仍在**,
+    //     登记 D81,失效期 **≤118**(四眼判 ≤120 太晚,采纳)。
+    // `forPos` :某些出路**天然只对某个触发分支成立**——例如 W 的样例里写着
+    //   `pos[0]` 那个交付物名,对别的正例当然不成立。**默认是「所有正例都要过」**,
+    //   要缩小适用面必须显式写出来 ⇒ 缩得见、不是悄悄只测第一条(四眼 117 乙1① 的原意)。
+    const posIdx = e.forPos === undefined
+      ? r.cases.pos.map((_, i) => i)
+      : (Array.isArray(e.forPos) ? e.forPos : [e.forPos]);
+    for (const pi of (r.cases.pos.length ? posIdx : [0])) {
+    const base = r.cases.pos[pi] || {};
+    // ⚠️ 两种出路形状,对应两种建模(批 117 当轮补;原设计只有前一种,是 D79 盲区①):
+    //   **加法型**(`sample.text`):在正例后面**接一句**就能过 —— 自标、就地声明、标 ⏸ 等。
+    //   **减法型**(`sample.replaceText`):必须**少说一句**才能过 —— T 的「别复述登记句」、
+    //     Q 的「当场做掉」、S 的「自己定」。这类接不上去,故改为**整轮换成这样说**:
+    //     sample 给出一整段应当放行的正文,替换而非追加。
+    //   两者都是「照消息做真的能过」的证明,只是一个证明「加什么」、一个证明「怎么说」。
+    //   ⇒ D79 盲区① 由此消解;剩下的盲区②(同义变体)仍靠 cases.neg,两者互补不互替。
+    const isReplace = typeof e.sample.replaceText === "string";
+    const { replaceText, ...rest } = e.sample;
+    // ⚠️ `bash` **追加不覆盖**(对照探针首跑即逮到,四眼 117 乙1②预言的正是这个):
+    //   W 的正例靠 `bash: "…batch-goal.mjs --clear"` 触发(它的 blocking 就是 ranClear),
+    //   而三条出路样例各自带 `bash` ⇒ 展开时把 `--clear` **覆盖掉** ⇒ 规则压根不触发,
+    //   于是三条「出路自证 PASS」全是假绿。语义上出路是**在原有动作之外再做一件事**,
+    //   所以命令面必须并存。其余字段仍是覆盖——覆盖出了问题由对照探针当场打红。
+    const mergeBash = (a, b) => [a, b].filter(Boolean).join("\n");
+    const withFields = { ...base, ...rest };
+    if (base.bash && rest.bash) withFields.bash = mergeBash(base.bash, rest.bash);
+    const merged = isReplace
+      ? { ...withFields, text: replaceText }
+      : { ...withFields, text: `${base.text || ""}${e.sample.text ? " " + e.sample.text : ""}` };
+    const tag = `${r.id} 出路自证[正例${pi}]:${e.say.replace(/\*/g, "").slice(0, 24)}…`;
+    // ── say ↔ sample 词面咬合(D81 的**部分**处置,批 117;先例=doctest)────────
+    //   doctest 之所以不漂,是因为**说明里的例子就是被执行的那个东西**——说明与测试
+    //   是同一份文本。我们这里是两份(`say` 散文 + `sample` 数据),所以绑定只能靠断言。
+    //   四眼给的 `caseRef` 方案**解决不了这个**:指向一个命名夹具仍是人手填的一句断言,
+    //   改名不等于加验证(诊断对、药方错)。
+    //   ⇒ 退而求其次,做两条**词面**咬合,把最容易犯的那一类挡住:
+    //   ① `say` 里用「」引出的字面出路,`sample` 必须真的含它(说什么就写什么);
+    //   ② `sample` 用了某个强特征(⏸ / 机械判据 / xros / 工具面已扫 …)而 `say` 只字未提
+    //      ⇒ 这个样例八成演示的是**别的**出路。四眼逮到的实例正是此形:
+    //      S 的「自己定并写明依据」当时挂着一个 `⏸ 需要你确认…` 的样例。
+    //   **天花板照实说**:这是词面启发式,不是语义等价判定;
+    //   同义改写、或两条出路共用同一批词的情形它都判不出。D81 的余下部分不可机械化。
+    {
+      const sTextAll = `${e.sample.text || ""} ${e.sample.replaceText || ""}`;
+      // ⚠️ 这里**曾有第①条**:「say 里用「」引出的字面出路,sample 必须真的含它」。
+      //   **当轮写出来就被自己的用例打红并撤掉**——`say` 里第一个「」经常不是出路本身:
+      //   I 的是**反例**(「你打算写的实现」,消息正教人别拿它当搜索键),
+      //   E2 的是**占位符模板**(「机械判据:已跑X」的 X,样例写的是真脚本名)。
+      //   **这是「散文里的引号靠不住」在本批的第三次**(前两次:朴素抠引号回灌 22/27 错、
+      //   T 的失效期记法)。⇒ doctest 式的结构绑定要的是一个**专用标记**
+      //   (say 里划出「这一段是要照抄的字面量」),那才是 D81 的正解,不是再猜引号。
+      // ── D81 的正解(2026-08-27,先例=doctest):**专用标记**让说明与样例结构上咬死。
+      //   doctest 之所以不漂,是因为**说明里的例子就是被执行的那个东西**;我们两份分开写,
+      //   所以给 `say` 里「**要照抄的那段字面量**」划一个专用标记 `⟪…⟫`,
+      //   然后断言 sample 的正文**真的含它**。这样「say 说 A、sample 演示 B」在机器上就成立不了。
+      //   选 `⟪⟫` 而不是 `「」/『』`:后两者在 say 里已被大量用作普通引号(当轮试过抠 `「」`,
+      //   27 条里 22 条抠错——那些是**反例**或占位符模板)。标记必须是**专为此用**的,
+      //   否则就退回「猜哪对引号是出路」那条已被证伪的路。
+      //   适用面:只管**规定了字面量**的出路(自标、就地声明、⏸ 标记…);
+      //   动作型出路(真回读、跑探针)没有字面量可咬,仍靠 sample 的动作面 + 下面的强特征检查。
+      //   ⚠️ 比对前**剥掉 markdown 强调与空白**:样例里写的是 `⏸ **需要你确认**`,
+      //   而标记里的字面量不带星号 —— 与 D76 同一个形状(判据被加粗打瞎)。
+      //   标记命名的是**内容**,不是**排版**;判据侧(`PAT.waitMarkStrict`)也已容忍同样的强调符,
+      //   两边口径必须一致,否则这条新检查自己就变成下一个「画在墙上的门」。
+      const bare = (x) => String(x).replace(/[*_~`\s]/g, "");
+      const lit = (e.say.match(/⟪([^⟫]{2,40})⟫/) || [])[1];
+      if (lit && !bare(sTextAll).includes(bare(lit))) {
+        say(false, `${tag} ← **say↔sample 不咬合**:say 规定要写 ⟪${lit}⟫,样例正文里没有`);
+        continue;
+      }
+      const MARKS = [["⏸", /⏸/], ["机械判据", /机械判据/], ["xros", /xros/],
+        ["工具面已扫", /工具面已扫/], ["免签例外已核", /免签例外已核/]];
+      const stray = MARKS.find(([n, re]) => re.test(sTextAll) && !re.test(e.say) && !e.say.includes(n));
+      if (stray) {
+        say(false, `${tag} ← **say↔sample 不咬合**:样例用了「${stray[0]}」而 say 只字未提,` +
+          `它演示的可能是别的出路`);
+        continue;
+      }
+    }
+    // ⚠️ **这里曾放过一条「对照探针」,当轮设计错了并撤掉**,记在这以免有人再想一遍:
+    //   构想=把 sample 的字段合并进来但不加出路文本,断言仍须命中,以此证明
+    //   「这次放行是出路起的作用,不是触发条件被抹掉了」。
+    //   **对动作型出路它必然误判**:M 的出路就是「真回读」(`read` 字段),
+    //   把它加进对照组等于把出路本身加进去 ⇒ 对照组当然不命中。
+    //   而对纯文本出路,对照组退化成「正例本身」,那由「正例应命中」已经保证,零新增信息。
+    //   ⇒ 真正要挡的是「`say` 与 `sample` 无语义绑定」(四眼 117 乙1③),
+    //   而那需要语义判定,不是加一条探针能解决的。登记 D81,失效期 ≤118。
+    const f = runRules([r], mkCtx(merged));
+    say(f.length === 0, tag);
+  }
+  }
+}
+
+// ── 2a′. 出路自证的**迁移进度**:未迁的必须显出来,不能让「没迁」看起来像「没问题」。
+//   这是「无声上限」纪律:凡工作流缩了覆盖面,就得把缩掉的部分打印出来,
+//   否则一份全绿报告读起来像「全覆盖」,而它不是。
+{
+  const promises = [];
+  for (const r of RULES) {
+    let msg = "";
+    try { msg = String(r.message(["样例"])); } catch { continue; }
+    if (!/出路|①|就地(自标|声明)/.test(msg)) continue;
+    promises.push([r.id, (r.escapes || []).length]);
+  }
+  const done = promises.filter(([, n]) => n > 0);
+  const todo = promises.filter(([, n]) => n === 0).map(([id]) => id);
+  console.log(`\n出路自证覆盖:${done.length}/${promises.length} 条带出路说明的规则已迁为数据` +
+    (todo.length ? `;**未迁**:${todo.join(" ")} —— 它们的出路仍是散文,漂了不会变红(D79)` : ""));
 }
 
 // ── 2b. 变异验收:每条规则必须存在一条能把它的用例打红的变异 ────────────

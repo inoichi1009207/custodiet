@@ -24,6 +24,7 @@
 // CEILING: 结构化只能消灭「把别人说的话当成我做的事」这一类;
 //   判据本身写得对不对,仍要靠正反例、变异测试与外部审计。CALIBRATED=false。
 
+
 /** 扫描输入的硬上限。理由:实测 600KB 输入使某条正则跑 43 秒,超过 hook 的 30s 超时,
  *  而**被超时杀死的 hook 不阻断** ⇒ 全部检查静默跳过。宁可截断也不能静默失效。 */
 export const SCAN_CAP = 200_000;
@@ -76,7 +77,7 @@ export function buildCtx(entries, extra = {}) {
    *  ⚠️ 但只解析入参还不够。codex 060 §1.3 给出三条反例,原实现全判错:
    *    `echo git commit`        → 原 true(它只是在**打印**这个字符串)
    *    `git commit --dry-run`   → 原 true(它**刻意不提交**)
-   *    `git -C /repo commit`  → 原 **false**(`-C <路径>` 是两个 token,`(-\S+\s+)*` 吃不下)
+   *    `git -C D:/test commit`  → 原 **false**(`-C <路径>` 是两个 token,`(-\S+\s+)*` 吃不下)
    *  故改为**按分隔符切段 + 段首必须是 git + 排除 --dry-run**:
    *  判的是「这一段命令的主语是不是 git、动作是不是 commit」,
    *  而不是「这串字符里有没有出现 git commit」。
@@ -90,11 +91,30 @@ export function buildCtx(entries, extra = {}) {
       return true;
     });
 
-  /** 写过的文件路径:Write/Edit 的 file_path,加上 Bash 里可判定的写目标。 */
+  /** 写过的文件路径:**只有** Write/Edit/NotebookEdit 的 `file_path`。
+   *
+   *  ⚠️ 2026-08-27(D90):此处原注写着「加上 Bash 里可判定的写目标」——**实现里没有**。
+   *  注释与实现不符,方向是**把覆盖面说大了**:读注释的人(包括我)会以为
+   *  `node -e 'fs.writeFileSync(...)'`、`sed -i`、重定向都被算进来了,而它们**都不在**。
+   *  当天实撞:我用 node heredoc 改 `docs/gate-debts.md`,`writes` 为空 ⇒
+   *  K0 的簿记豁免够不着 ⇒ 每次「改台账 + 提交」都误报。
+   *  **先把注释改成实情**(谎话比缺口更贵:缺口会被撞见,谎话让人不去撞)。
+   *  要不要把 Bash 目标真并进来 = 一次性改变 I/P/K0 三条规则的触发面,已登记 D90 余项。
+   *  需要 Bash 面写目标的判据,现在各自调 `bashWriteTargets()`(I 项一直这么做)。 */
   const writes = actions
     .filter((a) => /^(Write|Edit|NotebookEdit)$/.test(a.name))
     .map((a) => String(a.input.file_path || "").replace(/\\/g, "/"))
     .filter(Boolean);
+
+  /** 归一到判据用的相对形(与 `isNew` 共用一份,免得两处各写各的)。 */
+  const relOf = (p) => String(p || "").replace(/\\/g, "/").replace(/^.*?(?=\.claude\/|scripts\/|docs\/)/, "");
+
+  // ⚠️ 此处原有 `preExisting`(D56:「本轮首个写动作是 Edit ⇒ 本轮之前已存在」),
+  //   已于 2026-08-26 同批**撤回并删除**,不留死代码——留着会诱导下一位维护者复活一条已被证伪的判据
+  //   (跨模型复核点名的形态)。证伪它的反例:创建可以不经 Write 工具发生
+  //   ——子代理的工具调用不进主 transcript;Bash 重定向同理 ⇒ 首个**被观察到**的动作是 Edit,
+  //   而「主 transcript 里没有更早的 Write」推不出「文件此前存在」。
+  //   要重做这条判据,先解决 D60(子代理动作不可见),别再从工具名下手。
 
   /** 读过的文件路径:Read 的 file_path。用于「回读验证」这类**动作面**豁免。 */
   const reads = actions
@@ -135,11 +155,23 @@ export function buildCtx(entries, extra = {}) {
   //   ⇒ I 对我自己建的每个新载体都不响)——**在引擎接管后原样复活**。
   //   即:一条刚亲签落地的修法,几小时后被另一个改动**无声撤销**,而全套自测毫无反应。
   const justAdded = extra.justAdded instanceof Set ? extra.justAdded : null;
+  // ── D56 结清(2026-08-27):`preExisted` = **PreToolUse 那一刻实测**存在的载体路径。
+  //   成因已机器坐实:`MEMORY.md` 在磁盘上,而 `git ls-files` 里 memory/ 条目为 0
+  //   ⇒ `tracked` 永远不含它 ⇒ `isNew` 恒真 ⇒ I 对每次写 memory 都误报。
+  //   与 2026-08-26 被撤回的那版的**关键差别**:那版从 transcript **猜**
+  //   (「第一个写动作是 Edit ⇒ 已存在」),可被绕过 ⇒ 误报换漏放;
+  //   这版是 `hook-guard` 在**写发生之前**用 `existsSync` **量**出来的,不是推断。
+  //   注入面(调用方可控、夹具可控),与 `tracked`/`justAdded` 同形。
+  //   **无记录时退回旧判据**——那是**误报**侧,不开漏放口(经 Bash 造的文件走这一支)。
+  const preExisted = extra.preExisted instanceof Set ? extra.preExisted : null;
   const isNew = (p) => {
+    const rel = relOf(p);
     if (tracked === null) return true;
-    const rel = String(p).replace(/\\/g, "/").replace(/^.*?(?=\.claude\/|scripts\/|docs\/)/, "");
     if (justAdded && justAdded.has(rel)) return true;   // 本轮刚加进来的,仍算新建
-    return !tracked.has(rel);
+    if (tracked.has(rel)) return false;
+    // 仓外/未跟踪:git 说不上话,只能看写前那一刻的实测。
+    if (preExisted && (preExisted.has(rel) || preExisted.has(String(p).replace(/\\/g, "/")))) return false;
+    return true;
   };
 
   /** **跨轮窗口**:本轮之前的那一段(例如「自上次 commit 以来」)。
@@ -253,7 +285,7 @@ export function selfTest() {
   // codex 060 §1.3 的三条反例:判的是「这段命令的主语是不是 git」,不是「字符串里有没有 git commit」
   chk("echo git commit ⇒ 假(只是打印)", buildCtx([A([use("Bash", { command: "echo git commit" })])]).didCommit(), false);
   chk("--dry-run ⇒ 假(刻意不提交)", buildCtx([A([use("Bash", { command: "git commit --dry-run" })])]).didCommit(), false);
-  chk("git -C <路径> commit ⇒ 真", buildCtx([A([use("Bash", { command: "git -C /repo commit -m x" })])]).didCommit(), true);
+  chk("git -C <路径> commit ⇒ 真", buildCtx([A([use("Bash", { command: "git -C D:/test commit -m x" })])]).didCommit(), true);
 
   // S2-b:文件里提到 codex-run.mjs ⇒ 旧实现让跨模型复核那一半消失
   chk("文件内容提到 codex-run.mjs ⇒ ranBash 为假",

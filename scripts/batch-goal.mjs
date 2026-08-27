@@ -264,25 +264,40 @@ if (argv.includes("--arm")) {
   catch (e) { console.error(e.message); process.exit(2); }
   console.log(`已武装批 ${batch} 的 ${conds.length} 条完成条件;收尾时须逐条写「条件N:达成/未达成/不适用」`);
   // ── 到期债强制腿(2026-08-22,用户逼出:「失效期是装饰品——D34/D35 ≤080 早到期,没人查」)──
-  //   立法史:词表路线(Q 的 defer 正则)已判死(B 扩表实败 + oracle non-goal + Q「确无结构判据」),
+  //   立法史:词表路线(Q 的 defer 正则)已判死(B 扩表实败 + xros non-goal + Q「确无结构判据」),
   //   「推迟」的结构载体 = 批条件 + 带失效期的债表;失效期没有执行腿 ⇒ 装饰品。
   //   本腿在**开工时刻**(--arm = 唯一必经的结构点)机械列出到期未结的债,不靠散文不靠词表。
   //   一期只警不拦(拦会把「开工」堵死在还债上——比例归人判);连续多批仍列 ⇒ 升级另议。
   try {
     const rows = fs.readFileSync("docs/gate-debts.md", "utf8").split(/\r?\n/)
-      .filter((l) => /^\| D\d+ \|/.test(l) && !/已结|已撤销|待用户裁/.test(l));
+      .filter((l) => /^\| D\d+ \|/.test(l) && !/已撤销|待用户裁/.test(l));
     const cur = parseInt(batch, 10);
     // 分诊(2026-08-23 批 099,用户点破「到期腿跑出一堆我看不懂的」):
     //   行含亲签/呈签/归用户/用户裁 ⇒ 【需你裁】,其余 ⇒ 【我做】——用户只须看前一列。
     //   判据是关键词面,天花板:亲签字样写在方案叙述里也会归到【需你裁】(宁多勿漏,
     //   错归方向=多请示一次,反向=漏请示,代价不对称选这边)。
+    // ⚠️ 2026-08-27 改为**按列解析**(D88,批 118 关账后当场撞到)。两个毛病叠在一起:
+    //   ① 排除词表认 `已结` **不认 `已修`** —— 又一次措辞白名单(本族第十二次);
+    //   ② `≤` 取的是**整行第一个**匹配,而已结清的行里同时有 `~~≤113~~`(旧,划掉)
+    //      与 `**已修 118**`(新)⇒ 抓到旧的那个 ⇒ 判成逾期。
+    //   合起来:我一批清掉七条债,下一批 `--arm` **照样把它们全列成到期未结**。
+    //   **假欠账比没有欠账清单更坏**:它让人对整张清单脱敏,真到期的那几条就淹在里面。
+    //   ⇒ 失效期只从**第 4 列**取(表头:`| # | 欠账 | 批 | 失效期 | 复核来源 | 出路 |`),
+    //   并按**结构**判已结:该列被 `~~` 划掉,或含 已修/已结/已销 之一。
+    //   天花板:仍依赖表格列序;列序若变,本腿会静默失准 ⇒ 下面加了列数断言。
     const mine = [], yours = [];
+    let colWarn = 0;
     for (const l of rows) {
       const id = (l.match(/^\| (D\d+) \|/) || [])[1];
-      const m = l.match(/≤\s*0?(\d+)/);
+      const cells = l.split("|").slice(1, -1);           // 去掉首尾空串
+      if (cells.length < 6) { colWarn++; continue; }      // 列数不对 ⇒ 不猜,计数后跳过
+      const expiryCell = cells[3];
+      if (/~~[^~]*≤/.test(expiryCell) || /已(修|结|销)/.test(expiryCell)) continue;  // 已结
+      const m = expiryCell.match(/≤\s*0?(\d+)/);
       if (!(m && Number.isFinite(cur) && cur > +m[1])) continue;
       (/亲签|呈签|归用户|用户裁/.test(l) ? yours : mine).push(`${id}(≤${m[1]})`);
     }
+    if (colWarn) console.log(`⚠ 到期腿:${colWarn} 行列数异常已跳过 —— 表格列序可能变了,本腿会失准`);
     const due = [...mine, ...yours];
     if (due.length) {
       console.log(`⚠ **到期未结的债 ${due.length} 条**(本批号已超过其失效期):`);

@@ -28,10 +28,22 @@
 //
 // ── 装载期不变量(违反即拒绝装载,不是警告)────────────────────────────────
 //   INV-1  blocking:true 的规则**不得只有 kind:"text" 的豁免**
-//          (当日实证:纯文本出路必然吞掉其余出路,自标 8 次 : oracle 1 次)
+//          (当日实证:纯文本出路必然吞掉其余出路,自标 8 次 : xros 1 次)
 //   INV-2  每条必须有 law 锚点(否则 verify-laws 无从对账,断链会静默)
 //   INV-3  每条必须有 ≥1 正例 + ≥1 反例(否则「全绿」不含信息)
+//   INV-7  规则若声明 `escapes`(出路即数据),每条出路必须有 ≥1 个 `sample`,
+//          且 `say` 非空——消息由 `escapes` 渲染,故缺 say = 印出一条空出路。
+//          **立法动机(2026-08-27,批 117)**:本批一天内撞到**七次**同一个错型——
+//          「闸的消息承诺一条出路,而判据不认那个写法」(自标只认模板七字 / 探针只认 node /
+//          W 说只能派子代理 / F 要求的格式它自己不检测 / 声明只认「有」/ ⏸ 加粗失效 /
+//          分类名加引号被剥掉)。根因**不是七个 bug**,是出路清单与判据**两处各写一遍**。
+//          曾试过更便宜的路——从消息散文里自动抠出「…」当出路回灌——**当场证伪**:
+//          22 条抠出来的串里绝大多数是消息引用的**反例**(「工作量大」是**不算**合法停工的),
+//          机器分不出「这是出路」与「这是反面教材」。⇒ 只能反过来:出路写成数据、消息从数据生。
+//          配套的运行期证明在自测「出路自证」一节:每条出路的 sample 接在该规则**自己的正例**
+//          后面,必须放行——即「照消息做真的能过」被机器每次跑一遍。
 //
+
 // CEILING: 引擎只保证结构性质,不保证某条 detect 写得对。
 //   判据对不对仍要靠正反例 + 变异测试 + 外部审计。CALIBRATED=false。
 
@@ -51,6 +63,33 @@ export function validateRules(rules) {
     //   fail-closed 但代价大);在装载期拦住比在运行期炸便宜。
     if (r.requires !== undefined && (!Array.isArray(r.requires) || r.requires.some((x) => typeof x !== "string")))
       problems.push(`${at}: requires 必须是字符串数组(现在是 ${typeof r.requires})`);
+
+    // INV-7:出路即数据(见头注)。校验两件:①结构;②**凡消息里写了出路,就必须声明**。
+    //   ②是 2026-08-27 批 117 迁完 10/10 之后才升上来的——升级时机是刻意的:
+    //   在还有规则没迁时就 fail-closed,等于要求一次性改十条,那种「先立法再迁」
+    //   会逼人为了装载通过而胡乱填 escapes。**先迁完、再焊死**,顺序反了就白立。
+    //   「sample 真的能过」不在这儿判,由 `gate-migrate-check` 的「出路自证」每次跑。
+    {
+      let msg = "";
+      try { msg = String(r.message(["样例"])); } catch { msg = ""; }
+      const promisesEscape = /出路|就地(自标|声明)/.test(msg);
+      if (promisesEscape && !(Array.isArray(r.escapes) && r.escapes.length)) {
+        problems.push(`${at}: 消息里写了「出路」却没声明 escapes —— ` +
+          `出路说明与判据两处各写必漂,本批实撞八次(INV-7)`);
+      }
+    }
+    if (r.escapes !== undefined) {
+      if (!Array.isArray(r.escapes) || !r.escapes.length) {
+        problems.push(`${at}: escapes 若在必须是非空数组(INV-7)`);
+      } else {
+        r.escapes.forEach((e, i) => {
+          if (!e || typeof e.say !== "string" || !e.say.trim())
+            problems.push(`${at}: escapes[${i}] 缺 say —— 会渲染出一条空出路(INV-7)`);
+          if (!e || typeof e.sample !== "object" || e.sample === null)
+            problems.push(`${at}: escapes[${i}] 缺 sample —— 出路无从自证(INV-7)`);
+        });
+      }
+    }
 
     // INV-2
     if (!r.law || typeof r.law !== "string") {

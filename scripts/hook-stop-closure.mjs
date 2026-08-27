@@ -193,8 +193,8 @@ export const PAT = {
     /我可以(帮你|去)?(跑|做|核|查)/,
     /需要(我)?(的话|再)/,
   ],
-  // E 项:因果断言。纪律 32 第②款要求它走双通道(能造机械判据→oracle:compile+run;
-  // 造不出→oracle:reason + codex 独立复核,一个管形一个管独立性)。
+  // E 项:因果断言。纪律 32 第②款要求它走双通道(能造机械判据→xros:compile+run;
+  // 造不出→xros:reason + codex 独立复核,一个管形一个管独立性)。
   // ⚠️ 召回率是本项的命门:2026-08-19 实测,原五条模式对当日全部输出只逮到 3 条,
   // 而实际因果断言远多于此——最常见的「X 是因为 Y」因原模式强制要求「之所以」而全数漏过。
   // 宁可误报不可漏报(本项只提示不阻断,误报成本≈一行提示;漏报成本=断言无声进法条)。
@@ -239,7 +239,7 @@ export const PAT = {
   selfAudit: [/自审/, /grill\s*yourself/i, /逐条(核对|自查)/, /四问/],
   // I 项:纪律 32「造之前先扫工具面」的**闸化**。该纪律 2026-08-17 立,
   // 但它住在 skill 正文(按需加载)且只是纪律不是闸,故 08-19 同一个病复发三次
-  // (扫了已装件仍手搓官方已有实现 / oracle 联动未触发 / 绕过命令直调底层)。
+  // (扫了已装件仍手搓官方已有实现 / xros 联动未触发 / 绕过命令直调底层)。
   // 判据取「本轮新建了载体文件」这一结构事实,不猜意图。
   scanned: [/工具面已扫/, /已扫(三层|一遍)/, /命中\s*\d|无命中/, /扫过(工具面|三层)/],
   // S 项:**把决定推回给用户**的表述。只收「我停下来等你定」那一族,
@@ -256,6 +256,21 @@ export const PAT = {
     // 而第一版 handoff 漏了它:自测「过」是因为模式没命中,不是因为那句话合法。
     // 差点据此宣布 S 覆盖到位。
     /[A-D]\s*[\/、]\s*[A-D]/, /还是先不做|要不要先/, /哪(个|种)方案/,
+    // ⚠️ **第三次漏网,形态同前两次:本表是措辞白名单**(2026-08-26,用户逮到)。
+    //   实况漏网句:「要我现在接着办 D60,还是**先停在这里**?」——同一个行为、第一人称说法,
+    //   上面 11 条一条不中 ⇒ S 整条跳过,连「标没标 ⏸」那一问都没走到。
+    //   我不是故意绕的,这更糟:**规则能不能拦住我,取决于我碰巧挑了哪个词**。
+    //   下面补的是「把『继续 vs 停下』摆给用户挑」这一族的通用形状,不再逐句枚举:
+    /要我(现在)?[^。?？]{0,12}(还是|,还是)/,          // 要我…还是…
+    /还是(先)?(停|不做|放着|搁|等)/,                    // …还是先停在这里
+    // ⚠️ 原写作 `/(需不需要|是否需要|用不用)(我)?[^。?？]{0,10}/` —— 跨模型复核 Q3 判它
+    //   **误报面可能高频**:不要求问号、不要求指向用户,技术讨论里「这里需不需要加个锁」
+    //   这类**自问自答**会被命中。已收窄为「必须指向我 + 必须以问号收尾」。
+    /(需不需要|是否需要|用不用)我[^。]{0,14}[?？]/,      // 需不需要我…?
+    /(接着|继续)(办|做|干|修)[^。?？]{0,10}(还是|吗|？|\?)/,
+    // 天花板(照抄进任何引用本表的报告):**本表仍是措辞面,不是行为面**。
+    //   真正的行为判据应是「本轮以提问收尾 + 批目标尚有未达成条件 + 无阻断理由」,
+    //   那需要结构信号而不是正则。已登记 D67,补上之前本表只能靠加词维持。
   ],
   // ⚠️ 光有 `handoff` 不够:**「陈述某事归你」≠「停下来等你」**。
   //   实撞:Q 的用例「这件留给下次——它改的是授权边界,需亲签,归你签。」被 S 误伤,
@@ -266,10 +281,38 @@ export const PAT = {
   registered: [/已登记未修/, /登记(未修|在案|下来|了)/, /记在案/, /先挂着|挂着不修|暂不处理/,
     /登记(而非|不是)处置/, /已(记|录)(下|入)(案|册)/],
   // 失效期标记:到期就该自动回到 active。
+  // ⚠️ 2026-08-27(D84):原表不认 **`失效期 ≤NNN`** —— 而那正是 `docs/gate-debts.md`
+  //   全表在用的规范记法(每一行的失效期列都是 `≤115`/`≤118` 这个形状)。
+  //   于是:照台账的写法交代失效期,T 判「没给失效期」。**第十次同型**——
+  //   闸的判据不认本仓自己的规范记法。方向是**误拦**:交代了却被判没交代。
+  //   要求带数字,免得只写「失效期」三个字就过。
   expiry: [/失效条件/, /到期/, /\d+\s*(批|天|周|月)内/, /下(一)?批(必|须)/, /复议/,
-    /\d{4}-\d{2}-\d{2}/, /(本|下)批(收尾|关账)前/],
+    /\d{4}-\d{2}-\d{2}/, /(本|下)批(收尾|关账)前/,
+    /失效期\s*[:：]?\s*(≤|<=|不晚于)?\s*\d+/, /(≤|<=)\s*\d{2,4}\s*批?/],
   // 宪法:「停下等确认必标『⏸ 需要你确认』——三家 CLI 唯一通用等待标识,不得省略」。
-  waitMark: [/⏸/],
+  // ⚠️ 认**宪法写死的规范形态**,不认裸字符(2026-08-26 实测误报,当轮就撞上):
+  //   宪法「永久红线」写的是「停下等确认必标『⏸ 需要你确认』——三家 CLI 唯一通用等待标识」。
+  //   而判据只认一个裸 `⏸` ⇒ **讨论这个标记本身就会触发它**:那一轮我在复述用户的话、
+  //   写夹具名、写判据说明,文里出现了三次 ⏸,零次真停工 ⇒ S 判「标了但没给理由」。
+  //   这在本仓是高频形态——闸自己就是本仓的工作对象,谈论判据是日常。
+  //   收紧成「⏸ + 需要你确认(允许中间有空白/冒号)」或行首独立出现,不是加规矩,是照宪法改对。
+  //   ⚠️ **拆成两个判据**(2026-08-26 跨模型复核 Q4 判「方向只对了一半」):
+  //     收紧「合规凭证」是对的,但**同时把它当成唯一的「停工意图入口」**是在**放松闸**——
+  //     一个只写了裸 `⏸`、不写规范形态的停工,会从「该被拦的违规停工」变成「完全不审」。
+  //     故:`waitMark` = **意图**面(宽,但要求行首独立出现,以排除散文里的提及);
+  //         `waitMarkStrict` = **凭证**面(窄,认宪法写死的完整形态)。
+  //     意图命中而凭证不中 ⇒ 拦「标了但没用规范形态」,不再静默放行。
+  //     ⚠️ 2026-08-27(D76,本轮自撞第三轮):`\s*` **吃不下 markdown 强调符**。
+  //       实测 `⏸ **需要你确认 …**` 不认、`⏸ 需要你确认` 认——而把短语加粗
+  //       (`⏸ **需要你确认**`)恰恰是最自然的写法,我连着三轮都这么写、连着被拦三轮。
+  //       **同族第六次**(D69 自标出路、ranProbe 运行时、D73 的 W 拦词、D75 的 F 格式、
+  //       四眼逮到的 declHasOracle 白名单):**出路的判据比出路的说明窄**。
+  //       本项尤其贵:它是**凭证**面——不认凭证 = 合法停工被判成违规停工,
+  //       而人照着宪法原文写却过不去,只会去关逃生口。
+  //       修法:⏸ 与「需要你确认」之间允许**有界**的强调符/空白/冒号。
+  //       量词全部封顶(本文件有 ReDoS 前科,见 PROBE_SCAN_CAP 头注)。
+  waitMark: [/⏸[\s*_~`]{0,8}[:：]?[\s*_~`]{0,8}需要你确认/, /^[\s*_~`]{0,8}⏸/m],
+  waitMarkStrict: [/⏸[\s*_~`]{0,8}[:：]?[\s*_~`]{0,8}需要你确认/],
   // 三类合法停工理由(宪法「执行共识」:只有实打实阻断才算)。
   stopReason: [/不可逆/, /亲签|需你签|要你签|签字/, /缺凭据|站点不可达|不可达|只有(用户|你)能/,
     /需用户亲签|归用户/, /产品(形态|取舍)|涉钱|版权|凭据/],
@@ -426,7 +469,10 @@ function checkA(entries) {
   // 原实现把 running 中的任务判成未闭环,而两套 id 并存[后台 Bash id / codex job id]会误报)。
   for (const m of raw.matchAll(/--poll\s+([A-Za-z0-9_-]+)/g)) closed.add(m[1]);
   for (const m of raw.matchAll(/<task-id>([A-Za-z0-9_-]+)<\/task-id>/g)) closed.add(m[1]);
-  for (const m of raw.matchAll(/([A-Za-z0-9_-]{6,})\.output/g)) closed.add(m[1]);
+  // ⚠️ 量词必须封顶(D57,2026-08-26)。无上限的 `{6,}` 后接字面量,在 200KB 单字符输入上
+  //   实测 **57.6 秒**——远超 hook 的 30s 超时,而**被超时杀死的 hook 不阻断** ⇒ 整闸静默失效。
+  //   封顶到 64(后台任务 id 远短于此)后同一输入 55ms,千倍。同族封顶见本批 D57 另五处。
+  for (const m of raw.matchAll(/([A-Za-z0-9_-]{6,64})\.output/g)) closed.add(m[1]);
   // ④ 只在「发起之后」再次出现才算——发起行自身不算跟踪
   for (const id of started) {
     const first = raw.indexOf(id);
@@ -471,23 +517,36 @@ export const PROBE_WINDOW = 2000;
  *  两害相权:漏判一次出路①只是多拦一轮,闸静默失效是全局无声关闭。 */
 export const PROBE_SCAN_CAP = 200_000;
 
+/** 认得出的探针运行时。**每加一个词都是 fail-open 面**,故只按实撞加,不按「可能有人用」加。
+ *
+ *  ⚠️ 消费者只有一个:`eFacts().shaped`,即 E0 与 E2。**本注释首版写的是「C/H/E0/E2 都吃」,
+ *  那是错的**(codex 114 Q4 逐行核出,已复证:C 看写入/登记、H 看承诺兑现,均不调 `ranProbe`)。
+ *  错的来源是文件里更早的一处同样过期的注释——**注释漂移会直接把攻击面判大或判小**,
+ *  而安全审计正是照着注释找入口的。改这条时请连带核一遍调用点,别再照抄。
+ *  - `node`/`nodejs`:本仓自身。
+ *  - `python`/`python3`:2026-08-27 实撞(D69)——另一条会话在 Python 仓里写了
+ *    `tests/probe_rate1_determinism.py` 并跑出退出码,是教科书式的「形」证据,
+ *    却因运行时不是 node 而 `shaped=false` ⇒ E0 拦下一句**有机器判据兜底**的话。
+ *    闸已开源(custodiet),别人的仓本就不必是 Node。
+ *  **天花板**:这是一张运行时白名单,go/cargo/ruby/deno 一律不认。
+ *  **失效条件**:再撞到第二个未列运行时,就不许继续往表里塞词——
+ *  改成读仓库配置(或按「本轮写出的文件被本轮执行」这一行为判据),否则这表会长到没人维护。 */
+export const PROBE_RUNTIMES = ["nodejs", "node", "python3", "python"];
+/** 词界与旧式逐字等价:前界非 `[\w-]`(挡 `bin/mynode`),后界非 `[A-Za-z0-9_-]`
+ *  (挡 `nodemon`/`pythonic`,放行 `node.exe`)。长词在前,`nodejs`/`python3` 先于短词匹配。
+ *  形状上是纯字面量交替 + 环视,**无嵌套量词、线性**——这条路径上一次爆炸过一回(见上文)。 */
+const PROBE_RT_RE = new RegExp(
+  String.raw`(?<![\w-])(?:${PROBE_RUNTIMES.join("|")})(?![A-Za-z0-9_-])`, "g");
+
 export function ranProbe(blob) {
   const s = String(blob).slice(-PROBE_SCAN_CAP);
   const PROBE = /verify|check|probe|-test|audit/;
-  let i = 0;
+  PROBE_RT_RE.lastIndex = 0;
   for (;;) {
-    const at = s.indexOf("node", i);
-    if (at < 0) return false;
-    // D7(2026-08-23 探针逐一验时逮到):`node` 是**子串**匹配 ⇒ `nodemon --watch check.js`、
-    //   `bin/mynode …verify…` 都被当成 node 探针 ⇒ 白给 C/H 豁免(fail-open)。
-    //   补 token 边界:前界非词字符,后界非 [A-Za-z0-9_-](`.` 放行——`node.exe` 要认)。
-    // ⚠️ `nodejs` 整词放行(codex 092 复审逮到:Debian 官方包装的就是 /usr/bin/nodejs,
-    //   一刀切排字母后界会把真实探针误杀成「没跑过」)。nodemon 仍拒:词不等于 nodejs。
-    const pre = at === 0 ? "" : s[at - 1];
-    const end = s.slice(at, at + 6) === "nodejs" ? at + 6 : at + 4;
-    const post = s[end] || "";
-    if ((pre && /[\w-]/.test(pre)) || /[A-Za-z0-9_-]/.test(post)) { i = at + 4; continue; }
-    // 只看这条 `node` 之后的一段:命令通常远短于此,超出即视为跨到别的命令去了
+    const m = PROBE_RT_RE.exec(s);
+    if (!m) return false;
+    const at = m.index;
+    // 只看这条运行时命令之后的一段:命令通常远短于此,超出即视为跨到别的命令去了
     const seg = s.slice(at, at + PROBE_WINDOW)
       // ⚠️ shell 续行 `\<换行>` 要先接回来,否则换行被当命令边界 ⇒
       //   `node --no-warnings \<换行> scripts/verify-laws.mjs` 漏判(codex 复核给出)。
@@ -499,7 +558,6 @@ export function ranProbe(blob) {
     //   (第一版我就这么写的,自测当场逮住。Windows 长路径几乎总要加引号。)
     const cmd = seg.split(/(?<!\\)"|[;&|\n]/)[0];
     if (PROBE.test(cmd)) return true;
-    i = at + 4;
   }
 }
 
@@ -626,7 +684,8 @@ export function bashWrites(rawCmd, pathRe) {
 export function extractTargets(line) {
   const t = new Set();
   for (const m of line.matchAll(/`([^`\n]{2,60})`/g)) t.add(m[1].trim());
-  for (const m of line.matchAll(/([\w.-]+\/[\w./-]+\.\w{1,5})/g)) t.add(m[1]);
+  // 量词封顶同上(D57):原 `[\w.-]+\/[\w./-]+` 在 200KB 单字符输入上实测 31.3 秒。
+  for (const m of line.matchAll(/([\w.-]{1,128}\/[\w./-]{1,512}\.\w{1,5})/g)) t.add(m[1]);
   for (const m of line.matchAll(/(--[a-z][\w-]{2,})/g)) t.add(m[1]);
   for (const m of line.matchAll(/\b([\w-]+\.(mjs|ts|js|md|json))\b/g)) t.add(m[1]);
   return [...t];
@@ -658,11 +717,21 @@ function toolRawText(entries) {
  *      于是它们既没被拦、也没被看见。这横切 12 条 PAT 驱动的规则。
  *  ⇒ 去掉 `break`,收全部命中行(仍按行去重:一行撞多个模式只列一次)。
  *  代价:消息可能变长 ⇒ 由各规则的 `.slice(0, N)` 控制展示条数,**但计数是真的**。 */
-export function matchAny(text, pats) {
+/** @param {string} [echoFrom] 回显源。给了就**拿它的同号行**当回显,判据仍跑在 `text` 上。
+ *  用途:因果族先把引文抹成空格再判(免得跨引号边界咬合),但抹完的文本**不能拿去回显**
+ *  —— 2026-08-27 astrbot 实况:拦截消息显示成「是因为 会让你在 和 之间反复权衡」,
+ *  引文里的名词全没了,人看不出被拦的是哪句、更无从处置(D71)。
+ *  成立前提:掩码**等长且保留换行**(见 `maskQuoted`),行号才对得上;
+ *  对不上时按 `echo[i] != null` 退回剥过的行,**不抛错**——回显退化远好过整闸崩。 */
+export function matchAny(text, pats, echoFrom) {
   const hits = new Set();   // 去重:一行可能同时撞上多个模式,不重复列
+  const lines = text.split("\n");
+  const echo = typeof echoFrom === "string" ? echoFrom.split("\n") : null;
   for (const re of pats) {
-    for (const line of text.split("\n")) {
-      if (re.test(line)) hits.add(line.trim().slice(0, 120));
+    for (let i = 0; i < lines.length; i++) {
+      if (!re.test(lines[i])) continue;
+      const shown = echo && echo[i] != null ? echo[i] : lines[i];
+      hits.add(shown.trim().slice(0, 120));
     }
   }
   return [...hits];
@@ -711,6 +780,25 @@ function readPLedger() {
 }
 
 let _trackedCache;
+/** D56:PreToolUse 实测的「写之前是否已存在」记录。
+ *  由 `hook-guard` 在写发生**之前**用 `existsSync` 量出来并追加,收尾侧只读不写。
+ *  与 `tracked` 同为**注入面**——规则不自读磁盘(那条纪律的代价已实测过)。
+ *  读失败/文件不在 ⇒ 返回 null ⇒ `isNew` 退回旧判据(误报侧,不开漏放口)。 */
+let _preExistedCache;
+function preExistedSet() {
+  if (_preExistedCache !== undefined) return _preExistedCache;
+  try {
+    const txt = fs.readFileSync(".claude/.carrier-precheck.jsonl", "utf8");
+    const set = new Set();
+    for (const line of txt.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try { const r = JSON.parse(line); if (r && r.existed && r.path) set.add(String(r.path)); } catch { /* 跳过坏行 */ }
+    }
+    _preExistedCache = set;
+  } catch { _preExistedCache = null; }
+  return _preExistedCache;
+}
+
 /** `git log -1 --diff-filter=A` 的进程内缓存(同 _trackedCache 的理由)。 */
 let _justAddedCache;
 
@@ -741,14 +829,14 @@ let _justAddedCache;
 //   `creation`(新建触发 I)与 `loadBearing`(改动并提交触发 P)两个属性,因为两者
 //   问的不是同一个问题——「改一个已有法典条文」是承重不是造物,「新建一份 memory」反之。
 export { CARRIER_SURFACE } from "./lib/gate-carriers.mjs";
-import { CARRIER_SURFACE } from "./lib/gate-carriers.mjs";
+import { CARRIER_SURFACE, normPath as normPathC, isCarrierPath as isCarrierPathC, selfTest as carriersSelfTest } from "./lib/gate-carriers.mjs";
 // ⚠️ **反向导入引擎**(2026-08-20)。看起来是循环依赖(`gate-rules` 也从本文件导入
 //   `PAT`/`matchAny`/`bashWrites`…),但**实测无害**:规则只在 `detect` **体内**
 //   (调用时)碰那些符号,不在模块求值时碰 ⇒ ESM 的循环导入对这种形态成立。
 //   我此前断言「循环依赖是这道缝做不成的唯一技术障碍」——**那是没试就说的**,
 //   探针(scratchpad/cycle-probe)三条全过:两边 import 成功、依赖 PAT 的规则在环里正常命中、
 //   旧实现同进程也正常。**障碍不存在,缝一直做得成。**
-import { RULES, ranClear as ranClearRule } from "./lib/gate-rules.mjs";
+import { RULES, ranClear as ranClearRule, maskQuoted } from "./lib/gate-rules.mjs";
 // `validateRules` 是 2026-08-20 才接进**生产路径**的 —— 此前它只在 `gate:accept` 里跑,
 // 于是 INV-1..4 对真跑的闸完全不生效(grill:recon 查出,`grep -c` = 0)。
 import { runRules, validateRules } from "./lib/gate-registry.mjs";
@@ -800,7 +888,14 @@ export function gateMachineryFiles(settingsDir = ".claude") {
     const pkg = fs.readFileSync("package.json", "utf8");
     const scripts = JSON.parse(pkg).scripts || {};
     for (const [k, v] of Object.entries(scripts)) {
-      if (!k.startsWith("gate:")) continue;
+      // ⚠️ 2026-08-27:也认 `_gate:machinery` 这个**专用声明键**。
+      //   此前清单是寄生在 `gate:lint` 的 glob 上的副产品——把那条 glob 从 5 个点名文件
+      //   改成 `scripts/` 目录(D59①),清单当场少一项,而自测印的是
+      //   「承重面漂移 26/26」:**分母缩了还全绿**,正是这条测试当初立来防的那种漂移,
+      //   这次它自己被同一种手法绕过去了。根因=清单来源不该是一条管别的事的脚本。
+      //   目录形态(`scripts/`)刻意**不展开**:52 个 .mjs 里 24 个本就不是承重件
+      //   (`cdp.mjs`/`prod-lib.mjs` 是业务工装),展开只会制造 24 条假红。
+      if (!/^_?gate:/.test(k)) continue;
       any = true;
       for (const m of String(v).matchAll(/(scripts\/[\w./-]+\.mjs)/g)) found.add(m[1]);
     }
@@ -854,7 +949,7 @@ export function run(transcriptPath, ctx = {}) {
   // 立法动机 —— **同一天两次**「假陈述进耐久载体」:
   //   ① 我在 `gate-carriers.mjs` 的注释里把 memory 相对路径那条标成「**已修**」,
   //      而实测它没修(绝对路径才认)。代码注释会被后来的人当事实。
-  //   ② 我在报告里写「工具面已扫(四层)…④ 联网/GitHub——搜到 `一个社区扫描器`」,
+  //   ② 我在报告里写「工具面已扫(四层)…④ 联网/GitHub——搜到 `nlpm:vague-scanner`」,
   //      而第四层**一次都没跑**,那个发现来自本地 `ls`。用户当场逮到:
   //      「我连联网搜索命令都没看到」。
   //   两次都不是记错,是**在没做的情况下按流程该有的样子把格子填了**。
@@ -869,8 +964,16 @@ export function run(transcriptPath, ctx = {}) {
   //   也判不出跨轮完成的事(上一轮修的、这一轮才报)。后者是已知误报形态。
   {
     const claims = [];
+    // ⚠️ **剥引文**(2026-08-27,D74,本轮自撞):本项原来在原文上匹配 ⇒
+    //   **引用被拦的那句话来更正它,更正本身再被拦**——我照出路把话改准,
+    //   而改准的写法必然要复述原词(「说了『工具面已扫』,那是转述台账不是本轮动作」),
+    //   于是连撞两轮,第二轮的触发源就是第一轮的处置。
+    //   回声族第四次(前三:S 的 handoff、E2 的 declHasOracle、E0/E2 的 PAT.causal),
+    //   口径统一到 `maskQuoted`:**引文=提及不是使用**。
+    //   方向:本项证据一律落动作面,剥引文只减少「文本命中」,不放松任何真拦截。
+    const rTxt = maskQuoted(text);
     // 「已扫/已查工具面」⇒ 须有读或搜的动作
-    if (/工具面已扫|已扫(三层|四层|一遍)|扫过(工具面|三层|四层)/.test(text)) {
+    if (/工具面已扫|已扫(三层|四层|一遍)|扫过(工具面|三层|四层)/.test(rTxt)) {
       const acted = tools.some((n) => /^(Read|Grep|Glob|WebSearch|WebFetch)$/.test(n)) ||
         /(^|[\s;&|])(gh|grep|ls|rg)\s/.test(toolRawText(turn));
       if (!acted) claims.push("说了「工具面已扫」,但本轮没有任何读取或搜索动作");
@@ -880,13 +983,13 @@ export function run(transcriptPath, ctx = {}) {
     //   于是七问自审里的「⑤ **已跑** ⑥ 已查」被当成完成时陈述——那是清单答案不是断言。
     //   现要求其后紧跟一个像名字的 token(≥3 字符的路径/命令/反引号内容)。
     //   天花板:**无对象的完成陈述**(光说「跑过了」)因此漏掉——那种本来也无从核。
-    if (/(已跑|跑完了|实测(过)?)\s*[`「"']?[\w./:-]{3,}/.test(text)) {
+    if (/(已跑|跑完了|实测(过)?)\s*[`「"']?[\w./:-]{3,}/.test(rTxt)) {
       if (!tools.some((n) => /^(Bash|PowerShell)$/.test(n))) {
         claims.push("说了「已跑/实测 X」,但本轮没有任何命令执行动作");
       }
     }
     // 「已修 X / 已改 X」⇒ 须有写动作。同样要求指名对象。
-    if (/(已修(掉|好)?|已改(掉|好)?|修好了|改好了)\s*[`「"']?[\w./:-]{3,}/.test(text)) {
+    if (/(已修(掉|好)?|已改(掉|好)?|修好了|改好了)\s*[`「"']?[\w./:-]{3,}/.test(rTxt)) {
       const wroteSomething = tools.some((n) => /^(Edit|Write|NotebookEdit)$/.test(n)) ||
         /writeFileSync|sed\s+-i|>>?\s*[\w./-]+\./.test(toolRawText(turn));
       if (!wroteSomething) claims.push("说了「已修/已改」,但本轮没有任何写入动作");
@@ -980,6 +1083,8 @@ export function run(transcriptPath, ctx = {}) {
         tracked: _trackedCache instanceof Set ? _trackedCache : undefined,
         // `justAdded` 同样要传:少了它,今天亲签的「取证时机前移」在接管后原样失效(grill A3)
         justAdded: _justAddedCache instanceof Set ? _justAddedCache : undefined,
+        // D56:写之前实测的「已存在」集合(仓外/未跟踪文件唯一说得上话的证据)
+        preExisted: preExistedSet() || undefined,
         lastAssistantMessage: typeof ctx.text === "string" ? ctx.text : undefined,
         bgTasks: ctx.bgTasks,
         // 批次状态**在这里读一次、注入进去**,不让规则自己读磁盘 ——
@@ -1034,7 +1139,14 @@ export function run(transcriptPath, ctx = {}) {
           const allThree = _P.CH.every((ch) => scope.some((a) => { try { return ch.test(a); } catch { return false; } }));
           const next = allThree ? 0 : prior + mine;
           if (next !== prior || allThree) {
-            fs.writeFileSync(".claude/.p-ledger.json", JSON.stringify({ carriers: next, at: new Date().toISOString() }));
+            // D52(批 104):裸 writeFileSync=截断后写,崩在中间读者见半文件;换 tmp+rename 原子写
+            //   (同 batch-goal atomicWrite 的形)。读-改-写竞态半条:并发 Stop 仅在双写会话违规时
+            //   存在,姿态见 104 威胁模型呈签件;此处只修「写不半截」这一确定收益。
+            const tmpP = `.claude/.p-ledger.json.${process.pid}.tmp`;
+            try {
+              fs.writeFileSync(tmpP, JSON.stringify({ carriers: next, at: new Date().toISOString() }));
+              fs.renameSync(tmpP, ".claude/.p-ledger.json");
+            } finally { try { if (fs.existsSync(tmpP)) fs.unlinkSync(tmpP); } catch { /* 残骸不阻断 */ } }
           }
         }
       } catch { /* 账写不了不影响闸;规则侧下轮读到旧值只会更严 */ }
@@ -1045,7 +1157,11 @@ export function run(transcriptPath, ctx = {}) {
       try {
         const wroteDoc = (eCtx.writes || []).some((w) =>
           /gate-playbook\.md$/.test(w) || /(^|[\\/])docs[\\/].+\.md$/i.test(String(w)));
-        if (live && wroteDoc) {
+        // ⚠️ 2026-08-27:先看那个件在不在。本闸已开源(custodiet),而 `tool-usage-census.mjs`
+        //   **不随开源仓发布** ⇒ 在别人的仓里这一句必然抛错,再被下面的 catch 变成
+        //   一条「文档引用漂移」的假报告——**把「工具不在」伪装成「你的文档漂了」**。
+        //   同一族:catch 吞掉真错(D90)。件不在就静默跳过,不假装跑过。
+        if (live && wroteDoc && fs.existsSync("scripts/tool-usage-census.mjs")) {
           try {
             execFileSync(process.execPath, ["--no-warnings", "scripts/tool-usage-census.mjs", "--doc-drift"],
               { encoding: "utf8", timeout: 15000 });
@@ -1324,23 +1440,23 @@ function selfTest() {
     { name: "A 不命中:发起且已 poll", lines: [U("go"), A("CODEX_JOB=abc123"), A("跑 --poll abc123")], want: [] },
     { name: "B 命中:承诺句零工具", lines: [U("go"), A("我这就去改,不问,你喊停就停")], want: ["B"] },
     { name: "B 命中:干了别的那件(今日实撞形态)",
-      lines: [U("go"), A("我这就去改 `foo.mjs`", [{ name: "Edit", input: { file_path: "/repo/bar.md" } }])], want: ["B", "K0"] },
+      lines: [U("go"), A("我这就去改 `foo.mjs`", [{ name: "Edit", input: { file_path: "D:/test/bar.md" } }])], want: ["B", "K0"] },
     { name: "B 命中:无具体对象的空头承诺",
-      lines: [U("go"), A("我这就去处理一下", [{ name: "Edit", input: { file_path: "/repo/bar.md" } }])], want: ["B", "K0"] },
+      lines: [U("go"), A("我这就去处理一下", [{ name: "Edit", input: { file_path: "D:/test/bar.md" } }])], want: ["B", "K0"] },
     { name: "B 不命中:承诺对象与动作对得上",
-      lines: [U("go"), A("工具面已扫:无命中。我这就去改 `foo.mjs`", [{ name: "Grep", input: { pattern: "x", path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Edit", input: { file_path: "/repo/scripts/foo.mjs" } }])], want: ["K0"] },
+      lines: [U("go"), A("工具面已扫:无命中。我这就去改 `foo.mjs`", [{ name: "Grep", input: { pattern: "x", path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Edit", input: { file_path: "D:/test/scripts/foo.mjs" } }])], want: ["K0"] },
     { name: "C 命中:缺陷陈述无处置", lines: [U("go"), A("这条还没落盘,也没入仓")], want: ["C"] },
     // ⚠️ 2026-08-20 引擎接管后,这几条夹具从简写 `["Write"]` 改成**带真入参**。
     //   原写法造出的是**没有 file_path 的 Write**:旧实现只看「出现了 Write 这个工具名」就算写过,
     //   引擎要求真有路径。**「出现了 Write 工具」≠「写了文件」正是这次重写要消灭的东西**,
     //   所以是夹具跟上契约,不是放宽规则。
     { name: "C 不命中:缺陷陈述后有写",
-      lines: [U("go"), A("这条还没落盘", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
+      lines: [U("go"), A("这条还没落盘", [{ name: "Write", input: { file_path: "D:/test/docs/foo.md" } }])], want: ["K0"] },
     { name: "D 命中:强制面降级", lines: [U("go"), A("这条要交叉验证。要不要我去跑一下?")], want: ["D"] },
     { name: "D 不命中:非强制面", lines: [U("go"), A("配色你要是想换我可以帮你调")], want: [] },
     { name: "E0+E2 阻断:裸因果断言两半都没走", lines: [U("go"), A("根因是缓存没刷新")], want: ["E0","E2"] },
     { name: "自标豁免 E0 但**不豁免 E2**(承认不确定≠找过判据)", lines: [U("go"), A("根因是缓存没刷新——这是我的推断,证据不足")], want: ["E2"] },
-    { name: "E2 单命中:发了 codex 但没走 oracle(今日实撞形态)", lines: [U("go"), A("根因是缓存没刷新", [{ name: "Bash", input: { command: "node ~/.claude/scripts/codex-run.mjs --task t.md" } }]), A("--poll x1")], want: ["E2"] },
+    { name: "E2 单命中:发了 codex 但没走 xros(今日实撞形态)", lines: [U("go"), A("根因是缓存没刷新", [{ name: "Bash", input: { command: "node ~/.claude/scripts/codex-run.mjs --task t.md" } }]), A("--poll x1")], want: ["E2"] },
     { name: "E1 单命中:跑了探针但没跨模型", lines: [U("go"), A("根因是缓存没刷新", [{ name: "Bash", input: { command: "node scripts/verify-laws.mjs" } }])], want: ["E1"] },
     { name: "E0+E2 覆盖最常见句式「X 是因为 Y」", lines: [U("go"), A("它失败是因为路径写错了")], want: ["E0","E2"] },
     // F:今日实撞原句形态——同段既说全部执行完毕、又登记还欠一件
@@ -1356,37 +1472,37 @@ function selfTest() {
       lines: [U("go"), A("这就提交", [{ name: "Bash", input: { command: "git commit -m x" } }])], want: ["K0"] },
     { name: "G v2 不命中:仪式文本说什么都不影响判据",
       lines: [U("go"), A("先自审四问:全部齐了", [{ name: "Bash", input: { command: "git commit -m x" } }])], want: ["K0"] },
-    { name: "G 不命中:七问逐条答过", lines: [U("go"), A("自审:① 无新造件 ② 失效条件已写 ③ 已接线 ④ 日记已补 ⑤ oracle 已跑 ⑥ 已查先例 ⑦ 已过 grill"), A("git commit -m x")], want: [] },
+    { name: "G 不命中:七问逐条答过", lines: [U("go"), A("自审:① 无新造件 ② 失效条件已写 ③ 已接线 ④ 日记已补 ⑤ xros 已跑 ⑥ 已查先例 ⑦ 已过 grill"), A("git commit -m x")], want: [] },
     { name: "G v2 命中:触闸机件提交而无自测动作(④)",
       lines: [U("go"), A("改闸,提交", [
-        { name: "Edit", input: { file_path: "/repo/scripts/hook-stop-closure.mjs" } },
+        { name: "Edit", input: { file_path: "D:/test/scripts/hook-stop-closure.mjs" } },
         { name: "Bash", input: { command: "git commit -m x" } }])], want: ["G", "K0"] },
     { name: "G 不命中:没提交", lines: [U("go"), A("改完了", ["Edit"])], want: [] },
     // H:今日实撞原形——自己写下「我能做、不需要你签」然后停手等发话
     { name: "H 命中:自陈能做却没做", lines: [U("go"), A("这两件我能做,不需要你签,属工装面")], want: ["H"] },
     { name: "H 不命中:自陈能做且做了",
-      lines: [U("go"), A("这件我能做,不需要你签", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
+      lines: [U("go"), A("这件我能做,不需要你签", [{ name: "Write", input: { file_path: "D:/test/docs/foo.md" } }])], want: ["K0"] },
     // I:纪律 32 闸化——新建载体必须留工具面扫描痕迹
     { name: "I 阻断:新建 agent 未留扫描痕迹",
-      lines: [U("go"), A("造好了", [{ name: "Write", input: { file_path: "/repo/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
+      lines: [U("go"), A("造好了", [{ name: "Write", input: { file_path: "D:/test/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
     { name: "I 阻断:新建 scripts 工装未留痕",
-      lines: [U("go"), A("写好了", [{ name: "Write", input: { file_path: "/repo/scripts/foo.mjs" } }])], want: ["I", "K0"] },
+      lines: [U("go"), A("写好了", [{ name: "Write", input: { file_path: "D:/test/scripts/foo.mjs" } }])], want: ["I", "K0"] },
     { name: "I 不命中:已留扫描痕迹",
       // ⚠️ `WebSearch` 是 2026-08-20 补的:纪律 32 从三层扩到**四层**(加「搜 GitHub」),
       //   本夹具原来只扫本地 ⇒ 新规则下它不再是「已扫」。夹具跟着契约走,不是反过来。
-      lines: [U("go"), A("工具面已扫:四层无命中,造", [{ name: "Read", input: { file_path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Write", input: { file_path: "/repo/.claude/skills/y/SKILL.md" } }])], want: ["K0"] },
+      lines: [U("go"), A("工具面已扫:四层无命中,造", [{ name: "Read", input: { file_path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Write", input: { file_path: "D:/test/.claude/skills/y/SKILL.md" } }])], want: ["K0"] },
     { name: "I 不命中:写的不是载体面",
-      lines: [U("go"), A("更新文档", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
+      lines: [U("go"), A("更新文档", [{ name: "Write", input: { file_path: "D:/test/docs/foo.md" } }])], want: ["K0"] },
     // J:立法必答触发层——递归的最后一层
     { name: "J 命中:改法典未交代触发层",
-      lines: [U("go"), A("新增一条纪律", [{ name: "Edit", input: { file_path: "/repo/docs/laws/collab.md" } }])], want: ["J", "K0"] },
+      lines: [U("go"), A("新增一条纪律", [{ name: "Edit", input: { file_path: "D:/test/docs/laws/collab.md" } }])], want: ["J", "K0"] },
     { name: "J 不命中:触发层写在对话里",
-      lines: [U("go"), A("新增一条,触发层:Stop hook 的 I 项,必然执行", [{ name: "Edit", input: { file_path: "/repo/AGENTS.md" } }])], want: ["K0"] },
+      lines: [U("go"), A("新增一条,触发层:Stop hook 的 I 项,必然执行", [{ name: "Edit", input: { file_path: "D:/test/AGENTS.md" } }])], want: ["K0"] },
     { name: "J 不命中:没碰法典",
-      lines: [U("go"), A("工具面已扫:无命中。改工装", [{ name: "Grep", input: { pattern: "x", path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Edit", input: { file_path: "/repo/scripts/x.mjs" } }])], want: ["K0"] },
+      lines: [U("go"), A("工具面已扫:无命中。改工装", [{ name: "Grep", input: { pattern: "x", path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Edit", input: { file_path: "D:/test/scripts/x.mjs" } }])], want: ["K0"] },
     // I 的两个新覆盖面(2026-08-19 实测漏掉整类动作后补)
     { name: "I 命中:Edit 已有载体也算造物",
-      lines: [U("go"), A("改一下", [{ name: "Edit", input: { file_path: "/repo/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
+      lines: [U("go"), A("改一下", [{ name: "Edit", input: { file_path: "D:/test/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
     { name: "I 命中:经 Bash 写载体绕不过去",
       lines: [U("go"), A("改一下", [{ name: "Bash", input: { command: "node -e \"fs.writeFileSync('scripts/foo.mjs',s)\"" } }])], want: ["I","M"] },
     // 两条反向用例:2026-08-19 实撞的误报形态
@@ -1415,6 +1531,35 @@ function selfTest() {
       lines: [U("go"), A("造一个", [
         { name: "Write", input: { file_path: "scripts/zzz-not-tracked-probe.mjs", content: "x" } },
       ])], want: ["I", "K0"] },
+    // ── D56(批 109):memory 面误报**二犯**的正反三面。
+    //   memory 永不入仓 ⇒ git 判据恒判新建 ⇒ 改一行索引也被当造物拦。
+    //   修法=`Edit` 语义证明「本轮之前已存在」,**只施于 memory 面**。
+    // ⚠️ 本条**记的曾是已知误报**;2026-08-27 D56 结清后语义变了,原注留此为史:
+    //   「D56 的修法已同批撤回(grill:edge-cases F1),故 Edit 改 MEMORY.md 索引行仍会命中 I。」
+    //   **现在的判据**:命不命中取决于有没有 `preExisted` 记录(写之前实测),
+    //   而本夹具**不注入**它 ⇒ 落在「无记录」那一支 ⇒ 仍应命中。
+    //   这正是修法不开漏放口的那一侧:**没量过就当新建**。
+    //   有记录的那一侧由接缝「D56 有 precheck 记录 ⇒ 不算新建」钉住,两侧成对。
+    { name: "I 命中:Edit 改 MEMORY.md 索引行(**无 precheck 记录 ⇒ 按新建**,D56 结清后语义)",
+      lines: [U("go"), A("加一行索引", [
+        { name: "Edit", input: { file_path: "C:/Users/x/.claude/projects/D--test/memory/MEMORY.md", old_string: "a", new_string: "b" } },
+      ])], want: ["I", "K0"] },
+    // F1 回归钉:非工具面造(Bash)+ Edit 收尾,**必须仍算新建**。
+    //   这是 D56 撤回前实测会漏放的那条路径;子代理造+主代理 Edit 是它的同族(且不可见)。
+    { name: "I 命中:Bash 造 memory 文件 + Edit 收尾(F1 漏放回归钉)",
+      lines: [U("go"), A("造完改", [
+        { name: "Bash", input: { command: "printf '# t' > C:/Users/x/.claude/projects/D--test/memory/zz-f1.md" } },
+        { name: "Edit", input: { file_path: "C:/Users/x/.claude/projects/D--test/memory/zz-f1.md", old_string: "# t", new_string: "# real" } },
+      ])], want: ["I", "K0"] },
+    { name: "I 命中:Write 造一个新 memory 条目(修 D56 不许把这面一并放掉)",
+      lines: [U("go"), A("记一条", [
+        { name: "Write", input: { file_path: "C:/Users/x/.claude/projects/D--test/memory/zzz-new.md", content: "x" } },
+      ])], want: ["I", "K0"] },
+    { name: "I 命中:同轮先 Write 再 Edit 同一 memory 文件(首个动作是 Write,洗不掉触发)",
+      lines: [U("go"), A("造完顺手改", [
+        { name: "Write", input: { file_path: "C:/Users/x/.claude/projects/D--test/memory/zzz-new2.md", content: "x" } },
+        { name: "Edit", input: { file_path: "C:/Users/x/.claude/projects/D--test/memory/zzz-new2.md", old_string: "x", new_string: "y" } },
+      ])], want: ["I", "K0"] },
     // `2>/dev/null` 的 `>` 曾被当成「写载体」,于是纯读命令被判成新建载体。
     // E2 出路②必须认**全角冒号**——中文正文里「机械判据：」天然是全角,
     // 原判据的字符类两个都是半角,该出路对中文形同虚设。
@@ -1423,11 +1568,11 @@ function selfTest() {
       lines: [U("go"), A("根因是索引失效导致的。", [
         { name: "Bash", input: { command: 'node --no-warnings "/c/tmp/scratchpad/verify-idx.mjs"' } },
       ])], want: ["E1"] },   // E1 属正确:过了「形」,未过「独立性」
-    // 「无判据」档必须附一条带实参的 /oracle:sharpen,否则出路②不成立。
+    // 「无判据」档必须附一条带实参的 /xros:sharpen,否则出路②不成立。
     { name: "E2 命中:只说「无机械判据」而未递出 sharpen",
       lines: [U("go"), A("根因是缓存未失效。机械判据:无,因该命题不可机械核定。", [])], want: ["E0", "E2"] },
     { name: "E2 不命中:说「无判据」且递出带实参的 sharpen",
-      lines: [U("go"), A("根因是缓存未失效。机械判据:无,不可机械核定 ⇒ 请敲 `/oracle:sharpen 缓存失效判据怎么定`", [])], want: ["E0"] },
+      lines: [U("go"), A("根因是缓存未失效。机械判据:无,不可机械核定 ⇒ 请敲 `/xros:sharpen 缓存失效判据怎么定`", [])], want: ["E0"] },
     // 本例同时跑了探针(满足 E0 要求的「真动作」),故只考核冒号那一处。
     // ⚠️ E0 与 E2 出路**故意不同**:E2 认一句声明,E0 要真动作(见 E0 注释「出路刻意留便宜」)。
     //   所以纯文本回合里写「机械判据:已跑」豁免 E2 但不豁免 E0——那是设计,不是 bug。
@@ -1437,9 +1582,9 @@ function selfTest() {
       ])], want: ["E1"] },   // E1 属正确:跑了探针=过「形」,未跨模型=缺「独立性」
     // N:正文报出计数即满足法条的「指出第二个 agent 在哪」,不必本轮再读一次文件。
     { name: "N 不命中:递给用户但正文已报出 agent 计数",
-      lines: [U("go"), A("`/oracle:sharpen` 只能你亲手下(`parallel(` 2 处,多 agent 管线)。", [])], want: [] },
+      lines: [U("go"), A("`/xros:sharpen` 只能你亲手下(`parallel(` 2 处,多 agent 管线)。", [])], want: [] },
     { name: "N 命中:递给用户且说不出计数",
-      lines: [U("go"), A("这个 `/oracle:sharpen` 只能你亲手下。", [])], want: ["N"] },
+      lines: [U("go"), A("这个 `/xros:sharpen` 只能你亲手下。", [])], want: ["N"] },
     { name: "I 不命中:ls/grep 读载体目录且带 2>/dev/null(读不是写)",
       lines: [U("go"), A("看看", [
         { name: "Bash", input: { command: "ls .claude/agents/*.md 2>/dev/null | wc -l" } },
@@ -1477,6 +1622,16 @@ function selfTest() {
       [String.raw`{"command":"node --no-warnings scripts/verify-laws.mjs"}`, true, "裸路径探针"],
       [String.raw`{"command":"node --no-warnings \"D:/x/scripts/verify-claims.mjs\""}`, true, "带引号路径(08-19 漏判的那个)"],
       [String.raw`{"command":"node -e \"console.log(1)\""}`, false, "普通 node 一行不算探针"],
+      // D69(2026-08-27 astrbot 实况):非 node 运行时的探针
+      [String.raw`{"command":"cd /d/bqbot && python tests/probe_rate1_determinism.py; echo x"}`,
+        true, "python 探针(旧式不认 ⇒ 一句有退出码兜底的话被 E0 误拦)"],
+      [String.raw`{"command":"python3 scripts/verify_x.py"}`, true, "python3 整词"],
+      // 词界两侧都要钉:放宽运行时表最容易顺手把词界一起放松,那是 fail-open。
+      [String.raw`{"command":"pythonic-tool --check"}`, false, "pythonic 不是 python(后界)"],
+      [String.raw`{"command":"/opt/mypython verify.py"}`, false, "mypython 不是 python(前界)"],
+      [String.raw`{"command":"nodemon --watch check.js"}`, false, "nodemon 不是 node(D7 旧钉,重构后须仍红)"],
+      [String.raw`{"command":"/usr/bin/nodejs scripts/verify-laws.mjs"}`, true, "nodejs 整词(092 旧钉)"],
+      [String.raw`{"command":"bin/mynode --verify"}`, false, "mynode 不是 node(D7 旧钉)"],
       [String.raw`{"command":"node app.mjs"} {"command":"grep check foo"}`, false, "node 与关键词在不同命令里"],
       [String.raw`{"command":"node a.mjs"}{"file_path":"docs/check-list.md"}`, false, "关键词在别的工具入参里"],
       // ⚠️ 阈值两侧都要钉(codex 复核:「400 与 200KB 都是无业务依据的硬阈值,
@@ -1556,6 +1711,57 @@ function selfTest() {
       if (ok) seamPass++;
     };
     const ids = (fs2) => fs2.map((f) => f.id + (f.block ? "!" : "")).sort().join(",");
+
+    // ── D71 回显钉(2026-08-27,astrbot 实况)────────────────────────────────
+    // 因果族先把引文抹成空格再判,但**回显必须取原文**。缺了这条钉,
+    // 有人把 `matchAny` 的第三参去掉、或把 `maskQuoted` 改回不等长,测试照样全绿,
+    // 而闸会退回「拦得住但说不清拦的是什么」——实况原样:
+    //   「是因为 会让你在 和 之间反复权衡」(引文里的名词全没了)。
+    {
+      const raw = "不是因为技术——是因为「装 QQNT」会让你在「本地」和「服务器」之间反复权衡。";
+      const e0 = RULES.find((r) => r.id === "E0");
+      const shown = e0.detect({
+        text: raw, actions: [], toolNames: [], skills: [], ranBash: () => false,
+      }).join(" ");
+      sc("E0 回显保留引文(不拿掩码文本当回显)", shown.includes("「装 QQNT」"), true);
+      // 反向钉:判据本身仍跑在掩码上——引文内的因果词不得单独把整句咬出来。
+      const quotedOnly = e0.detect({
+        text: "问题一句话:「根因是缓存没刷新」。拿它当搜索键扫了三层。",
+        actions: [], toolNames: [], skills: [], ranBash: () => false,
+      });
+      sc("引文内的因果仍不命中(掩码没白做)", quotedOnly.length, 0);
+      // 掩码的两条硬性质:等长 + 保行。行号对不上则回显会串行(比抹掉更坏)。
+      const ml = "前「跨\n行引文」后";
+      sc("maskQuoted 等长", maskQuoted(ml).length, ml.length);
+      sc("maskQuoted 保行", maskQuoted(ml).split("\n").length, ml.split("\n").length);
+
+      // D74:R 的回声。引用被拦的原词来**更正**它,更正本身不得再被拦。
+      const echoFix = "说了「工具面已扫」,那是转述 D59 台账里批 110 的记载,不是本轮动作。";
+      sc("R 不咬更正句里的引文", ids(run(null, { text: echoFix, turn: [] })).includes("R!"), false);
+      // 反向钉:引文外的裸完成陈述照拦,否则等于把 R 关掉。
+      sc("R 仍拦引文外的裸完成陈述",
+        ids(run(null, { text: "工具面已扫,三层都看过了。", turn: [] })).includes("R!"), true);
+
+      // D73:W 的**消息**必须列全法条给的三条通道。旧文案只写子代理一条,
+      //   并把「计数不另计」写成「通道不可用」⇒ 照消息找出路会得出错结论(我本人撞过)。
+      //   鉴别力:旧文案里既无 `codex-run.mjs` 也无 `battle`,恢复旧文即变红。
+      const wMsg = RULES.find((r) => r.id === "W").message(["测试交付物"]);
+      sc("W 消息列出 codex 通道", /codex-run\.mjs/.test(wMsg), true);
+      sc("W 消息列出 battle 通道", /battle/.test(wMsg), true);
+      sc("W 消息不把「不另计数」说成「通道不可用」",
+        /不在本项(?![^\n]*不另计)/.test(wMsg), false);
+
+      // ── D56 回归钉(2026-08-27):`preExisted` 是**写之前实测**的注入面。
+      //   两侧都要钉:①有记录 ⇒ 不算新建(消除 memory 面的系统性误报);
+      //   ②**没记录仍算新建** ⇒ 不开漏放口(2026-08-26 那版正是在这一侧塌的:
+      //   它从 transcript 猜「第一个写动作是 Edit ⇒ 已存在」,可被绕过)。
+      const memP = "C:/Users/x/.claude/projects/example-project/memory/MEMORY.md";
+      const mkNew = (pre) => buildCtx(
+        [{ type: "assistant", message: { content: [{ type: "tool_use", name: "Write", input: { file_path: memP } }] } }],
+        { tracked: new Set(["scripts/x.mjs"]), ...(pre ? { preExisted: new Set([memP]) } : {}) });
+      sc("D56 有 precheck 记录 ⇒ 不算新建", mkNew(true).isNew(memP), false);
+      sc("D56 无 precheck 记录 ⇒ 仍算新建(不开漏放口)", mkNew(false).isNew(memP), true);
+    }
 
     // ⚠️ 核心回归:transcript 读不到(turn=[])、只有官方 last_assistant_message 的形态。
     //   那一刻正是官方字段存在的全部理由,而缝原来在那一刻是瞎的。
@@ -1659,7 +1865,7 @@ function selfTest() {
       { type: "assistant", message: { content: [
         { type: "text", text: "工具面已扫:无命中。新建了零件。" },
         { type: "tool_use", name: "Grep", input: { path: "docs/tool-register.md", pattern: "shell" } },
-        { type: "tool_use", name: "Write", input: { file_path: "/repo/scripts/lib/新零件.mjs", content: "x" } },
+        { type: "tool_use", name: "Write", input: { file_path: "D:/test/scripts/lib/新零件.mjs", content: "x" } },
       ] } },
     ];
     const idsOf = (fs2) => fs2.map((f) => f.id).join(",");
@@ -1735,6 +1941,14 @@ function selfTest() {
         rc('node scripts/batch-goal.mjs --arm 072 --cond "K 的 --clear 阻断与 systemMessage"'), false);
       hp("ranClear:纯 --arm", rc('node scripts/batch-goal.mjs --arm 072 --cond "甲"'), false);
       hp("ranClear:只是 grep 到这个命令串", rc('grep -n "batch-goal.mjs --clear" docs/laws/collab.md'), false);
+      // D62 钉(2026-08-26):三条**此前判不中**的真结清形态。前两条是 109 批量词封顶造成的
+      //   新洞(超界即不命中 ⇒ 关掉 W 与关账族的触发器),第三条是既有致盲
+      //   (stripQuoted 抹掉引号内容 ⇒ 带引号的脚本路径整个消失,而 Windows 上加引号是本能)。
+      hp("ranClear:长参数后接 --clear(D62:封顶曾使其漏判)",
+        rc("node scripts/batch-goal.mjs --note " + "x".repeat(300) + " --clear"), true);
+      hp("ranClear:带引号的绝对路径(既有致盲:stripQuoted 抹掉脚本名)",
+        rc('node "D:/test/scripts/batch-goal.mjs" --clear'), true);
+      hp("ranClear:单引号包裹脚本路径", rc("node 'scripts/batch-goal.mjs' --clear"), true);
       // ⚠️ **不带引号的管道/分号形态**(2026-08-20 codex 三条复现,当时全是 true)。
       //   上面那条 grep 用例带引号,`stripQuoted` 就够了;
       //   下面三条不带引号,**必须逐段判**才杀得掉。
@@ -1816,7 +2030,7 @@ function selfTest() {
   {
     let src = "";
     try {
-      src = fs.readFileSync(fileURLToPath(new URL(import.meta.url)), "utf8");
+      src = fs.readFileSync(fileURLToPath(new URL(import.meta.url)), "utf8");   // F6:同上,不用 pathname
     } catch { /* 读不到自己 ⇒ 下面按未检查处理 */ }
     if (!src) {
       console.log("SKIP  零件契约:读不到本文件源码 —— **未检查**,不作通过");
@@ -1861,14 +2075,14 @@ function selfTest() {
   } else {
     for (const f of machinery) {
       driftTotal++;
-      const ok = CARRIER_SURFACE.test(f);
+      const ok = isCarrierPathC(CARRIER_SURFACE, f);   // D63+D86
       console.log(`${ok ? "PASS" : "FAIL"}  承重面漂移:${f}${ok ? "" : "  ← 它是 hook 机件却**不在承重面**,P 不会为它响"}`);
       if (ok) driftPass++;
     }
     // 反向:承重面不该宽到把普通业务代码卷进来
     for (const f of ["src/app/page.tsx", "content/private/x.md", "README.md"]) {
       driftTotal++;
-      const ok = !CARRIER_SURFACE.test(f);
+      const ok = !isCarrierPathC(CARRIER_SURFACE, f);  // D63+D86
       console.log(`${ok ? "PASS" : "FAIL"}  承重面不误扩:${f}`);
       if (ok) driftPass++;
     }
@@ -1907,7 +2121,18 @@ function selfTest() {
     }
   }
 
+  // ⚠️ 2026-08-27:把**载体分类自测**接进来。它此前是个孤儿——只在有人手动
+  //   `node -e import(...).selfTest()` 时才跑,于是那张分类表(I/P/G 三项共用的地基)
+  //   的用例**从不随闸自测执行**。我当天往里加了 9 条 D63 回归钉,加完才发现这一点
+  //   (本批第四次「验过而没钉住」)。**孤儿测试比没有测试更坏**:它让人以为有覆盖。
+  let carrPass = 0, carrTotal = 0;
+  try {
+    const r = carriersSelfTest();
+    if (r && typeof r === "object") { carrPass = r.pass; carrTotal = r.total; }
+  } catch (e) { console.log(`FAIL  载体分类自测跑不起来:${e && e.message}`); carrTotal = 1; }
+
   console.log(`\n自测 ${pass}/${cases.length}` +
+    (carrTotal ? ` · 载体分类 ${carrPass}/${carrTotal}` : "") +
     (seamTotal ? ` · 接缝 ${seamPass}/${seamTotal}` : "") +
     (escTotal ? ` · 逃生口 ${escPass}/${escTotal}` : "") +
     (probeTotal ? ` · ranProbe ${probePass}/${probeTotal}` : "") +
@@ -1917,7 +2142,7 @@ function selfTest() {
     (lawTotal ? ` · law锚点 ${lawPass}/${lawTotal}` : ""));
   return (pass === cases.length && driftPass === driftTotal && probePass === probeTotal
     && partPass === partTotal && hpPass === hpTotal && seamPass === seamTotal && escPass === escTotal
-    && lawPass === lawTotal) ? 0 : 1;
+    && lawPass === lawTotal && carrPass === carrTotal) ? 0 : 1;
 }
 
 // ── main
@@ -1934,10 +2159,10 @@ if (argv.includes("--self-test")) process.exit(selfTest());
 
 // --audit <transcript> [--from N] [--to M]:**逐轮**扫描,给每一轮输出命中项。
 // 为什么要它:--dry-run 只看最后一轮,测不了「留出集」——而评测一个分类器必须在
-// **未参与设计的数据**上逐样本比对(2026-08-19 oracle:sharpen 指出:自己编用例自测
+// **未参与设计的数据**上逐样本比对(2026-08-19 xros:sharpen 指出:自己编用例自测
 // 在分类器评测里叫 testing on training data,必然高估)。本模式产出机器判定侧,
 // 人工/独立标注侧另出,两者比对才得出漏报率。
-// ── 误报台账(2026-08-22,批 077 条件②;仪器形态来自 oracle/reason 第 7 节 + codex 四点最小补救)──
+// ── 误报台账(2026-08-22,批 077 条件②;仪器形态来自 xros/reason 第 7 节 + codex 四点最小补救)──
 // **半张真相表的危险**:只量误报会诱导「误报少 ⇒ 闸很好」——漏报静默,系统会朝「少吵」
 // 而不是「少漏」优化(自审六类结构性失效之⑤:可见性偏差)。故本台账强制携带另一半的缺席声明:
 //   · 分母 = `.gate-alerts.jsonl`,由 emit() 自动记**每一次**命中(不是只记被抱怨的那些);
@@ -2115,12 +2340,97 @@ else {
 //   锚定失败按原 cwd 跑(fail-open:锚不上不该让闸崩)。CLI 模式(--audit/--fp 等)不锚——
 //   用户传的相对路径以他的 cwd 为准。
 try {
+  // ⚠️ 路径归一必须走 fileURLToPath(F6,2026-08-26 grill:edge-cases 审出并机器复证):
+  //   `URL.pathname` **保留百分号编码**,`.replace` 只脱盘符不解码 ⇒ 仓路径含空格/中文时
+  //   得到 "D:/my%20test%20repo/",chdir 抛 ENOENT ⇒ 被下面的 catch 吞掉 ⇒ **静默退回继承的 cwd**,
+  //   正是 2026-08-25 那次「审错树」事故的原状——修 cwd 的这行自己会在带空格的仓上失效。
+  //   custodiet 已公开,`C:\Users\Some Name\...` 在 Windows 上是常态,故这条按公开面优先级修。
   process.chdir(fileURLToPath(new URL("..", import.meta.url)));
 } catch { /* 锚定失败按原 cwd 跑 */ }
+// 自测隔离 env 只属 --self-test 形态:外部把 STOP_CLOSURE_SELFTEST=1 带进生产环境时,
+// batch-goal 与 P-ledger 两处真读会被静默跳过(codex 104 复核「没问到的」)——生产段进门即清。
+delete process.env.STOP_CLOSURE_SELFTEST;
 let payload = "";
 try { payload = fs.readFileSync(0, "utf8"); } catch {}
 let hookInput = {};
 try { hookInput = JSON.parse(payload || "{}"); } catch {}
+
+// ── SubagentStop:在**子代理自己的边界**上判它自己的动作(D60,批 112)────────────
+//
+// 为什么走这条路而不是「父侧把子代理动作并进 ctx」:两条只读通道独立收敛到同一判词,
+// 且给了机器证据——把一份**真实**子代理转录喂进 buildCtx,`didCommit()` 变 true 而
+// 那 4 条「提交」全是它写测试夹具时的**字符串字面量**(真实 commit 次数 0)⇒ K0 由提示升阻断。
+// 那正是本仓 gate-ctx 头注第 12 行记的事故换了个信使。另一条更根本:`agent-*.jsonl` 是
+// **可写文件**,父侧拿它当自己的证据 = 开一个「伪造『我做过 X』」的新洞。
+// 在子代理自己的边界上判它自己,则不涉及跨主体归并:被审的和产出证据的是同一方,
+// 与主档的信任假设**同级**,不是新增假设。
+//
+// 地基事实(2026-08-26 一次性探针实测,记 docs/carrier-facts.md;探针用完即拆):
+//   本事件的 `transcript_path` 指**父**会话,`agent_transcript_path` 才指子代理那份。
+//   照 Stop 的习惯直接用 transcript_path 会**审错对象且不报错**——我本来就要那么写。
+//
+// 本版刻意**只做两条**(I 造物须先扫工具面 / M 写了须回读),且**非阻断**:
+//   · 现有 23 条规则一条不改(两家通道一致要求的规模纪律);
+//   · P 的满足侧永不吃后代动作 ⇒ 本分支不碰 P;
+//   · 首版走 additionalContext 提示面,先量误报再谈升阻断。
+// 失效条件:`agent_transcript_path` 是 harness 内部字段、无文档承诺;缺字段 ⇒ 报 UNKNOWN
+//   提示行,**不得静默跳过**(fail-closed 的提示面版本)。
+if (hookInput.hook_event_name === "SubagentStop") {
+  const say = (s) => process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: "SubagentStop", additionalContext: s },
+  }));
+  const at = hookInput.agent_transcript_path;
+  const who = `${hookInput.agent_type || "?"}/${String(hookInput.agent_id || "?").slice(0, 8)}`;
+  if (typeof at !== "string" || !at) {
+    say(`⟦子代理闸 UNKNOWN⟧ ${who}:payload 里没有 agent_transcript_path——该字段是 harness 内部实现、`
+      + `无文档承诺,可能已改名。判不了 ⇒ 按 fail-closed 报出来,不当作「没问题」。`);
+    process.exit(0);
+  }
+  let out = "";
+  try {
+    const st = fs.statSync(at);
+    const CAP = 4_000_000;                       // 字节预算:超了报 UNKNOWN,不截断继续
+    if (st.size > CAP) {
+      out = `⟦子代理闸 UNKNOWN⟧ ${who}:转录 ${(st.size / 1e6).toFixed(1)}MB 超预算 `
+        + `${CAP / 1e6}MB,不截断继续(截断=fail-open)。`;
+    } else {
+      const entries = readTranscript(at);
+      const sCtx = buildCtx(entries, { tracked: _trackedCache instanceof Set ? _trackedCache : undefined });
+      // ── D60 余项裁决(2026-08-27,批 119)。判据=**每条规则的触发门依赖什么**:
+      //   · `G`(造物没入册)门是 `didCommit` —— **子代理不提交** ⇒ 那道门永远开不了,
+      //     接进来只会制造「跑了但从不响」的假覆盖。**不接入**。
+      //   · `K0`(没武装完成条件)门是 `batchGoal` + `didCommit` —— 批目标是**会话级**概念,
+      //     子代理不武装批。同上,**不接入**。
+      //   · `L`(手工清点工具面而没用现成普查器)与 `B`(承诺必闭环)只吃**本轮动作与文本**,
+      //     在子代理边界上语义完整 ⇒ **接入**。
+      //   ⇒ 「G/K0 接入」这条余项的答案是**不接**,而且理由不是「以后再说」,
+      //     是它们的触发门在这个边界上结构性地开不了。
+      // **升阻断的判据**(不再含糊):本项保持**非阻断**,直到子代理面累计出现
+      //   ≥10 次命中且 fp 台账零条 —— 有了这个分母才谈得上升档;
+      //   在那之前升档等于拿一个没量过误报率的判据去拦人。
+      const only = new Set(["I", "M", "L", "B"]);
+      const hits = runRules(RULES.filter((r) => only.has(r.id)), sCtx)
+        // finding 形状 = `{ id, block, msg }`(gate-registry.mjs:174);msg 是多行数组或字符串。
+        .map((f) => {
+          const m = Array.isArray(f.msg) ? f.msg.join(" ") : String(f.msg || "");
+          return `${f.id}:${m.replace(/\s+/g, " ").trim().slice(0, 110)}`;
+        });
+      if (hits.length) {
+        out = `⟦子代理闸⟧ ${who} 收尾时命中 ${hits.length} 项(提示面,不阻断):\n  · `
+          + hits.join("\n  · ")
+          // ⚠️ 这一行**从 `only` 生成**,不再手写(2026-08-27):原文写死「只跑 I 与 M」,
+          //   而我当轮把 L/B 加进 `only` 后它**当场说谎**——消息与判据两处各写一遍,
+          //   本会话第十三次同型,这次隔了不到十分钟。凡「消息里列举判据内容」的地方,
+          //   都得从判据本身派生,否则下一次改判据的人不会想起来改这句话。
+          + `\n本闸在**它自己的**动作面上跑这几项:${[...only].join(" / ")}。`;
+      }
+    }
+  } catch (e) {
+    out = `⟦子代理闸 UNKNOWN⟧ ${who}:读转录失败(${String(e.message).slice(0, 60)})——报出来不静默。`;
+  }
+  if (out) say(out);
+  process.exit(0);
+}
 
 // ⚠️ 官方明写:**优先用 `last_assistant_message`,不要解析 transcript**
 // ——「the transcript file isn't guaranteed to include the final message at Stop time
@@ -2130,11 +2440,28 @@ try { hookInput = JSON.parse(payload || "{}"); } catch {}
 //   `stop_hook_active` 是否存在**文档未记载**(≠ 不存在)。而这件事有比文档更硬的通道:
 //   看闸自己收到了什么。**只记键名不记值**——值里可能有 transcript 路径与正文。
 //   落点在 gitignore 面内(冲突表 #3:遥测追加不计写入)。查清后即可拆。
+// ⚠️ 2026-08-27(D68 出路①):**扩成通用形态并入册**。
+//   立此的教训:2026-08-26 我要查 `SubagentStop` 的载荷长什么样,**新建了一个探针脚本**,
+//   被 I 项当场逮到——而这套设施本来就在这儿、落点也现成,我只是**没找到它**。
+//   纪律 32 的字面要求是「动手前扫工具面」,我扫的时机是「造完被拦了」。
+//   ⇒ 两条修法:①这里改成**按事件名记全部顶层键名**(不只 Stop、不只一个字段),
+//     ②写进 `docs/tool-register.md`,让下次的工具面扫描**搜得到它**。
+//   **只记键名 + 布尔/数字这类无正文的标量值**——字符串值里可能有 transcript 路径与正文。
+//   落点在 gitignore 面内(冲突表 #3:遥测追加不计写入)。
+//   开关:`GATE_PAYLOAD_CAPTURE=0` 关闭。默认开,因为成本是一行 append。
+//   失效条件:当某事件的键名连续 N 批无新增时,该事件从捕获面移除(手动,无自动裁撤)。
 try {
-  // 键名已查清(2026-08-20):`stop_hook_active` **存在**——运行时直证,而官方页那节截断、
-  // changelog 未记载。现在改记它的**值**(布尔,不含任何正文/路径),判它何时为 true。
-  fs.appendFileSync(".claude/.hook-payload-keys.log",
-    new Date().toISOString() + " stop_hook_active=" + JSON.stringify(hookInput.stop_hook_active) + "\n");
+  if (process.env.GATE_PAYLOAD_CAPTURE !== "0") {
+    const evt = String(hookInput.hook_event_name || "(无事件名)");
+    const keys = Object.keys(hookInput || {}).sort();
+    // 标量白名单:只记**不可能含正文/路径**的类型,字符串一律只记键名不记值。
+    const scalars = keys
+      .filter((k) => typeof hookInput[k] === "boolean" || typeof hookInput[k] === "number")
+      .map((k) => `${k}=${JSON.stringify(hookInput[k])}`);
+    fs.appendFileSync(".claude/.hook-payload-keys.log",
+      `${new Date().toISOString()} ${evt} keys=[${keys.join(",")}]` +
+      (scalars.length ? ` ${scalars.join(" ")}` : "") + "\n");
+  }
 } catch { /* 捕获失败不影响闸本身 */ }
 
 const lastMsg = typeof hookInput.last_assistant_message === "string" ? hookInput.last_assistant_message : "";
