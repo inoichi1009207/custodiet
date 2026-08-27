@@ -150,7 +150,7 @@ const join = (pred) => new RegExp(CARRIERS.filter(pred).map((c) => c.re.source).
 //   绝对路径转成仓相对形,而现存夹具与 `ctx.writes` 都是绝对路径 ⇒ 一改打红 8 条自测。
 //   记在这以免有人再想一遍;真要走那条路,得连调用方一起改(D86 的失效条件写着)。
 /** 非本仓载体区:命中即**不算**载体路径,不论后半段长得多像。
- *  `clipboard/`=暂存与外发面(公开仓暂存树就在这儿),`node_modules/`=依赖,
+ *  `clipboard/`=暂存与外发面(外发暂存树就在这儿),`node_modules/`=依赖,
  *  `.git/`=版本库内部,`dist|build|coverage/`=产物。
  *  天花板:这是**枚举**,漏一类就漏一类;但比锚定路径开头稳——后者要求全部调用方
  *  先转成仓相对形,而现存夹具与 ctx.writes 都用绝对路径(当轮实测:锚定打红 8 条自测)。
@@ -224,13 +224,13 @@ export function selfTest() {
 
   // ── D86 回归钉(2026-08-27,I 项当场误报逼出来的):**路径面必须锚到开头**。
   //   不锚 ⇒ 任何**含有** `scripts/*.mjs` 或 `.claude/agents/` 的路径都算载体:
-  //   公开仓暂存树(`clipboard/oss/gate-repo/…`,当轮实撞)、`node_modules/…` 全中招。
+  //   外发暂存树(`clipboard/oss/<公开仓暂存目录>/…`,当轮实撞)、`node_modules/…` 全中招。
   //   同时钉反向:命令串面**不许**锚(`git add scripts/x.mjs` 里那段不在开头),
   //   否则把 P 的命令面判据打瞎 ⇒ 漏放。两个用途、两条判据,钉子也分两侧。
   for (const [p, want] of [
     ["scripts/lib/x.mjs", true], [".claude/agents/a.md", true],
-    ["clipboard/oss/gate-repo/scripts/lib/x.mjs", false],
-    ["clipboard/oss/gate-repo/.claude/agents/a.md", false],
+    ["clipboard/oss/<公开仓暂存目录>/scripts/lib/x.mjs", false],
+    ["clipboard/oss/<公开仓暂存目录>/.claude/agents/a.md", false],
     ["node_modules/a/scripts/b.mjs", false],
   ]) {
     chk(`D86 路径面排除非载体区  ${p.padEnd(40)}`, isCarrierPath(CREATION_SURFACE, p), want);

@@ -160,7 +160,7 @@ const EXPECTED_DIVERGENCE = {
      "这条分歧是 2026-08-20 grill:testing 在**全语料 6604 片**上量出来的(20 条,双向)," +
      "而当时 65 片的采样看到 **0 条**;撤销采样正是为了让它现形。\n" +
      "① **旧有新无(假阳)**:`/ls\\s+[^\"]*scripts/` 里的 `[^\"]*` 横跨整条序列化命令 ⇒ " +
-     "`ls clipboard/reader-capture-030/; …; node -e \"…'./scripts/baselines/…'\"` 命中 L," +
+     "`ls clipboard/<一次性采集目录>/; …; node -e \"…'./scripts/baselines/…'\"` 命中 L," +
      "而那条 `ls` 根本没在清点 scripts/。新实现**先按 `&&|;|\\||换行` 切段再匹配**,不再命中。\n" +
      "② **新有旧无(假阴)**:`/grep\\s+-c[^\"]*(tool-register|repo-brief)/` 的 `[^\"]*` " +
      "**跨不过引号** ⇒ `grep -c \"fetch-quote-check\" …/tool-register.md` 旧的**不**命中," +
@@ -530,6 +530,31 @@ for (const r of RULES) {
     say(f.length === 0, tag);
   }
   }
+}
+
+// ── 2a″. **死指针普查**(2026-08-27,四眼 Q4 逼出来的)。────────────────────
+//   四眼原话:出路自证「**并不执行** bash/Skill/MCP,夹具只是构造一个虚拟 tool_use
+//   把命令字符串塞进 input.command……因此不存在的 fetch-quote-check.mjs、codex-run.mjs、
+//   xros 也能自证为 PASS:判据看到『动作字符串在场』,却没验证目标存在或执行成功」。
+//   ⇒ **这就是为什么「出路自证 0 FAIL」没发现那些死命令**。我造的是「判据接受这个样例」
+//   的证明,不是「这个样例跑得起来」的证明。两者差一整层,而我当时以为堵上了。
+//   本节补最便宜的那一层:把出路 say/sample 里出现的**仓相对脚本路径**捞出来,
+//   逐个 `existsSync`。**只报不判红**——公开仓刻意不含上游若干件,那不是错误而是事实;
+//   报出来是为了让「消息指着一个不在的东西」这件事**可见**,而不是继续隐身。
+{
+  const dead = [];
+  for (const r of RULES) {
+    for (const e of (r.escapes || [])) {
+      const blob = `${e.say || ""} ${JSON.stringify(e.sample || {})}`;
+      for (const m of blob.matchAll(/(?<![\w~/.])(scripts\/[\w./-]+\.mjs)/g)) {
+        if (!fs.existsSync(m[1])) dead.push(`${r.id}: ${m[1]}`);
+      }
+    }
+  }
+  const uniq = [...new Set(dead)];
+  console.log(uniq.length
+    ? `\n出路死指针:${uniq.length} 处——消息/样例指向本仓不存在的脚本(只报不判红):\n  · ${uniq.join("\n  · ")}`
+    : "\n出路死指针:0 处(所有出路引用的仓内脚本都在场)");
 }
 
 // ── 2a′. 出路自证的**迁移进度**:未迁的必须显出来,不能让「没迁」看起来像「没问题」。

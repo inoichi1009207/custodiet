@@ -541,7 +541,7 @@ function touched(ctx, pathRe, onlyNew) {
     // 归一后再分类(D63):反斜杠 / 大小写 / `./` 段在 NTFS 上指向同一文件,
     //   而分类正则原来一条都不认 ⇒ I 收集不到 carriers 就 return [],P 也不响(漏放)。
     // **锚到路径开头**(D86):这里手里是**路径**不是命令串,不锚会把
-    //   `clipboard/oss/gate-repo/scripts/lib/…`(公开仓暂存树)与 `node_modules/…/scripts/…`
+    //   `clipboard/oss/<公开仓暂存目录>/scripts/lib/…`(外发暂存树)与 `node_modules/…/scripts/…`
     //   一并算成载体——前者当轮实撞,I 判我「新建载体」。
     if (!isCarrierPath(pathRe, p)) continue;
     if (onlyNew && !ctx.isNew(p)) continue;
@@ -655,17 +655,17 @@ export const RULE_I = {
   ],
   cases: {
     pos: [
-      { text: "新建了一个 agent。", write: "D:/test/.claude/agents/_foo.md" },
+      { text: "新建了一个 agent。", write: "/repo/.claude/agents/_foo.md" },
       // 只说不做:写了「工具面已扫」但本轮没有任何读取动作 ⇒ 仍应命中
-      { text: "工具面已扫:无命中。", write: "D:/test/.claude/agents/_bar.md" },
+      { text: "工具面已扫:无命中。", write: "/repo/.claude/agents/_bar.md" },
     ],
     neg: [
       // 说了且做了
       // ⚠️ `web:` 是四层扩容后必须的:只扫本地不再算「已扫」。
-      { text: "工具面已扫:四层无命中。", write: "D:/test/.claude/agents/_baz.md",
-        read: "D:/test/docs/tool-register.md", web: "existing agent-builder impl" },
+      { text: "工具面已扫:四层无命中。", write: "/repo/.claude/agents/_baz.md",
+        read: "/repo/docs/tool-register.md", web: "existing agent-builder impl" },
       // 改的是**既有**载体(tracked 注入),不是造物
-      { text: "改了一行既有脚本的注释。", write: "D:/test/scripts/hook-stop-closure.mjs",
+      { text: "改了一行既有脚本的注释。", write: "/repo/scripts/hook-stop-closure.mjs",
         tracked: ["scripts/hook-stop-closure.mjs"] },
       { text: "今天只写了报告,没碰载体。" },
     ],
@@ -715,15 +715,15 @@ export const RULE_J = {
     } }) },
   ],
   cases: {
-    pos: [{ text: "给协作法加了一条新规则。", write: "D:/test/docs/laws/collab.md" }],
+    pos: [{ text: "给协作法加了一条新规则。", write: "/repo/docs/laws/collab.md" }],
     neg: [
       // 对话里交代了触发层
       { text: "加了一条新规则,触发层:挂在 Stop 事件的 hook,每回合必跑。",
-        write: "D:/test/docs/laws/collab.md" },
+        write: "/repo/docs/laws/collab.md" },
       // 只写进了法条正文,对话里没复述 —— 旧实现在这里误报
-      { text: "改完了。", write: "D:/test/docs/laws/collab.md",
+      { text: "改完了。", write: "/repo/docs/laws/collab.md",
         written: "本条触发层:每会话加载(法典层),`/nlpm:check` 关账必跑。" },
-      { text: "只改了一个脚本,没碰法典。", write: "D:/test/scripts/foo.mjs" },
+      { text: "只改了一个脚本,没碰法典。", write: "/repo/scripts/foo.mjs" },
     ],
   },
 };
@@ -885,10 +885,10 @@ export const RULE_M = {
       //   ⚠️ 这里必须是 `grep:`(Grep 工具)不能是 `read:`(Read 工具):
       //   变异体照样看 `ctx.reads`,用 Read 写这条反例会让「不认 Grep」变成等价变异、逮不住。
       { text: "改完并用 Grep 回读。", bash: `node -e "fs.writeFileSync('docs/real.md','x')"`,
-        grep: "D:/test/docs/real.md" },
+        grep: "/repo/docs/real.md" },
       // 用 Read 工具回读同样算数(对照,防「只认 Grep」)
       { text: "改完并用 Read 回读。", bash: `node -e "fs.writeFileSync('docs/real.md','x')"`,
-        read: "D:/test/docs/real.md" },
+        read: "/repo/docs/real.md" },
       // 另起**一条独立命令**真回读 ⇒ 放行。与上面那条正例配对:
       //   同一条 `cat >>` 不算,另一条 `grep` 才算。这一对才证明「自引豁免」被堵住了。
       { text: "追加后回读。", bash: ["cat >> docs/report.md <<EOF\nx\nEOF", "grep -c x docs/report.md"] },
@@ -1518,7 +1518,7 @@ export function ranClear(ctx) {
   //      (W 交付物四眼、关账族)。实测 `--note <300字符> --clear` 由命中变不命中。
   //      跨模型判词:「不能在『超时导致整闸 fail-open』和『封顶导致触发器 fail-open』之间二选一」。
   //   ③ 另有一条既有致盲:`stripQuoted` 把引号内容抹成等长空格,于是
-  //      `node "D:/test/scripts/batch-goal.mjs" --clear` 里**脚本名整个消失** ⇒ 判不中。
+  //      `node "/repo/scripts/batch-goal.mjs" --clear` 里**脚本名整个消失** ⇒ 判不中。
   //      而 Windows 上给带盘符路径加引号是本能动作。
   //   现改为**不用长正则**:两个独立的 O(n) 存在性判定 + 原串与去引号串**并集**。
   //   没有回溯面(纯 includes 与短正则),没有长度上限(不会因命令长而漏判),
@@ -3263,7 +3263,14 @@ export const RULE_O = {
   blocking: false,
   law: "AGENTS.md#永久红线",
   escapes: [
-    { say: "真取页核实(本仓装了取页核实件时):node --no-warnings scripts/fetch-quote-check.mjs <url> \"引文\"",
+    // ⚠️ 2026-08-27 四眼逮到:此处**只在 say 里加了「本仓装了…时」的限定语,却没真去判**
+    //   ——而同批 CHANGELOG 已经把「凡让人跑脚本的消息都先判文件在不在」写成了已实现。
+    //   **限定语不是判据**:加一句「如果你有的话」既没让消息变准,也骗过了我自己。
+    //   现改为真调 `toolPresent()`,与 L 项同一条口径。
+    { say: toolPresent("scripts/fetch-quote-check.mjs")
+        ? "真取页核实:node --no-warnings scripts/fetch-quote-check.mjs <url> \"引文\""
+        : "真取页核实——**本仓没装取页核实件**(`scripts/fetch-quote-check.mjs` 不在)," +
+          "用下面的 WebFetch 那条,或自己装一个「给 URL + 引文、取页后逐字比对」的件",
       sample: { bash: "node --no-warnings scripts/fetch-quote-check.mjs https://x.test/a \"某句\"" } },
     // ⚠️ 样例用 `mcp`(= 造一个该名字的 tool_use)而不是 `web`——夹具的 `web:` 造的是
     //   **WebSearch**,而本判据**刻意只认 WebFetch**:搜索返回的是**摘要**,不是那一页。

@@ -1440,18 +1440,18 @@ function selfTest() {
     { name: "A 不命中:发起且已 poll", lines: [U("go"), A("CODEX_JOB=abc123"), A("跑 --poll abc123")], want: [] },
     { name: "B 命中:承诺句零工具", lines: [U("go"), A("我这就去改,不问,你喊停就停")], want: ["B"] },
     { name: "B 命中:干了别的那件(今日实撞形态)",
-      lines: [U("go"), A("我这就去改 `foo.mjs`", [{ name: "Edit", input: { file_path: "D:/test/bar.md" } }])], want: ["B", "K0"] },
+      lines: [U("go"), A("我这就去改 `foo.mjs`", [{ name: "Edit", input: { file_path: "/repo/bar.md" } }])], want: ["B", "K0"] },
     { name: "B 命中:无具体对象的空头承诺",
-      lines: [U("go"), A("我这就去处理一下", [{ name: "Edit", input: { file_path: "D:/test/bar.md" } }])], want: ["B", "K0"] },
+      lines: [U("go"), A("我这就去处理一下", [{ name: "Edit", input: { file_path: "/repo/bar.md" } }])], want: ["B", "K0"] },
     { name: "B 不命中:承诺对象与动作对得上",
-      lines: [U("go"), A("工具面已扫:无命中。我这就去改 `foo.mjs`", [{ name: "Grep", input: { pattern: "x", path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Edit", input: { file_path: "D:/test/scripts/foo.mjs" } }])], want: ["K0"] },
+      lines: [U("go"), A("工具面已扫:无命中。我这就去改 `foo.mjs`", [{ name: "Grep", input: { pattern: "x", path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Edit", input: { file_path: "/repo/scripts/foo.mjs" } }])], want: ["K0"] },
     { name: "C 命中:缺陷陈述无处置", lines: [U("go"), A("这条还没落盘,也没入仓")], want: ["C"] },
     // ⚠️ 2026-08-20 引擎接管后,这几条夹具从简写 `["Write"]` 改成**带真入参**。
     //   原写法造出的是**没有 file_path 的 Write**:旧实现只看「出现了 Write 这个工具名」就算写过,
     //   引擎要求真有路径。**「出现了 Write 工具」≠「写了文件」正是这次重写要消灭的东西**,
     //   所以是夹具跟上契约,不是放宽规则。
     { name: "C 不命中:缺陷陈述后有写",
-      lines: [U("go"), A("这条还没落盘", [{ name: "Write", input: { file_path: "D:/test/docs/foo.md" } }])], want: ["K0"] },
+      lines: [U("go"), A("这条还没落盘", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
     { name: "D 命中:强制面降级", lines: [U("go"), A("这条要交叉验证。要不要我去跑一下?")], want: ["D"] },
     { name: "D 不命中:非强制面", lines: [U("go"), A("配色你要是想换我可以帮你调")], want: [] },
     { name: "E0+E2 阻断:裸因果断言两半都没走", lines: [U("go"), A("根因是缓存没刷新")], want: ["E0","E2"] },
@@ -1475,34 +1475,34 @@ function selfTest() {
     { name: "G 不命中:七问逐条答过", lines: [U("go"), A("自审:① 无新造件 ② 失效条件已写 ③ 已接线 ④ 日记已补 ⑤ xros 已跑 ⑥ 已查先例 ⑦ 已过 grill"), A("git commit -m x")], want: [] },
     { name: "G v2 命中:触闸机件提交而无自测动作(④)",
       lines: [U("go"), A("改闸,提交", [
-        { name: "Edit", input: { file_path: "D:/test/scripts/hook-stop-closure.mjs" } },
+        { name: "Edit", input: { file_path: "/repo/scripts/hook-stop-closure.mjs" } },
         { name: "Bash", input: { command: "git commit -m x" } }])], want: ["G", "K0"] },
     { name: "G 不命中:没提交", lines: [U("go"), A("改完了", ["Edit"])], want: [] },
     // H:今日实撞原形——自己写下「我能做、不需要你签」然后停手等发话
     { name: "H 命中:自陈能做却没做", lines: [U("go"), A("这两件我能做,不需要你签,属工装面")], want: ["H"] },
     { name: "H 不命中:自陈能做且做了",
-      lines: [U("go"), A("这件我能做,不需要你签", [{ name: "Write", input: { file_path: "D:/test/docs/foo.md" } }])], want: ["K0"] },
+      lines: [U("go"), A("这件我能做,不需要你签", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
     // I:纪律 32 闸化——新建载体必须留工具面扫描痕迹
     { name: "I 阻断:新建 agent 未留扫描痕迹",
-      lines: [U("go"), A("造好了", [{ name: "Write", input: { file_path: "D:/test/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
+      lines: [U("go"), A("造好了", [{ name: "Write", input: { file_path: "/repo/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
     { name: "I 阻断:新建 scripts 工装未留痕",
-      lines: [U("go"), A("写好了", [{ name: "Write", input: { file_path: "D:/test/scripts/foo.mjs" } }])], want: ["I", "K0"] },
+      lines: [U("go"), A("写好了", [{ name: "Write", input: { file_path: "/repo/scripts/foo.mjs" } }])], want: ["I", "K0"] },
     { name: "I 不命中:已留扫描痕迹",
       // ⚠️ `WebSearch` 是 2026-08-20 补的:纪律 32 从三层扩到**四层**(加「搜 GitHub」),
       //   本夹具原来只扫本地 ⇒ 新规则下它不再是「已扫」。夹具跟着契约走,不是反过来。
-      lines: [U("go"), A("工具面已扫:四层无命中,造", [{ name: "Read", input: { file_path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Write", input: { file_path: "D:/test/.claude/skills/y/SKILL.md" } }])], want: ["K0"] },
+      lines: [U("go"), A("工具面已扫:四层无命中,造", [{ name: "Read", input: { file_path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Write", input: { file_path: "/repo/.claude/skills/y/SKILL.md" } }])], want: ["K0"] },
     { name: "I 不命中:写的不是载体面",
-      lines: [U("go"), A("更新文档", [{ name: "Write", input: { file_path: "D:/test/docs/foo.md" } }])], want: ["K0"] },
+      lines: [U("go"), A("更新文档", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
     // J:立法必答触发层——递归的最后一层
     { name: "J 命中:改法典未交代触发层",
-      lines: [U("go"), A("新增一条纪律", [{ name: "Edit", input: { file_path: "D:/test/docs/laws/collab.md" } }])], want: ["J", "K0"] },
+      lines: [U("go"), A("新增一条纪律", [{ name: "Edit", input: { file_path: "/repo/docs/laws/collab.md" } }])], want: ["J", "K0"] },
     { name: "J 不命中:触发层写在对话里",
-      lines: [U("go"), A("新增一条,触发层:Stop hook 的 I 项,必然执行", [{ name: "Edit", input: { file_path: "D:/test/AGENTS.md" } }])], want: ["K0"] },
+      lines: [U("go"), A("新增一条,触发层:Stop hook 的 I 项,必然执行", [{ name: "Edit", input: { file_path: "/repo/AGENTS.md" } }])], want: ["K0"] },
     { name: "J 不命中:没碰法典",
-      lines: [U("go"), A("工具面已扫:无命中。改工装", [{ name: "Grep", input: { pattern: "x", path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Edit", input: { file_path: "D:/test/scripts/x.mjs" } }])], want: ["K0"] },
+      lines: [U("go"), A("工具面已扫:无命中。改工装", [{ name: "Grep", input: { pattern: "x", path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Edit", input: { file_path: "/repo/scripts/x.mjs" } }])], want: ["K0"] },
     // I 的两个新覆盖面(2026-08-19 实测漏掉整类动作后补)
     { name: "I 命中:Edit 已有载体也算造物",
-      lines: [U("go"), A("改一下", [{ name: "Edit", input: { file_path: "D:/test/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
+      lines: [U("go"), A("改一下", [{ name: "Edit", input: { file_path: "/repo/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
     { name: "I 命中:经 Bash 写载体绕不过去",
       lines: [U("go"), A("改一下", [{ name: "Bash", input: { command: "node -e \"fs.writeFileSync('scripts/foo.mjs',s)\"" } }])], want: ["I","M"] },
     // 两条反向用例:2026-08-19 实撞的误报形态
@@ -1865,7 +1865,7 @@ function selfTest() {
       { type: "assistant", message: { content: [
         { type: "text", text: "工具面已扫:无命中。新建了零件。" },
         { type: "tool_use", name: "Grep", input: { path: "docs/tool-register.md", pattern: "shell" } },
-        { type: "tool_use", name: "Write", input: { file_path: "D:/test/scripts/lib/新零件.mjs", content: "x" } },
+        { type: "tool_use", name: "Write", input: { file_path: "/repo/scripts/lib/新零件.mjs", content: "x" } },
       ] } },
     ];
     const idsOf = (fs2) => fs2.map((f) => f.id).join(",");
@@ -1947,7 +1947,7 @@ function selfTest() {
       hp("ranClear:长参数后接 --clear(D62:封顶曾使其漏判)",
         rc("node scripts/batch-goal.mjs --note " + "x".repeat(300) + " --clear"), true);
       hp("ranClear:带引号的绝对路径(既有致盲:stripQuoted 抹掉脚本名)",
-        rc('node "D:/test/scripts/batch-goal.mjs" --clear'), true);
+        rc('node "/repo/scripts/batch-goal.mjs" --clear'), true);
       hp("ranClear:单引号包裹脚本路径", rc("node 'scripts/batch-goal.mjs' --clear"), true);
       // ⚠️ **不带引号的管道/分号形态**(2026-08-20 codex 三条复现,当时全是 true)。
       //   上面那条 grep 用例带引号,`stripQuoted` 就够了;

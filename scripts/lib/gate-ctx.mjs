@@ -77,7 +77,7 @@ export function buildCtx(entries, extra = {}) {
    *  ⚠️ 但只解析入参还不够。codex 060 §1.3 给出三条反例,原实现全判错:
    *    `echo git commit`        → 原 true(它只是在**打印**这个字符串)
    *    `git commit --dry-run`   → 原 true(它**刻意不提交**)
-   *    `git -C D:/test commit`  → 原 **false**(`-C <路径>` 是两个 token,`(-\S+\s+)*` 吃不下)
+   *    `git -C /repo commit`  → 原 **false**(`-C <路径>` 是两个 token,`(-\S+\s+)*` 吃不下)
    *  故改为**按分隔符切段 + 段首必须是 git + 排除 --dry-run**:
    *  判的是「这一段命令的主语是不是 git、动作是不是 commit」,
    *  而不是「这串字符里有没有出现 git commit」。
@@ -285,7 +285,7 @@ export function selfTest() {
   // codex 060 §1.3 的三条反例:判的是「这段命令的主语是不是 git」,不是「字符串里有没有 git commit」
   chk("echo git commit ⇒ 假(只是打印)", buildCtx([A([use("Bash", { command: "echo git commit" })])]).didCommit(), false);
   chk("--dry-run ⇒ 假(刻意不提交)", buildCtx([A([use("Bash", { command: "git commit --dry-run" })])]).didCommit(), false);
-  chk("git -C <路径> commit ⇒ 真", buildCtx([A([use("Bash", { command: "git -C D:/test commit -m x" })])]).didCommit(), true);
+  chk("git -C <路径> commit ⇒ 真", buildCtx([A([use("Bash", { command: "git -C /repo commit -m x" })])]).didCommit(), true);
 
   // S2-b:文件里提到 codex-run.mjs ⇒ 旧实现让跨模型复核那一半消失
   chk("文件内容提到 codex-run.mjs ⇒ ranBash 为假",
