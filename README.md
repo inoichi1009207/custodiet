@@ -90,7 +90,7 @@ node --no-warnings scripts/batch-goal.mjs --clear
 - [guardrails-ai](https://github.com/guardrails-ai/guardrails) / [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails) 校验**模型说出来的内容**;我们审计**它说做过的事有没有真的发生**。内容闸 vs 言行一致闸。
 - [tdd-guard](https://github.com/nizos/tdd-guard) / [probity](https://github.com/nizos/probity) 闸**每次写入**的流程合规(probity 也读 transcript);我们在 Stop 时刻闸**整轮的言行**。互补,可以同时跑。
 - Claude Code 官方自带 `/goal`(目标追踪)——但它是**内建 slash command,模型自己调不了,只有用户能敲**(2026-08-19 实测)。这意味着官方目标机制无法进入 agent 的自我闭环:agent 没法自己立验收条件;而它的收尾评估走的是 LLM 裁判(session 级 prompt hook)——正是上文 AUROC ≤0.65 的那类,不是机器判据。`batch-goal --arm/--clear` 就是为此存在的仓内等价物——立条件是 agent 的开工动作,对照是 Stop 闸的机器动作,人只在想看的时候看。
-- [unlazy](https://github.com/Leonxlnx/unlazy)(2026-09 调研)与我们**同用 Stop hook 当墙**,但治的病相反:它治**用力不足**(Depth Tree 把任务逐层裂解、每片叶继承全额时间预算,gates 文件用 `CHECK:` 命令 + `EXPECT:` 词元验收),我们治**宣称不实**(说做过的事有没有真做、出处有没有真取、对照有没有真跑)。它文档自认不管 false claims 与出处核验——恰是本仓主场。互补大于替代:**unlazy 让 agent 多干活,custodiet 让 agent 不说谎**。它有两处值得学:「连续 N 次无进展阻断即放行+警告」的防死循环阀,和 `ABANDON: <gate> <reason>` 诚实退出通道——本仓的等价物是连撞上限自动降级与「⏸ 需要你确认 + 三类理由」。
+- [unlazy](https://github.com/Leonxlnx/unlazy)(2026-09 调研,经跨模型逐句取页复核)与我们**同用 Stop hook 当墙**,但治的病相反:它治**用力不足**(Depth Tree 按请求深度逐层拆任务、每片叶多轮打磨;gates 文件用 `CHECK:` 命令 + `EXPECT:` 词元验收),我们治**宣称不实**(说做过的事有没有真做、出处有没有真取、对照有没有真跑)。它文档自认的天花板很窄:`EXPECT` 命中证明不了 gate 标题诚实、传递依赖也不自动核——而「言行一致」这一整层正是本仓主场。互补大于替代:**unlazy 让 agent 多干活,custodiet 让 agent 不说谎**。它有两处值得学:「连续 6 次无进展阻断即放行」的防死循环阀,和 `ABANDON: <id> <non-empty reason>` 的失败式交接通道——本仓的等价物是连撞上限自动降级与「⏸ 需要你确认 + 三类理由」。
 - 按本次调研(2026-08-25,2026-09-02 复核),「承诺-行动比对 + 变异测试验收 + 到期债台账」的组合在开源里**未观测到**同类——这是观测陈述,不是不存在证明。
 
 ## FAQ
