@@ -160,9 +160,29 @@ export const NON_CARRIER_AREA = /(^|\/)(clipboard|node_modules|\.git|dist|build|
 /** 「这是不是一个载体**路径**」。与 `*_SURFACE` 的分工:
  *  `*_SURFACE` 扫**命令串**(`git add scripts/x.mjs` 里那段不在开头,故不能锚也不能排除);
  *  本谓词判**路径**,要把非本仓载体区剔掉。选错哪边都有代价,故在此写明。 */
+// ⚠️ 2026-08-28:这里原有 `REPO_ROOT` 与 `inThisRepo()`(D93「限定本仓」用的),
+//   随该裁决撤销一并删除。**不留死代码**:留着它下一个人会以为这条判据还在用。
+//   撤销理由见下面 `isCarrierPath` 内的注;要复原走 `git revert`(单独 commit)。
+
 export function isCarrierPath(re, p) {
   const s = normPath(p);
-  return re.test(s) && !NON_CARRIER_AREA.test(s);
+  if (!re.test(s) || NON_CARRIER_AREA.test(s)) return false;
+  // ⚠️ 2026-08-28:**D93「限定本仓」已撤销**(它上线不到一天就被反证推翻)。
+  //   原裁的两条依据现在都不成立:
+  //   ①「边界不可预期」——**前提说过头了**。这张表本来就有**两类条目**:
+  //     通用的(`AGENTS.md`、`docs/laws/`、`.claude/{agents,skills,commands}/`)与
+  //     **本仓机件专名的**(`hook-*`、`verify-laws`…)。外仓只命中通用那类,
+  //     这是**可解释的**,不是「碰上哪条算哪条」。
+  //   ②「拿本仓宪法要求别人的项目没有法源」——**法条锚点管的是「这条规则为什么存在」,
+  //     不是「它能看哪个仓的文件」**。宪法约束的是**执行方**,不是文件的户籍。
+  //   **反证(另一条会话当天用计数给出,已复核其转录逐字)**:那批跨仓作业里的
+  //   codex 外审抓出了**真实 QQ 号泄漏**、一个**必然通过的假检查**
+  //   (`git status --short` 在干净树上恒空)、群白名单 fail-open、五处过度断言、
+  //   三处对第三方项目的失实描述 ⇒ **三通道作用在跨仓批上是有效的**,
+  //   而我写的「不损失真实覆盖」正被这份证据推翻。
+  //   ⇒ 方向按代价不对称回到 fail-closed 侧:**多看一个仓的承重件,好过漏掉一次真泄漏**。
+  //   `NON_CARRIER_AREA`(暂存树/依赖/产物)保留——那条是按**区域**剔除,与户籍无关。
+  return true;
 }
 
 /** 「新建它算造物」的合并正则(I 项用)。 */
@@ -235,6 +255,25 @@ export function selfTest() {
   ]) {
     chk(`D86 路径面排除非载体区  ${p.padEnd(40)}`, isCarrierPath(CREATION_SURFACE, p), want);
   }
+  // ── D93 的钉子(2026-08-28 **随裁决撤销而反向**)。
+  //   原钉的是「限定本仓」:他仓的宪法/法典**不算**承重。该裁决上线不到一天被反证推翻
+  //   ——那批跨仓作业里的 codex 外审抓出真实 QQ 号泄漏与一个必然通过的假检查,
+  //   ⇒ 三通道作用在跨仓批上**有效**,限定等于把一道抓到过真东西的检查关掉。
+  //   **留这段注释是刻意的**:夹具是会跟着裁决翻面的,而翻面本身要留痕——
+  //   否则下一个人看到「他仓算承重」会以为从来如此,不知道中间被否过一次。
+  //   ⚠️ **按行选面**:宪法/法典的 `creation` 是 false(不存在「手搓一部已有的法」),
+  //   它们只在承重面上;memory 反过来(creation 真、loadBearing 假)。
+  for (const [surf, p, want, why] of [
+    [CREATION_SURFACE, "scripts/lib/gate-rules.mjs", true, "本仓相对路径"],
+    [CARRIER_SURFACE, "AGENTS.md", true, "本仓宪法"],
+    [CARRIER_SURFACE, "/other/AGENTS.md", true, "**他仓宪法照样算**——宪法约束的是执行方,不是文件户籍"],
+    [CARRIER_SURFACE, "/other/docs/laws/x.md", true, "他仓法典同上"],
+    [CARRIER_SURFACE, "clipboard/oss/<公开仓暂存目录>/AGENTS.md", false, "暂存树:按**区域**剔除,与户籍无关"],
+    [CREATION_SURFACE, "C:/Users/x/.claude/projects/example-project/memory/y.md", true, "memory:刻意纳入的仓外载体"],
+  ]) {
+    chk(`D93′ 载体面  ${p.slice(-40).padEnd(40)} ${why}`, isCarrierPath(surf, p), want);
+  }
+
   chk("D86 命令串面**不**排除(否则 P 的命令判据被打瞎)",
     CARRIER_SURFACE.test(normPath("git add scripts/lib/gate-rules.mjs")), true);
 

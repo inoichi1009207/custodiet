@@ -25,7 +25,7 @@
 //
 // ── 工具面已扫(纪律 32 三层,2026-08-20)──────────────────────────────────────
 // ① `docs/tool-register.md`:**无命中**——在册件里没有做 shell 词法/切段的。
-// ② 已在册市场(claude-plugins-official / project-pinned / xiaolai):**无命中**,
+// ② 已在册市场(claude-plugins-official / my-pinned / xiaolai):**无命中**,
 //    没有可直接装、能给 hook 内部用的词法器。
 // ③ 本项目已有封装:**命中,且比预想的重**——
 //    · `tplan-gate.mjs` 的 `shellMetachar` 是**探测器**(命中即 FAIL)不是切段器,

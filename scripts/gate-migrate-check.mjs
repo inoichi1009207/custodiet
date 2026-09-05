@@ -160,7 +160,7 @@ const EXPECTED_DIVERGENCE = {
      "这条分歧是 2026-08-20 grill:testing 在**全语料 6604 片**上量出来的(20 条,双向)," +
      "而当时 65 片的采样看到 **0 条**;撤销采样正是为了让它现形。\n" +
      "① **旧有新无(假阳)**:`/ls\\s+[^\"]*scripts/` 里的 `[^\"]*` 横跨整条序列化命令 ⇒ " +
-     "`ls clipboard/<一次性采集目录>/; …; node -e \"…'./scripts/baselines/…'\"` 命中 L," +
+     "`ls clipboard/reader-capture-030/; …; node -e \"…'./scripts/baselines/…'\"` 命中 L," +
      "而那条 `ls` 根本没在清点 scripts/。新实现**先按 `&&|;|\\||换行` 切段再匹配**,不再命中。\n" +
      "② **新有旧无(假阴)**:`/grep\\s+-c[^\"]*(tool-register|repo-brief)/` 的 `[^\"]*` " +
      "**跨不过引号** ⇒ `grep -c \"fetch-quote-check\" …/tool-register.md` 旧的**不**命中," +
@@ -276,7 +276,7 @@ console.log("正反例:");
 //   判别实验(剥掉通道动作看规则是否翻面)测得 16 条反例里只有 7 条真检验了计数器,
 //   且四套的形态覆盖齐齐停在 3/4,缺的都是这一种。规则本身判得对(探针 3/3),
 //   **漏的是夹具**——这正是「四份候选互打全绿」证不了的那类洞:一致地少测。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "batchGoal", "pLedger", "prior"]);
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "batchGoal", "pLedger", "prior", "user"]);
 //   第六次:`prior`(K 的批漂判据)—— 与 `batchGoal` 同族,也是**注入通道**而非动作。
 //   值是「上几轮的 assistant 文本/动作」简写,由 mkEntries 拼成 entries 再交 priorEntries。
 const mkEntries = (c) => {
@@ -307,7 +307,12 @@ const mkEntries = (c) => {
   if (c.skill) blocks.push({ type: "tool_use", name: "Skill", input: { skill: String(c.skill) } });
   // `mcp` = 走 MCP 工具的调用,值即工具名(如 "mcp__codex-cli__codex")。
   if (c.mcp) blocks.push({ type: "tool_use", name: String(c.mcp), input: { prompt: "x" } });
-  return [{ type: "assistant", message: { content: blocks } }];
+  // `user` = 本轮用户消息文本(2026-08-31 加,ND 项要判「用户问了什么」)。
+  //   第八次同族:夹具支持面不足会让规则「测不出来」,而它长得像规则写错了(见上方预言句)。
+  const pre = c.user
+    ? [{ type: "user", message: { role: "user", content: [{ type: "text", text: String(c.user) }] } }]
+    : [];
+  return [...pre, { type: "assistant", message: { content: blocks } }];
 };
 // ⚠️ `tracked` 必须**从夹具注入**,不能让规则自己去 execFileSync git。
 //   注不进来 ⇒ ctx 侧 fail-closed 当「新建」——于是 I 的「改既有载体」这一支

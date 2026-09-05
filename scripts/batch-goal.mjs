@@ -34,7 +34,110 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { ledgerAppend } from "./lib/ledger-chain.mjs";
+import { quoteUntrusted } from "./lib/gate-ctx.mjs";
+const JOURNAL = path.join(".claude", ".batch-goal.jsonl");
+
+// ── 可执行判据(D98-③,2026-09-04 用户「趁这个功夫把闸修了」;同日 codex + grill 双审后加固)──────
+//   `--cond "…" --check "<命令>" [--expect "<子串>" | --expect-re "<正则>"]`:check 挂在**它前面最近的那条** --cond 上。
+//   `--clear` 先跑全部 check:退出码非 0、或输出(stdout+stderr)不含 expect ⇒ **拒清**(fail-closed),
+//   不再只认「条件N:达成」那句自述。实撞:半写的 mp4 被我按日志行宣布落盘,ffprobe 当场就能否掉。
+//   加固点(审出的漏放,逐条):
+//   · check 一律经 **Git Bash** `bash -c` 跑(不是 cmd.exe——`$()`/`2>/dev/null`/`;` 在 cmd 下要么字面要么报错,曾能空过);
+//     找不到 bash ⇒ --arm 直接拒(fail-closed),并把 shell 写进状态。
+//   · 语法严格:未知 `--flag`、缺值、空值、值以 `--` 开头、重复 --expect、--expect 前没有 --check ⇒ 退出 2;
+//     expect 为空/纯空白 ⇒ 拒(空串 includes 恒真);expect ≤2 字符 ⇒ 警告。
+//   · 判据与武装台账绑定:--clear/--dry-check 先核状态文件里的 checks 与本批最后一条 arm 日志行**逐字相同**,
+//     不同 ⇒ 拒跑(状态文件 gitignore、可被别的进程改写;曾有后台 codex 用 --force 盖过它——把它变成 RCE 入口不行)。
+//   · 同批重武装若 conditions/checks 有任何变化 ⇒ 须 --force(否则可以悄悄把判据删掉);--force 覆盖带判据的批时先跑一遍旧判据并记入日志。
+//   · 整批 wall-clock 上限 600 s、单条 120 s、maxBuffer 4 MiB;失败输出经 quoteUntrusted 回显。
+//   天花板(诚实写出):自由 `--check` 只证「这条命令在此刻通过」,不证它和条件对象真有关系——写 `echo 218.` 照样过;
+//   它是低保证级判据,结构性绑定(按路径自动组 ffprobe)是另一批;探针结果与写入时序的关系由引擎 X 项另管。
+const KNOWN_ARM_FLAGS = new Set(["--arm", "--cond", "--check", "--expect", "--expect-re", "--force"]);
+export function parseArm(argv) {
+  const conds = [], checks = [];
+  const val = (i, flag) => {
+    const v = argv[i + 1];
+    if (v === undefined || String(v).trim() === "") throw new Error(`${flag} 缺值或为空`);
+    if (/^--/.test(v)) throw new Error(`${flag} 的值不能以 -- 开头(得到「${v}」,像是漏写了值)`);
+    return v;
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--arm") { i++; continue; }
+    if (a === "--force" || a === "--imported-noop") continue;
+    if (a === "--cond") { conds.push(val(i, a)); i++; continue; }
+    if (a === "--check") {
+      if (!conds.length) throw new Error("--check 必须跟在某条 --cond 之后");
+      checks.push({ i: conds.length - 1, cmd: val(i, a) }); i++; continue;
+    }
+    if (a === "--expect" || a === "--expect-re") {
+      const last = checks[checks.length - 1];
+      if (!last || last.i !== conds.length - 1) throw new Error(`${a} 必须紧跟本条 --check`);
+      if (last.expect !== undefined || last.expectRe !== undefined) throw new Error(`${a} 重复:一条 --check 只能配一个 expect`);
+      const v = val(i, a); i++;
+      if (a === "--expect-re") { try { new RegExp(v); } catch (e) { throw new Error(`--expect-re 不是合法正则:${e.message}`); } last.expectRe = v; }
+      else { if (v.trim().length < 4) throw new Error(`--expect「${v}」太短(<4 字符):几乎任何输出都含它;要短匹配用 --expect-re 加锚点`); last.expect = v; }
+      continue;
+    }
+    if (/^--/.test(a)) throw new Error(`未知参数 ${a}(合法:${[...KNOWN_ARM_FLAGS].join(" ")})`);
+    throw new Error(`多余的位置参数「${a}」——每个值都要跟在它的 flag 后面`);
+  }
+  return { conds, checks };
+}
+/** Git Bash 路径(check 一律经它跑)。找不到返回 null。 */
+export function findBash() {
+  const cands = [process.env.BATCH_GOAL_BASH, "C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe", "/usr/bin/bash", "/bin/bash"].filter(Boolean);
+  // r2:也扫 PATH(便携 Git / 自定义安装目录只在 PATH 里)
+  for (const d of String(process.env.PATH || "").split(path.delimiter)) if (d) cands.push(path.join(d, "bash.exe"), path.join(d, "bash"));
+  for (const c of cands) { try { if (fs.existsSync(c) && fs.statSync(c).isFile()) return c; } catch {} }
+  return null;
+}
+/** 跑一批 check,返回失败清单(空数组 = 全过)。`run` 可注入(自测用)。checks 形状不对 ⇒ 当失败(fail-closed)。 */
+export function runChecks(goal, run = defaultRun, budgetMs = 600_000) {
+  const out = []; const t0 = Date.now();
+  const checks = goal?.checks;
+  if (checks !== undefined && checks !== null && !Array.isArray(checks)) return [{ i: 0, cmd: String(checks), status: -1, stdout: "", stderr: "checks 不是数组(状态文件损坏或被改写)" }];
+  for (const c of (checks || [])) {
+    if (!c || typeof c.cmd !== "string" || !c.cmd.trim()) { out.push({ i: c?.i ?? 0, cmd: String(c?.cmd), status: -1, stdout: "", stderr: "check 命令不是非空字符串" }); continue; }
+    if (Date.now() - t0 > budgetMs) { out.push({ i: c.i, cmd: c.cmd, status: -1, stdout: "", stderr: `整批判据超过 ${budgetMs / 1000}s 上限,未跑` }); continue; }
+    const r = run(c.cmd);
+    const output = (String(r.stdout || "") + "\n" + String(r.stderr || "")).slice(0, 65536);   // r2:正则只跑在前 64 KB 上,压住 ReDoS 面
+    let ok = r.status === 0;
+    if (ok && c.expect !== undefined) ok = String(c.expect).trim() !== "" && output.includes(c.expect);
+    if (ok && c.expectRe !== undefined) { try { ok = new RegExp(c.expectRe, "m").test(output); } catch { ok = false; } }
+    if (!ok) out.push({ i: c.i, cmd: c.cmd, expect: c.expect ?? c.expectRe, status: r.status, stdout: String(r.stdout || "").trim().slice(0, 200), stderr: String(r.stderr || "").trim().slice(0, 200) });
+  }
+  return out;
+}
+function defaultRun(cmd) {
+  const bash = findBash();
+  if (!bash) return { status: -1, stdout: "", stderr: "找不到 Git Bash(BATCH_GOAL_BASH 可指定)" };
+  const r = spawnSync(bash, ["-c", cmd], { encoding: "utf8", timeout: 120_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+  return { status: r.status ?? -1, stdout: r.stdout, stderr: String(r.stderr || "") + (r.error ? " " + String(r.error) : "") };
+}
+function printCheckFails(fails, goal) {
+  for (const f of fails) {
+    const text = (goal?.conditions || [])[f.i]; console.error(`  条件${f.i + 1}«${typeof text === "string" ? text.slice(0, 60) : ""}» check 未过:`);
+    console.error(`    $ ${f.cmd}\n    退出码 ${f.status}${f.expect !== undefined ? `,期待含「${f.expect}」` : ""}${f.stdout ? `\n    stdout: ${quoteUntrusted(f.stdout, 200)}` : ""}${f.stderr ? `\n    stderr: ${quoteUntrusted(f.stderr, 200)}` : ""}`);
+  }
+}
+/** 本批最后一条 arm 日志行(按批号),用来核状态文件里的 checks 没被改过。 */
+function lastArmRow(batch) {
+  let lines = []; try { lines = fs.readFileSync(JOURNAL, "utf8").split("\n").filter(Boolean); } catch { return null; }
+  for (let k = lines.length - 1; k >= 0; k--) { let o; try { o = JSON.parse(lines[k]); } catch { continue; } if (o.action === "arm" && o.batch === batch) return o; }
+  return null;
+}
+export function checksMatchJournal(goal, row) {
+  const norm = (x) => JSON.stringify(Array.isArray(x) ? x : []);
+  return norm(goal?.checks) === norm(row?.checks);
+}
+/** 同批重武装是否改了内容(conditions 或 checks 任一不同)。 */
+export function armChanged(cur, conds, checks) {
+  const norm = (x) => JSON.stringify(Array.isArray(x) ? x : []);
+  return norm(cur?.conditions) !== norm(conds) || norm(cur?.checks) !== norm(checks);
+}
 
 const FILE = path.join(".claude", ".batch-goal.json");
 
@@ -53,7 +156,6 @@ const FILE = path.join(".claude", ".batch-goal.json");
 //      ——这就是那个「小 git」,任何一次覆盖都能从这儿翻回来;
 //   ③ **覆盖保护**:当前已武装且批号不同时,`--arm` 拒绝执行,除非显式 `--force`。
 //      这一条直接挡住本次事故的形态。
-const JOURNAL = path.join(".claude", ".batch-goal.jsonl");
 
 function journal(action, payload) {
   try {
@@ -174,6 +276,32 @@ function selfTest() {
   t("已结清 + 换批号 ⇒ **放行**(不是拒绝)", blocks({ cleared: true, batch: "073" }, "074"), false);
   t("未结清 + 换批号 ⇒ 拒绝", blocks({ batch: "073", conditions: ["x"] }, "074"), true);
   t("未结清 + 同批号 ⇒ 放行(重武装同一批)", blocks({ batch: "073", conditions: ["x"] }, "073"), false);
+  // ── D98-③ 可执行判据 ──
+  t("check 挂到它前面最近的 cond", parseArm(["--arm", "170", "--cond", "甲", "--cond", "乙", "--check", "c2", "--expect", "okay"]),
+    { conds: ["甲", "乙"], checks: [{ i: 1, cmd: "c2", expect: "okay" }] });
+  t("check 在任何 cond 之前 ⇒ 抛", (() => { try { parseArm(["--check", "x"]); return "no-throw"; } catch { return "throw"; } })(), "throw");
+  const fake = (m) => (cmd) => m[cmd] || { status: 1, stdout: "", stderr: "unknown" };
+  const g = { conditions: ["a", "b"], checks: [{ i: 0, cmd: "ok-cmd", expect: "218." }, { i: 1, cmd: "bad-cmd" }] };
+  t("退出 0 且含 expect ⇒ 过;退出非 0 ⇒ 拒", runChecks(g, fake({ "ok-cmd": { status: 0, stdout: "218.83" }, "bad-cmd": { status: 1, stdout: "" } })).map((f) => f.i), [1]);
+  t("退出 0 但 stdout 不含 expect ⇒ 拒", runChecks(g, fake({ "ok-cmd": { status: 0, stdout: "moov atom not found" }, "bad-cmd": { status: 0 } })).map((f) => f.i), [0]);
+  t("无 check ⇒ 空失败表(旧批不受影响)", runChecks({ conditions: ["a"] }, fake({})), []);
+  t("真跑:node 退出 1 被判失败", runChecks({ conditions: ["a"], checks: [{ i: 0, cmd: `node -e "process.exit(1)"` }] }).length, 1);
+  t("真跑:node 打印 ok 且期待 ok ⇒ 过", runChecks({ conditions: ["a"], checks: [{ i: 0, cmd: `node -e "console.log('ok')"`, expect: "ok" }] }).length, 0);
+  // ── 双审后加固 ──
+  const throws = (args) => { try { parseArm(args); return "no-throw"; } catch { return "throw"; } };
+  t("未知 flag 拼错 ⇒ 抛(不再静默跳过)", throws(["--cond", "a", "--chek", "x"]), "throw");
+  t("空 expect ⇒ 抛", throws(["--cond", "a", "--check", "x", "--expect", ""]), "throw");
+  t("expect <4 字符 ⇒ 抛(宽子串)", throws(["--cond", "a", "--check", "x", "--expect", "0"]), "throw");
+  t("值以 -- 开头(漏写值)⇒ 抛", throws(["--cond", "--check", "x"]), "throw");
+  t("重复 expect ⇒ 抛", throws(["--cond", "a", "--check", "x", "--expect", "1", "--expect", "2"]), "throw");
+  t("--expect-re 解析", parseArm(["--cond", "a", "--check", "x", "--expect-re", "^duration=218"]).checks[0].expectRe, "^duration=218");
+  t("expect 匹配面含 stderr", runChecks({ conditions: ["a"], checks: [{ i: 0, cmd: "x", expect: "moov" }] }, () => ({ status: 0, stdout: "", stderr: "moov atom not found" })).length, 0);
+  t("expectRe 不匹配 ⇒ 拒", runChecks({ conditions: ["a"], checks: [{ i: 0, cmd: "x", expectRe: "^dur=218" }] }, () => ({ status: 0, stdout: "dur=1218.8" })).length, 1);
+  t("checks 不是数组 ⇒ 当失败(fail-closed)", runChecks({ conditions: ["a"], checks: "ls" }, fake({})).length, 1);
+  t("check 真经 bash:$() 会展开", runChecks({ conditions: ["a"], checks: [{ i: 0, cmd: "echo size=$(echo 42)", expect: "size=42" }] }).length, 0);
+  t("同批重武装内容不同 ⇒ armChanged", armChanged({ conditions: ["a"], checks: [{ i: 0, cmd: "x" }] }, ["a"], []), true);
+  t("同批逐字相同 ⇒ 不算改", armChanged({ conditions: ["a"], checks: [] }, ["a"], []), false);
+  t("判据与台账不一致 ⇒ 拒", checksMatchJournal({ checks: [{ i: 0, cmd: "x" }] }, { checks: [{ i: 0, cmd: "y" }] }), false);
   const pass = cases.filter(Boolean).length;
   console.log(`\n自测 ${pass}/${cases.length}`);
   return pass === cases.length ? 0 : 1;
@@ -187,6 +315,8 @@ const IS_MAIN = !!process.argv[1] &&
   import.meta.url.endsWith(process.argv[1].split(/[\\/]/).pop());
 const argv = IS_MAIN ? process.argv.slice(2) : ["--imported-noop"];
 if (argv.includes("--self-test")) process.exit(selfTest());
+{ const modes = ["--arm", "--status", "--dry-check", "--clear", "--history"].filter((m) => argv.includes(m));
+  if (modes.length > 1) { console.error(`一次只能一个模式,得到:${modes.join(" ")}`); process.exit(2); } }
 
 if (argv.includes("--clear")) {
   // 写「已结清」标记而**不删文件**:直接删会让同一轮的 K0 立刻抱怨「未武装」
@@ -195,8 +325,25 @@ if (argv.includes("--clear")) {
   // 标记在下次 --arm 时被整体覆盖。
   try {
     const prev = load();
+    // D98-③:先核判据未被改写(与本批 arm 日志逐字相同),再跑;任一未过 ⇒ 拒清、退出 2、状态不动。写在 journal 之前:拒清不该留 clear 行。
+    // 拒清要**留痕在状态文件**(clearRefusedAt):引擎的 ranClear 只看得到 tool_use 入参与盘上状态,
+    //   看不到退出码;没有这条痕迹,「发起过 --clear」会被当成「已结清」(codex/grill 双审 2026-09-04)。
+    const refuse = (reason) => { try { atomicWrite({ ...prev, clearRefusedAt: new Date().toISOString(), clearRefusedReason: reason }); } catch (e) { console.error("BATCH-GOAL-REFUSE-TRACE-FAILED " + e.message + "\n  留痕没写进状态文件 ⇒ 引擎会把这次 --clear 当成功;请先修状态文件再收工。"); } };
+    if (prev && !prev.cleared && (prev.checks || []).length && !checksMatchJournal(prev, lastArmRow(prev.batch))) {
+      console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev.batch} reason=checks-tampered`);
+      console.error("拒绝结清:状态文件里的可执行判据与武装时的台账不一致——有人改过状态文件。用 --history 对照后重新 --arm。");
+      refuse("checks-tampered"); process.exit(2);
+    }
+    const fails = runChecks(prev);
+    if (fails.length) {
+      refuse("checks-failed");
+      console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev?.batch} reason=checks-failed n=${fails.length}`);
+      console.error(`拒绝结清:${fails.length} 条可执行判据未过(条件自述不顶用,判据是命令说了算)`);
+      printCheckFails(fails, prev);
+      process.exit(2);
+    }
     journal("clear", { batch: prev?.batch ?? null, conditions: prev?.conditions ?? null,
-      armedAt: prev?.armedAt ?? null });
+      checks: prev?.checks ?? null, armedAt: prev?.armedAt ?? null });
     // ⚠️ **批号要留在状态文件里**(2026-08-20,grill:edge-cases E6)。
     //   闸判「这次关账是真的」靠台账末行,但  的 catch 会把写失败整个吞掉
     //   (Windows 上文件被占用即触发),而 atomicWrite 照常成功、CLI 照常 exit 0
@@ -222,14 +369,15 @@ if (argv.includes("--status")) {
   }
   console.log(`批 ${g.batch} · ${g.conditions.length} 条完成条件:`);
   g.conditions.forEach((c, i) => console.log(`  条件${i + 1}: ${typeof c === "string" ? c : c.text}`));
+  for (const c of (Array.isArray(g.checks) ? g.checks : [])) console.log(`    判据(条件${c.i + 1}): $ ${c.cmd}${c.expect !== undefined ? `  期待含「${c.expect}」` : ""}${c.expectRe !== undefined ? `  期待匹配 /${c.expectRe}/` : ""}`);
   process.exit(0);
 }
 
 if (argv.includes("--arm")) {
   const batch = argv[argv.indexOf("--arm") + 1];
-  const conds = [];
-  argv.forEach((a, i) => { if (a === "--cond" && argv[i + 1]) conds.push(argv[i + 1]); });
-  if (!batch || !conds.length) { console.error("用法: --arm <批号> --cond \"条件\" [--cond \"条件\"]"); process.exit(2); }
+  let conds, checks;
+  try { ({ conds, checks } = parseArm(argv)); } catch (e) { console.error(`用法错误:${e.message}`); process.exit(2); }
+  if (!batch || !conds.length) { console.error("用法: --arm <批号> --cond \"条件\" [--check \"命令\" [--expect \"子串\"]] [--cond …]"); process.exit(2); }
   // ⚠️ 覆盖保护:当前已武装且批号不同 ⇒ 拒绝,除非 --force。
   //   本次事故的形态就是这个:后台 codex 用它自己的批号 --arm,把 061 的条件盖没了。
   // load() 现在对**损坏/空**状态会抛(F1 的 fail-closed)。在这里接住并给人话:
@@ -250,19 +398,32 @@ if (argv.includes("--arm")) {
   //   于是**结清之后再 --arm 会当场崩**:`cur.conditions` 是 undefined,读 `.length` 抛 TypeError。
   //   两个教训:①「已结清」与「有批号」不是一回事,守卫得判前者;
   //   ②我改的是 clear 那一侧,崩的是 arm 那一侧 —— **同一状态文件的两个读者,只改了一个**。
+  if (cur && cur.batch && !cur.cleared && cur.batch === batch && armChanged(cur, conds, checks) && !argv.includes("--force")) {
+    console.error(`拒绝:批 ${batch} 已武装且本次 conditions/checks 与盘上不同——同批只允许逐字相同的重放。改判据要显式 --force(会记入台账)。`);
+    process.exit(2);
+  }
+  if (cur && cur.batch && !cur.cleared && argv.includes("--force") && (cur.checks || []).length) {
+    const oldFails = runChecks(cur);
+    journal("force-over-checks", { batch: cur.batch, failing: oldFails.length, total: cur.checks.length, newBatch: batch });
+    console.error(`注意:--force 覆盖了批 ${cur.batch} 的 ${cur.checks.length} 条判据(其中 ${oldFails.length} 条当时未过),已记台账。`);
+  }
+  if (checks.length && !findBash()) { console.error("拒绝武装:带 --check 但找不到 Git Bash(判据一律经 bash -c 跑;可设 BATCH_GOAL_BASH)"); process.exit(2); }
   if (cur && cur.batch && !cur.cleared && cur.batch !== batch && !argv.includes("--force")) {
     console.error(`拒绝:批 ${cur.batch} 尚未结清(${(cur.conditions || []).length} 条条件),不能直接武装批 ${batch}。`);
     console.error(`  正常序:先把批 ${cur.batch} 逐条对照并 --clear,再武装新批。`);
     console.error(`  确需覆盖(会丢失当前条件,但可从 .claude/.batch-goal.jsonl 翻回):加 --force`);
     process.exit(2);
   }
-  journal("arm", { batch, conditions: conds, overwrote: cur?.batch ?? null });
+  journal("arm", { batch, conditions: conds, checks, shell: "bash", overwrote: cur?.batch ?? null });
   // ⚠️ `armedAt` 是 2026-08-20 加的:开工面闸要判「**本批**跑过哪几条通道」,
   //   而状态文件此前**不记武装时刻**,于是那个窗口起点取不到 ⇒ 闸只能闭嘴。
   //   台账 .jsonl 里有时间,但让读者去 join 两份文件是把简单的事做复杂了。
-  try { atomicWrite({ batch, conditions: conds, armedAt: new Date().toISOString() }, seenVersion); }
+  // r2:同批逐字重放不得抹掉拒清痕迹(否则「拒清 → 原样重 arm → 正文写达成」就绕过了 K);换批或 --force 才清
+  const carry = (cur && !cur.cleared && cur.batch === batch && cur.clearRefusedAt && !argv.includes("--force")) ? { clearRefusedAt: cur.clearRefusedAt, clearRefusedReason: cur.clearRefusedReason } : {};
+  try { atomicWrite({ batch, conditions: conds, checks, shell: "bash", armedAt: new Date().toISOString(), ...carry }, seenVersion); }
   catch (e) { console.error(e.message); process.exit(2); }
-  console.log(`已武装批 ${batch} 的 ${conds.length} 条完成条件;收尾时须逐条写「条件N:达成/未达成/不适用」`);
+  console.log(`已武装批 ${batch} 的 ${conds.length} 条完成条件${checks.length ? `(其中 ${checks.length} 条带可执行判据,--clear 时经 bash 跑)` : ""};收尾时须逐条写「条件N:达成/未达成/不适用」`);
+  for (const c of checks) console.log(`  条件${c.i + 1} ⇐ $ ${c.cmd}${c.expect !== undefined ? `  期待含「${c.expect}」` : ""}${c.expectRe !== undefined ? `  期待匹配 /${c.expectRe}/` : ""}`);
   // ── 到期债强制腿(2026-08-22,用户逼出:「失效期是装饰品——D34/D35 ≤080 早到期,没人查」)──
   //   立法史:词表路线(Q 的 defer 正则)已判死(B 扩表实败 + xros non-goal + Q「确无结构判据」),
   //   「推迟」的结构载体 = 批条件 + 带失效期的债表;失效期没有执行腿 ⇒ 装饰品。
@@ -309,6 +470,17 @@ if (argv.includes("--arm")) {
   process.exit(0);
 }
 
+if (argv.includes("--dry-check")) {
+  // 只跑可执行判据不结清:干活中途看看离「机器认可」还差哪条。
+  const g = load();
+  if (!g || g.cleared || !Array.isArray(g.conditions)) { console.log("未武装或已结清,无判据可跑"); process.exit(0); }
+  if ((g.checks || []).length && !checksMatchJournal(g, lastArmRow(g.batch))) { console.error("状态文件里的判据与武装时的台账不一致,拒跑"); process.exit(2); }
+  const fails = runChecks(g); const n = (g.checks || []).length;
+  if (!n) { console.log(`批 ${g.batch}:${g.conditions.length} 条条件均无可执行判据`); process.exit(0); }
+  if (fails.length) { console.error(`批 ${g.batch}:${n} 条判据,${fails.length} 条未过`); printCheckFails(fails, g); process.exit(2); }
+  console.log(`批 ${g.batch}:${n} 条可执行判据全过`); process.exit(0);
+}
+
 if (argv.includes("--history")) {
   // 「小 git」的 log:任何一次覆盖都能从这儿翻回来
   let lines = [];
@@ -329,6 +501,6 @@ if (argv.includes("--history")) {
 // ⚠️ 被 import 时到此**什么都不做**。原实现在这里无条件 `exit(2)`,
 //   于是守卫算对了也没用——调用方照样被这句用法错误杀掉(实测复现)。
 if (IS_MAIN) {
-  console.error("用法: --arm <批号> --cond \"…\" [--force] | --status | --clear | --history [n] | --self-test");
+  console.error("用法: --arm <批号> --cond \"…\" [--check \"命令\" [--expect \"子串\" | --expect-re \"正则\"]] [--force] | --status | --dry-check | --clear | --history [n] | --self-test");
   process.exit(2);
 }

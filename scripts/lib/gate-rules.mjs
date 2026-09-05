@@ -287,7 +287,7 @@ export const RULE_C = {
     const hits = matchAny(ctx.text, PAT.defect);
     if (!hits.length) return [];
     if (ctx.writes.length) return [];                                  // 动手处置了
-    // 登记面:写进未覆盖栏 / 落进批次签单目录 / 事件流。只看**我说的**与**我写的**,
+    // 登记面:写进未覆盖栏 / 落进 clipboard/prompts / 事件流。只看**我说的**与**我写的**,
     // 不看工具输出(旧实现用 rawText,于是闸自己上一轮消息里的「未覆盖」就能豁免它)。
     if (/未覆盖/.test(ctx.text) || ctx.wroteAny(/clipboard[/\\]prompts|constraint-events\.jsonl/)) return [];
     return hits;
@@ -894,6 +894,152 @@ export const RULE_M = {
       { text: "追加后回读。", bash: ["cat >> docs/report.md <<EOF\nx\nEOF", "grep -c x docs/report.md"] },
       { text: "复制后回读。", bash: ["cp a/src.md docs/dest.md", "cat docs/dest.md"] },
       { text: "本轮没有经 Bash 写文件。" },
+    ],
+  },
+};
+
+// ── X:「文件已落盘」的断言必须绑一次以该路径为入参的直接探针(D98-①,2026-09-04)──────
+//
+// 实撞:一条后台命令先打印 v7 的 `ffmpeg exit 0 / yuv420p / 218.83`,再开始渲染 v7b;
+// 我 `grep -E "exit|pix_fmt|duration"` 日志取到的是 v7 的行,据此宣布 v7b 已出并结清批,
+// 实际 v7b 还在写(用户打开报「被占用」)。M 管「写后回读」,这条管「说它在,就得探它本身」。
+//
+// 判据(grill:edge-cases 首审 20 条后重写,2026-09-04 当日):
+//   · 断言 = 正文里媒体/二进制文件名(mp4/mp3/wav/png/zip/pth…)前后 40 字内有「已落盘/出来了/渲染完成…」;
+//     否定句(还没/未/尚未/没 + 落盘)、代码围栏、「」引文、`--fp X` 记账行里的文件名、占位符(单字母/foo/bar)不算断言。
+//     文本类扩展名(md/json/txt)**不归 X 管**——那是 M 的写后回读面,放进来只会制造 --fp 洪水。
+//   · 探针 = 某个**命令段**(按 shell 分隔符切、剥引号与 heredoc 后)以探针动词**开头**,且该段原文里
+//     以**整词**形式含该路径(全路径优先,basename 兜底);媒体文件只认**读内容**的动词
+//     (ffprobe / ffmpeg -i <它> / md5|sha / mediainfo / soxi / file / Get-FileHash),`ls`/`stat`/`Test-Path`
+//     对半写的 mp4 照样成功,不算。图片另认 Read 工具(路径以该文件结尾;Grep 的 pattern 不是路径)。
+//   · 次序:探针段必须在该文件**最后一次产出段**之后——先 ls 再 ffmpeg 不算探过。
+//   天花板:只证「探针被发出」,不证探针结果(那是 batch-goal --check 的事);文件名含空格/中文认不出;
+//   `&` 不切段。
+import { stripQuoted as xStripQuoted, segments as xSegments } from "./gate-cmd.mjs";
+// 完成词表(codex r1 #10 补了 13 个漏报说法;`已出` 后面排除「发/口/路/现/门」这些常见连字,JS 的 \b 对中文不起作用)
+const X_DONE = /(?<!还没|尚未|没有|未|没|不|并未)(已落盘|落盘了|落盘|已出(?![发口路现门])|已经产出|产出完成|产出了|出来了|渲染完成|渲染完了|渲染成功|已生成|生成了|生成完毕|已写完|写完了|写好了|已导出|导出了|导出完成|做好了|已完成|完成了|已保存|保存了|已输出|输出了|就绪|交付完成)/;
+const X_EXT = "mp4|mkv|webm|mov|mp3|wav|flac|ogg|m4a|png|jpe?g|gif|webp|zip|7z|tar\\.gz|pdf|docx|xlsx|pth|exe";
+const X_FILE = new RegExp(`((?:[\\p{L}\\p{N}_.\\-]+[\\\\/])*[\\p{L}\\p{N}_.\\-]+\\.(?:${X_EXT}))(?![\\p{L}\\p{N}.])`, "giu");
+const X_IMG = /\.(?:png|jpe?g|gif|webp)$/i;
+const X_PROBE_MEDIA = /^(?:\S+=\S+\s+)*(?:sudo\s+)?(ffprobe|md5sum|sha256sum|sha1sum|md5|Get-FileHash|mediainfo|soxi|file)\b/i;
+const X_WRITER = /^(?:\S+=\S+\s+)*(?:sudo\s+)?(ffmpeg|cp|mv|rsync|curl|wget|python(?:3|\.exe)?|node|bash|sh|cat|tee|touch|make|dd|zip|tar|7z|magick|convert|sox)\b/i;
+const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// 路径身份:全路径或 basename 作为整词出现;前面允许 `/`(绝对路径探针 `/abs/…/pv/out.mp4` 也算探到 `pv/out.mp4`),但 `notout.mp4` 不算 `out.mp4`
+const xHasToken = (seg, p) => new RegExp(`(?:^|[\\s=:"'(/])${reEsc(p)}(?=$|[\\s"')])`).test(seg.replace(/\\/g, "/"));
+/** 正文里的断言文件:返回 [{full, base}];已剥围栏/引文/--fp 行。 */
+function xClaims(text, fpBases) {
+  const t = String(text || "").replace(/```[\s\S]*?```/g, " ").replace(/「[^」]*」/g, " ")
+    .replace(/(如果|若|假如|要是)[^,，。;\n]*/g, " ")            // 条件句不是断言(r2)
+    .replace(/(原话|他说|她说|你说|对方说|朋友说)[:：]?[^。\n]*/g, " ");   // 无「」的引语
+  const out = new Map();
+  for (const m of t.matchAll(X_FILE)) {
+    const full = m[0].replace(/\\/g, "/"); const base = full.split("/").pop();
+    if (/^(?:[A-Za-z]|foo|bar|baz|xxx|example|placeholder)\.[a-z0-9]+$/i.test(base)) continue;   // 占位符
+    if (fpBases.has(base)) continue;                                                            // --fp 记账行里的名字
+    const around = t.slice(Math.max(0, m.index - 40), m.index + m[0].length + 40);
+    if (X_DONE.test(around)) out.set(base, full);
+  }
+  return [...out].map(([base, full]) => ({ base, full }));
+}
+/** 命令段流:按 ctx.bashCmds 顺序,每段 {raw, masked};heredoc 正文先剥掉。 */
+function xSegs(ctx) {
+  const out = [];
+  for (const c of ctx.bashCmds) for (const s of xSegments(stripHeredoc(c))) out.push({ raw: s.replace(/\\/g, "/"), masked: xStripQuoted(s).trim() });
+  return out;
+}
+function xProbed(ctx, segs, { base, full }) {
+  const hit = (s) => xHasToken(s.raw, full) || xHasToken(s.raw, base);
+  const isProbe = (s) => X_PROBE_MEDIA.test(s.masked) ||
+    (/^(?:\S+=\S+\s+)*ffmpeg\b/i.test(s.masked) && new RegExp(`-i\\s+["']?[^\\s"']*${reEsc(base)}`).test(s.raw));
+  const isWriter = (s) => !isProbe(s) && X_WRITER.test(s.masked);
+  let lastWrite = -1, lastProbe = -1;
+  segs.forEach((s, i) => { if (!hit(s)) return; if (isProbe(s)) lastProbe = i; else if (isWriter(s)) lastWrite = i; });
+  if (lastProbe > lastWrite) return true;
+  if (X_IMG.test(base)) {   // 图片:Read 工具直接看图也算(路径须以断言的**全路径**结尾;只给了 basename 的断言才退到 basename;Grep 的 pattern 不是路径)
+    const p = (a) => String(a.input.file_path || a.input.path || "").replace(/\\/g, "/");
+    const ok = (q) => q.endsWith("/" + full) || q === full || (!full.includes("/") && q.endsWith("/" + base));
+    if (ctx.actions.some((a) => /^(Read|Grep)$/.test(a.name) && ok(p(a)))) return true;
+  }
+  return false;
+}
+export const RULE_X = {
+  id: "X",
+  blocking: true,
+  law: "docs/laws/reporting.md#「完成」靠核对不靠断言",
+  detect: (ctx) => {
+    const fpBases = new Set();
+    for (const c of ctx.bashCmds) if (/--fp\s+X\b/.test(c)) for (const m of String(c).matchAll(X_FILE)) fpBases.add(m[0].replace(/\\/g, "/").split("/").pop());
+    const claims = xClaims(ctx.text, fpBases);
+    if (!claims.length) return [];
+    const segs = xSegs(ctx);
+    return claims.filter((c) => !xProbed(ctx, segs, c)).map((c) => c.base);
+  },
+  exempts: [],
+  escapes: [
+    // forPos:样例探的是 pos[0..6] 那个 mp4;pos[7] 是图片(另一路径),出路本身要求「指向同一文件」,样例天然不覆盖它
+    { say: "**直接探针**:ffprobe / ffmpeg -i / md5 / mediainfo / file 以该文件路径为入参,且在最后一次产出之后(ls·stat·grep 日志·产出它的那条 ffmpeg 都不算)",
+      forPos: [0, 1, 2, 3, 4, 5, 6], sample: { bash: "ffprobe -v error -show_entries format=duration -of csv=p=0 pv/draft_pv_v7b.mp4" } },
+  ],
+  message: (hits) =>
+    `「已落盘」断言未绑直接探针:${hits.join(", ")}\n` +
+    `      断言对象是这个文件,本轮却没有一条读它内容的探针——2026-09-04 实撞:拿别的文件的核对行当证据,宣布还在写的 mp4 已出。\n` +
+    `      出路:\n${renderEscapes(RULE_X.escapes)}`,
+  mutations: [
+    { name: "任何提及即证据(不看探针动词)", apply: (r) => ({ ...r, detect: (ctx) => {
+      const claims = xClaims(ctx.text, new Set()); const all = ctx.bashCmds.join("\n").replace(/\\/g, "/");
+      return claims.filter((c) => !all.includes(c.base)).map((c) => c.base);
+    } }) },
+    { name: "纯文本豁免(说「已核对」就放行)", apply: (r) => ({ ...r, detect: (ctx) => (ctx.says(/已核对|核过了/) ? [] : r.detect(ctx)) }) },
+    { name: "产出它的 ffmpeg 也算探针(写目标当凭证)", apply: (r) => ({ ...r, detect: (ctx) => {
+      const claims = xClaims(ctx.text, new Set()); const segs = xSegs(ctx);
+      return claims.filter((c) => !segs.some((s) => xHasToken(s.raw, c.base) && (X_PROBE_MEDIA.test(s.masked) || /\bffmpeg\b/i.test(s.masked)))).map((c) => c.base);
+    } }) },
+    { name: "探针动词在段内任意位置即算(flag 名、引号里都算)", apply: (r) => ({ ...r, detect: (ctx) => {
+      const claims = xClaims(ctx.text, new Set());
+      const raw = ctx.bashCmds.flatMap((c) => String(c).split(/&&|\|\||[;|]|\n/)).map((s) => s.replace(/\\/g, "/"));
+      return claims.filter((c) => !raw.some((s) => s.includes(c.base) && /\b(ffprobe|md5sum|sha256sum|md5|mediainfo|soxi|file)\b/i.test(s))).map((c) => c.base);
+    } }) },
+  ],
+  cases: {
+    pos: [
+      // 实撞原型:证据是 grep 日志,不是探文件
+      { text: "v7b 已落盘:`pv/draft_pv_v7b.mp4`,批 163 结清。", bash: 'grep -c "draft_pv_v7b" pv/build_pv7.log' },
+      // 纯文本豁免必须无效
+      { text: "`pv/draft_pv_v7b.mp4` 渲染完成,已核对。" },
+      // 产出它的那条命令不能当凭证
+      { text: "出来了:`pv/draft_pv_v7b.mp4`。", bash: "ffmpeg -y -loglevel error -i leadB.wav -i inst.wav -c:v libx264 pv/draft_pv_v7b.mp4" },
+      // 探针动词只是 flag 名 / 在引号里 ⇒ 不是探针(grill r1 #1/#2)
+      { text: "`pv/draft_pv_v7b.mp4` 已落盘。", bash: "python render.py --file pv/draft_pv_v7b.mp4" },
+      { text: "`pv/draft_pv_v7b.mp4` 已落盘。", bash: "echo 'ffprobe pv/draft_pv_v7b.mp4'" },
+      // ls 对半写的 mp4 照样成功 ⇒ 媒体文件不认 ls(grill r1 #6)
+      { text: "`pv/draft_pv_v7b.mp4` 渲染完成。", bash: "ls -la pv/draft_pv_v7b.mp4" },
+      // 先探后写 ⇒ 探的是旧文件
+      { text: "`pv/draft_pv_v7b.mp4` 出来了。", bash: "ffprobe -v error pv/draft_pv_v7b.mp4 && ffmpeg -y -i a.wav pv/draft_pv_v7b.mp4" },
+      { text: "`pv/draft_pv_v7b.mp4` 出来了。", bash: "ffprobe -v error pv/draft_pv_v7b.mp4 && touch pv/draft_pv_v7b.mp4" },
+      // notout.mp4 不是 out.mp4
+      { text: "`pv/out.mp4` 已生成。", bash: "ffprobe -v error pv/notout.mp4" },
+      // 同名不同目录的图片 Read 不算(grill r1 #5)
+      { text: "封面 `pv/final/cover.png` 已生成。", read: "/other/cover.png" },
+    ],
+    neg: [
+      { text: "v7b 已落盘:`pv/draft_pv_v7b.mp4`。", bash: "ffprobe -v error -show_entries format=duration -of csv=p=0 pv/draft_pv_v7b.mp4" },
+      { text: "`pv/draft_pv_v7b.mp4` 已生成。", bash: "md5sum pv/draft_pv_v7b.mp4" },
+      { text: "封面 `pv/cover.png` 已生成。", read: "/repo/clipboard/proj/pv/cover.png" },
+      // 产出 + 另起一段探针(在产出之后)⇒ 放行
+      { text: "出来了:`pv/draft_pv_v7b.mp4`。", bash: "ffmpeg -y -i a.wav pv/draft_pv_v7b.mp4 && ffprobe -v error -show_entries format=duration -of csv=p=0 pv/draft_pv_v7b.mp4" },
+      // 没有落盘断言 / 否定句 / 引文 / 记账行 / 占位符 ⇒ 不管
+      { text: "渲染中,`pv/draft_pv_v7b.mp4` 还在写,先别打开。" },
+      { text: "`pv/draft_pv_v7b.mp4` 还没落盘,别打开。" },
+      { text: "你说「out.mp4 出来了」,我这边还没核。" },
+      { text: "如果 pv/out.mp4 已落盘,再发布;现在还没。" },
+      { text: "对方原话: pv/out.mp4 已落盘,但我尚未核实。" },
+      // 绝对路径探针也算探到相对路径的断言(路径身份)
+      { text: "`pv/draft_pv_v7b.mp4` 已生成。", bash: "ffprobe -v error /repo/clipboard/proj/pv/draft_pv_v7b.mp4" },
+      { text: "记了误报:X。", bash: 'node --no-warnings scripts/hook-stop-closure.mjs --fp X "pv/draft_pv_v7b.mp4 已落盘 是引用"' },
+      { text: "规则:正文里出现「X.mp4 已落盘/出来了」时,本轮必须有探针。" },
+      // 文本文件不归 X 管(M 的面)
+      { text: "`docs/noun-diary.md` 登记已完成。", write: "docs/noun-diary.md" },
+      { text: "本轮没有产物断言。" },
     ],
   },
 };
@@ -1531,10 +1677,16 @@ export function ranClear(ctx) {
   //      不能默认「多命中=保守」。同一条原则在 W/I 上是多命中,在本条上是少命中。
   //   最终形态:**两个面分开取**,各取所长,都不含无界回溯。
   const hasClearTok = (s) => typeof s === "string" && /(^|\s)--clear(\s|$)/.test(s);
+  // ⑤ **clear 意图 ≠ clear 成功**(2026-09-04 codex/grill 双审逮到,D98-③ 让 --clear 可以合法拒清退出 2):
+  //   batch-goal 拒清时把 `clearRefusedAt` 写进状态文件;盘上未结清且带此痕迹 ⇒ 这次 --clear 没成 ⇒ false。
+  //   (不能只看「盘上未结清」:同轮「关旧批 + 开新批」盘上也是武装态,那是合法的,E9 三分支就靠它。)
+  //   方向:本条为真 = 「已结清」⇒ 下游关账族放行 ⇒ 误真是漏放 ⇒ 拿不准取 false。
+  const g = ctx.batchGoal;
+  if (g && g.cleared !== true && g.clearRefusedAt) return false;
   return (ctx.actions || []).some((a) =>
     segments(a.input?.command).some((seg) => {
       if (typeof seg !== "string" || !seg) return false;
-      // 脚本名认**原串**:带引号的绝对路径(`node "D:/…/batch-goal.mjs" --clear`)照样算数
+      // 脚本名认**原串**:带引号的绝对路径(`node "/abs/…/batch-goal.mjs" --clear`)照样算数
       //   ——stripQuoted 会把它整个抹掉,这是既有致盲(Windows 上加引号是本能动作)。
       if (!seg.includes("batch-goal.mjs")) return false;
       // `--clear` 只认**去引号后**的:引号里的条件文本提到 --clear 不算数(用例④)。
@@ -1609,6 +1761,9 @@ const RULE_K = {
     if (!g || g.cleared) return [];                       // 无状态 / 已结清 ⇒ K0 的地盘
     const conds = Array.isArray(g.conditions) ? g.conditions : [];
     if (!conds.length) return [];                         // ⇒ K0
+    // ⚠️ **拒清 ⇒ 自述一律不认**(2026-09-04 D98-③):batch-goal 跑判据未过时把 clearRefusedAt 写进状态,
+    //   此时正文再怎么写「条件N:达成」都不算——判据是命令说了算,不是被审方的字。
+    if (g.clearRefusedAt) return conds.map((t, i) => ({ n: i + 1, t: `${String(t || "")}(可执行判据未过,--clear 已拒)` }));
     // ⚠️ **裁决在批窗口内给过就算数,不必每轮重写**(2026-08-20 实撞,codex P4)。
     //   原判据只看**本轮文本** ⇒ 逐条对照写过一次之后,下一轮说句别的它又报,
     //   而提示走 `additionalContext`(官方语义「keep the turn going」)⇒ 每轮空烧一轮。
@@ -1783,6 +1938,10 @@ const RULE_K = {
         bash: ['node --no-warnings scripts/batch-goal.mjs --arm 096 --cond "丁"',
                'node --no-warnings scripts/batch-goal.mjs --clear'],
         batchGoal: { batch: "096", conditions: ["丁"] } },
+      // ㈧ **拒清后自述不算**(2026-09-04,codex/grill 双审):判据未过、--clear 退出 2 留痕,
+      //   正文照写「条件1:达成」也拦——被审方自己写的字顶不掉命令的判。
+      { text: "条件1: 达成。收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+        batchGoal: { batch: "097", conditions: ["戊"], clearRefusedAt: "2026-09-04T12:00:00Z" } },
     ],
     neg: [
       // 两条都给了裁决(半角 + 全角混用),**且未达成那条标了 ⏸** ⇒ 正当停工,放行。
@@ -2140,13 +2299,33 @@ const RULE_S = {
       //   同一概念在两处各查一遍 ⇒ 修一处不等于修好——与 D72① 的否定词表同型。
       const marked = matchAny(sTxt, PAT.waitMark).length &&
         matchAny(String(ctx.text || ""), PAT.stopReason).length;
+      // A 态的痕迹=「说出下一步」。⚠️ 2026-09-02(D97):此判据原先只在**第二分支**查,
+      //   而第一分支(零动作)排在它前面 ⇒ 纯文本轮写了「接下来把剩下两条迁完」照样被拦,
+      //   出路②在零动作轮**结构性不可达**(探针 T5 复现)。现提前计算、两个分支共用。
+      const saidNext = /(下一步|接下来|接着|继续|随后|然后)[^。\n]{0,24}(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删|候|等|盯|守|收)/
+        .test(String(ctx.text || ""));
       // 「继续跑」= **本轮有任何工具动作**,不是「写了文件」。
       //   首版把它编成 writes||commits||agents,实测三个候选四态全被误拦:
       //   「等 codex 回件」「只读了一堆文件」「发现条件错了」——前两个本来就是 A 且确实在跑
       //   (轮询、读文件都是继续跑),第三个折回 C(裁决词里本就有 `不适用`)。
       //   ⇒ **没有第四态,但我的编码错了**:把"推进"窄化成"产出",于是调查与等待都被当成停工。
-      if (!marked && !(ctx.actions || []).length) {                           // 非 B 且**纯说话**
+      if (!marked && !saidNext && !(ctx.actions || []).length) {              // 非 B、未声明下一步、且**纯说话**
         return ["批目标尚有未裁条件、本轮一个动作都没有,却既没继续跑也没标 ⏸ 说明属哪一类合法停工"];
+      }
+      // ── D96 结清(2026-09-02,批 145):出路②的**跨轮兑现核查**。
+      //   D96 的形态:每轮说一句「接下来验收 X」然后什么都不做,可以无限过闸——
+      //   出路②把「说了」当「做了」收下,正是 R 项要消灭的形态换了个时态。
+      //   判据取**结构信号**:上一窗(`ctx.window()`,本轮之前若干轮的聚合)零动作且已含
+      //   「下一步」承诺,本轮又零动作、又只靠 saidNext 撑 ⇒ 承诺连续两窗未兑现,出路②失效。
+      //   窗口为 null(夹具/旧路径未喂 priorEntries)⇒ 不判,保持原语义(「没窗口」≠「窗口空」)。
+      //   代价不对称:误拦=多做一次真实轮询/读文件(便宜);漏放=空转轮无限续(D96 实录 5+ 轮)。
+      //   天花板:只看「零动作+承诺句」的结构,判不出承诺的对象是否同一件事;
+      //   且 ⏸+三类理由(B 态)仍照常放行——等待用户是合法停工,本条只收「假装在跑」。
+      const prior = typeof ctx.window === "function" ? ctx.window() : null;
+      if (!marked && saidNext && !(ctx.actions || []).length && prior &&
+          !(prior.actions || []).length &&
+          /(下一步|接下来|接着|继续|随后|然后)[^。\n]{0,24}(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删|候|等|盯|守|收)/.test(String(prior.text || ""))) {
+        return ["上一窗已说过「接下来做 X」且零动作,本窗又零动作只靠「下一步」句——承诺连续未兑现,出路②失效(D96);要么真做一次,要么标 ⏸ 说明属哪一类合法停工"];
       }
       // ── D67③ 补齐(2026-08-27,批 117;用户当轮第三次逮到同一形态)────────────
       //   旧版只逮「纯说话就收尾」。真实逃脱形态是「**做了活、然后停下**」——
@@ -2169,13 +2348,23 @@ const RULE_S = {
       //   现补齐工程语境常用的收尾/推进动词。**天花板照实说**:这仍是措辞表,
       //   下一个没列的动词照样被拦;而它守的是**出路**不是闸口,窄 ⇒ 误拦且无处可逃。
       //   失效条件:再撞到第三个未列动词,改判为「只要出现『下一步/接下来』+ 任意动宾」。
-      const saidNext = /(下一步|接下来|接着|继续|随后|然后)[^。\n]{0,24}(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删)/
-        .test(String(ctx.text || ""));
+      //   (`saidNext` 已提前到第一分支之前计算——2026-09-02 D97;动词表同轮补入
+      //   候|等|盯|守|收——「接下来我候你的耳裁」是等待轮的自然写法,原表不认。)
       if (!marked && !saidNext) {
         return ["批目标尚有未裁条件,却既没结清、没标 ⏸ 说明属哪一类合法停工、也没说出下一步做什么"];
       }
     }
-    const asks = matchAny(sTxt, PAT.handoff);
+    // ⚠️ 2026-08-27(D91,当轮自撞):**否定式盲区**。我写「**不构成**需要你裁的取舍」
+    //   ——一句明确说「这不用你管」的话——被判成「把决定推回给用户」。
+    //   判据认的是**措辞**不是**行为**,同一族第十四次;而这次尤其别扭:
+    //   本项的出路①正是「自己定并写明依据,不回问」,**照做了反而被拦**。
+    //   修法:命中前先把**带否定前缀**的推决定词消掉(`不/不构成/无须/毋须/不必/无需`)。
+    //   窄:只消「否定词紧贴推决定词」这一形态,不做句法分析。
+    //   天花板:「不是我要推给你,但你看看?」这类**先否定后又问**的句子仍会漏——
+    //   那种句子的后半截会被 `askMark` 与别的 handoff 形态接住,不靠本条。
+    const sTxtNeg = sTxt.replace(
+      /(不构成|不需要|无需|无须|毋须|不必|不)\s*(需要你裁|需你裁|归你裁|要你(决定|裁)|由你(决定|裁))/g, " ");
+    const asks = matchAny(sTxtNeg, PAT.handoff);
     if (!asks.length) return [];
     // **「陈述某事归你」≠「停下来等你」**——还得真的在问(问号 / 显式等待动词)。
     // 缺这一条会误伤合法的推迟(Q 的地盘),当日实撞过一次。
@@ -2273,12 +2462,23 @@ const RULE_S = {
       { name: "A 态:零推进就收尾,且一个字的问句都没有",
         text: "这批还剩两条没办。我先看看情况。",
         batchGoal: { armedAt: "2026-08-26T00:00:00Z", conditions: ["甲", "乙"] } },
+      // D96 回归钉(2026-09-02):上一窗说了「接下来验收 X」且零动作,本窗又零动作再说一遍
+      //   ——「验收中」式空转,承诺连续两窗未兑现,出路②失效。
+      { name: "D96:连续两窗只说下一步、零动作",
+        text: "接下来我核 stems 双 FLAC 与退出码,到件即验。",
+        prior: [{ text: "接下来我验收 stems 产物,到件即核。" }],
+        batchGoal: { armedAt: "2026-09-02T00:00:00Z", conditions: ["甲", "乙"] } },
     ],
     neg: [
       // 合法停工:标了且属亲签面
       { text: "⏸ 需要你确认：这一行要不要加进冲突表——改宪法需你亲签。" },
       // 合法停工:实打实阻断
       { text: "⏸ 需要你确认：这条通道只有用户能触发（缺凭据），我这边站点不可达。" },
+      // D91 回归钉(2026-08-27 当轮自撞):**否定式不算推决定**。
+      //   我写「不构成需要你裁的取舍」——一句明确说「这不用你管」的话——被判成推回给用户。
+      //   尤其别扭的是:本项出路①正是「自己定并写明依据,不回问」,**照做了反而被拦**。
+      { text: "保留。依据是代价不对称。既不涉及不可逆、也不涉及安全面,不构成需要你裁的取舍。" },
+      { text: "这条我自己定了,不需要你裁。" },
       // D76 回归钉(2026-08-27,本轮自撞第三轮):**把短语加粗是最自然的写法**,
       //   而 `\s*` 吃不下 `**` ⇒ 凭证面判瞎 ⇒ 合法停工被判成违规停工。连撞三轮。
       // ⚠️ **首版这两条是废的**(D77 当轮实测发现):它们没有 handoff/askMark 形态,
@@ -2293,6 +2493,28 @@ const RULE_S = {
       { text: "按代价不对称，误报便宜，直接选 B，已实现并验证。" },
       // 等机器不算停工
       { text: "codex 回件还没到，等它回来我逐条读。" },
+      // D97 回归钉(2026-09-02;一夜 30+ 笔误报台账的两种实况形态):
+      //   ① 第三类分类名本身「实打实阻断」——闸消息明写三类名,原 stopReason 表却不认它。
+      { name: "D97①:属实打实阻断类(第三类分类名本身)",
+        // ⚠️ 样本**不得含旧词表已认的词**(只有你能/缺凭据/不可逆/亲签),否则证明不了新词生效
+        //   (codex 复核 audit-145 逮到首版正是这么写的)。
+        text: "候三选一,到即续。\n\n⏸ 需要你确认:属『实打实阻断』类——三选一等你回。",
+        bash: "node scripts/hook-stop-closure.mjs --fp S x",
+        batchGoal: { armedAt: "2026-09-02T00:00:00Z", conditions: ["甲", "乙"] } },
+      //   ② 零动作轮但声明了下一步——出路②原先在零动作分支结构性不可达。
+      { name: "D97②:零动作但说出下一步(A 态痕迹)",
+        text: "接下来把剩下两条迁完。",
+        batchGoal: { armedAt: "2026-09-02T00:00:00Z", conditions: ["甲", "乙"] } },
+      { name: "D97②':零动作、等待动词『候』",
+        // 同上:去掉「结批」——「结」在旧动词表里,留着就证明不了「候」生效。
+        text: "接下来我候你对 v3 的耳裁。",
+        batchGoal: { armedAt: "2026-09-02T00:00:00Z", conditions: ["甲", "乙"] } },
+      // D96 的边界:上一窗空转承诺,本窗**真做了一次**(有动作)⇒ 放行——判据只收「假装在跑」。
+      { name: "D96 边界:上窗空承诺,本窗有真动作",
+        text: "上轮说要核,这轮核了:退出码 0,双 FLAC 在。接下来做混音。",
+        bash: "ls stems/",
+        prior: [{ text: "接下来我验收 stems 产物,到件即核。" }],
+        batchGoal: { armedAt: "2026-09-02T00:00:00Z", conditions: ["甲", "乙"] } },
     ],
   },
 };
@@ -2599,10 +2821,24 @@ const RULE_P = {
     },
 
     /** 触发面 = 本轮真提交过 且(本轮写过承重件 或 提交命令的参数面上有承重路径)。 */
+    // ⚠️ 2026-08-27(D92):证据①从「**本轮**写入」放宽到「**窗口 ∪ 本轮**」。
+    //   实撞(用户让我复审另一条会话时逐条数出来的):那会话 120 轮里,
+    //   **同时有承重写入和提交的轮 = 0**,提交命令参数里带承重路径的 = 0
+    //   ⇒ P 在 258 次闸触发里**一次没响**。而它并非在偷懒:
+    //   它的节奏是「干几轮活 → 最后 `cd /other && git add -A && git commit`」——
+    //   `git add -A` 的参数面**没有路径**,写入又在几轮之前 ⇒ **两条证据都结构性为空**。
+    //   这不是罕见形态,是最自然的提交节奏;⇒ 承重面的三通道要求对它**从未生效过**。
+    //   `scopeActions` 早就取「窗口 ∪ 本轮」,只有 `triggered` 还卡在本轮——口径不一致。
+    //   **动手前先量**(PAT.causal 头注定的规矩):放宽后 astrbot 0→1、本会话 41→41,
+    //   代价可忽略;方向是**收紧**(补漏放),窄例外④「新增/收紧机器闸」明确适用。
+    //   ⚠️ 但 P 是**阻断且无逃生口**的规则,所以只放宽**触发**、不动通道判据,
+    //   且宽限计账(每 5 次承重提交欠一轮)原样保留——它就是防这条变吵的那个阀。
     triggered(ctx) {
       if (!ctx || typeof ctx.didCommit !== "function" || !ctx.didCommit()) return false;
       if (RULE_P._p.carrierCommitCount(ctx) > 0) return true;
-      return (ctx.writes || []).some((p) => isCarrierPath(CARRIER_SURFACE, p));  // D86:路径面剔除非载体区
+      const w = RULE_P._p.win(ctx);
+      const seen = [...(ctx.writes || []), ...((w && w.writes) || [])];
+      return seen.some((p) => isCarrierPath(CARRIER_SURFACE, p));  // D86:路径面剔除非载体区
     },
 
     win(c) { try { return c && typeof c.window === "function" ? c.window() : null; } catch { return null; } },
@@ -2848,6 +3084,16 @@ const RULE_P = {
   cases: {
     // 正例 = **四种已知文本伪造形态**各一条(全部必须照拦)+ 一条写入面伪造。
     pos: [
+      // ⚠️ D92 回归钉:**跨轮**形态——承重写入在前几轮,本轮只 `git add -A && git commit`。
+      //   旧 `triggered` 只看**本轮**写入与提交命令的参数面,这形态下**两者都空**
+      //   ⇒ P 从不触发。实撞:另一条会话 120 轮里「同轮既写又提交」= 0,
+      //   提交命令带承重路径 = 0,于是 P 在 258 次闸触发里**一次没响**。
+      //   这不是罕见形态,是「干几轮活、最后提交一次」的自然节奏。
+      { name: "P:跨轮——写在前几轮、本轮只提交(D92)",
+        text: "收工提交。",
+        prior: [{ text: "改判据", write: "scripts/lib/gate-rules.mjs" }],
+        bash: ["cd /repo && git add -A && git commit -m x"],
+        pLedger: { carriers: 9 } },
       // 伪造①:正文里写出三条通道的字面量。实测过:纯文本曾刷出「跨模型 1 / 独立视角 2」。
       { text: "已跑跨模型 mcp__codex-cli__codex,起了 grill:architecture 只读子代理,并用 WebSearch 查了外部先例。",
         bash: ["git add -A scripts/hook-stop-closure.mjs && git commit -m x"] },
@@ -3319,5 +3565,84 @@ export const RULE_O = {
   },
 };
 
+/** ND:名词日记漏记。约定正文在 `docs/noun-diary.md` 头部(2026-08-23 用户立):
+ *  「用户问『这是什么』或点名 mapgen 时,AI 当场追加一行」。
+ *  触发层 2026-08-31 用户亲签「加了吧」后才建——此前靠模型自觉,当日实撞:
+ *  用户问「winget 到底是啥」,答了没记,用户事后问「进日记了吗」才补。
+ *  「记了但没看」族(memory `nlpm-check-standing-auth` 同型):规则在,触发层空缺。
+ *  判据:本轮用户消息含名词提问句式,而日记未动、且未就地声明不适用 ⇒ 拦。
+ *  失效条件:`docs/noun-diary.md` 不在盘 ⇒ 本项静默退场——守的是便利性约定,
+ *  非承重八族;载体没了先修载体,不拿闸顶(与 O 项 toolPresent 同一口径)。
+ *  天花板:① 句式白名单只认「是什么/是啥/什么意思」族,「为什么 X」类机制问抓不到
+ *  (当日 PATH 一词就是靠判断补的,这类靠自觉);② 判不出问的词是否已在册
+ *  (同名词二次出现按约定不重记——那是合法的不动日记,走声明出路);
+ *  ③ 判不出追加的那一行质量够不够。 */
+const RULE_ND = {
+  id: "ND",
+  blocking: true,   // 2026-08-31 用户亲签:「日记要不要加闸项——加了吧」
+  law: "docs/noun-diary.md#名词日记",
+  requires: ["userText"],
+  escapes: [
+    { say: "真追加一行进 docs/noun-diary.md(表尾追加,表体不留空行,一句话够下次自己搜,深挖件挂链接)",
+      sample: { write: "/repo/docs/noun-diary.md" } },
+    { say: "就地声明 ⟪名词日记:不适用,因⟫ + 理由——合法理由如:不是名词问 / 同名词已在册(改原行补「再遇」)/ 纯闲聊",
+      sample: { text: "名词日记:不适用,因这是对上文指代的追问,不是名词问。" } },
+  ],
+  detect: (ctx) => {
+    if (!toolPresent("docs/noun-diary.md")) return [];
+    const ut = maskQuoted(String(ctx.userText || ""));
+    const m = ut.match(/(是什么|是啥|什么意思|啥意思|到底是啥|什么东西)/);
+    if (!m) return [];
+    // 出路1(动作面):本轮真动过日记——Write/Edit 面或 Bash 面都认
+    const touched = (ctx.writes || []).some((w) => /docs\/noun-diary\.md$/.test(String(w).replace(/\\/g, "/"))) ||
+      (ctx.bashCmds || []).some((c) => /noun-diary\.md/.test(c));
+    if (touched) return [];
+    // 出路2(文本出路,按 INV-1 写进判据受正反例与变异约束):就地声明不适用+理由
+    const at = maskQuoted(String(ctx.text || ""));
+    if (/名词日记[::][^\n]{0,80}(不适用|已在册|已记|已补|非名词|同名词)/.test(at)) return [];
+    return [m[1]];
+  },
+  exempts: [],
+  message: (hits) =>
+    `**用户问了「${hits[0]}」型的问题,而名词日记没动**(约定见 docs/noun-diary.md 头部:问「这是什么」当场追加一行)。\n` +
+    `${renderEscapes(RULE_ND.escapes)}\n` +
+    `      天花板:句式白名单只认「是什么/是啥/什么意思」族;「为什么 X」类机制问抓不到,那半仍靠自觉。`,
+  mutations: [
+    { name: "去掉两条出路(动了日记/声明了也照拦)", apply: (r) => ({ ...r, detect: (ctx) => {
+      if (!toolPresent("docs/noun-diary.md")) return [];
+      const m = maskQuoted(String(ctx.userText || "")).match(/(是什么|是啥|什么意思|啥意思|到底是啥|什么东西)/);
+      return m ? [m[1]] : [];
+    } }) },
+    { name: "不剥引文(用户引用一句含「是什么」的话也拦)", apply: (r) => ({ ...r, detect: (ctx) => {
+      if (!toolPresent("docs/noun-diary.md")) return [];
+      const m = String(ctx.userText || "").match(/(是什么|是啥|什么意思|啥意思|到底是啥|什么东西)/);
+      if (!m) return [];
+      const touched = (ctx.writes || []).some((w) => /docs\/noun-diary\.md$/.test(String(w).replace(/\\/g, "/"))) ||
+        (ctx.bashCmds || []).some((c) => /noun-diary\.md/.test(c));
+      if (touched) return [];
+      const at = maskQuoted(String(ctx.text || ""));
+      if (/名词日记[::][^\n]{0,80}(不适用|已在册|已记|已补|非名词|同名词)/.test(at)) return [];
+      return [m[1]];
+    } }) },
+  ],
+  cases: {
+    pos: [
+      { user: "winget 到底是啥?", text: "winget 是 Windows 官方包管理器。" },
+      // 提了日记但既没动也没按格式声明 ⇒ 照拦(光嘴上说不算)
+      { user: "SVC 是什么?", text: "SVC 是歌声音色转换。名词日记我回头再补。" },
+    ],
+    neg: [
+      // 动作面出路:真追加了日记
+      { user: "RVC 是什么?", text: "RVC 是检索式声音转换,已补日记。", write: "/repo/docs/noun-diary.md" },
+      // 文本出路:就地声明不适用+理由
+      { user: "你刚说的到底是啥意思?", text: "名词日记:不适用,因这是对上文指代的追问,不是名词问。" },
+      // 引文形态:用户引的是话不是问 ⇒ maskQuoted 剥掉不拦
+      { user: "你上一条说「这是什么」那个判据有问题。", text: "收到,我去看那条判据。" },
+      // 无名词问
+      { user: "继续吧。", text: "好,接着跑。" },
+    ],
+  },
+};
+
 export const RULES = [RULE_O, RULE_V, RULE_W, RULE_Q, RULE_D, RULE_G, RULE_B, RULE_C, RULE_H, RULE_F, RULE_L, RULE_N, RULE_I, RULE_J, RULE_M,
-  RULE_E0, RULE_E1, RULE_E2, RULE_K, RULE_K0, RULE_S, RULE_T, RULE_U, RULE_P];
+  RULE_E0, RULE_E1, RULE_E2, RULE_K, RULE_K0, RULE_S, RULE_T, RULE_U, RULE_P, RULE_ND, RULE_X];

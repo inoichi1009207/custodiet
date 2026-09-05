@@ -47,11 +47,23 @@ export function buildCtx(entries, extra = {}) {
   /** 助理说的话。**只取 assistant 的 text 块**——不含工具输出、不含用户输入、
    *  不含被读文件的内容。想判「他说了什么」只能用这个。 */
   let text = "";
+  /** 用户说的话(ND 项消费)。**只取 user 条目的 text 块**——tool_result 也挂在 user 型
+   *  条目下,但那是工具输出不是用户的字,不进;<system-reminder> 是系统注入,剥掉。
+   *  2026-08-31 加(用户亲签名词日记闸项):此前 ctx 只有助理面,「用户问了什么」判不了。 */
+  let userText = "";
   /** 助理做的事。每项 `{name, input}`,**只来自 tool_use 入参**。
    *  工具**输出**(tool_result)一律不进——那是别人说的话,不是他做的事。 */
   const actions = [];
 
   for (const e of entries) {
+    if (e?.type === "user") {
+      const uc = e.message?.content;
+      if (typeof uc === "string") userText += uc + "\n";
+      else if (Array.isArray(uc)) for (const b of uc) {
+        if (b?.type === "text") userText += (b.text || "") + "\n";
+      }
+      continue;
+    }
     if (e?.type !== "assistant") continue;
     const c = e.message?.content;
     if (!Array.isArray(c)) continue;
@@ -61,6 +73,9 @@ export function buildCtx(entries, extra = {}) {
     }
   }
   if (typeof extra.lastAssistantMessage === "string") text += extra.lastAssistantMessage + "\n";
+  // 用户面同样留尾不留头;系统注入块整段剥离(它们不是用户的字,却常含判据词)。
+  userText = userText.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, " ");
+  if (userText.length > SCAN_CAP) userText = userText.slice(-SCAN_CAP);
   // ⚠️ 截**尾部保留**,不是从头截。原实现 `slice(0, CAP)` 把最新的话切掉了:
   //   codex 060 §1.1 给出可复现输入——20 万个 x + 尾部一句推迟句,旧命中 Q、新漏报。
   //   收尾闸关心的恰恰是**最近说了什么**,所以要留尾不留头。
@@ -230,6 +245,8 @@ export function buildCtx(entries, extra = {}) {
       batch: typeof g.batch === "string" ? g.batch : null,
       armedAt: typeof g.armedAt === "string" ? g.armedAt : null,
       cleared: g.cleared === true,
+      /** batch-goal 拒清留痕(判据未过 / 判据被改):有它且未结清 ⇒ 本批的 `--clear` 没成,ranClear 不得为真。 */
+      clearRefusedAt: typeof g.clearRefusedAt === "string" ? g.clearRefusedAt : null,
       // 中和在**进 ctx 时**做,不指望每个调用方记得——那是「靠人记得」,今天已证不可靠
       conditions: Array.isArray(g.conditions) ? g.conditions.map((c) => quoteUntrusted(c, 120)) : [],
       /** 原始条数(中和不改变计数,K 要拿它数「几条未确认」)。 */
@@ -247,7 +264,7 @@ export function buildCtx(entries, extra = {}) {
   //   tracked 的 fail-closed 语义在 `isNew` 内部自持,不需要外露旗标。
   //   INV-5 的仪器即该扫描;字段再断线由它报,不靠注释宣称。
   return {
-    text, actions, bashCmds, commits, writes, reads, agents, toolNames, skills, written, isNew,
+    text, userText, actions, bashCmds, commits, writes, reads, agents, toolNames, skills, written, isNew,
     window, batchGoal,
     /** P 的跨批持久计数(2026-08-22 用户亲签「改吧」)。三态与 batchGoal 同构:
      *  `undefined`=通道没接(夹具/旧路径 ⇒ 规则退回窗口式计账);

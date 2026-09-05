@@ -78,6 +78,8 @@ npm run gate:self-test     # 引擎+输入面+零件,全部夹具
 npm run gate:accept        # 外加每规则正反例 + 变异验收
 # 4. 用批级完成条件干活
 node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "什么算完成,写成可核的"
+#    条件可带机器判据(0.3.0):--clear 时自己跑,不过即拒清,不再认自述
+node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "成片已出" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."
 # ……干活……
 # 收尾:逐条写「条件N: 达成/未达成/不适用」,然后
 node --no-warnings scripts/batch-goal.mjs --clear

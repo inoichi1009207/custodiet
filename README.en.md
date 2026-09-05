@@ -73,6 +73,8 @@ npm run gate:self-test     # engine + ctx + registry + parts, all fixtures
 npm run gate:accept        # + per-rule pos/neg fixtures + mutation acceptance
 # 4. work with batch goals
 node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "what done means, checkable"
+#    a condition may carry a machine check (0.3.0): --clear runs it and refuses to clear on failure — no self-attestation
+node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "render is out" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."
 # ... work ...
 # closing: write 条件1: 达成/未达成/不适用 verdicts, then
 node --no-warnings scripts/batch-goal.mjs --clear
