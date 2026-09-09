@@ -73,7 +73,10 @@ export function buildCtx(entries, extra = {}) {
     if (!Array.isArray(c)) continue;
     // 动作带条目时间戳(ms;转录条目有 `timestamp`,夹具没有 ⇒ null)。消费者:P 的红队凭证池按批武装时刻切
     //   (红队 186 BP-1~8:用「提交」近似批边界被八种写法打穿,批号武装时刻才是本仓的批时钟)。
-    const at = Date.parse(String(e.timestamp || "")) || null;
+    // codex 191:`Date.parse("1970-01-01T00:00:00Z")` 得 0,而 `0 || null` 把这个**合法**时间戳吞成 null(⇒ 该动作恒在凭证池内)。
+    //   按有限性判,别按真值判。
+    const parsed = Date.parse(String(e.timestamp || ""));
+    const at = Number.isFinite(parsed) ? parsed : null;
     for (const b of c) {
       if (b?.type === "text") text += (b.text || "") + "\n";
       else if (b?.type === "tool_use") actions.push({ name: b.name, input: b.input || {}, at });

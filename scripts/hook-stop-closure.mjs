@@ -2579,9 +2579,6 @@ const tp = hookInput.transcript_path || "";
 //   (`triageResultFrom` 定义在 `preExistedSet` 旁的顶层——这里是主路径的块作用域,放这儿自测够不着。)
 const concurrentWriters = (() => {
   if (!hookInput.session_id) return null;
-  // 载体不在盘则静默退场(与 ND 同口径;custodiet 公开树不带 session-triage/session-liveness 探针,缺件时不该每次 Stop 报 UNKNOWN):
-  //   本仓两个探针文件恒在,此行只对拷走闸脚本的仓生效。
-  if (!fs.existsSync("scripts/session-triage.mjs") || !fs.existsSync("scripts/lib/session-liveness.mjs")) return null;
   // ⚠️ 超时 2026-09-07 当轮实撞:首版 8 s,而 session-triage 在 48 个遗留会话+两个 codex 进程在活时实测 8.8 s
   //   ⇒ 第一次生产触发就报 UNKNOWN「无 JSON 输出」。现 15 s(Stop 预算 30 s,本 hook 自身 <5 s);
   //   仍超时的话 detail 里带 ETIMEDOUT 与耗时,别再让「超时」与「坏 JSON」混成一句。

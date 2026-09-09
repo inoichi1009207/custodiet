@@ -242,7 +242,10 @@ export const RULE_G = {
 import { PAT, extractTargets, matchAny, bashWrites, bashWriteTargets, ranProbe } from "../hook-stop-closure.mjs";
 
 /** 只由**工具入参**拼成的证据面。工具输出一律不进——那是别人说的话。 */
-const actionText = (ctx) => JSON.stringify(ctx.actions);
+// 红队 191 BP-6(codex 191 同指):原来整体序列化 `ctx.actions`,每个元素都带 `at:<13 位毫秒>`,
+//   于是「我这就去改 `889`」这类指向短数字的承诺,会因某个动作的时间戳恰好含子串 `889` 而被判「已兑现」
+//   (红队实测:同一输入加 timestamp 即由 HIT 变 PASS)。时间戳是元数据不是证据,只序列化 {name,input}。
+const actionText = (ctx) => JSON.stringify((ctx.actions || []).map((a) => ({ name: a.name, input: a.input })));
 
 const unfulfilledOn = (lines, evidence) => lines.filter((line) => {
   const targets = extractTargets(line);
@@ -3130,19 +3133,38 @@ const RULE_P = {
       //   回退(夹具/无时间戳/未武装):**任何**含 commit 的命令都切(fail-closed,不再给 docs-only 例外);
       //   `git stage` 视同 add;`--dry-run` 在剥 message 之后判。代价:回退路径下「红队 → 记台账提交 → 关账」
       //   会被拦一次——出路是关账前把红队放在最后一次提交之后,或让批武装(主路径)生效。
-      const armedAt = Date.parse(String((ctx.batchGoal && ctx.batchGoal.armedAt) || "")) || null;
-      const all = [...wa, ...(ctx.actions || [])];
-      if (armedAt && all.some((a) => Number.isFinite(a.at))) {
-        return all.filter((a) => !Number.isFinite(a.at) || a.at >= armedAt);   // 本轮动作(无 at)恒在池内
-      }
       const commitCuts = (cmd) => segments(cmd).some((s) => {
         if (!H.GIT.test(s) || !/\bcommit\b/.test(s)) return false;
         const noMsg = s.replace(/(?:-m|--message|-F|--file)(?:\s+|=)(?:"[^"]*"|'[^']*'|\S+)/g, " ");
         return !/--dry-run\b/.test(noMsg);
       });
+      const isCommitAction = (a) => /^(Bash|PowerShell)$/.test(String(a.name || "")) && commitCuts(String((a.input && a.input.command) || ""));
+      // ── 191 两队红队重写(BP-1/2/4/7/8;上一版的四处毛病逐条对应)────────────────
+      //   ① 切点只取武装时刻,而法条(reporting.md 触发层)写的是「自上一次**承重面 commit** 以来」⇒
+      //      批开头跑一次红队后,后续闸改动可无限追加提交而不再复跑,达成它**不需要伪造、只需不重新 --arm**;
+      //      且 `--clear` 会抹掉 armedAt ⇒「不结清反而更松」。现取 max(武装时刻, 窗口最后一次切边界提交),
+      //      比两句中任一句都严,不与任一句冲突。代价是回退路径的老账重现:「红队 → 记台账提交 → 关账」会被拦一次,
+      //      出路照旧=关账前把红队放在最后一次提交之后。漏放贵于误拦,取这一边。
+      //   ② 量词不一致:开关是「**任一**动作有 at」,豁免是「**这一条**没 at」⇒ 一条带 at 的动作就能让所有
+      //      不带 at 的条目白拿凭证资格。两队红队各自实测到同一形态。现改为窗口动作**必须**有有效 at 才入池(fail-closed)。
+      //      误伤成本已量:两队合计读 93850 + 1991 条真实条目,缺时间戳 0 条 ⇒ 生产上这一支本就是空集。
+      //   ③ `a.at >= armedAt` 只有下界没有上界 ⇒ 未来时间戳恒在池内。现加上界=本轮最晚动作时刻(取不到则不设上界)。
+      //   ④ armedAt 用真值兜底 ⇒ epoch(Date.parse 得 0)被吞成 null、主路径整条关闭;改按有限性判(与 gate-ctx 同族修法)。
+      const parsedArm = Date.parse(String((ctx.batchGoal && ctx.batchGoal.armedAt) || ""));
+      const armedAt = Number.isFinite(parsedArm) ? parsedArm : null;
+      // 本轮动作恒在池内:它们就是「此刻正在做的事」,不参与批边界过滤(BP-7:原注释说本轮动作无 at,
+      //   而生产上本轮条目同样带 at,于是「先红队后武装」这类合规次序会被自己的时间戳踢出池)。
+      const own = ctx.actions || [];
+      if (armedAt && wa.some((a) => Number.isFinite(a.at))) {
+        let lastCommitAt = null;
+        for (const a of wa) if (isCommitAction(a) && Number.isFinite(a.at)) lastCommitAt = a.at;
+        const cutAt = lastCommitAt !== null ? Math.max(armedAt, lastCommitAt) : armedAt;
+        const upper = own.map((a) => a.at).filter(Number.isFinite).sort((x, y) => y - x)[0] ?? null;
+        return [...wa.filter((a) => Number.isFinite(a.at) && a.at >= cutAt && (upper === null || a.at <= upper)), ...own];
+      }
       let cut = -1;
-      wa.forEach((a, i) => { if (/^(Bash|PowerShell)$/.test(String(a.name || "")) && commitCuts(String((a.input && a.input.command) || ""))) cut = i; });
-      return [...wa.slice(cut + 1), ...(ctx.actions || [])];
+      wa.forEach((a, i) => { if (isCommitAction(a)) cut = i; });
+      return [...wa.slice(cut + 1), ...own];
     })();
     const hunterMissing = engine && !hunterPool.some((a) => { try { return hunterCh.test(a, ctx); } catch { return false; } });
     const hunterHit = (commits) => ({ ch: hunterCh.key + "——闸引擎面每批必跑(D11 独立于宽限)", got: 0, need: 1, commits, every: H.rearm() });
@@ -3366,6 +3388,40 @@ const RULE_P = {
         write: "scripts/lib/gate-rules.mjs", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x",
         prior: [{ text: "批 184", agent: { type: "_gate-bypass-hunter", prompt: "红队批 184 的 gate-rules.mjs 改动" } },
                 { text: "批 184 结束", commit: true }] },
+      // D107 主路径证人(191):凭证池的**主路径**按 `batchGoal.armedAt` 切动作时间戳,而在此之前
+      //   夹具条目没有 `timestamp` ⇒ 所有用例都走回退路径(任何提交都切),主路径零机器证人。
+      //   这两条(pos 早于武装 ⇒ 仍欠 / neg 晚于武装 ⇒ 放行)钉住那条过滤,变量只有时间戳一个。
+      { name: "D107 主路径:红队调用早于本批武装时刻 ⇒ 不在凭证池,仍欠",
+        text: "本批闸引擎改动,提交。", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-09-09T10:00:00Z", conditions: ["甲"] },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", at: "2026-09-09T09:00:00Z",
+                  agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }] },
+      // ── 191 两队红队补的四格(它们「写得出却没写」正是 D107 那一族:夹具能表达而没人写)──────
+      //   四条都是 pos(应拦),各钉一处修法;把 `at` 挪一挪就能让它们互相翻面,故都是单变量证人。
+      { name: "红队一/二 BP-1(量词):红队条目无时间戳 + 窗口另有带 at 的动作 ⇒ 不得白拿凭证",
+        text: "本批闸引擎改动,提交。", at: "2026-09-09T12:00:00Z", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-09-09T10:00:00Z", conditions: ["甲"] },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "别的活", at: "2026-09-09T11:00:00Z", bash: "echo x" }] },
+      { name: "红队二 BP-4(上界):红队时间戳在未来 ⇒ 不得在池内",
+        text: "本批闸引擎改动,提交。", at: "2026-09-09T12:00:00Z", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-09-09T10:00:00Z", conditions: ["甲"] },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", at: "2030-01-01T00:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }] },
+      { name: "红队一 BP-1/BP-2(切点):红队晚于武装时刻,但其后又有一次承重提交 ⇒ 该次提交之后的改动仍欠红队",
+        text: "再改一版判据,提交。", at: "2026-09-09T13:00:00Z", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-09-09T10:00:00Z", conditions: ["甲"] },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", at: "2026-09-09T11:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "按回件改判据并提交", at: "2026-09-09T11:30:00Z", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x" }] },
+      { name: "红队二 BP-3(epoch):armedAt=1970 是合法时刻,主路径不得因真值兜底整条关闭",
+        text: "本批闸引擎改动,提交。", at: "2026-09-09T13:00:00Z", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "1970-01-01T00:00:00Z", conditions: ["甲"] },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", at: "1970-01-01T00:00:01Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "其后的承重提交", at: "2026-09-09T11:00:00Z", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x" }] },
       // codex 185「你没问到」2(High):闸引擎经 Bash 写 + `git add -A` ⇒ 原 triggered 看不见,红队检查走不到
       { name: "codex-185 ②:Bash 写闸文件 + git add -A ⇒ P 触发且欠红队",
         text: "第一笔。", pLedger: { carriers: 0 },
@@ -3438,6 +3494,15 @@ const RULE_P = {
       { text: "承重面改完并提交,三通道各跑一遍。",
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A scripts/hook-stop-closure.mjs && git commit -m x"],
         agent: { type: "_gate-bypass-hunter", prompt: "红队本批对 scripts/hook-stop-closure.mjs 的改动,规则 id K/S" }, web: "业界先例" },
+      // D107 主路径证人的接受侧(191):同一形态,红队调用**晚于**武装时刻 ⇒ 在凭证池内 ⇒ 放行。
+      //   与 pos 那条**只差一个时间戳**(正文同为「红队」,codex 191 指出原来正文不同 ⇒ 不是单变量对照)。
+      //   ⚠️ 注意:主路径失效时本条**仍放行**(变异实测 neg 前后同为 hits=0),故它不是变异的证人——杀变异的是 pos。
+      { name: "D107 主路径:红队调用晚于本批武装时刻 ⇒ 在凭证池内 ⇒ 放行",
+        text: "本批闸引擎改动,提交。", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-09-09T10:00:00Z", conditions: ["甲"] },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", at: "2026-09-09T11:00:00Z",
+                  agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }] },
       // D11 独立于宽限的另一半:计数不足时**只**要求红队,另两通道仍按宽限 ⇒ 只有红队在场也放行
       { name: "D11 独立于宽限:pLedger=0、只有绑定的红队在场 ⇒ 放行(另两通道仍按宽限)",
         text: "第一笔,闸引擎批,红队跑过。", pLedger: { carriers: 0 },

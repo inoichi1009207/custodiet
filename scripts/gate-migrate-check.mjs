@@ -281,12 +281,21 @@ console.log("正反例:");
 //   「追加既有 memory 文件不算新建」这条反例根本写不出来。
 //   第十次:`bgTasks`(2026-09-06,D104(a) S 的动作面)与 `concurrentWriters`(D95 CW 项)——两条都是
 //   **注入通道**(官方 background_tasks[] 载荷 / 收尾时点三查①结果),不进 entries。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "concurrentWriters"]);
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "concurrentWriters", "at"]);
+//   第七次:`at`(ISO 时间 ⇒ 条目 `timestamp`)—— D107(191):P 的凭证池主路径按 `batchGoal.armedAt`
+//   切动作,而 gate-ctx 的 `at` 只从条目 `timestamp` 来;夹具不给时间戳 ⇒ 所有用例只走回退路径,
+//   主路径零机器证人(「验过而没钉住」的形态,与上面六次同族)。
 //   第六次:`prior`(K 的批漂判据)—— 与 `batchGoal` 同族,也是**注入通道**而非动作。
 //   值是「上几轮的 assistant 文本/动作」简写,由 mkEntries 拼成 entries 再交 priorEntries。
 const mkEntries = (c) => {
   for (const k of Object.keys(c)) {
     if (!FIXTURE_KEYS.has(k)) throw new Error(`夹具键不认识:「${k}」—— 拼错的键会被静默丢弃并伪装成规则缺陷。合法键:${[...FIXTURE_KEYS].join(", ")}`);
+  }
+  // 红队 191 BP-5:补了键名校验,值层却没有——`at: 0`/`at: ""` 被真值判定静默丢弃、`at: "2026-09-09 10:00"`(非 ISO)
+  //   写进去了却被 Date.parse 吞成 null,两者都让用例悄悄退回回退路径。本文件头注自己写着
+  //   「静默丢弃拼错的键正是这一族的传播机制」——同族失败从键名层搬到值层,一并堵上。
+  if ("at" in c) {
+    if (!Number.isFinite(Date.parse(String(c.at)))) throw new Error(`夹具 at 解析不出时刻:${JSON.stringify(c.at)} —— 用 ISO 串(如 "2026-09-09T10:00:00Z");解析不出会让用例静默退回回退路径`);
   }
   const blocks = [{ type: "text", text: c.text }];
   if (c.commit) blocks.push({ type: "tool_use", name: "Bash", input: { command: "git commit -m x" } });
@@ -317,7 +326,9 @@ const mkEntries = (c) => {
   const pre = c.user
     ? [{ type: "user", message: { role: "user", content: [{ type: "text", text: String(c.user) }] } }]
     : [];
-  return [...pre, { type: "assistant", message: { content: blocks } }];
+  // `at`:本轮条目的转录时间戳(D107)。不给则不写该字段——gate-ctx 解析不出 ⇒ `at` 为 null,
+  //   与旧夹具行为一字不差(本轮动作恒在凭证池内),故加这条键不改任何既有用例的判定。
+  return [...pre, { type: "assistant", ...(c.at ? { timestamp: c.at } : {}), message: { content: blocks } }];
 };
 // ⚠️ `tracked` 必须**从夹具注入**,不能让规则自己去 execFileSync git。
 //   注不进来 ⇒ ctx 侧 fail-closed 当「新建」——于是 I 的「改既有载体」这一支
@@ -340,10 +351,13 @@ const mkEntries = (c) => {
 //   **「夹具支持面不足会让规则『测不出来』,而它长得像规则写错了」**。
 //   第七次仍是照着这句话栽的,故这次连**键名校验**一起补上(下面 PRIOR_KEYS):
 //   静默丢弃拼错的键正是这一族的传播机制。
-const PRIOR_KEYS = new Set(["text", "write", "skill", "bash", "agent", "web", "read", "grep", "commit", "mcp"]);
+const PRIOR_KEYS = new Set(["text", "write", "skill", "bash", "agent", "web", "read", "grep", "commit", "mcp", "at"]);
 const mkPriorEntry = (x) => {
   for (const k of Object.keys(x)) {
     if (!PRIOR_KEYS.has(k)) throw new Error(`prior 夹具键不认识:「${k}」—— 拼错的键会被静默丢弃并伪装成规则缺陷。合法键:${[...PRIOR_KEYS].join(", ")}`);
+  }
+  if ("at" in x) {
+    if (!Number.isFinite(Date.parse(String(x.at)))) throw new Error(`prior 夹具 at 解析不出时刻:${JSON.stringify(x.at)} —— 用 ISO 串`);
   }
   const b = [{ type: "text", text: String(x.text || "") }];
   if (x.write) b.push({ type: "tool_use", name: "Write", input: { file_path: x.write, content: "x" } });
@@ -359,7 +373,7 @@ const mkPriorEntry = (x) => {
   if (x.read) b.push({ type: "tool_use", name: "Read", input: { file_path: x.read } });
   if (x.grep) b.push({ type: "tool_use", name: "Grep", input: { pattern: "x", path: x.grep } });
   if (x.mcp) b.push({ type: "tool_use", name: String(x.mcp), input: { prompt: "x" } });
-  return { type: "assistant", message: { content: b } };
+  return { type: "assistant", ...(x.at ? { timestamp: x.at } : {}), message: { content: b } };
 };
 const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...(c.tracked ? { tracked: new Set(c.tracked) } : {}),
