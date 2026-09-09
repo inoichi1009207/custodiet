@@ -541,7 +541,7 @@ function touched(ctx, pathRe, onlyNew) {
     // 归一后再分类(D63):反斜杠 / 大小写 / `./` 段在 NTFS 上指向同一文件,
     //   而分类正则原来一条都不认 ⇒ I 收集不到 carriers 就 return [],P 也不响(漏放)。
     // **锚到路径开头**(D86):这里手里是**路径**不是命令串,不锚会把
-    //   `clipboard/oss/<公开仓暂存目录>/scripts/lib/…`(外发暂存树)与 `node_modules/…/scripts/…`
+    //   `clipboard/oss/public-repo/scripts/lib/…`(外发暂存树)与 `node_modules/…/scripts/…`
     //   一并算成载体——前者当轮实撞,I 判我「新建载体」。
     if (!isCarrierPath(pathRe, p)) continue;
     if (onlyNew && !ctx.isNew(p)) continue;
@@ -560,6 +560,14 @@ function touched(ctx, pathRe, onlyNew) {
     const targets = bashWriteTargets(c, pathRe);
     if (!targets.length) { out.push("bash-write(未解出目标)"); continue; }
     for (const t of targets) {
+      // ⚠️ D100(2026-09-06):Bash 面的目标**也要过 `isCarrierPath`**——与上面 Write/Edit
+      //   分支同一个谓词。原先只有 Write/Edit 分支剔 `NON_CARRIER_AREA`,Bash 分支拿到目标
+      //   直接判新旧 ⇒ `cp … clipboard/oss/public-repo/scripts/lib/x.mjs`(往外发暂存树
+      //   同步副本)被判成「新建载体」,一日两笔误报。同一概念两处各判一遍 ⇒ 修一处不等于修好。
+      if (!isCarrierPath(pathRe, t)) continue;
+      // 新旧判据(`ctx.isNew`)的 Bash 面证据由 hook-guard 在 PreToolUse 用 existsSync 量出
+      //   (D100 同批接线:`cat >> memory/x.md` 这类追加既有文件不再恒判新建);
+      //   无记录时仍退回旧判据(误报侧,不开漏放口)。
       if (onlyNew && !ctx.isNew(t)) continue;
       out.push(t + "(经 Bash)");
     }
@@ -668,9 +676,42 @@ export const RULE_I = {
       { text: "改了一行既有脚本的注释。", write: "/repo/scripts/hook-stop-closure.mjs",
         tracked: ["scripts/hook-stop-closure.mjs"] },
       { text: "今天只写了报告,没碰载体。" },
+      // ── D100 回归钉(2026-09-06;一日 4 笔误报台账的两种实况形态)────────────
+      //   ① 经 Bash 往**外发暂存树**拷副本:`clipboard/` 是 NON_CARRIER_AREA,
+      //      Write/Edit 分支早剔掉了,Bash 分支原先不剔 ⇒ 判「新建载体」。
+      { name: "D100①:Bash 往暂存树拷副本不算造物",
+        text: "同步了一份副本到外发暂存树。", tracked: ["scripts/lib/ledger-anchor.mjs"],
+        bash: "cp scripts/lib/ledger-anchor.mjs clipboard/oss/public-repo/scripts/lib/ledger-anchor.mjs" },
+      //   ② 经 Bash **追加既有** memory 文件:memory 不入仓 ⇒ tracked 永不含它,
+      //      只有写前实测(`preExisted`)能证明它本来就在。
+      { name: "D100②:Bash 追加既有 memory 文件不算新建",
+        text: "给 memory 追加了一行。", tracked: ["scripts/x.mjs"],
+        preExisted: ["C:/Users/u/.claude/projects/D--test/memory/notes.md"],
+        bash: "cat >> C:/Users/u/.claude/projects/D--test/memory/notes.md <<'EOF'\n- 新事实\nEOF" },
     ],
   },
 };
+// D100 的反向钉:与反例②**同一条** Bash 追加命令、只是**没有**写前实测记录 ⇒ 仍按新建拦
+//   (无记录退回旧判据是误报侧,这条钉住「接线没把口子开大」)。
+RULE_I.cases.pos.push({
+  name: "D100 反向钉:Bash 写 memory 且无写前记录 ⇒ 仍算新建",
+  text: "给 memory 追加了一行。", tracked: ["scripts/x.mjs"],
+  bash: "cat >> C:/Users/u/.claude/projects/D--test/memory/notes.md <<'EOF'\n- 新事实\nEOF",
+}, {
+  // grill 复核(2026-09-06,High):`bashWrites` 的 execForm 支是路径类的**第三处**,首版漏改 ⇒
+  //   解释器在执行位 + 重定向到 `~`/盘符路径 对 I 隐形。
+  name: "D100 反向钉:node 脚本重定向到 ~ 路径的新 memory 仍算新建",
+  text: "生成了一份 memory。", tracked: ["scripts/gen.mjs"],
+  bash: "node scripts/gen.mjs > ~/.claude/projects/D--test/memory/new.md",
+});
+RULE_I.cases.neg.push({
+  // grill 复核 Q2:在外发暂存树里**直接新写**一个闸脚本,I 不管——这是 D86/NON_CARRIER_AREA 的
+  //   既定天花板(by design),钉在这里是为了让它成为**有记录的**取舍而不是无人知晓的口子。
+  //   真正的发布路径是拷回本仓(`cp clipboard/… scripts/lib/x.mjs`),那一步 I 照管。
+  name: "by design:暂存树内直接新写不在 I 的辖区(D86 天花板,有记录的取舍)",
+  text: "在暂存树里起草了一个新脚本。", tracked: ["scripts/x.mjs"],
+  bash: "cat > clipboard/oss/public-repo/scripts/lib/brand-new.mjs <<'EOF'\nexport {};\nEOF",
+});
 
 /** J:立/改法未交代触发层。 */
 export const RULE_J = {
@@ -1089,7 +1130,8 @@ export const RULE_X = {
  *
  *  口径只此一份:`eFacts` 与 `RULE_E2` 原先各抄了一遍同样的字面量,是漂移预备役。 */
 export function maskQuoted(s) {
-  return String(s || "").replace(/「[^」]*」|«[^»]*»|“[^”]*”|"[^"]*"/g,
+  // 红队 182 BP-6 附:『』(内层引号,本仓正文里与「」混用)原不在集合 ⇒ 引闸拦词『别外审』不被剥。
+  return String(s || "").replace(/「[^」]*」|『[^』]*』|«[^»]*»|“[^”]*”|"[^"]*"/g,
     (m) => m.replace(/[^\n]/g, " "));
 }
 
@@ -2238,6 +2280,58 @@ const RULE_K0 = {
 //
 // CEILING(说在前面):它抓不到「不说等待、直接少做」那一族——闷声缩范围没有字面痕迹。
 // 那一族本闸管不了,别指望。
+
+/** A 态痕迹:「说出下一步做什么」。**只此一份**——原先同一条正则在 S 的两个分支各抄一遍
+ *  (D96 那支是照抄的),同一概念两处各写 ⇒ 补词补一处不等于补好(D72①/D83/D85 同型)。
+ *  ⚠️ D99(2026-09-06,用户 09-05 原话「下一个批可以考虑把英语的问题也加入进去」):
+ *    动词表原来**只有中文**。等待后台渲染的轮次我用英文写「next: run --clear / make 720p / send」,
+ *    S 按「零动作且未说下一步」拦,换成中文同形态即放——**语言不该是闸的判据**。
+ *    英文支要求「引导词 + 动词 + 宾语」形态(动词后须跟一个非标点 token),
+ *    免得 "then" 一个词就算说了下一步;中文支沿用既有形态不动。
+ *  天花板:仍是措辞表——两种语言的动词表都是枚举,下一个没列的动词照样被拦;
+ *    而它守的是**出路**不是闸口,窄 ⇒ 误拦且无处可逃。失效条件同 D87:再撞到未列动词,
+ *    改判为「引导词 + 任意动宾」。 */
+// 2026-09-06 当轮又撞一个未列动词(「回件到齐后我接着**判**」被拦,fp 已记)——这是 D87 写明的
+//   失效条件第三次触发;补「判|裁|派」止血,**方向问题**(措辞面 → 动作面)登记在 gate-debts D104 归用户裁。
+const SAID_NEXT_ZH = /(下一步|接下来|接着|继续|随后|然后)[^。\n]{0,24}(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删|候|等|盯|守|收|判|裁|派)/;
+// ⚠️ 首版英文支被 grill 复核判 CRITICAL(2026-09-06 当轮):引导词含裸 `then`/`will`/`going to`/`plan to`,
+//   动词表 50 个常用词,窗口不辨否定与时态 ⇒ 「The hook then runs the check and exits 0.」
+//   「I will not run the check until you confirm.」「I then ran the check」全算「说了下一步」——
+//   等于**写两句英文就能过 S**。现收紧为:引导词只认承诺形(`next:`/`next step:`/`next I`/`I'll`/`we'll`/
+//   `after that I`),窗口内不得出现否定,动词表只留推进类动作,动词后须跟宾语 token。
+//   `wait/watch/poll/monitor` 保留——与中文 `候|等`(D97,用户放行)对等;是否算 A 态归用户。
+const SAID_NEXT_EN = new RegExp(
+  "(?:^|[\\s(\\[])(?:next(?:\\s+steps?|\\s+up)?\\s*[:,]|next\\s+(?:i|we)\\b|after(?:wards|\\s+that)\\s*,?\\s*(?:i|we)\\b|i'll|i\\s+will|we'll|we\\s+will)" +
+  "(?:(?!\\bnot\\b|\\bnever\\b|n't\\b)[^.\\n]){0,40}?" +
+  "\\b(?:run|re-?run|verify|check|send|probe|make|build|rebuild|test|measure|clear|fix|write|read|scan|push|deploy|redeploy|" +
+  "wait|watch|poll|monitor|review|render|encode|upload|merge|commit|retry|inspect|compare|kick\\s+off|sync|migrate)" +
+  "\\b\\s+[^\\s.,;:!?\\n]", "i");
+/** 措辞面**跑在剥引文的文本上**(grill 复核:原先读 `ctx.text`,引用闸自己的拦词「next: run --clear」
+ *  即可过关——回声豁免正是 S 头注点名的贵方向;剥引文只减少文本命中,不放松任何真拦截)。 */
+/** **动作面**的「在跑」证据(D104(a),2026-09-06 用户裁「动作面吧」):官方 `background_tasks[]` 里有在飞任务
+ *  ⇒ 零动作轮不是停工,是**等**——等待后台渲染/codex 回件时被 K 的提示轮逼出的空回合,原先只能靠措辞面
+ *  (saidNext)救,一次没写对就拦(2026-09-05 一日 6 轮)。状态词表与 `checkAFromPayload` 同口径。
+ *  措辞面动词表自此**冻结**:再撞未列动词不再补词,改看这里(D87 失效条件的归宿)。 */
+// ⚠️ codex 182 复核(Q1):首版「有在飞任务即放行」**无上限**——挂一个永不结束的无关任务,S 永远不响,
+//   A 项也跳过 running 状态,不兜底;且子串匹配让 `inactive` 命中 `active`。现:①状态用**整词枚举**;
+//   ②「等」有上限——上一窗也零动作(同样只靠在飞任务撑)⇒ 本窗不再豁免,与 D96 的跨窗判据同口径:
+//   一个真在等的执行者两窗内总会有一次轮询/读文件之类的真动作。天花板:仍不绑定任务与批条件的关系。
+// 导出:hook-stop-closure 的 A 项(`checkAFromPayload`)与本条共用**这一份**状态枚举(红队 182 附节二 7:
+//   原来两处各写一份同一正则,下次补词只会补一处——D72①/D83/D85 同型)。
+export const BG_RUNNING_STATUS = /^(running|pending|in[_-]?progress|queued|active|started)$/;
+function bgRunning(ctx) {
+  const tasks = Array.isArray(ctx && ctx.bgTasks) ? ctx.bgTasks : [];
+  if (!tasks.some((t) => BG_RUNNING_STATUS.test(String((t && t.status) || "").toLowerCase().trim()))) return false;
+  const prior = typeof ctx.window === "function" ? (() => { try { return ctx.window(); } catch { return null; } })() : null;
+  if (prior && !(prior.actions || []).length) return false;   // 连续两窗零动作 ⇒ 不再算「等」
+  return true;
+}
+function saidNextIn(text) {
+  // 与 E0/E2/R 同一份剥引文实现(D71/D74),不用 gate-cmd 的 shell 引号版(会吃掉 I'll 的撇号);
+  //   围栏代码块整块抹掉——粘贴闸拦词/命令样例不算「说了下一步」。
+  const s = maskQuoted(String(text || "").replace(/```[\s\S]*?```/g, " "));
+  return SAID_NEXT_ZH.test(s) || SAID_NEXT_EN.test(s);
+}
 const RULE_S = {
   id: "S",
   blocking: true,          // 用户常设授权:「新增阻断项一律授权自动化」
@@ -2302,14 +2396,15 @@ const RULE_S = {
       // A 态的痕迹=「说出下一步」。⚠️ 2026-09-02(D97):此判据原先只在**第二分支**查,
       //   而第一分支(零动作)排在它前面 ⇒ 纯文本轮写了「接下来把剩下两条迁完」照样被拦,
       //   出路②在零动作轮**结构性不可达**(探针 T5 复现)。现提前计算、两个分支共用。
-      const saidNext = /(下一步|接下来|接着|继续|随后|然后)[^。\n]{0,24}(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删|候|等|盯|守|收)/
-        .test(String(ctx.text || ""));
+      const saidNext = saidNextIn(ctx.text);
       // 「继续跑」= **本轮有任何工具动作**,不是「写了文件」。
       //   首版把它编成 writes||commits||agents,实测三个候选四态全被误拦:
       //   「等 codex 回件」「只读了一堆文件」「发现条件错了」——前两个本来就是 A 且确实在跑
       //   (轮询、读文件都是继续跑),第三个折回 C(裁决词里本就有 `不适用`)。
       //   ⇒ **没有第四态,但我的编码错了**:把"推进"窄化成"产出",于是调查与等待都被当成停工。
-      if (!marked && !saidNext && !(ctx.actions || []).length) {              // 非 B、未声明下一步、且**纯说话**
+      // D104(a):动作面优先——后台任务在飞的零动作轮是「等」不是「停」,不看措辞。
+      const running = bgRunning(ctx);
+      if (!marked && !saidNext && !running && !(ctx.actions || []).length) {   // 非 B、未声明下一步、无在飞任务、且**纯说话**
         return ["批目标尚有未裁条件、本轮一个动作都没有,却既没继续跑也没标 ⏸ 说明属哪一类合法停工"];
       }
       // ── D96 结清(2026-09-02,批 145):出路②的**跨轮兑现核查**。
@@ -2322,9 +2417,8 @@ const RULE_S = {
       //   天花板:只看「零动作+承诺句」的结构,判不出承诺的对象是否同一件事;
       //   且 ⏸+三类理由(B 态)仍照常放行——等待用户是合法停工,本条只收「假装在跑」。
       const prior = typeof ctx.window === "function" ? ctx.window() : null;
-      if (!marked && saidNext && !(ctx.actions || []).length && prior &&
-          !(prior.actions || []).length &&
-          /(下一步|接下来|接着|继续|随后|然后)[^。\n]{0,24}(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删|候|等|盯|守|收)/.test(String(prior.text || ""))) {
+      if (!marked && saidNext && !running && !(ctx.actions || []).length && prior &&
+          !(prior.actions || []).length && saidNextIn(prior.text)) {
         return ["上一窗已说过「接下来做 X」且零动作,本窗又零动作只靠「下一步」句——承诺连续未兑现,出路②失效(D96);要么真做一次,要么标 ⏸ 说明属哪一类合法停工"];
       }
       // ── D67③ 补齐(2026-08-27,批 117;用户当轮第三次逮到同一形态)────────────
@@ -2350,7 +2444,8 @@ const RULE_S = {
       //   失效条件:再撞到第三个未列动词,改判为「只要出现『下一步/接下来』+ 任意动宾」。
       //   (`saidNext` 已提前到第一分支之前计算——2026-09-02 D97;动词表同轮补入
       //   候|等|盯|守|收——「接下来我候你的耳裁」是等待轮的自然写法,原表不认。)
-      if (!marked && !saidNext) {
+      // D104(a):做了活(或后台在飞)且没说下一步——后台在飞的轮次是「等」,不是「做了活然后停下」。
+      if (!marked && !saidNext && !running) {
         return ["批目标尚有未裁条件,却既没结清、没标 ⏸ 说明属哪一类合法停工、也没说出下一步做什么"];
       }
     }
@@ -2468,8 +2563,64 @@ const RULE_S = {
         text: "接下来我核 stems 双 FLAC 与退出码,到件即验。",
         prior: [{ text: "接下来我验收 stems 产物,到件即核。" }],
         batchGoal: { armedAt: "2026-09-02T00:00:00Z", conditions: ["甲", "乙"] } },
+      // D99 回归钉(2026-09-06):英文**纯空转**(零动作、没有「引导词+动词+宾语」)仍拦——
+      //   钉住「认英文」没把口子开成「写英文就放」。
+      { name: "D99 反向钉:英文空转、零动作",
+        text: "Still waiting on the background render. Nothing to report yet.",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      // D99 × D96:英文承诺连续两窗未兑现,同样失效(跨语言同一判据)。
+      { name: "D99×D96:英文承诺连续两窗零动作",
+        text: "Next I'll verify the 720p output and send it.",
+        prior: [{ text: "Next: run --clear, then make the 720p version." }],
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      // grill 复核(2026-09-06,CRITICAL)给的三种「写两句英文就过」形态,首版全放行:
+      { name: "D99 反向钉:否定句不是下一步",
+        text: "I will not run the check until you confirm.",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      { name: "D99 反向钉:解释既有行为的 then 不是下一步",
+        text: "The hook then runs the check and exits 0. I then ran the check and it passed.",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      { name: "D99 反向钉:引用闸自己的拦词不算说了下一步(回声)",
+        text: "The gate said \"next: run --clear\" but I disagree.\n```\nnext: run --clear\n```",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      // codex 复核(2026-09-06)另给的三句,首版全放行:否定 / 过去式 / 引用措辞示例
+      // codex 182 Q1 反向钉:①永不结束的无关任务 + 连续两窗零动作 ⇒ 拦(「等」有上限);②`inactive` 不算在飞(整词枚举)。
+      { name: "codex-182 Q1:永驻后台任务撑不过第二个零动作窗",
+        text: "Still waiting.",
+        prior: [{ text: "Still waiting." }],
+        bgTasks: [{ id: "forever", status: "running" }],
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      { name: "codex-182 Q1:inactive 不是在飞",
+        text: "还在渲染。",
+        bgTasks: [{ id: "b9", status: "inactive" }],
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      // D104(a) 反向钉:后台任务**已完成**(不在飞)+ 零动作 + 无下一步 ⇒ 仍拦——动作面只认在飞。
+      { name: "D104(a) 反向钉:后台任务已完成的零动作轮照拦",
+        text: "渲染早完了。",
+        bgTasks: [{ id: "b1", status: "completed" }, { id: "b3", status: "failed" }],
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      { name: "D99 反向钉(codex):过去式与引用示例都不是下一步",
+        text: "I will not run any commands. Back then we would run the checks manually. The phrase \"I will run the tests\" is only an example.",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
     ],
     neg: [
+      // D99 回归钉(2026-09-06;fp 台账 2026-09-05T05:17Z 那笔的实况措辞):
+      //   零动作、英文写出下一步(动词+宾语)⇒ A 态痕迹成立,放行。**样本不含中文动词**。
+      { name: "D99:英文说出下一步(零动作)",
+        text: "Render is still going. Next: run --clear, then make the 720p version and send it.",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      // D104(a) 动作面(2026-09-06 用户裁「动作面吧」):后台任务在飞 + 零动作 + 一个字的下一步都没说 ⇒ 放行——
+      //   这就是 2026-09-05 被 K 提示轮逼出的空回合的实况形态;**样本不含任何引导词/动词**,证的是动作面。
+      { name: "D104(a):后台任务在飞的零动作轮不算停工",
+        text: "还在渲染。",
+        bgTasks: [{ id: "b1", status: "running", description: "ffmpeg 720p" }],
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      // 与 D96 交叉(codex 182 Q1 后改向):上窗**有过真动作**(轮询)、本窗零动作但后台在飞 ⇒ 放行(等,不是假装在跑)
+      { name: "D104(a)×D96:上窗有轮询动作,本窗零动作、后台在飞 ⇒ 放行",
+        text: "接下来我核 stems 双 FLAC。",
+        prior: [{ text: "轮询一次。", bash: "node ~/.claude/scripts/codex-run.mjs --poll x" }],
+        bgTasks: [{ id: "b2", status: "pending" }],
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
       // 合法停工:标了且属亲签面
       { text: "⏸ 需要你确认：这一行要不要加进冲突表——改宪法需你亲签。" },
       // 合法停工:实打实阻断
@@ -2812,7 +2963,7 @@ const RULE_P = {
       return raw.some((s) => {
         const noMsg = s.replace(/(?:-m|--message|-F|--file)(?:\s+|=)(?:"[^"]*"|'[^']*'|\S+)/g, " ");
         const u = H.unquote(noMsg);
-        return H.GIT.test(u) && /\b(add|commit)\b/.test(u) && CARRIER_SURFACE.test(u);
+        return H.GIT.test(u) && /\b(add|stage|commit)\b/.test(u) && CARRIER_SURFACE.test(u);   // stage=add 的官方别名(红队 186 BP-7)
       });
     },
     carrierCommitCount(c) {
@@ -2833,12 +2984,43 @@ const RULE_P = {
     //   代价可忽略;方向是**收紧**(补漏放),窄例外④「新增/收紧机器闸」明确适用。
     //   ⚠️ 但 P 是**阻断且无逃生口**的规则,所以只放宽**触发**、不动通道判据,
     //   且宽限计账(每 5 次承重提交欠一轮)原样保留——它就是防这条变吵的那个阀。
+    /** 本批提交是否触及**闸引擎文件**(D11 收紧的适用面):提交命令参数面或窗口内写面命中即算。
+     *  只看这三样——它们是判据本体;夹具/文档/agent 定义改动不在此列(那些仍走 grill 口径)。 */
+    //   红队 182 BP-8:`cd scripts/lib && git add gate-rules.mjs` 的相对形躲过全前缀 ⇒ 裸文件名也认(库文件按名枚举,
+    //   与 gate-carriers 的机件专名同一思路;顶层 `scripts/gate-*.mjs` 与 session-triage 刻意不在——法条口径)。
+    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard)\.mjs|scripts\/lib\/gate-[\w-]+\.mjs|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|gate-(?:rules|ctx|carriers|registry|cmd|slice))\.mjs\b/i,
+    /** 红队 182 BP-9:起一次空 prompt 的 `_gate-bypass-hunter` 也满足收紧 ⇒ 与 W 的 reviewedOne 同法,
+     *  入参须提及闸引擎文件名 / 规则 id / diff 文件——只证发起,不证采纳(与另两通道同一 CEILING)。 */
+    hunterBound(a) {
+      const p = JSON.stringify((a && a.input) || {});
+      return /hook-stop-closure|hook-guard|gate-[\w-]+\.mjs|\.diff\b|规则 ?id|rule ids?|\bRULE_[A-Z0-9]+\b|批 ?\d{3}/i.test(p);
+    },
+    gateEngineTouched(ctx) {
+      const H = RULE_P._p;
+      const w = H.win(ctx);
+      const seen = [...(ctx.writes || []), ...((w && w.writes) || [])].map((p) => String(p).replace(/\\/g, "/"));
+      if (seen.some((p) => H.GATE_ENGINE.test(p))) return true;
+      const cmds = [...(ctx.bashCmds || []), ...((w && w.bashCmds) || [])];
+      // codex 182 Q3:`ctx.writes` 不含 Bash 写目标 ⇒ `node -e writeFileSync('scripts/lib/gate-rules.mjs')` 后
+      //   `git add -A` 提交,收紧看不见。Bash 面写目标与 I 项同一实现(`bashWriteTargets`),不另抄。
+      if (cmds.some((cmd) => { try { return bashWriteTargets(cmd, H.GATE_ENGINE).length > 0; } catch { return false; } })) return true;
+      return cmds.some((cmd) => segments(cmd).some((s) => {
+        const noMsg = s.replace(/(?:-m|--message|-F|--file)(?:\s+|=)(?:"[^"]*"|'[^']*'|\S+)/g, " ");
+        return H.GIT.test(noMsg) && /\b(add|commit)\b/.test(noMsg) && H.GATE_ENGINE.test(noMsg.replace(/\\/g, "/"));
+      }));
+    },
     triggered(ctx) {
       if (!ctx || typeof ctx.didCommit !== "function" || !ctx.didCommit()) return false;
       if (RULE_P._p.carrierCommitCount(ctx) > 0) return true;
       const w = RULE_P._p.win(ctx);
       const seen = [...(ctx.writes || []), ...((w && w.writes) || [])];
-      return seen.some((p) => isCarrierPath(CARRIER_SURFACE, p));  // D86:路径面剔除非载体区
+      if (seen.some((p) => isCarrierPath(CARRIER_SURFACE, p))) return true;   // D86:路径面剔除非载体区
+      // codex 185「你没问到」2(High):承重件经 **Bash** 改 + `git add -A` ⇒ writes 空、参数面无路径 ⇒ 原式不触发,
+      //   于是 gateEngineTouched 为真也走不到红队检查。Bash 写目标与 I/D11 同一实现。
+      const cmds = [...(ctx.bashCmds || []), ...((w && w.bashCmds) || [])];
+      return cmds.some((cmd) => {
+        try { return bashWriteTargets(cmd, CARRIER_SURFACE).some((t) => isCarrierPath(CARRIER_SURFACE, t)); } catch { return false; }
+      });
     },
 
     win(c) { try { return c && typeof c.window === "function" ? c.window() : null; } catch { return null; } },
@@ -2892,15 +3074,22 @@ const RULE_P = {
       { key: "跨模型(codex:判「我说的对不对」)",
         test: (a) => /codex/i.test(String(a.name || "")) ||
           (/^(Bash|PowerShell)$/.test(String(a.name || "")) && RULE_P._p.execsCodexRun(a.input)) },
+      // ⚠️ D11 收紧(2026-09-06 用户亲签;法条 reporting.md#承重面三通道必跑 同批改):本批提交触及
+      //   **闸引擎文件**时,本通道只认红队 agent `_gate-bypass-hunter`——181 批双审证明闸修法的自测
+      //   全绿证明不了不漏放,而 grill 的通用视角没有「怎样绕过这条判据」这一专门问法。
+      //   第二参 ctx 可缺省(变异里的旧调用形态不带 ctx ⇒ 退回 grill/_ 通用口径)。
+      //   红队 182 BP-9:名字对了还不够——入参须绑定闸文件/规则 id/diff(`hunterBound`),空 prompt 起一次不算。
       { key: "独立视角(只读子代理:判「我漏了什么」)",
-        test: (a) => /^(Agent|Task)$/.test(String(a.name || "")) &&
-          /^(grill:|_)/.test(String((a.input && (a.input.subagent_type || a.input.agentType)) || "")) },
+        test: (a, ctx) => {
+          if (!/^(Agent|Task)$/.test(String(a.name || ""))) return false;
+          const t = String((a.input && (a.input.subagent_type || a.input.agentType)) || "");
+          if (ctx && RULE_P._p.gateEngineTouched(ctx)) return /^_gate-bypass-hunter$/.test(t) && RULE_P._p.hunterBound(a);
+          return /^(grill:|_)/.test(t);
+        } },
       { key: "外部先例(WebSearch/WebFetch:判「业界踩过没有」)",
         test: (a) => /^(WebSearch|WebFetch)$/.test(String(a.name || "")) },
     ],
-    attempted(a) {
-      return RULE_P._p.CH.some((ch) => { try { return ch.test(a); } catch { return false; } });
-    },
+    // (`attempted(a)` 已删:红队 182 附节二 1 逮到它全仓零调用,而 D11 注释还把它列为「旧调用形态」——死零件不留。)
 
     /** 每累计 K 次承重面提交,义务重新武装一次 ⇒ 各需 ceil(承重提交数 / K) 遍。
      *  本轮至少算 1 次(触发时已确认本轮有承重提交,只是路径可能只落在 writes 上)。 */
@@ -2920,15 +3109,53 @@ const RULE_P = {
     //    null=首跑无账 ⇒ 计 0;{carriers:n}=自上轮三通道后累计承重提交数。
     //    语义:**每 5 次承重提交欠一轮三通道**——累计+本轮 < 5 ⇒ 宽限放行;
     //    ≥ 5 ⇒ 各通道欠 1 遍,照旧只认动作面。计数落账在 hook 侧(规则纯函数)。
+    // ── D11 独立于宽限(2026-09-07 用户「你自行判断」,我判:独立)────────────────
+    //   举例:宽限=每 5 次承重提交武装一次三通道;承重面多数是法典/agent/文档,四次里漏一次审代价可控。
+    //   闸引擎不同:181/182 两批**四轮复核每轮都抓出 High**(两句英文就过 S、目录记成已存在、退出码 3 吞成 null、
+    //   裸词 audit 免了公开仓教程),且全在自测全绿状态下——按宽限口径这两批 4/5 的闸引擎提交可以一次红队都不跑。
+    //   漏放贵于误拦:多跑一次红队≈10 分钟;漏一次=闸看起来在守而实际是装饰,且没人再撞。
+    //   ⇒ 触及闸引擎的提交,红队**每批必跑**,不计入宽限;另两通道仍按宽限。
+    const engine = H.gateEngineTouched(ctx);
+    const hunterCh = H.CH.find((c) => /独立视角/.test(c.key));
+    // codex 185「你没问到」1(High):红队凭证得绑**本批**——窗口里上一批的红队调用(它之后已有一次提交)
+    //   不能抵本批。凭证池=本轮动作 ∪ 窗口里**最后一次提交之后**的动作;窗口不分批,提交是最近的批边界近似。
+    const hunterPool = (() => {
+      const w = H.win(ctx);
+      const wa = (w && w.actions) || [];
+      // ── 批边界(红队 186 BP-1~8 之后重写)────────────────────────────────
+      //   首版用「提交」近似批边界,第二版给 docs-only 提交开例外——红队一次给出八种写法打穿例外
+      //   (分次 add、`-A` 与显式路径并列、`docs/.`、`cd` 相对形、反斜杠/绝对路径/glob、提交信息含 --dry-run、
+      //   `git stage`、子代理提交)。结论:提交不是批边界,**批号武装时刻才是**(本仓的批时钟=batch-goal)。
+      //   主路径:动作带转录时间戳(gate-ctx `at`),`batchGoal.armedAt` 在 ⇒ 凭证池=武装之后的动作。
+      //   回退(夹具/无时间戳/未武装):**任何**含 commit 的命令都切(fail-closed,不再给 docs-only 例外);
+      //   `git stage` 视同 add;`--dry-run` 在剥 message 之后判。代价:回退路径下「红队 → 记台账提交 → 关账」
+      //   会被拦一次——出路是关账前把红队放在最后一次提交之后,或让批武装(主路径)生效。
+      const armedAt = Date.parse(String((ctx.batchGoal && ctx.batchGoal.armedAt) || "")) || null;
+      const all = [...wa, ...(ctx.actions || [])];
+      if (armedAt && all.some((a) => Number.isFinite(a.at))) {
+        return all.filter((a) => !Number.isFinite(a.at) || a.at >= armedAt);   // 本轮动作(无 at)恒在池内
+      }
+      const commitCuts = (cmd) => segments(cmd).some((s) => {
+        if (!H.GIT.test(s) || !/\bcommit\b/.test(s)) return false;
+        const noMsg = s.replace(/(?:-m|--message|-F|--file)(?:\s+|=)(?:"[^"]*"|'[^']*'|\S+)/g, " ");
+        return !/--dry-run\b/.test(noMsg);
+      });
+      let cut = -1;
+      wa.forEach((a, i) => { if (/^(Bash|PowerShell)$/.test(String(a.name || "")) && commitCuts(String((a.input && a.input.command) || ""))) cut = i; });
+      return [...wa.slice(cut + 1), ...(ctx.actions || [])];
+    })();
+    const hunterMissing = engine && !hunterPool.some((a) => { try { return hunterCh.test(a, ctx); } catch { return false; } });
+    const hunterHit = (commits) => ({ ch: hunterCh.key + "——闸引擎面每批必跑(D11 独立于宽限)", got: 0, need: 1, commits, every: H.rearm() });
     if (ctx.pLedger !== undefined) {
       const prior = ctx.pLedger ? ctx.pLedger.carriers : 0;
       const mine = Math.max(H.carrierCommitCount(ctx), 1);
       const effective = prior + mine;
-      if (effective < H.rearm()) return [];
+      if (effective < H.rearm()) return hunterMissing ? [hunterHit(effective)] : [];
       const acts = H.scopeActions(ctx);
       const out = [];
       for (const ch of H.CH) {
-        const chActs = acts.filter((a) => { try { return ch.test(a); } catch { return false; } });
+        const pool = (engine && ch === hunterCh) ? hunterPool : acts;   // 红队凭证只认本批(见 hunterPool 注)
+        const chActs = pool.filter((a) => { try { return ch.test(a, ctx); } catch { return false; } });   // 带 ctx:D11 闸引擎面收紧
         if (chActs.length >= 1) continue;
         out.push({ ch: ch.key, got: 0, need: 1, commits: effective, every: H.rearm() });
       }
@@ -2938,7 +3165,8 @@ const RULE_P = {
     const acts = H.scopeActions(ctx);
     const out = [];
     for (const ch of H.CH) {
-      const mine = acts.filter((a) => { try { return ch.test(a); } catch { return false; } });
+      const pool = (engine && ch === hunterCh) ? hunterPool : acts;   // 红队凭证只认本批
+      const mine = pool.filter((a) => { try { return ch.test(a, ctx); } catch { return false; } });   // 带 ctx:D11 闸引擎面收紧
       const got = mine.length;
       if (got >= need) continue;
       // **豁免按通道分账**(2026-08-20 修,grill:testing 报 CRITICAL、本机实测复现):
@@ -2970,8 +3198,17 @@ const RULE_P = {
 
   message: (hits) => {
     const h0 = hits[0];
+    // codex 185 Q5:只欠红队(闸引擎面、宽限内)时,消息按实际缺项说,别再念「三通道各需 1 遍」
+    const hunterOnly = hits.length === 1 && /闸引擎面每批必跑/.test(String(h0.ch));
+    if (hunterOnly) {
+      return `**闸引擎面提交,红队未跑**(D11,独立于「每 ${h0.every} 次武装一次」的宽限;本批累计 ${h0.commits} 次承重提交,另两通道仍在宽限内)。\n` +
+        `      处置只有一条:起 \`_gate-bypass-hunter\`,prompt 里带上本批闸文件名 / 规则 id / diff 文件(空 prompt 不算,` +
+        `上一批的红队调用不抵账),回件处置后再提交或关账。grill 在此格**不充分**。`;
+    }
     return `承重面批次三通道未跑够(本批 ${h0.commits} 次承重面提交 ⇒ 各需 ${h0.need} 遍,` +
       `每 ${h0.every} 次重新武装一次)。缺:${hits.map((h) => `${h.ch} ${h.got}/${h.need}`).join(" / ")}\n` +
+      (hits.some((h) => /闸引擎面每批必跑|独立视角/.test(String(h.ch))) && RULE_P._p ?
+        `      （闸引擎面的「独立视角」只认 \`_gate-bypass-hunter\` 且入参绑定闸文件/规则 id;grill 在该格不充分——D11。）\n` : "") +
       `      **「本轮不需要」不是豁免**——当日自审第⑤⑥⑦问六次全答「不需要」、零次触发行动,\n` +
       `      而同日一跑三通道:codex 判死我 4/5 条诊断,grill 报出 97 条变异里 40 条在「全绿」下存活。\n` +
       `      唯一合法豁免=**通道本身不可用**,且须有动作证据:真发起过那条通道,\n` +
@@ -3106,6 +3343,54 @@ const RULE_P = {
       { text: "第五笔,子代理是通用的。", pLedger: { carriers: 4 },
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A scripts/hook-stop-closure.mjs && git commit -m x"],
         agent: "general-purpose", web: "先例" },
+      // D11 收紧(2026-09-06 亲签):提交触及**闸引擎文件**时,独立视角只认 `_gate-bypass-hunter`——
+      //   grill 在场也算欠(与 neg 里换成红队 agent 即放行的那条配对)。
+      { name: "D11:闸引擎提交,独立视角只有 grill ⇒ 仍欠",
+        text: "第五笔,闸引擎批。", pLedger: { carriers: 4 },
+        bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        agent: "grill:edge-cases", web: "先例" },
+      // 红队 186 BP-6/BP-7(回退路径):提交信息含 --dry-run 仍是提交 ⇒ 切;`git stage` 视同 add
+      { name: "BP-6:提交信息含 --dry-run 的旧批提交仍切边界 ⇒ 旧红队不抵账",
+        text: "本批新改动,提交。", pLedger: { carriers: 0 },
+        write: "scripts/lib/gate-rules.mjs", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x",
+        prior: [{ text: "上批红队", agent: { type: "_gate-bypass-hunter", prompt: "红队批 184 的 scripts/lib/gate-rules.mjs 改动" } },
+                { text: "提交", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m \"fix: drop --dry-run flag\"" }] },
+      { name: "回退路径 fail-closed:红队之后的 docs-only 提交也切(无批时间戳时不给例外)",
+        text: "本批收尾提交。", pLedger: { carriers: 0 },
+        write: "scripts/lib/gate-rules.mjs", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x",
+        prior: [{ text: "本批红队", agent: { type: "_gate-bypass-hunter", prompt: "红队本批 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "记台账", bash: "git add docs/gate-debts.md docs/product-diary.md && git commit -m x" }] },
+      // codex 185「你没问到」1(High):上一批的红队调用(之后已有一次提交)不能抵本批
+      { name: "codex-185 ①:旧批红队调用不抵本批 ⇒ 仍欠",
+        text: "批 185 新改动。", pLedger: { carriers: 0 },
+        write: "scripts/lib/gate-rules.mjs", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x",
+        prior: [{ text: "批 184", agent: { type: "_gate-bypass-hunter", prompt: "红队批 184 的 gate-rules.mjs 改动" } },
+                { text: "批 184 结束", commit: true }] },
+      // codex 185「你没问到」2(High):闸引擎经 Bash 写 + `git add -A` ⇒ 原 triggered 看不见,红队检查走不到
+      { name: "codex-185 ②:Bash 写闸文件 + git add -A ⇒ P 触发且欠红队",
+        text: "第一笔。", pLedger: { carriers: 0 },
+        bash: ["node -e \"require('fs').writeFileSync('scripts/lib/gate-rules.mjs','x')\"", "git add -A && git commit -m x"] },
+      // D11 独立于宽限(2026-09-07):计数不足 5(pLedger 0)也要红队——闸引擎面每批必跑
+      { name: "D11 独立于宽限:pLedger=0 的闸引擎提交,只 grill ⇒ 仍欠红队",
+        text: "第一笔,闸引擎批。", pLedger: { carriers: 0 },
+        bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        agent: "grill:edge-cases", web: "先例" },
+      // 红队 182 BP-7:闸引擎经 **Bash** 改(writes 里没有)+ `git add -A`(参数面无路径)⇒ 首版收紧看不见
+      { name: "BP-7:闸引擎经 Bash 改、只 grill ⇒ 仍欠",
+        text: "第五笔。", pLedger: { carriers: 4 }, write: "docs/laws/collab.md",
+        bash: ["node -e \"require('fs').appendFileSync('scripts/lib/gate-rules.mjs','//x')\"",
+               "node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A && git commit -m x"],
+        agent: "grill:testing", web: "先例" },
+      // 红队 182 BP-8:`cd scripts/lib && git add gate-rules.mjs` 的相对形 ⇒ 裸文件名也认
+      { name: "BP-8:cd 后相对路径提交闸文件、只 grill ⇒ 仍欠",
+        text: "第五笔。", pLedger: { carriers: 4 }, write: "docs/laws/collab.md",
+        bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "cd scripts/lib && git add gate-rules.mjs && cd ../.. && git commit -m x"],
+        agent: "grill:testing", web: "先例" },
+      // 红队 182 BP-9:起一次空 prompt 的红队 agent 不算独立视角(入参须绑定闸文件/规则 id/diff)
+      { name: "BP-9:红队 agent 空 prompt ⇒ 仍欠",
+        text: "第五笔。", pLedger: { carriers: 4 },
+        bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        agent: { type: "_gate-bypass-hunter", prompt: "hi" }, web: "先例" },
       // D34 证人②:本地读**不算**外部先例 ⇒ 仍欠。变异「Read/Grep 也算联网」在此翻面。
       { text: "第五笔,只本地读了页面缓存。", pLedger: { carriers: 4 },
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A docs/laws/collab.md && git commit -m x"],
@@ -3148,8 +3433,25 @@ const RULE_P = {
     neg: [
       // 真调用集:三条通道各真跑一遍 ⇒ 放行。**这是唯一的接受侧证人**,
       //   它红了不是「少过一条」,是「本条判据是不是一律拦」没人测了。
+      //   D11 收紧后(2026-09-06):这条提交的是**闸引擎文件**,独立视角须是红队 agent;grill 的接受侧证人
+      //   挪到下一条(法典提交)——两条合起来才证「收紧只作用于闸引擎面」。
       { text: "承重面改完并提交,三通道各跑一遍。",
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A scripts/hook-stop-closure.mjs && git commit -m x"],
+        agent: { type: "_gate-bypass-hunter", prompt: "红队本批对 scripts/hook-stop-closure.mjs 的改动,规则 id K/S" }, web: "业界先例" },
+      // D11 独立于宽限的另一半:计数不足时**只**要求红队,另两通道仍按宽限 ⇒ 只有红队在场也放行
+      { name: "D11 独立于宽限:pLedger=0、只有绑定的红队在场 ⇒ 放行(另两通道仍按宽限)",
+        text: "第一笔,闸引擎批,红队跑过。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+      // codex 185 ① 的边界:红队调用在窗口里**最后一次提交之后**(同一批内、隔轮跑的)⇒ 认
+      { name: "codex-185 ① 边界:本批内隔轮跑的红队(晚于上次提交)⇒ 放行",
+        text: "本批收尾提交。", pLedger: { carriers: 0 },
+        write: "scripts/lib/gate-rules.mjs", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x",
+        prior: [{ text: "批 184 结束", commit: true },
+                { text: "本批红队", agent: { type: "_gate-bypass-hunter", prompt: "红队本批 scripts/lib/gate-rules.mjs 的改动" } }] },
+      { name: "D11 边界:非闸引擎的承重提交,grill 仍充分",
+        text: "法典改完并提交,三通道各跑一遍。",
+        bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A docs/laws/collab.md && git commit -m x"],
         agent: "grill:testing", web: "业界先例" },
       // 同上,但跨模型走的是 **MCP 工具**而非 `node codex-run.mjs` ⇒ 同样放行。
       //   2026-08-20 补:产它的四套独立夹具**一致地**漏掉这一种形态(覆盖齐停在 3/4)。
@@ -3189,8 +3491,9 @@ const RULE_P = {
         bash: ["git add -A src/app/page.tsx && git commit -m \"顺手记一句 scripts/hook-stop-closure.mjs 的事\""] },
       // **跨批宽限**(2026-08-22 亲签「改吧」的正面证人):持久账累计 3 + 本轮 1 = 4 < 5
       //   ⇒ 零通道也放行。谁把计账支路撤了(退回窗口式每次欠),这条就红。
+      //   2026-09-07(D11 独立于宽限):证人改提交**法典**——闸引擎提交在宽限内也要红队,不再是零通道放行的例子。
       { text: "小修提交。", pLedger: { carriers: 3 },
-        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"] },
+        bash: ["git add -A docs/laws/collab.md && git commit -m x"] },
       // 账满且通道齐 ⇒ 放行(与 pos 的「账满无通道 ⇒ 拦」配对)
       { text: "第五笔,通道跑齐。", pLedger: { carriers: 4 },
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md",
@@ -3266,6 +3569,21 @@ export const RULE_W = {
         return /^(Agent|Task)$/.test(n) && /^(grill:|_)/.test(String((a.input && a.input.subagent_type) || ""));
       });
     },
+    /** 用户豁免入口(D101②,2026-09-06 亲签):用户**自己的消息**(本轮或窗口内)明示免外审。
+     *  只认用户话,不认我转述的「用户说过别外审」——转述是措辞面,可被自己写出来。
+     *  措辞形态:别/不用/不必/无需/免/不要 + (再)?+ 外审/四眼/battle/codex/审读/审。
+     *  剥引文后判(用户引用闸的拦词「须外审」不算)。天花板:只认这一族措辞;没说到的写法照拦,走 fp。 */
+    // ⚠️ codex 182 复核(Q2)后收窄:①首版认窗口内的用户话 ⇒ 上一批的「别外审」能盖过本批「必须外审」
+    //   (窗口不分批、不认撤销顺序)⇒ 现**只认本轮** `ctx.userText`(条件原文就是「用户本轮原话」);
+    //   ②裸 `审` 让「别审太久」「不要审错」「不用审核旧稿」全被免 ⇒ 去掉裸 `审`,免审词只留完整名词,
+    //   且其后必须是句读/语气词/行尾(「别外审了」「不需要外审。」),后面还跟别的字(太久/错/旧稿)不算;
+    //   ③补「不需要」「免于」「无需进行」三形。
+    userExempt(ctx) {
+      const t = maskQuoted(String(ctx.userText || ""));
+      // 红队 182 BP-4:「不要跳过外审」「不能免审」是**要求外审**——豁免词前面带否定的一律不算(否定-否定)。
+      const RE = /(?<!不要|不能|不许|不得|不可|别|避|请勿|勿)(别|不用|不必|不需要|无需|无须|毋须|免于?|不要|不做|跳过)\s*(再|进行)?\s*(外审|外部审查|四眼|battle|codex|审读|复核)\s*(了|吧|啦|的)?\s*(?=[,，。;;!！?？)\)\]\s]|$)/i;
+      return RE.test(t);
+    },
     /** 充分核(2026-08-22 用户裁定):battle/codex 在场即充分;仅 grill 不充分。 */
     battleOrCodex(ctx) {
       const acts = [...(ctx.actions || [])], skills = [...(ctx.skills || [])];
@@ -3310,7 +3628,10 @@ export const RULE_W = {
     if (!ranClear(ctx)) return [];
     const out = [];
     // 支① 交付物(docs/clipboard 文章):须只读子代理审读且入参绑定文件名
-    const names = H.deliverablesOf(ctx);
+    // D101②(2026-09-06 用户亲签「1 做」):**用户本轮原话**明示免外审 ⇒ 支①放行。
+    //   证据取 `ctx.userText`(用户自己的消息,不是我转述的「用户说过」),窗口内的用户话也认;
+    //   只免交付物支,不免支②(生产内容写入的外审是 W′ 修正案另签的)。
+    const names = H.userExempt(ctx) ? [] : H.deliverablesOf(ctx);
     if (names.length) {
       // 2026-08-22 用户裁定:充分性=battle/codex 在场;绑定=某外审入参提及文件名(codex/grill 皆可作载体)。
       if (!H.battleOrCodex(ctx)) out.push(`本批交付物外审不充分(仅 grill 或全无——须 battle/codex 在场):${names.slice(0, 4).join(", ")}`);
@@ -3434,9 +3755,45 @@ export const RULE_W = {
         write: "clipboard/mapgen/tdd/README.md",
         prior: [{ text: "审读轮", bash: "node ~/.claude/scripts/codex-run.mjs --task t.md",
                   agent: { type: "grill:edge-cases", prompt: "审 clipboard/mapgen/tdd/README.md" } }] },
+      // D101②(2026-09-06 亲签):**用户本轮原话**免外审 ⇒ 交付物支放行(证据是 userText,不是我的转述)
+      { name: "D101②:用户原话免外审 ⇒ 放行",
+        user: "这份 README 别外审了,直接关账。",
+        text: "按你说的不外审,收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+        write: "clipboard/oss/public-repo/README.md" },
     ],
   },
 };
+// D101② 的两条反向钉(pos):①我**转述**「用户说别外审」但用户话里没有 ⇒ 照拦(措辞面伪造);
+//   ②用户话里的「外审」是在**引用闸拦词**(剥引文后不剩豁免形态)⇒ 照拦。
+RULE_W.cases.neg.push({
+  // codex 182 Q2 给的三句「是免审却不命中」之一,现认
+  name: "D101②:「这次不需要外审。」也是免审",
+  user: "这次不需要外审。",
+  text: "收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+  write: "clipboard/oss/public-repo/README.md",
+});
+RULE_W.cases.pos.push({
+  // 红队 182 BP-4:否定-否定形态是**要求外审**
+  name: "BP-4:「不要跳过外审」「不能免于复核」是要求外审,不是免审",
+  user: "这份 README 不要跳过外审,也不能免于复核。",
+  text: "收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+  write: "clipboard/oss/public-repo/README.md",
+}, {
+  // codex 182 Q2 给的三句「不是免审却命中」,首版全免:限制耗时 / 要求审对 / 改审查对象
+  name: "codex-182 Q2:「别审太久」「不要审错」「不用审核旧稿」都不是免审",
+  user: "别审太久。不要审错。不用审核旧稿,只审新版。",
+  text: "收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+  write: "clipboard/oss/public-repo/README.md",
+}, {
+  name: "D101② 反向钉:转述用户免审不算(userText 里没有)",
+  text: "用户说过别外审,收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+  write: "clipboard/oss/public-repo/README.md",
+}, {
+  name: "D101② 反向钉:用户引用闸拦词「须外审」不是豁免",
+  user: "闸刚才说「本批交付物须外审」,这是什么意思?",
+  text: "名词日记:不适用,因这是对闸拦词的追问。收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+  write: "clipboard/oss/public-repo/README.md",
+});
 // ===== RULE_W END =====
 
 /** V:呈签清单缺「免签例外已核」痕迹(绊线,2026-08-25 批 102)。
@@ -3644,5 +4001,72 @@ const RULE_ND = {
   },
 };
 
+// ── CW:收尾时点另有活跃写会话(D95,2026-09-06 用户亲签「7 签吧」;首批**提示不阻断**)────
+// 立法动机:宪法恒定条款①「同一时刻只许一个写会话」的触发层原来只有开工三查①,
+//   「跑一次只能证明那一刻没人在写」。2026-08-28 两个写会话并发一整天、`git add -A` 互相扫进对方半成品、
+//   欠账编号撞车,全程零闸响。判据与工装(session-triage)都是现成的,这里只是把检查挪到收尾面。
+// 样本:批132 一误报(mtime 心跳污染,成因已被进程亡短路盖住)、批135/181 两干净 ⇒ 先以提示跑一批量误报,
+//   零误报后再议升阻断(升阻断=守卫语义改动,归亲签;届时 UNKNOWN 也须报)。
+// 注入面:hook 在 Stop 主路径跑一次 `session-triage --json`,只取①行注入 `ctx.concurrentWriters`
+//   ({status, detail});null=通道没接/探测失败 ⇒ 不响(提示面 fail-open,与「没窗口≠窗口空」同口径)。
+// CEILING:它只报三查①的判定,判定本身的天花板在 session-liveness(mtime 心跳、进程亡短路);
+//   codex 只读进程按宪法豁免,是它自己的口径不是本条的。
+const RULE_CW = {
+  id: "CW",
+  blocking: false,
+  law: "docs/laws/collab.md#开工两查",
+  requires: ["concurrentWriters"],
+  // 本条**没有文本面或动作面出路**(刻意):它的凭证是注入值本身——下一次 Stop 时三查①变 PASS 就不响。
+  //   任何「本轮做了 X 就消音」的出路都是命令面字符串,codex/红队 182 同判可伪造(BP-11);
+  //   故**不声明 escapes**(INV-7 要求声明了就非空、消息写了出路就必须声明——这里两边都不写),消息只写**处置**。
+  detect: (ctx) => {
+    const cw = ctx.concurrentWriters;
+    if (!cw || typeof cw !== "object") return [];
+    const st = String(cw.status || "").toUpperCase();
+    if (st === "PASS") return [];
+    // ⚠️ 首版有一条「本轮重跑过三查 ⇒ 不重复提示」的动作面出路,codex 182 Q4③ 与红队 BP-11 同判开口:
+    //   命令串含文件名(grep/echo/cat)即消音,而**注入值本身就是 Stop 时点的最新判定**——重跑之后若仍 FAIL,
+    //   它注入的就是 FAIL;若已 PASS,本条本来不响。出路凭证=注入值,不看命令面 ⇒ 整条出路删除。
+    return [`${st || "UNKNOWN"}:${String(cw.detail || "").slice(0, 160)}`];
+  },
+  exempts: [],
+  message: (hits) =>
+    `**收尾时点三查①不是 PASS**(${hits[0]})——宪法恒定条款①「同一时刻只许一个写会话」,开工查一次管不了后来(D95 实撞:两会话并发一整天零闸响)。\n` +
+    `      处置:先看对方会话最后一条 user/assistant 的时间(不看 mtime)判它是不是真在写;真在写 ⇒ 协调只留一个写会话;` +
+    `对方是只读会话 ⇒ 让它跑 \`session-triage --declare-readonly\` 落标记。本条凭证=下一次 Stop 时注入的三查①结果,不认本轮命令面。\n` +
+    `      本条首批只提示;误报形态(mtime 心跳污染)已由进程亡短路盖住,若仍误报 → --fp CW 记账。`,
+  mutations: [
+    { name: "UNKNOWN 不报(只报 FAIL)", apply: (r) => ({ ...r, detect: (ctx) => {
+      const cw = ctx.concurrentWriters;
+      if (!cw || String(cw.status || "").toUpperCase() !== "FAIL") return [];
+      return [`FAIL:${String(cw.detail || "").slice(0, 160)}`];
+    } }) },
+    { name: "PASS 也报(去掉唯一的放行支)", apply: (r) => ({ ...r, detect: (ctx) => {
+      const cw = ctx.concurrentWriters;
+      if (!cw || typeof cw !== "object") return [];
+      return [`${String(cw.status || "UNKNOWN").toUpperCase()}:${String(cw.detail || "").slice(0, 160)}`];
+    } }) },
+  ],
+  cases: {
+    pos: [
+      { name: "CW:三查①FAIL 点名活跃写会话", text: "收工。",
+        concurrentWriters: { status: "FAIL", detail: "活跃写会话 cd1c7cae(mode=normal)" } },
+      { name: "CW:三查①UNKNOWN 也报(判不了≠没有)", text: "收工。",
+        concurrentWriters: { status: "UNKNOWN", detail: "会话目录不可读" } },
+      // 红队 BP-11 反向钉:命令串里出现探针文件名不是出路
+      { name: "BP-11:只是 grep 了探针文件,FAIL 照报", text: "收工。",
+        bash: "grep -n foo scripts/session-triage.mjs",
+        concurrentWriters: { status: "FAIL", detail: "活跃写会话 cd1c7cae" } },
+      // 红队 BP-12:通道**没接**(undefined)⇒ 契约层报「必需通道缺席,未能判定」(非阻断提示)——
+      //   不供与供 null 是两件事;首版 gate-ctx 把没接归一成 null,这条契约从未生效。
+      { name: "BP-12:通道没接 ⇒ 契约层报未能判定", text: "收工。" },
+    ],
+    neg: [
+      { name: "CW:PASS 不响", text: "收工。", concurrentWriters: { status: "PASS", detail: "无并发写" } },
+      { name: "CW:接了但探测失败(null)⇒ 不响(提示面 fail-open;适配层已把无 JSON 归成 UNKNOWN,null 只剩「无 session_id」一种来源)", text: "收工。", concurrentWriters: null },
+    ],
+  },
+};
+
 export const RULES = [RULE_O, RULE_V, RULE_W, RULE_Q, RULE_D, RULE_G, RULE_B, RULE_C, RULE_H, RULE_F, RULE_L, RULE_N, RULE_I, RULE_J, RULE_M,
-  RULE_E0, RULE_E1, RULE_E2, RULE_K, RULE_K0, RULE_S, RULE_T, RULE_U, RULE_P, RULE_ND, RULE_X];
+  RULE_E0, RULE_E1, RULE_E2, RULE_K, RULE_K0, RULE_S, RULE_T, RULE_U, RULE_P, RULE_ND, RULE_X, RULE_CW];

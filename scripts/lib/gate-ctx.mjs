@@ -58,7 +58,11 @@ export function buildCtx(entries, extra = {}) {
   for (const e of entries) {
     if (e?.type === "user") {
       const uc = e.message?.content;
-      if (typeof uc === "string") userText += uc + "\n";
+      // 红队 182 BP-6:字符串型 user 条目里混着 harness 回灌的文本(「Stop hook feedback:」「[SYSTEM NOTIFICATION」
+      //   「<task-notification>」)——那是闸/后台任务在说话,不是用户;W 的用户豁免、ND 的名词问都不得从它们取证。
+      if (typeof uc === "string") {
+        if (!/^\s*(Stop hook (feedback|additional context)|\[SYSTEM NOTIFICATION|<task-notification>|<cross-session-message)/.test(uc)) userText += uc + "\n";
+      }
       else if (Array.isArray(uc)) for (const b of uc) {
         if (b?.type === "text") userText += (b.text || "") + "\n";
       }
@@ -67,9 +71,12 @@ export function buildCtx(entries, extra = {}) {
     if (e?.type !== "assistant") continue;
     const c = e.message?.content;
     if (!Array.isArray(c)) continue;
+    // 动作带条目时间戳(ms;转录条目有 `timestamp`,夹具没有 ⇒ null)。消费者:P 的红队凭证池按批武装时刻切
+    //   (红队 186 BP-1~8:用「提交」近似批边界被八种写法打穿,批号武装时刻才是本仓的批时钟)。
+    const at = Date.parse(String(e.timestamp || "")) || null;
     for (const b of c) {
       if (b?.type === "text") text += (b.text || "") + "\n";
-      else if (b?.type === "tool_use") actions.push({ name: b.name, input: b.input || {} });
+      else if (b?.type === "tool_use") actions.push({ name: b.name, input: b.input || {}, at });
     }
   }
   if (typeof extra.lastAssistantMessage === "string") text += extra.lastAssistantMessage + "\n";
@@ -102,7 +109,10 @@ export function buildCtx(entries, extra = {}) {
     .filter((seg) => {
       if (!/^(\w+=\S+\s+)*git\b/.test(seg)) return false;   // 段首必须是 git(允许前置 VAR=)
       if (!/\bcommit\b/.test(seg)) return false;
-      if (/--dry-run/.test(seg)) return false;               // 刻意不提交
+      // 红队 186 BP-6:`--dry-run` 原在**原始段**上测 ⇒ 提交信息里写一句「drop --dry-run flag」就让整笔承重提交
+      //   对 P 隐形(didCommit=false,计账也不计)。先剥 -m/-F 载荷再测;这里是唯一实现,P 的边界判据复用同口径。
+      const noMsg = seg.replace(/(?:-m|--message|-F|--file)(?:\s+|=)(?:"[^"]*"|'[^']*'|\S+)/g, " ");
+      if (/--dry-run\b/.test(noMsg)) return false;           // 刻意不提交
       return true;
     });
 
@@ -178,6 +188,10 @@ export function buildCtx(entries, extra = {}) {
   //   这版是 `hook-guard` 在**写发生之前**用 `existsSync` **量**出来的,不是推断。
   //   注入面(调用方可控、夹具可控),与 `tracked`/`justAdded` 同形。
   //   **无记录时退回旧判据**——那是**误报**侧,不开漏放口(经 Bash 造的文件走这一支)。
+  // ⚠️ D100(2026-09-06)试过一版「记录同时按 relOf 形收进来」——**当轮被自测打红撤回**:
+  //   relOf 会把不同用户目录下的同名 memory 文件折成同一个键,一条别人的记录就能让
+  //   「无记录仍算新建」那侧塌掉(接缝自测 D56 反向钉当场变红)。比对**只认全路径**;
+  //   `~/…` 形的目标由记录方(hook-guard)同时记 raw 与展开形解决,不在这里放宽。
   const preExisted = extra.preExisted instanceof Set ? extra.preExisted : null;
   const isNew = (p) => {
     const rel = relOf(p);
@@ -185,7 +199,11 @@ export function buildCtx(entries, extra = {}) {
     if (justAdded && justAdded.has(rel)) return true;   // 本轮刚加进来的,仍算新建
     if (tracked.has(rel)) return false;
     // 仓外/未跟踪:git 说不上话,只能看写前那一刻的实测。
-    if (preExisted && (preExisted.has(rel) || preExisted.has(String(p).replace(/\\/g, "/")))) return false;
+    // ⚠️ 原式还认 `preExisted.has(rel)`(相对形)。codex 复核(2026-09-06)逮到:Bash 面记录可以是相对形,
+    //   于是一条 `.claude/projects/D--test/memory/n.md` 记录能让**另一用户目录**下同名文件判「已存在」
+    //   ——与当轮撤回的 relOf 放宽是同一个洞换了个入口。现只认全路径;
+    //   记录方(hook-guard)已按 cwd 解析并同时记 raw 原形,对不上就退回「新建」(误报侧)。
+    if (preExisted && preExisted.has(String(p).replace(/\\/g, "/"))) return false;
     return true;
   };
 
@@ -275,6 +293,15 @@ export function buildCtx(entries, extra = {}) {
         ? { carriers: Number.isFinite(+extra.pLedger.carriers) ? Math.max(0, Math.floor(+extra.pLedger.carriers)) : 0 }
         : null),
     bgTasks: Array.isArray(extra.bgTasks) ? extra.bgTasks : null,
+    /** 并发写会话(D95,2026-09-06 用户亲签接线):收尾时点跑一次三查①的结果,注入形
+     *  `{status:"PASS"|"FAIL"|"UNKNOWN", detail}`;`null`=通道没接/探测失败(离线回放、夹具)。
+     *  规则不自己 spawn 探针(热路径纪律),hook 跑一次注入。消费者只有 CW 项。 */
+    //   三态与 pLedger 同构(红队 182 BP-12:首版把「没注入」也归一成 null ⇒ CW 的 `requires` 契约永不触发,
+    //   宣称了一个不存在的保护):undefined=通道没接(夹具/离线回放,契约层跳过规则)/ null=接了但探测失败 / 对象=判定。
+    concurrentWriters: extra.concurrentWriters === undefined ? undefined
+      : (extra.concurrentWriters && typeof extra.concurrentWriters === "object"
+        ? { status: String(extra.concurrentWriters.status || "UNKNOWN"), detail: String(extra.concurrentWriters.detail || "") }
+        : null),
     /** 便捷谓词。规则应当优先用这些,而不是自己写正则去扫 `text`。 */
     didCommit: () => commits.length > 0,
     wroteAny: (re) => writes.some((p) => re.test(p)),

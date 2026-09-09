@@ -91,8 +91,27 @@ export const CARRIERS = [
 //   交付物=方法论/教程/报告类 .md 产出。**台账与日记类刻意排除**(审台账行=纯税);
 //   clipboard 在 gitignore 面、永不提交 ⇒ commit 触发的 P 天生看不见它,
 //   故 W 项挂在 --clear 上——这正是本面单列、不并入 loadBearing 的理由。
-const DELIVERABLE_INCLUDE = /clipboard\/[\w./ -]*\.md\b|docs\/[\w.-]+\.md\b/;
-const DELIVERABLE_EXCLUDE = /docs\/(laws\/|gate-debts|noun-diary|product-diary|tool-register|tool-index|prod-facts|repo-brief)/;
+// ⚠️ INCLUDE 原为 `[\w./ -]*`+ 无 `i`:CJK 文件名(`clipboard/教程.md`)与 `.MD` 从来不是交付物
+//   (grill 复核 2026-09-06 逮到,顺带使下面的 `回件` 排除支根本不可达——自测那条是空过的)。
+//   现加 CJK 区段与 `i`;方向是**收紧**(更多真交付物进 W)。
+const DELIVERABLE_INCLUDE = /clipboard\/[\w./ 一-鿿-]*\.md\b|docs\/[\w.-]+\.md\b/i;
+// ⚠️ D101①(2026-09-06):clipboard 面原来**零排除**——任何 clipboard 下的 md 都是交付物,
+//   于是**审计的产物**(codex/grill 回件、处置单、派给外审的任务文件)被当成**被审物**,
+//   W 要求「再找人审一遍这份审计处置单」,同一文件两轮各拦一次。
+//   首版按裸词 `audit`/`task` 排除,grill 复核当轮判「开了口子」:`how-to-audit.md`(公开仓教程)、
+//   `security-audit-report.md`(报告)、`task-management.md` 全被免审——那正是 W 存在的最贵一类。
+//   现改两半:①**目录面**:`clipboard/{codex,audit,battle,grill}/` 下全是外审的进出件;
+//   ②**文件名面**只认审计产物的**专名形**:`disposition` / `回件` / `<codex|grill|battle>-audit` /
+//   `audit-r<n>` / `task-<n>` / `<n>-task`。裸 `audit`/`task` 不再算。
+//   **天花板**:落在别的目录、名字又不带专名形的审计产物照拦;想免审走 fp 台账——
+//   用户豁免入口(D101②)属改闸语义,归亲签,本条不碰。
+const DELIVERABLE_EXCLUDE = new RegExp(
+  "docs/(laws/|gate-debts|noun-diary|product-diary|tool-register|tool-index|prod-facts|repo-brief)" +
+  "|clipboard/(?:codex|audit|battle|grill)/" +
+  // 2026-09-07(批 184,窄例外③判据过重):撞额度待续标记 `clipboard/.pending-after-limit.md`(全局规范§八约定载体)
+  //   被当交付物,每次 --clear 各拦一次。点文件是状态/标记,不是文章;整族排除。
+  "|clipboard/(?:[^/]*/)*\\.[^/]*\\.md$" +
+  "|clipboard/(?:[^/]*/)*[^/]*(?:disposition|回件|(?<![^/_-])(?:codex|grill|battle)-audit|audit-r\\d+|(?<![^/_-])task-\\d+|\\d+-task(?=[-_.]))[^/]*\\.md$", "i");
 /** 生产内容写入命令(W′ 修正案的判据面,2026-08-22 亲签):
  *  ai-note/feed/bulk 管线全部经这些脚本走生产——动作面上可见,单源在此。 */
 export const CONTENT_WRITE_RE = /write-node\.mjs|prod-lib\.mjs|bulk[-_]?create|deploy-prod/;
@@ -244,13 +263,13 @@ export function selfTest() {
 
   // ── D86 回归钉(2026-08-27,I 项当场误报逼出来的):**路径面必须锚到开头**。
   //   不锚 ⇒ 任何**含有** `scripts/*.mjs` 或 `.claude/agents/` 的路径都算载体:
-  //   外发暂存树(`clipboard/oss/<公开仓暂存目录>/…`,当轮实撞)、`node_modules/…` 全中招。
+  //   外发暂存树(`clipboard/oss/public-repo/…`,当轮实撞)、`node_modules/…` 全中招。
   //   同时钉反向:命令串面**不许**锚(`git add scripts/x.mjs` 里那段不在开头),
   //   否则把 P 的命令面判据打瞎 ⇒ 漏放。两个用途、两条判据,钉子也分两侧。
   for (const [p, want] of [
     ["scripts/lib/x.mjs", true], [".claude/agents/a.md", true],
-    ["clipboard/oss/<公开仓暂存目录>/scripts/lib/x.mjs", false],
-    ["clipboard/oss/<公开仓暂存目录>/.claude/agents/a.md", false],
+    ["clipboard/oss/public-repo/scripts/lib/x.mjs", false],
+    ["clipboard/oss/public-repo/.claude/agents/a.md", false],
     ["node_modules/a/scripts/b.mjs", false],
   ]) {
     chk(`D86 路径面排除非载体区  ${p.padEnd(40)}`, isCarrierPath(CREATION_SURFACE, p), want);
@@ -268,7 +287,7 @@ export function selfTest() {
     [CARRIER_SURFACE, "AGENTS.md", true, "本仓宪法"],
     [CARRIER_SURFACE, "/other/AGENTS.md", true, "**他仓宪法照样算**——宪法约束的是执行方,不是文件户籍"],
     [CARRIER_SURFACE, "/other/docs/laws/x.md", true, "他仓法典同上"],
-    [CARRIER_SURFACE, "clipboard/oss/<公开仓暂存目录>/AGENTS.md", false, "暂存树:按**区域**剔除,与户籍无关"],
+    [CARRIER_SURFACE, "clipboard/oss/public-repo/AGENTS.md", false, "暂存树:按**区域**剔除,与户籍无关"],
     [CREATION_SURFACE, "C:/Users/x/.claude/projects/example-project/memory/y.md", true, "memory:刻意纳入的仓外载体"],
   ]) {
     chk(`D93′ 载体面  ${p.slice(-40).padEnd(40)} ${why}`, isCarrierPath(surf, p), want);
@@ -276,6 +295,34 @@ export function selfTest() {
 
   chk("D86 命令串面**不**排除(否则 P 的命令判据被打瞎)",
     CARRIER_SURFACE.test(normPath("git add scripts/lib/gate-rules.mjs")), true);
+
+  // ── D101① 回归钉(2026-09-06):clipboard 面的**审计产物**不是交付物;真交付物照旧。
+  for (const [p, want, why] of [
+    ["clipboard/audit/grill-audit-aicover-readme-r1-disposition.md", false, "处置单(当日实撞)"],
+    ["clipboard/prompts/grill-audit-x-r1-disposition.md", false, "处置单落在别的目录:专名形仍认"],
+    ["clipboard/codex/codex-audit-145.md", false, "codex 回件"],
+    ["clipboard/codex/task-181.md", false, "派给外审的任务文件"],
+    ["clipboard/codex/181-回件.md", false, "中文回件(INCLUDE 补 CJK 后本支才可达)"],
+    ["clipboard/battle/181-verdict.md", false, "battle 目录整目录是外审进出件"],
+    ["clipboard/oss/public-repo/README.md", true, "README 类交付物仍算"],
+    ["clipboard/gate-playbook.md", true, "方法论文章仍算"],
+    // grill 复核(2026-09-06)给的三条真交付物:首版裸词排除把它们全免了
+    ["clipboard/oss/public-repo/docs/how-to-audit.md", true, "公开仓教程:名字含 audit 不得免审"],
+    ["clipboard/reports/security-audit-report.md", true, "报告:名字含 audit 不得免审"],
+    ["clipboard/mapgen/task-management.md", true, "教程:名字含 task 不得免审"],
+    ["clipboard/mapgen/multitask-guide.md", true, "名字里含 task 但无边界 ⇒ 不误免"],
+    ["clipboard/教程.md", true, "CJK 文件名也是交付物(原 INCLUDE 不认)"],
+    // codex 复核(2026-09-06)另给的三真三假
+    ["clipboard/audit-methodology.md", true, "审计方法论是交付物"],
+    ["clipboard/task-scheduling-tutorial.md", true, "任务调度教程是交付物"],
+    ["clipboard/codex/181-findings.md", false, "codex 目录下的回件(目录面)"],
+    ["clipboard/grill/181-review.md", false, "grill 目录下的回件(目录面)"],
+    ["clipboard/Playbook.MD", true, "大小写不敏感"],
+    ["docs/gate-debts.md", false, "docs 面台账排除不变"],
+    // 批 184:点文件/待续标记不是交付物;同名非点文件仍是
+    ["clipboard/.pending-after-limit.md", false, "撞额度待续标记(全局规范§八载体)"],
+    ["clipboard/pending-after-limit.md", true, "同名非点文件仍算交付物(排除只认点文件)"],
+  ]) chk(`D101 交付物面  ${p.slice(-44).padEnd(44)} ${why}`, isDeliverable(p), want);
 
   let pass = 0;
   for (const [r, n, extra] of t) { if (r === "FAIL") console.log(`  FAIL  ${n}  ← ${extra}`); if (r === "PASS") pass++; }

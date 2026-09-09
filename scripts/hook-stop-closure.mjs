@@ -454,7 +454,7 @@ function checkAFromPayload(tasks, raw, text) {
     const id = String(t?.id || "");
     if (!id) continue;
     const st = String(t?.status || "").toLowerCase();
-    if (/run|pend|progress|queue|active/.test(st)) continue;      // 在飞 ⇒ 放行
+    if (BG_RUNNING_STATUS.test(st.trim())) continue;               // 在飞 ⇒ 放行(整词枚举,与 S 的 bgRunning 同一份;子串版让 inactive 也算在飞)
     if (raw.includes(id) || text.includes(id)) continue;          // 本轮提过 ⇒ 跟过了
     open.push(`${id}(${st || "unknown"}${t?.description ? " · " + String(t.description).slice(0, 30) : ""})`);
   }
@@ -579,6 +579,12 @@ export function ranProbe(blob) {
  *  这正是 `isNew` 当初要修的那个误拦(「连改三轮同一个既有文件被连拦三次」),
  *  被合并原样放回来,而且这次带 `block: true`。
  *  修法不是改分类表,是**别用 m[0]**:拿 `bashWrites` 已经解出来的目标。 */
+/** 重定向目标的路径 token,**只此一份**(D100,2026-09-06;grill 复核逮到「两处须一起改」其实是三处:
+ *  本函数、`bashWrites` 的普通支、`bashWrites` 的 execForm 支——改了两处漏一处,
+ *  `node gen.mjs > ~/…/memory/x.md` 对 I 隐形)。允许盘符 / `~` / `$HOME` 前缀;
+ *  `${VAR}`、含空格的引号路径仍解不出——那是**漏放侧**(bashWrites 直接 false,I 根本不跑),不是误报侧。 */
+const PATH_TOK = String.raw`(?:[A-Za-z]:|~|\$HOME|\$\{HOME\})?[\w./-]+`;
+const REDIRECT_TARGET_RE = new RegExp(String.raw`(?<![=\-])>>?\s*['"]?(${PATH_TOK})`, "g");
 export function bashWriteTargets(rawCmd, pathRe) {
   // ⚠️ heredoc 界符要认**引号形式**(codex 2026-08-20:原式只认 `<<'X'` 与 `<<X`,
   //   而 `cat <<"EOF"` 剥不掉 ⇒ **正文被当命令**,产生假写入)。
@@ -606,7 +612,11 @@ export function bashWriteTargets(rawCmd, pathRe) {
     //   `node -e '….map(r=>r.ts)'` 的 `=>r.ts` 被当成 `> r.ts` ⇒ M 要求回读一个不存在的文件。
     //   箭头在 node -e 内联脚本里是日常形态,不修则天天复发。`->`(如 clang 参数)一并排除;
     //   合法的 `2>`/`&>`/`>>` 不受影响(前导是数字/&/空白,不在排除集里)。
-    for (const m of seg.matchAll(/(?<![=\-])>>?\s*['"]?([\w./-]+)/g)) { if (!/^\/dev\//.test(m[1])) out.push(m[1]); }
+    // ⚠️ D100(2026-09-06):路径类原来是 `[\w./-]+`,**吃不下盘符与 `~`**——
+    //   `cat >> C:/Users/…/memory/x.md` 只取到 `C`,`>> ~/.claude/…` 一个字都取不到
+    //   ⇒ 目标解不出 ⇒ 调用点按「未解出目标」兜底成命中(fail-closed),既有文件的追加也被判新建。
+    //   路径类见 `PATH_TOK`(单源)。
+    for (const m of seg.matchAll(REDIRECT_TARGET_RE)) { if (!/^\/dev\//.test(m[1])) out.push(m[1]); }
     // ⚠️ `--` 是**参数终止符**,取目标时要跳过它(codex 2026-08-20:
     //   `sed -i 's/x/y/' -- 既有文件` 会把 `--` 取成目标 ⇒ 过滤后 targets 为空
     //   ⇒ 调用点报「未解出目标」⇒ **阻断一次改既有文件的正常操作**)。
@@ -657,7 +667,8 @@ export function bashWrites(rawCmd, pathRe) {
     const execForm = new RegExp(`(node|python3?|bash|sh|npx|pnpm)\\s+(--?[\\w-]+\\s+)*${"[^|;&]*"}`).exec(seg);
     if (execForm && pathRe.test(execForm[0])) {
       // 载体在执行位:只有当写动作的**目标**另有其路径时才算写
-      const target = /(?:writeFileSync|appendFileSync)\s*\(\s*['"]([^'"]+)|>>?\s*([\w./-]+)|sed\s+-i[^ ]*\s+\S+\s+([\w./-]+)/.exec(seg);
+      // 路径类用 `PATH_TOK`(D100 三处之一;grill 复核逮到这一处漏改 ⇒ `node gen.mjs > ~/…/memory/x.md` 对 I 隐形)
+      const target = new RegExp(String.raw`(?:writeFileSync|appendFileSync)\s*\(\s*['"]([^'"]+)|>>?\s*['"]?(${PATH_TOK})|sed\s+-i[^ ]*\s+\S+\s+(${PATH_TOK})`).exec(seg);
       const t = target ? (target[1] || target[2] || target[3] || "") : "";
       return !!t && pathRe.test(t);
     }
@@ -667,7 +678,8 @@ export function bashWrites(rawCmd, pathRe) {
     //   `grep -Rl x .claude/skills/ 2>/dev/null` 被判成「本轮新建载体」——
     //   载体是被**读**的对象,`>` 的目标是 /dev/null。同族第 N 次:判据看措辞不看后果。
     if (/writeFileSync|appendFileSync|sed\s+-i|tee\s/.test(seg)) return true;
-    for (const m of seg.matchAll(/>>?\s*['"]?([\w./-]+)/g)) {
+    // 路径类见 `PATH_TOK`(D100 三处之一)。
+    for (const m of seg.matchAll(new RegExp(String.raw`>>?\s*['"]?(${PATH_TOK})`, "g"))) {
       if (/^\/dev\//.test(m[1])) continue;            // 丢进黑洞不算写
       if (pathRe.test(m[1])) return true;
     }
@@ -791,18 +803,53 @@ let _trackedCache;
  *  与 `tracked` 同为**注入面**——规则不自读磁盘(那条纪律的代价已实测过)。
  *  读失败/文件不在 ⇒ 返回 null ⇒ `isNew` 退回旧判据(误报侧,不开漏放口)。 */
 let _preExistedCache;
-function preExistedSet() {
+/** @param {string} [sid] 本会话 id。**按会话过滤、任一 false 记录即判新建**(D104(b);首版「只认首笔」对
+ *  rm+重建哑,已改。codex 复核 2026-09-06「你没问到」①):
+ *  原实现把整份台账里凡 `existed:true` 的路径都收——「首次创建前 false、第二次追加前 true」两笔普通写入
+ *  就让本批新建的载体判成既有(漏放);台账又从不修剪,几天前的 true 对今天的 rm+重建同样生效。
+ *  现:有 sid 且台账里有本会话记录 ⇒ 只看本会话,按路径取**第一笔**的 existed;
+ *  无 sid(离线回放/夹具)或本会话零记录 ⇒ 退回旧口径(误报侧不变,漏放侧不再扩大到本会话之外)。 */
+function preExistedSet(sid) {
   if (_preExistedCache !== undefined) return _preExistedCache;
   try {
-    const txt = fs.readFileSync(".claude/.carrier-precheck.jsonl", "utf8");
-    const set = new Set();
+    // 路径与 hook-guard 写侧同一环境变量改道(只供自测,不污染真台账)
+    const txt = fs.readFileSync(process.env.GATE_CARRIER_PRECHECK_FILE || ".claude/.carrier-precheck.jsonl", "utf8");
+    const rows = [];
     for (const line of txt.split(/\r?\n/)) {
       if (!line.trim()) continue;
-      try { const r = JSON.parse(line); if (r && r.existed && r.path) set.add(String(r.path)); } catch { /* 跳过坏行 */ }
+      try { const r = JSON.parse(line); if (r && r.path) rows.push(r); } catch { /* 跳过坏行 */ }
+    }
+    const mine = sid ? rows.filter((r) => r.sid === sid) : [];
+    const use = mine.length ? mine : rows;
+    // D104(b)(2026-09-06,窄例外④自签,收紧方向):一条路径**只要在所考虑的记录里出现过一次 false**,
+    //   就当本会话新建——覆盖「首次创建前 false」与「rm 后重建前 false」两种形态;
+    //   原「只看首笔」对后者哑(首笔 true 盖住后来的 false)。方向是更多路径判新建(误报侧)。
+    const seenFalse = new Set(), anyTrue = new Map();   // path → raw(取最早一笔 true 的 raw)
+    for (const r of use) {
+      const p = String(r.path);
+      if (!r.existed) { seenFalse.add(p); continue; }
+      if (!anyTrue.has(p)) anyTrue.set(p, r.raw);
+    }
+    const set = new Set();
+    for (const [p, raw] of anyTrue) {
+      if (seenFalse.has(p)) continue;
+      set.add(p);
+      // D100:Bash 面记录带 `raw`(命令里的 `~/…` 原形);收尾侧目标解出来就是原形,只认全路径比对。
+      if (raw) set.add(String(raw));
     }
     _preExistedCache = set;
   } catch { _preExistedCache = null; }
   return _preExistedCache;
+}
+
+/** D95/CW 注入面的解析(顶层定义,主路径与自测共用)。红灯(FAIL/UNKNOWN,退出码 3)带着完整 stdout,
+ *  照样解析;真超时/无 JSON ⇒ UNKNOWN,不沉默。机理与撞坑记在文件末尾主路径的注里。 */
+export function triageResultFrom(stdoutText) {
+  let j;
+  try { j = JSON.parse(String(stdoutText || "")); } catch { return { status: "UNKNOWN", detail: "session-triage 无 JSON 输出(超时或执行故障)" }; }
+  const r1 = (Array.isArray(j.results) ? j.results : []).find((r) => r && (r.id === "①" || /唯一写会话/.test(String(r.name || ""))));
+  return r1 ? { status: String(r1.status || "UNKNOWN").toUpperCase(), detail: String(r1.detail || "").slice(0, 400) }
+    : { status: "UNKNOWN", detail: "session-triage 输出里没有①行" };
 }
 
 /** `git log -1 --diff-filter=A` 的进程内缓存(同 _trackedCache 的理由)。 */
@@ -842,7 +889,7 @@ import { CARRIER_SURFACE, normPath as normPathC, isCarrierPath as isCarrierPathC
 //   我此前断言「循环依赖是这道缝做不成的唯一技术障碍」——**那是没试就说的**,
 //   探针(scratchpad/cycle-probe)三条全过:两边 import 成功、依赖 PAT 的规则在环里正常命中、
 //   旧实现同进程也正常。**障碍不存在,缝一直做得成。**
-import { RULES, ranClear as ranClearRule, maskQuoted } from "./lib/gate-rules.mjs";
+import { RULES, ranClear as ranClearRule, maskQuoted, BG_RUNNING_STATUS } from "./lib/gate-rules.mjs";
 // `validateRules` 是 2026-08-20 才接进**生产路径**的 —— 此前它只在 `gate:accept` 里跑,
 // 于是 INV-1..4 对真跑的闸完全不生效(grill:recon 查出,`grep -c` = 0)。
 import { runRules, validateRules } from "./lib/gate-registry.mjs";
@@ -1090,7 +1137,11 @@ export function run(transcriptPath, ctx = {}) {
         // `justAdded` 同样要传:少了它,今天亲签的「取证时机前移」在接管后原样失效(grill A3)
         justAdded: _justAddedCache instanceof Set ? _justAddedCache : undefined,
         // D56:写之前实测的「已存在」集合(仓外/未跟踪文件唯一说得上话的证据)
-        preExisted: preExistedSet() || undefined,
+        preExisted: preExistedSet(ctx.sessionId) || undefined,
+        // D95:收尾时点三查①,由文件末尾主路径跑一次注入。三态(红队 182 BP-12):
+        //   live 且没注入 ⇒ 保持 undefined ⇒ CW 的 requires 契约报「必需通道缺席」(hook 忘了注入是缺陷,不是没有);
+        //   离线回放/自测/dry-run 本来就探不了 ⇒ 归 null(「查过了,没有」),免得每轮回放都刷一条契约提示。
+        concurrentWriters: ctx.concurrentWriters !== undefined ? ctx.concurrentWriters : (ctx.live ? undefined : null),
         lastAssistantMessage: typeof ctx.text === "string" ? ctx.text : undefined,
         bgTasks: ctx.bgTasks,
         // 批次状态**在这里读一次、注入进去**,不让规则自己读磁盘 ——
@@ -1142,7 +1193,9 @@ export function run(transcriptPath, ctx = {}) {
           //   天花板写明:窗口里的旧一轮通道在滑出前可能多次抵账(有界宽松,上限=400 条窗口),
           //   方向是少收税;反向(原 bug)是无界多收。
           const scope = _P.scopeActions(eCtx);
-          const allThree = _P.CH.every((ch) => scope.some((a) => { try { return ch.test(a); } catch { return false; } }));
+          // codex 185「你没问到」3:这里原来 `ch.test(a)` 不带 ctx ⇒ 计账侧按通用口径认 grill 充分、判据侧却欠红队,
+          //   台账被清零而义务未兑现。计账与判据必须同一张脸:带 eCtx。
+          const allThree = _P.CH.every((ch) => scope.some((a) => { try { return ch.test(a, eCtx); } catch { return false; } }));
           const next = allThree ? 0 : prior + mine;
           if (next !== prior || allThree) {
             // D52(批 104):裸 writeFileSync=截断后写,崩在中间读者见半文件;换 tmp+rename 原子写
@@ -1482,7 +1535,8 @@ function selfTest() {
     { name: "G v2 命中:触闸机件提交而无自测动作(④)",
       lines: [U("go"), A("改闸,提交", [
         { name: "Edit", input: { file_path: "/repo/scripts/hook-stop-closure.mjs" } },
-        { name: "Bash", input: { command: "git commit -m x" } }])], want: ["G", "K0"] },
+        // 2026-09-07 起 P 也响:闸引擎提交无绑定红队 ⇒ 不计宽限(D11 独立于宽限)
+        { name: "Bash", input: { command: "git commit -m x" } }])], want: ["G", "K0", "P"] },
     { name: "G 不命中:没提交", lines: [U("go"), A("改完了", ["Edit"])], want: [] },
     // H:今日实撞原形——自己写下「我能做、不需要你签」然后停手等发话
     { name: "H 命中:自陈能做却没做", lines: [U("go"), A("这两件我能做,不需要你签,属工装面")], want: ["H"] },
@@ -1767,6 +1821,42 @@ function selfTest() {
         { tracked: new Set(["scripts/x.mjs"]), ...(pre ? { preExisted: new Set([memP]) } : {}) });
       sc("D56 有 precheck 记录 ⇒ 不算新建", mkNew(true).isNew(memP), false);
       sc("D56 无 precheck 记录 ⇒ 仍算新建(不开漏放口)", mkNew(false).isNew(memP), true);
+      // ── D100 消费者侧(codex 复核 2026-09-06「你没问到」①):按会话、按路径**首笔**。
+      //   台账改道临时文件;探完把缓存与环境变量复原,不影响本进程后面的真读取。
+      {
+        // 本文件不 import os/path(刻意保持 import 面不变),临时文件走环境变量拼路径
+        const tmp = `${process.env.TEMP || process.env.TMPDIR || process.env.TMP || "."}/gate-precheck-reader-selftest-${process.pid}.jsonl`;
+        const rows = [
+          { ts: "1", sid: "S", path: "scripts/new181.mjs", existed: false },     // 本会话首次创建前:不存在
+          { ts: "2", sid: "S", path: "scripts/new181.mjs", existed: true },      // 第二次追加前:存在(不得覆盖首笔)
+          { ts: "3", sid: "OTHER", path: "scripts/old.mjs", existed: true },     // 别的会话的记录
+          { ts: "4", sid: "S", path: "C:/u/.claude/projects/D--test/memory/m.md", raw: "~/.claude/projects/D--test/memory/m.md", existed: true },
+          { ts: "5", sid: "S", path: "scripts/old2.mjs", existed: true },       // D104(b):先存在……
+          { ts: "6", sid: "S", path: "scripts/old2.mjs", existed: false },      // ……rm 后重建前不存在 ⇒ 本会话新建
+        ];
+        fs.writeFileSync(tmp, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+        const saveEnv = process.env.GATE_CARRIER_PRECHECK_FILE, saveCache = _preExistedCache;
+        process.env.GATE_CARRIER_PRECHECK_FILE = tmp;
+        _preExistedCache = undefined; const mine = preExistedSet("S");
+        _preExistedCache = undefined; const none = preExistedSet(undefined);
+        _preExistedCache = undefined; const stranger = preExistedSet("NOBODY");
+        if (saveEnv === undefined) delete process.env.GATE_CARRIER_PRECHECK_FILE; else process.env.GATE_CARRIER_PRECHECK_FILE = saveEnv;
+        _preExistedCache = saveCache;
+        try { fs.rmSync(tmp, { force: true }); } catch {}
+        sc("D100 消费者:本会话首笔 false ⇒ 后续 true 不算已存在", mine.has("scripts/new181.mjs"), false);
+        sc("D104(b) 消费者:先 true 后 false(rm+重建)⇒ 判新建", mine.has("scripts/old2.mjs"), false);
+        // ── D95/CW 适配层三态(codex 182 Q4②:首版把退出码 3 的 FAIL/UNKNOWN 吞成 null,规则永远收不到红灯)
+        const mk = (status) => JSON.stringify({ results: [{ id: "①", name: "唯一写会话", status, detail: "x" }], verdict: "-" });
+        sc("CW 适配:PASS 解析", triageResultFrom(mk("PASS")).status, "PASS");
+        sc("CW 适配:FAIL 照样解析(退出码 3 带 stdout)", triageResultFrom(mk("FAIL")).status, "FAIL");
+        sc("CW 适配:UNKNOWN 照样解析", triageResultFrom(mk("UNKNOWN")).status, "UNKNOWN");
+        sc("CW 适配:无 JSON ⇒ UNKNOWN(不沉默)", triageResultFrom("").status, "UNKNOWN");
+        sc("CW 适配:缺①行 ⇒ UNKNOWN", triageResultFrom(JSON.stringify({ results: [] })).status, "UNKNOWN");
+        sc("D100 消费者:别的会话的 true 不进本会话集合", mine.has("scripts/old.mjs"), false);
+        sc("D100 消费者:raw 原形随首笔一起收", mine.has("~/.claude/projects/D--test/memory/m.md") && mine.has("C:/u/.claude/projects/D--test/memory/m.md"), true);
+        sc("D100 消费者:无 sid ⇒ 退回全量旧口径(首笔仍生效)", none.has("scripts/old.mjs") && !none.has("scripts/new181.mjs"), true);
+        sc("D100 消费者:本会话零记录 ⇒ 退回全量旧口径", stranger.has("scripts/old.mjs"), true);
+      }
     }
 
     // ⚠️ 核心回归:transcript 读不到(turn=[])、只有官方 last_assistant_message 的形态。
@@ -2473,6 +2563,47 @@ try {
 const lastMsg = typeof hookInput.last_assistant_message === "string" ? hookInput.last_assistant_message : "";
 const bgTasks = hookInput.background_tasks;
 const tp = hookInput.transcript_path || "";
+// ── D95(2026-09-06 用户亲签「7 签吧」):**收尾面**也查一次并发写会话。────────────
+//   宪法恒定条款①「同一时刻只许一个写会话」的触发层原来只有开工,「跑一次只能证明那一刻
+//   没人在写」——2026-08-28 两个写会话并发一整天、互相扫进对方的半成品,全程零闸响。
+//   这里跑一次三查①(`session-triage --json`,实测 1.2 s,Stop 预算 30 s),只取①那行注入 ctx,
+//   判据在规则 CW 里(首批**提示不阻断**,先量误报;三笔样本 1 误报 2 干净,误报成因已被进程亡短路盖住)。
+//   自身会话经 CLAUDE_CODE_SESSION_ID 传给探针,免得把自己判成并发者。探测失败 ⇒ null ⇒ CW 不响
+//   (提示面 fail-open,与「没窗口≠窗口空」同一口径;若日后升阻断须改为 UNKNOWN 也报)。
+//   ⚠️ codex 182 复核逮到的**确定缺陷**(首版):`session-triage` 在任一检查非 PASS 时**退出码 3**,
+//   `execFileSync` 对非零退出码抛错,首版 catch 直接返回 null ⇒ **正常检出并发写会话时 CW 正好收不到**——
+//   只有 PASS 才注入得进来,规则等于永远不响。现:抛错时取 `err.stdout` 照样解析(红灯是业务结果不是执行故障);
+//   真超时/无 JSON ⇒ 注入 UNKNOWN(提示面仍不阻断,但不再沉默)。解析抽成 `triageResultFrom()`,接缝自测钉住三态。
+//   副作用照实说:session-triage 会写 `.claude/.session-pid-*.json`(sidecar)与 heartbeat——都在 gitignore 面,
+//   按冲突表 #3「gitignore 面遥测不计写入」口径;只读会话的零写入证明以 git 管辖面为准,不受影响。
+//   (`triageResultFrom` 定义在 `preExistedSet` 旁的顶层——这里是主路径的块作用域,放这儿自测够不着。)
+const concurrentWriters = (() => {
+  if (!hookInput.session_id) return null;
+  // 载体不在盘则静默退场(与 ND 同口径;custodiet 公开树不带 session-triage/session-liveness 探针,缺件时不该每次 Stop 报 UNKNOWN):
+  //   本仓两个探针文件恒在,此行只对拷走闸脚本的仓生效。
+  if (!fs.existsSync("scripts/session-triage.mjs") || !fs.existsSync("scripts/lib/session-liveness.mjs")) return null;
+  // ⚠️ 超时 2026-09-07 当轮实撞:首版 8 s,而 session-triage 在 48 个遗留会话+两个 codex 进程在活时实测 8.8 s
+  //   ⇒ 第一次生产触发就报 UNKNOWN「无 JSON 输出」。现 15 s(Stop 预算 30 s,本 hook 自身 <5 s);
+  //   仍超时的话 detail 里带 ETIMEDOUT 与耗时,别再让「超时」与「坏 JSON」混成一句。
+  const t0 = Date.now();
+  const opts = {
+    encoding: "utf8", timeout: 15000, cwd: process.cwd(),
+    env: { ...process.env, CLAUDE_CODE_SESSION_ID: String(hookInput.session_id) },
+    stdio: ["ignore", "pipe", "ignore"],
+  };
+  try {
+    // `--fast`(D105(a),批 187):进程表吃缓存、跳 sidecar/heartbeat/anchor;批 188 起枚举器走 Toolhelp32 不走 WMI
+    //   (~1.5 s),快路前台枚举上限 8 s;其余耗时(git rev-parse、活跃转录读取)无统一截止,见 D108 天花板
+    return triageResultFrom(execFileSync(process.execPath, ["--no-warnings", "scripts/session-triage.mjs", "--json", "--fast"], opts));
+  } catch (e) {
+    // 非零退出码(FAIL/UNKNOWN ⇒ 3)也带着完整 stdout;拿不到 stdout 才是执行故障
+    const r = triageResultFrom(e && e.stdout ? String(e.stdout) : "");
+    if (r.status === "UNKNOWN" && !(e && e.stdout && String(e.stdout).trim())) {
+      r.detail += `(${e && (e.code || e.signal) ? String(e.code || e.signal) : "exit " + (e && e.status)};${Date.now() - t0} ms)`;
+    }
+    return r;
+  }
+})();
 
 try {
   let findings;
@@ -2487,10 +2618,11 @@ try {
     //   只看 last_assistant_message 就判它没写(2026-08-19 实撞,G 项误报)。
     const turnText = assistantText(turn);
     const merged = turnText.includes(lastMsg) ? turnText : `${turnText}\n${lastMsg}`;
-    findings = run(tp && fs.existsSync(tp) ? tp : null, { text: merged, turn, bgTasks, live: true });
+    // `sessionId`:写前实测台账按会话过滤(D100,codex 复核逮到「任一次已存在」覆盖「本轮首次不存在」)
+    findings = run(tp && fs.existsSync(tp) ? tp : null, { text: merged, turn, bgTasks, live: true, sessionId: hookInput.session_id, concurrentWriters });
   } else {
     if (!tp || !fs.existsSync(tp)) process.exit(0);   // fail-open:两个来源都没有就放行
-    findings = run(tp, { bgTasks, live: true });
+    findings = run(tp, { bgTasks, live: true, sessionId: hookInput.session_id, concurrentWriters });
   }
   process.exit(emit(findings, consecutiveBlocks(tp), { live: true }));
 } catch (e) {

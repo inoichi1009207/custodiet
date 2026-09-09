@@ -29,7 +29,7 @@ A Stop-hook rule engine that audits the agent's turn **after it claims to be fin
 
 The 23 engine rules read a **structured context** built exclusively from `assistant` text blocks and `tool_use` **inputs** — tool *outputs* never enter *their* evidence window, so *reading a file that mentions `git commit` cannot count as having committed* (that exact exploit is a regression test). Honesty note: the two not-yet-migrated built-in rules (A delegation-closure, R past-tense claims) still scan raw text including tool outputs — that ceiling is documented in their header comments. Don't trust guarantees we didn't write.
 
-## What it catches (selection of the 25 rules: 23 engine + 2 built-in; `gate:self-test` output is authoritative — hand counts drift)
+## What it catches (selection of the 29 rules: 27 engine + 2 built-in; `gate:self-test` output is authoritative — hand counts drift)
 
 - **B / R — promise vs. deed**: "I'll go fix X" / "I fixed X" with no matching action in the turn ⇒ flagged. Future-tense broken promises and past-tense fabricated records are separate rules.
 - **A / U — delegation must close the loop**: a background task you launched and never read back is debt, not progress.
@@ -38,6 +38,7 @@ The 23 engine rules read a **structured context** built exclusively from `assist
 - **I — search before you build**: creating a new tool/script without evidence of having scanned for existing implementations (local registry **and** web) blocks.
 - **P — load-bearing commits owe three independent checks**: cross-model review, read-only subagent, and external precedent — counted from tool actions only; *saying* you ran them counts zero.
 - **E0/E1/E2 — causal claims need mechanical evidence** or an independent check; a bare "the root cause is…" doesn't leave the room.
+- **CW — re-check concurrent writers at Stop time**: a start-of-session check only proves nobody was writing at that instant; at Stop the liveness probe (`scripts/session-triage.mjs --json --fast`) runs again and anything but PASS is surfaced as a notice, not a block. If the probe file is absent the rule stays silent — this repo does not ship the probe; plug in your own (JSON with a `results[]` entry `id:"①"` whose `status` is PASS/FAIL/UNKNOWN).
 
 Full tour and build order: [`docs/playbook.md`](docs/playbook.md) (the battle-tested construction manual, currently in Chinese).
 

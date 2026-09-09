@@ -276,7 +276,12 @@ console.log("正反例:");
 //   判别实验(剥掉通道动作看规则是否翻面)测得 16 条反例里只有 7 条真检验了计数器,
 //   且四套的形态覆盖齐齐停在 3/4,缺的都是这一种。规则本身判得对(探针 3/3),
 //   **漏的是夹具**——这正是「四份候选互打全绿」证不了的那类洞:一致地少测。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "batchGoal", "pLedger", "prior", "user"]);
+//   第九次:`preExisted`(2026-09-06,D100)—— 与 `tracked` 同族的注入通道:
+//   「写前那一刻实测存在」的路径集(生产上由 hook-guard 量出);没它,I 的
+//   「追加既有 memory 文件不算新建」这条反例根本写不出来。
+//   第十次:`bgTasks`(2026-09-06,D104(a) S 的动作面)与 `concurrentWriters`(D95 CW 项)——两条都是
+//   **注入通道**(官方 background_tasks[] 载荷 / 收尾时点三查①结果),不进 entries。
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "concurrentWriters"]);
 //   第六次:`prior`(K 的批漂判据)—— 与 `batchGoal` 同族,也是**注入通道**而非动作。
 //   值是「上几轮的 assistant 文本/动作」简写,由 mkEntries 拼成 entries 再交 priorEntries。
 const mkEntries = (c) => {
@@ -358,7 +363,10 @@ const mkPriorEntry = (x) => {
 };
 const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...(c.tracked ? { tracked: new Set(c.tracked) } : {}),
+  ...(c.preExisted ? { preExisted: new Set(c.preExisted) } : {}),
   ...("batchGoal" in c ? { batchGoal: c.batchGoal } : {}),
+  ...("bgTasks" in c ? { bgTasks: c.bgTasks } : {}),
+  ...("concurrentWriters" in c ? { concurrentWriters: c.concurrentWriters } : {}),
   // `pLedger` = P 的跨批持久账注入(2026-08-22 亲签)。与 batchGoal 同族:注入通道非动作。
   ...("pLedger" in c ? { pLedger: c.pLedger } : {}),
   // `prior` = [{text, write?, …}, …] ⇒ 拼成 assistant entries 交给 priorEntries。
