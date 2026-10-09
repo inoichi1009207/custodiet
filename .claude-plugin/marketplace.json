@@ -1,0 +1,17 @@
+{
+  "name": "custodiet",
+  "description": "Companion plugins for custodiet (Stop-hook accountability gates for Claude Code). custodiet itself is not a plugin yet: install it with `node scripts/custodiet-init.mjs --target <repo> --mode copy` (see README).",
+  "owner": {
+    "name": "inoichi1009207",
+    "url": "https://github.com/inoichi1009207"
+  },
+  "plugins": [
+    {
+      "name": "lanes",
+      "source": "./plugins/lanes",
+      "description": "Splits gate notices, edited files and tool calls out of the transcript into their own lanes (subagents in a separate bucket): a one-line summary above the prompt, details in the /lanes pane.",
+      "category": "ui",
+      "tags": ["custodiet", "mod", "hooks", "ui"]
+    }
+  ]
+}

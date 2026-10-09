@@ -1,0 +1,1 @@
+{ "name": "lanes", "version": "0.4.0", "description": "分道:把本轮的闸提示、改过的文件、工具调用从对话里拆出来(子代理的另记一桶),上方一行汇总 + /lanes 面板看明细", "author": { "name": "inoichi1009207", "url": "https://github.com/inoichi1009207" }, "repository": "https://github.com/inoichi1009207/custodiet", "license": "MIT", "types": "./types/index.d.ts" }
