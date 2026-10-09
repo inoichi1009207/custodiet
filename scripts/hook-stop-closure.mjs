@@ -737,7 +737,7 @@ function toolRawText(entries) {
  *  代价:消息可能变长 ⇒ 由各规则的 `.slice(0, N)` 控制展示条数,**但计数是真的**。 */
 /** @param {string} [echoFrom] 回显源。给了就**拿它的同号行**当回显,判据仍跑在 `text` 上。
  *  用途:因果族先把引文抹成空格再判(免得跨引号边界咬合),但抹完的文本**不能拿去回显**
- *  —— 2026-08-27 astrbot 实况:拦截消息显示成「是因为 会让你在 和 之间反复权衡」,
+ *  —— 2026-08-27 proj-a 实况:拦截消息显示成「是因为 会让你在 和 之间反复权衡」,
  *  引文里的名词全没了,人看不出被拦的是哪句、更无从处置(D71)。
  *  成立前提:掩码**等长且保留换行**(见 `maskQuoted`),行号才对得上;
  *  对不上时按 `echo[i] != null` 退回剥过的行,**不抛错**——回显退化远好过整闸崩。 */
@@ -840,16 +840,6 @@ function preExistedSet(sid) {
     _preExistedCache = set;
   } catch { _preExistedCache = null; }
   return _preExistedCache;
-}
-
-/** D95/CW 注入面的解析(顶层定义,主路径与自测共用)。红灯(FAIL/UNKNOWN,退出码 3)带着完整 stdout,
- *  照样解析;真超时/无 JSON ⇒ UNKNOWN,不沉默。机理与撞坑记在文件末尾主路径的注里。 */
-export function triageResultFrom(stdoutText) {
-  let j;
-  try { j = JSON.parse(String(stdoutText || "")); } catch { return { status: "UNKNOWN", detail: "session-triage 无 JSON 输出(超时或执行故障)" }; }
-  const r1 = (Array.isArray(j.results) ? j.results : []).find((r) => r && (r.id === "①" || /唯一写会话/.test(String(r.name || ""))));
-  return r1 ? { status: String(r1.status || "UNKNOWN").toUpperCase(), detail: String(r1.detail || "").slice(0, 400) }
-    : { status: "UNKNOWN", detail: "session-triage 输出里没有①行" };
 }
 
 /** `git log -1 --diff-filter=A` 的进程内缓存(同 _trackedCache 的理由)。 */
@@ -1138,10 +1128,6 @@ export function run(transcriptPath, ctx = {}) {
         justAdded: _justAddedCache instanceof Set ? _justAddedCache : undefined,
         // D56:写之前实测的「已存在」集合(仓外/未跟踪文件唯一说得上话的证据)
         preExisted: preExistedSet(ctx.sessionId) || undefined,
-        // D95:收尾时点三查①,由文件末尾主路径跑一次注入。三态(红队 182 BP-12):
-        //   live 且没注入 ⇒ 保持 undefined ⇒ CW 的 requires 契约报「必需通道缺席」(hook 忘了注入是缺陷,不是没有);
-        //   离线回放/自测/dry-run 本来就探不了 ⇒ 归 null(「查过了,没有」),免得每轮回放都刷一条契约提示。
-        concurrentWriters: ctx.concurrentWriters !== undefined ? ctx.concurrentWriters : (ctx.live ? undefined : null),
         lastAssistantMessage: typeof ctx.text === "string" ? ctx.text : undefined,
         bgTasks: ctx.bgTasks,
         // 批次状态**在这里读一次、注入进去**,不让规则自己读磁盘 ——
@@ -1680,10 +1666,10 @@ function selfTest() {
   {
     const cs = [
       [String.raw`{"command":"node --no-warnings scripts/verify-laws.mjs"}`, true, "裸路径探针"],
-      [String.raw`{"command":"node --no-warnings \"D:/x/scripts/verify-claims.mjs\""}`, true, "带引号路径(08-19 漏判的那个)"],
+      [String.raw`{"command":"node --no-warnings \"E:/x/scripts/verify-claims.mjs\""}`, true, "带引号路径(08-19 漏判的那个)"],
       [String.raw`{"command":"node -e \"console.log(1)\""}`, false, "普通 node 一行不算探针"],
-      // D69(2026-08-27 astrbot 实况):非 node 运行时的探针
-      [String.raw`{"command":"cd /d/bqbot && python tests/probe_rate1_determinism.py; echo x"}`,
+      // D69(2026-08-27 proj-a 实况):非 node 运行时的探针
+      [String.raw`{"command":"cd /d/proj-b && python tests/probe_rate1_determinism.py; echo x"}`,
         true, "python 探针(旧式不认 ⇒ 一句有退出码兜底的话被 E0 误拦)"],
       [String.raw`{"command":"python3 scripts/verify_x.py"}`, true, "python3 整词"],
       // 词界两侧都要钉:放宽运行时表最容易顺手把词界一起放松,那是 fail-open。
@@ -1772,7 +1758,7 @@ function selfTest() {
     };
     const ids = (fs2) => fs2.map((f) => f.id + (f.block ? "!" : "")).sort().join(",");
 
-    // ── D71 回显钉(2026-08-27,astrbot 实况)────────────────────────────────
+    // ── D71 回显钉(2026-08-27,proj-a 实况)────────────────────────────────
     // 因果族先把引文抹成空格再判,但**回显必须取原文**。缺了这条钉,
     // 有人把 `matchAny` 的第三参去掉、或把 `maskQuoted` 改回不等长,测试照样全绿,
     // 而闸会退回「拦得住但说不清拦的是什么」——实况原样:
@@ -1845,13 +1831,6 @@ function selfTest() {
         try { fs.rmSync(tmp, { force: true }); } catch {}
         sc("D100 消费者:本会话首笔 false ⇒ 后续 true 不算已存在", mine.has("scripts/new181.mjs"), false);
         sc("D104(b) 消费者:先 true 后 false(rm+重建)⇒ 判新建", mine.has("scripts/old2.mjs"), false);
-        // ── D95/CW 适配层三态(codex 182 Q4②:首版把退出码 3 的 FAIL/UNKNOWN 吞成 null,规则永远收不到红灯)
-        const mk = (status) => JSON.stringify({ results: [{ id: "①", name: "唯一写会话", status, detail: "x" }], verdict: "-" });
-        sc("CW 适配:PASS 解析", triageResultFrom(mk("PASS")).status, "PASS");
-        sc("CW 适配:FAIL 照样解析(退出码 3 带 stdout)", triageResultFrom(mk("FAIL")).status, "FAIL");
-        sc("CW 适配:UNKNOWN 照样解析", triageResultFrom(mk("UNKNOWN")).status, "UNKNOWN");
-        sc("CW 适配:无 JSON ⇒ UNKNOWN(不沉默)", triageResultFrom("").status, "UNKNOWN");
-        sc("CW 适配:缺①行 ⇒ UNKNOWN", triageResultFrom(JSON.stringify({ results: [] })).status, "UNKNOWN");
         sc("D100 消费者:别的会话的 true 不进本会话集合", mine.has("scripts/old.mjs"), false);
         sc("D100 消费者:raw 原形随首笔一起收", mine.has("~/.claude/projects/D--test/memory/m.md") && mine.has("C:/u/.claude/projects/D--test/memory/m.md"), true);
         sc("D100 消费者:无 sid ⇒ 退回全量旧口径(首笔仍生效)", none.has("scripts/old.mjs") && !none.has("scripts/new181.mjs"), true);
@@ -2438,7 +2417,7 @@ else {
 try {
   // ⚠️ 路径归一必须走 fileURLToPath(F6,2026-08-26 grill:edge-cases 审出并机器复证):
   //   `URL.pathname` **保留百分号编码**,`.replace` 只脱盘符不解码 ⇒ 仓路径含空格/中文时
-  //   得到 "D:/my%20test%20repo/",chdir 抛 ENOENT ⇒ 被下面的 catch 吞掉 ⇒ **静默退回继承的 cwd**,
+  //   得到 "C:/my%20test%20repo/",chdir 抛 ENOENT ⇒ 被下面的 catch 吞掉 ⇒ **静默退回继承的 cwd**,
   //   正是 2026-08-25 那次「审错树」事故的原状——修 cwd 的这行自己会在带空格的仓上失效。
   //   custodiet 已公开,`C:\Users\Some Name\...` 在 Windows 上是常态,故这条按公开面优先级修。
   process.chdir(fileURLToPath(new URL("..", import.meta.url)));
@@ -2563,44 +2542,8 @@ try {
 const lastMsg = typeof hookInput.last_assistant_message === "string" ? hookInput.last_assistant_message : "";
 const bgTasks = hookInput.background_tasks;
 const tp = hookInput.transcript_path || "";
-// ── D95(2026-09-06 用户亲签「7 签吧」):**收尾面**也查一次并发写会话。────────────
-//   宪法恒定条款①「同一时刻只许一个写会话」的触发层原来只有开工,「跑一次只能证明那一刻
-//   没人在写」——2026-08-28 两个写会话并发一整天、互相扫进对方的半成品,全程零闸响。
-//   这里跑一次三查①(`session-triage --json`,实测 1.2 s,Stop 预算 30 s),只取①那行注入 ctx,
-//   判据在规则 CW 里(首批**提示不阻断**,先量误报;三笔样本 1 误报 2 干净,误报成因已被进程亡短路盖住)。
-//   自身会话经 CLAUDE_CODE_SESSION_ID 传给探针,免得把自己判成并发者。探测失败 ⇒ null ⇒ CW 不响
-//   (提示面 fail-open,与「没窗口≠窗口空」同一口径;若日后升阻断须改为 UNKNOWN 也报)。
-//   ⚠️ codex 182 复核逮到的**确定缺陷**(首版):`session-triage` 在任一检查非 PASS 时**退出码 3**,
-//   `execFileSync` 对非零退出码抛错,首版 catch 直接返回 null ⇒ **正常检出并发写会话时 CW 正好收不到**——
-//   只有 PASS 才注入得进来,规则等于永远不响。现:抛错时取 `err.stdout` 照样解析(红灯是业务结果不是执行故障);
-//   真超时/无 JSON ⇒ 注入 UNKNOWN(提示面仍不阻断,但不再沉默)。解析抽成 `triageResultFrom()`,接缝自测钉住三态。
-//   副作用照实说:session-triage 会写 `.claude/.session-pid-*.json`(sidecar)与 heartbeat——都在 gitignore 面,
-//   按冲突表 #3「gitignore 面遥测不计写入」口径;只读会话的零写入证明以 git 管辖面为准,不受影响。
-//   (`triageResultFrom` 定义在 `preExistedSet` 旁的顶层——这里是主路径的块作用域,放这儿自测够不着。)
-const concurrentWriters = (() => {
-  if (!hookInput.session_id) return null;
-  // ⚠️ 超时 2026-09-07 当轮实撞:首版 8 s,而 session-triage 在 48 个遗留会话+两个 codex 进程在活时实测 8.8 s
-  //   ⇒ 第一次生产触发就报 UNKNOWN「无 JSON 输出」。现 15 s(Stop 预算 30 s,本 hook 自身 <5 s);
-  //   仍超时的话 detail 里带 ETIMEDOUT 与耗时,别再让「超时」与「坏 JSON」混成一句。
-  const t0 = Date.now();
-  const opts = {
-    encoding: "utf8", timeout: 15000, cwd: process.cwd(),
-    env: { ...process.env, CLAUDE_CODE_SESSION_ID: String(hookInput.session_id) },
-    stdio: ["ignore", "pipe", "ignore"],
-  };
-  try {
-    // `--fast`(D105(a),批 187):进程表吃缓存、跳 sidecar/heartbeat/anchor;批 188 起枚举器走 Toolhelp32 不走 WMI
-    //   (~1.5 s),快路前台枚举上限 8 s;其余耗时(git rev-parse、活跃转录读取)无统一截止,见 D108 天花板
-    return triageResultFrom(execFileSync(process.execPath, ["--no-warnings", "scripts/session-triage.mjs", "--json", "--fast"], opts));
-  } catch (e) {
-    // 非零退出码(FAIL/UNKNOWN ⇒ 3)也带着完整 stdout;拿不到 stdout 才是执行故障
-    const r = triageResultFrom(e && e.stdout ? String(e.stdout) : "");
-    if (r.status === "UNKNOWN" && !(e && e.stdout && String(e.stdout).trim())) {
-      r.detail += `(${e && (e.code || e.signal) ? String(e.code || e.signal) : "exit " + (e && e.status)};${Date.now() - t0} ms)`;
-    }
-    return r;
-  }
-})();
+// 0.4.2(分支 b-init-cut1):撤下 CW「收尾时点并发写会话」——源项目已裁撤「同一时刻只许一个写会话」检查,
+//   并发写改由 git 隔离(各写会话在自己的 worktree 与分支上干活)。规则 CW 与 Stop 时点的判活探针注入一并删除。
 
 try {
   let findings;
@@ -2616,10 +2559,10 @@ try {
     const turnText = assistantText(turn);
     const merged = turnText.includes(lastMsg) ? turnText : `${turnText}\n${lastMsg}`;
     // `sessionId`:写前实测台账按会话过滤(D100,codex 复核逮到「任一次已存在」覆盖「本轮首次不存在」)
-    findings = run(tp && fs.existsSync(tp) ? tp : null, { text: merged, turn, bgTasks, live: true, sessionId: hookInput.session_id, concurrentWriters });
+    findings = run(tp && fs.existsSync(tp) ? tp : null, { text: merged, turn, bgTasks, live: true, sessionId: hookInput.session_id });
   } else {
     if (!tp || !fs.existsSync(tp)) process.exit(0);   // fail-open:两个来源都没有就放行
-    findings = run(tp, { bgTasks, live: true, sessionId: hookInput.session_id, concurrentWriters });
+    findings = run(tp, { bgTasks, live: true, sessionId: hookInput.session_id });
   }
   process.exit(emit(findings, consecutiveBlocks(tp), { live: true }));
 } catch (e) {

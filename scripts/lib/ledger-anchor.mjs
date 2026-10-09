@@ -85,7 +85,7 @@
 // 退出码:0=过 1=违例/无锚 2=用法错
 // 触发层:snapshot=OS 计划任务(agent 会话外)。
 //   verify 的唤醒面**因仓而异,本件自己不接线**:
-//     · 源项目(KliniK)接在 `scripts/session-triage.mjs` 的开工面;
+//     · 源项目接在 `scripts/session-triage.mjs` 的开工面;
 //     · **custodiet 等拷贝仓没有 session-triage,也没有任何其他唤醒面** ⇒ 拷走后须自行接一个,
 //       否则下面的 STALE 看门狗没有唤醒者(= 闸在仓里但不在跑)。
 //   ⚠️ 本段原写作「本仓的唤醒面是…」——`本仓` 在移植后是**假指代**(grill:recon A2 审出:

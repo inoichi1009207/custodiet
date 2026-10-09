@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // custodiet-init.mjs —— 把收尾闸装进一个**已有的 git 仓**(拷贝模式;第一刀)
 //
-// 干什么:从本仓(custodiet)拷出运行期闸件 + 示例宪法 + 示例法典到目标仓,
+// 干什么:从本仓(custodiet)拷出运行期闸件 + 示例宪法 + 示例法典 + 红队 agent 到目标仓,
 //        把 Stop / SubagentStop hook 合并进目标的 `.claude/settings.json`,
 //        把闸的运行时台账追加进目标的 `.gitignore`。stdout 末行是一行 JSON 清单。
 //
@@ -45,6 +45,9 @@ const FILES = [
   "docs/laws/reporting.md",
   // 名词日记是 ND 项的 law 锚点所在;缺席时 ND 静默退场,但 law 锚点自测会报该锚点无目标。
   "docs/noun-diary.md",
+  // P 在「提交触及闸引擎文件」时,独立视角通道只认这个红队 agent。不随包装 ⇒ 新仓的装闸提交无出路阻断(第一刀 B1 实测)。
+  // ⚠️ 落盘后 Claude Code 不一定在**同一会话**里就列出它(agent 清单的刷新时机未核实:本机 changelog 未检到明确条目);装完最好新开会话再提交。
+  ".claude/agents/_gate-bypass-hunter.md",
 ];
 // 生成件(没有源文件):内容即源。
 const GENERATED = { "CLAUDE.md": "@AGENTS.md\n" };

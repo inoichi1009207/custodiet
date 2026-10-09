@@ -296,15 +296,6 @@ export function buildCtx(entries, extra = {}) {
         ? { carriers: Number.isFinite(+extra.pLedger.carriers) ? Math.max(0, Math.floor(+extra.pLedger.carriers)) : 0 }
         : null),
     bgTasks: Array.isArray(extra.bgTasks) ? extra.bgTasks : null,
-    /** 并发写会话(D95,2026-09-06 用户亲签接线):收尾时点跑一次三查①的结果,注入形
-     *  `{status:"PASS"|"FAIL"|"UNKNOWN", detail}`;`null`=通道没接/探测失败(离线回放、夹具)。
-     *  规则不自己 spawn 探针(热路径纪律),hook 跑一次注入。消费者只有 CW 项。 */
-    //   三态与 pLedger 同构(红队 182 BP-12:首版把「没注入」也归一成 null ⇒ CW 的 `requires` 契约永不触发,
-    //   宣称了一个不存在的保护):undefined=通道没接(夹具/离线回放,契约层跳过规则)/ null=接了但探测失败 / 对象=判定。
-    concurrentWriters: extra.concurrentWriters === undefined ? undefined
-      : (extra.concurrentWriters && typeof extra.concurrentWriters === "object"
-        ? { status: String(extra.concurrentWriters.status || "UNKNOWN"), detail: String(extra.concurrentWriters.detail || "") }
-        : null),
     /** 便捷谓词。规则应当优先用这些,而不是自己写正则去扫 `text`。 */
     didCommit: () => commits.length > 0,
     wroteAny: (re) => writes.some((p) => re.test(p)),

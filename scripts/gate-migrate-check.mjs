@@ -279,9 +279,9 @@ console.log("正反例:");
 //   第九次:`preExisted`(2026-09-06,D100)—— 与 `tracked` 同族的注入通道:
 //   「写前那一刻实测存在」的路径集(生产上由 hook-guard 量出);没它,I 的
 //   「追加既有 memory 文件不算新建」这条反例根本写不出来。
-//   第十次:`bgTasks`(2026-09-06,D104(a) S 的动作面)与 `concurrentWriters`(D95 CW 项)——两条都是
+//   第十次:`bgTasks`(2026-09-06,D104(a) S 的动作面)与 `concurrentWriters`(D95 CW 项,0.4.2 随 CW 撤下移除)——两条都是
 //   **注入通道**(官方 background_tasks[] 载荷 / 收尾时点三查①结果),不进 entries。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "concurrentWriters", "at"]);
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "at"]);
 //   第七次:`at`(ISO 时间 ⇒ 条目 `timestamp`)—— D107(191):P 的凭证池主路径按 `batchGoal.armedAt`
 //   切动作,而 gate-ctx 的 `at` 只从条目 `timestamp` 来;夹具不给时间戳 ⇒ 所有用例只走回退路径,
 //   主路径零机器证人(「验过而没钉住」的形态,与上面六次同族)。
@@ -380,7 +380,6 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...(c.preExisted ? { preExisted: new Set(c.preExisted) } : {}),
   ...("batchGoal" in c ? { batchGoal: c.batchGoal } : {}),
   ...("bgTasks" in c ? { bgTasks: c.bgTasks } : {}),
-  ...("concurrentWriters" in c ? { concurrentWriters: c.concurrentWriters } : {}),
   // `pLedger` = P 的跨批持久账注入(2026-08-22 亲签)。与 batchGoal 同族:注入通道非动作。
   ...("pLedger" in c ? { pLedger: c.pLedger } : {}),
   // `prior` = [{text, write?, …}, …] ⇒ 拼成 assistant entries 交给 priorEntries。

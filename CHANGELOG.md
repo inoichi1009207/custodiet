@@ -1,5 +1,14 @@
 # Changelog
 
+## 未发布(分支 b-init-cut1)
+
+- **撤下 CW(收尾时点并发写会话)**:源项目已裁撤「同一时刻只许一个写会话」检查,改由 git worktree/分支隔离并发写。
+  规则、Stop 时点的判活探针注入(`triageResultFrom`、`concurrentWriters`)、自测与迁移夹具键、
+  示例协作法里只为它存在的「开工两查」一节、README 的 CW 条目一并删除。此前未接探针的仓每次 Stop 都会收到一条 UNKNOWN 提示,该提示随之消失。
+- **新增 `scripts/custodiet-init.mjs`**:拷贝模式安装器(闸件 + 示例宪法/法典 + 红队 agent + hooks 合并 + .gitignore),已存在文件一律不覆盖。
+- **随包带红队 agent** `.claude/agents/_gate-bypass-hunter.md`:P 在闸引擎面提交上只认它,新仓此前没有它 ⇒ 无出路阻断。
+- **洗掉残留标识**:注释与夹具里的其他项目名、盘符夹具路径。
+
 ## 0.4.1 — 2026-09-09
 
 同一天的补丁版。0.4.0 发出后,对 P(承重提交欠三道独立复核)的凭证池做了一轮跨模型 + 两轮红队,

@@ -1181,7 +1181,7 @@ function eFacts(ctx) {
     "(我|尚|仍)不确定",
     "我猜", "(别|不要|勿)当(成)?结论",
     // 出处侧自标——用的是全局规范 §1.1/§1.3 自己的词(「取页失败」「文档未记载」),
-    //   而词表里原来一个都没有。astrbot #13 实撞:「(搜索摘要,未逐字取页。」被 E0 拦。
+    //   而词表里原来一个都没有。proj-a #13 实撞:「(搜索摘要,未逐字取页。」被 E0 拦。
     "(未|没)(有)?(逐字)?取页", "取页失败", "文档未记载",
     // 「这/该/以上…(只)是…推断/推测/猜测」——中间留空档以吃「这条只是我的猜测」,
     // 但不跨句读(`[^。;;\\n]`),免得跨句咬合成假豁免。
@@ -1259,7 +1259,7 @@ function eFacts(ctx) {
       "(我|尚|仍)不确定",
       "我猜", "(别|不要|勿)当(成)?结论",
       // 出处侧自标——用的是全局规范 §1.1/§1.3 自己的词(「取页失败」「文档未记载」),
-      //   而词表里原来一个都没有。astrbot #13 实撞:「(搜索摘要,未逐字取页。」被 E0 拦。
+      //   而词表里原来一个都没有。proj-a #13 实撞:「(搜索摘要,未逐字取页。」被 E0 拦。
       "(未|没)(有)?(逐字)?取页", "取页失败", "文档未记载",
       // 「这/该/以上…(只)是…推断/推测/猜测」——中间留空档以吃「这条只是我的猜测」,
       // 但不跨句读(`[^。;;\n]`),免得跨句咬合成假豁免。
@@ -1500,7 +1500,7 @@ export const RULE_E0 = {
       //   2026-08-22 实撞:「让」在 「」 内、「它」在 「」 外,#4 跨引号边界咬合,
       //   于是**引用被拦的话来处置它 ⇒ 处置本身再被拦**,连响两轮。
       { text: "问题一句话：「把跨项目的教训持久化，让未来会话能召回」。拿它当搜索键把工具面扫了三层。" },
-      // ── D69 回归钉(2026-08-27,astrbot 会话实况取样)────────────────────────
+      // ── D69 回归钉(2026-08-27,proj-a 会话实况取样)────────────────────────
       // 这两条是**另一条会话里被真的拦下来**的原话,逐字钉在这。旧判据两条都不认。
       { text: "根因是硬闸拦下的，未跑的原因是插件还不存在。在跑出来之前，这条只是我的猜测，别当结论。" },
       // ⚠️ 反向钉(D72,codex 114 Q3):**引文里别人的「我猜」不算我自标**。
@@ -1517,7 +1517,7 @@ export const RULE_E0 = {
       //   真正让它放行的是本轮**确实执行过**那个 probe 脚本。
       {
         text: "根因是 rate=1.0 时走的是硬闸分支，这句话现在有退出码兜着。",
-        bash: "cd /d/bqbot && python tests/probe_rate1_determinism.py; echo \"退出码=$?\"",
+        bash: "cd /d/proj-b && python tests/probe_rate1_determinism.py; echo \"退出码=$?\"",
       },
     ],
   },
@@ -2983,7 +2983,7 @@ const RULE_P = {
     //   `git add -A` 的参数面**没有路径**,写入又在几轮之前 ⇒ **两条证据都结构性为空**。
     //   这不是罕见形态,是最自然的提交节奏;⇒ 承重面的三通道要求对它**从未生效过**。
     //   `scopeActions` 早就取「窗口 ∪ 本轮」,只有 `triggered` 还卡在本轮——口径不一致。
-    //   **动手前先量**(PAT.causal 头注定的规矩):放宽后 astrbot 0→1、本会话 41→41,
+    //   **动手前先量**(PAT.causal 头注定的规矩):放宽后 proj-a 0→1、本会话 41→41,
     //   代价可忽略;方向是**收紧**(补漏放),窄例外④「新增/收紧机器闸」明确适用。
     //   ⚠️ 但 P 是**阻断且无逃生口**的规则,所以只放宽**触发**、不动通道判据,
     //   且宽限计账(每 5 次承重提交欠一轮)原样保留——它就是防这条变吵的那个阀。
@@ -4066,72 +4066,8 @@ const RULE_ND = {
   },
 };
 
-// ── CW:收尾时点另有活跃写会话(D95,2026-09-06 用户亲签「7 签吧」;首批**提示不阻断**)────
-// 立法动机:宪法恒定条款①「同一时刻只许一个写会话」的触发层原来只有开工三查①,
-//   「跑一次只能证明那一刻没人在写」。2026-08-28 两个写会话并发一整天、`git add -A` 互相扫进对方半成品、
-//   欠账编号撞车,全程零闸响。判据与工装(session-triage)都是现成的,这里只是把检查挪到收尾面。
-// 样本:批132 一误报(mtime 心跳污染,成因已被进程亡短路盖住)、批135/181 两干净 ⇒ 先以提示跑一批量误报,
-//   零误报后再议升阻断(升阻断=守卫语义改动,归亲签;届时 UNKNOWN 也须报)。
-// 注入面:hook 在 Stop 主路径跑一次 `session-triage --json`,只取①行注入 `ctx.concurrentWriters`
-//   ({status, detail});null=通道没接/探测失败 ⇒ 不响(提示面 fail-open,与「没窗口≠窗口空」同口径)。
-// CEILING:它只报三查①的判定,判定本身的天花板在 session-liveness(mtime 心跳、进程亡短路);
-//   codex 只读进程按宪法豁免,是它自己的口径不是本条的。
-const RULE_CW = {
-  id: "CW",
-  blocking: false,
-  law: "docs/laws/collab.md#开工两查",
-  requires: ["concurrentWriters"],
-  // 本条**没有文本面或动作面出路**(刻意):它的凭证是注入值本身——下一次 Stop 时三查①变 PASS 就不响。
-  //   任何「本轮做了 X 就消音」的出路都是命令面字符串,codex/红队 182 同判可伪造(BP-11);
-  //   故**不声明 escapes**(INV-7 要求声明了就非空、消息写了出路就必须声明——这里两边都不写),消息只写**处置**。
-  detect: (ctx) => {
-    const cw = ctx.concurrentWriters;
-    if (!cw || typeof cw !== "object") return [];
-    const st = String(cw.status || "").toUpperCase();
-    if (st === "PASS") return [];
-    // ⚠️ 首版有一条「本轮重跑过三查 ⇒ 不重复提示」的动作面出路,codex 182 Q4③ 与红队 BP-11 同判开口:
-    //   命令串含文件名(grep/echo/cat)即消音,而**注入值本身就是 Stop 时点的最新判定**——重跑之后若仍 FAIL,
-    //   它注入的就是 FAIL;若已 PASS,本条本来不响。出路凭证=注入值,不看命令面 ⇒ 整条出路删除。
-    return [`${st || "UNKNOWN"}:${String(cw.detail || "").slice(0, 160)}`];
-  },
-  exempts: [],
-  message: (hits) =>
-    `**收尾时点三查①不是 PASS**(${hits[0]})——宪法恒定条款①「同一时刻只许一个写会话」,开工查一次管不了后来(D95 实撞:两会话并发一整天零闸响)。\n` +
-    `      处置:先看对方会话最后一条 user/assistant 的时间(不看 mtime)判它是不是真在写;真在写 ⇒ 协调只留一个写会话;` +
-    `对方是只读会话 ⇒ 让它跑 \`session-triage --declare-readonly\` 落标记。本条凭证=下一次 Stop 时注入的三查①结果,不认本轮命令面。\n` +
-    `      本条首批只提示;误报形态(mtime 心跳污染)已由进程亡短路盖住,若仍误报 → --fp CW 记账。`,
-  mutations: [
-    { name: "UNKNOWN 不报(只报 FAIL)", apply: (r) => ({ ...r, detect: (ctx) => {
-      const cw = ctx.concurrentWriters;
-      if (!cw || String(cw.status || "").toUpperCase() !== "FAIL") return [];
-      return [`FAIL:${String(cw.detail || "").slice(0, 160)}`];
-    } }) },
-    { name: "PASS 也报(去掉唯一的放行支)", apply: (r) => ({ ...r, detect: (ctx) => {
-      const cw = ctx.concurrentWriters;
-      if (!cw || typeof cw !== "object") return [];
-      return [`${String(cw.status || "UNKNOWN").toUpperCase()}:${String(cw.detail || "").slice(0, 160)}`];
-    } }) },
-  ],
-  cases: {
-    pos: [
-      { name: "CW:三查①FAIL 点名活跃写会话", text: "收工。",
-        concurrentWriters: { status: "FAIL", detail: "活跃写会话 cd1c7cae(mode=normal)" } },
-      { name: "CW:三查①UNKNOWN 也报(判不了≠没有)", text: "收工。",
-        concurrentWriters: { status: "UNKNOWN", detail: "会话目录不可读" } },
-      // 红队 BP-11 反向钉:命令串里出现探针文件名不是出路
-      { name: "BP-11:只是 grep 了探针文件,FAIL 照报", text: "收工。",
-        bash: "grep -n foo scripts/session-triage.mjs",
-        concurrentWriters: { status: "FAIL", detail: "活跃写会话 cd1c7cae" } },
-      // 红队 BP-12:通道**没接**(undefined)⇒ 契约层报「必需通道缺席,未能判定」(非阻断提示)——
-      //   不供与供 null 是两件事;首版 gate-ctx 把没接归一成 null,这条契约从未生效。
-      { name: "BP-12:通道没接 ⇒ 契约层报未能判定", text: "收工。" },
-    ],
-    neg: [
-      { name: "CW:PASS 不响", text: "收工。", concurrentWriters: { status: "PASS", detail: "无并发写" } },
-      { name: "CW:接了但探测失败(null)⇒ 不响(提示面 fail-open;适配层已把无 JSON 归成 UNKNOWN,null 只剩「无 session_id」一种来源)", text: "收工。", concurrentWriters: null },
-    ],
-  },
-};
+// 0.4.2(分支 b-init-cut1):撤下 CW「收尾时点并发写会话」——源项目已裁撤「同一时刻只许一个写会话」检查,
+//   并发写改由 git 隔离(各写会话在自己的 worktree 与分支上干活)。规则 CW 与 Stop 时点的判活探针注入一并删除。
 
 export const RULES = [RULE_O, RULE_V, RULE_W, RULE_Q, RULE_D, RULE_G, RULE_B, RULE_C, RULE_H, RULE_F, RULE_L, RULE_N, RULE_I, RULE_J, RULE_M,
-  RULE_E0, RULE_E1, RULE_E2, RULE_K, RULE_K0, RULE_S, RULE_T, RULE_U, RULE_P, RULE_ND, RULE_X, RULE_CW];
+  RULE_E0, RULE_E1, RULE_E2, RULE_K, RULE_K0, RULE_S, RULE_T, RULE_U, RULE_P, RULE_ND, RULE_X];
