@@ -74,7 +74,7 @@ export function buildCtx(entries, extra = {}) {
       //   有 origin 的行只认 origin.kind==="human";没有 origin 的老转录行,isMeta(技能/命令正文、提醒)一律不收。
       //   此前靠「harness 前缀黑名单」:/kplan 正文里的「免 battle」被当用户原话白送 W 豁免、/codex 正文的「是什么」误拦 ND;
       //   前缀又会把用户贴来的、恰以该前缀开头的真话整条删掉。前缀只留作无 origin 老行的兜底。
-      //   转录实测(bc9cf8c1):human 77 / peer 55 / task-notification 44 / plugin 17 / 无 origin+isMeta 195。
+      //   转录实测(某会话):human 77 / peer 55 / task-notification 44 / plugin 17 / 无 origin+isMeta 195。
       const human = e.origin?.kind ? e.origin.kind === "human" : e.isMeta !== true;
       if (!human) continue;
       // `!` 命令与本地斜杠命令的输出行也没有 origin、也不是 isMeta——那是程序输出,不是用户的话(红队附二-7)
@@ -294,19 +294,41 @@ export function buildCtx(entries, extra = {}) {
   const turnHasHuman = entries.some((e) => e?.type === "user" && e.origin?.kind === "human" && e.isCompactSummary !== true);
   /** 同一用户轮里、被拦的 Stop 之前已做的写入(ND 等出路要认:日记在被拦前已补,续跑时不该再要一遍)。 */
   const turnPriorWrites = [];
+  /** 同一用户轮里、被拦的 Stop 之前跑过的 Bash 命令(ND 的 Bash 面出路同样要认,红队 7e1392f 轮 BP-9)。 */
+  const turnPriorBash = [];
   if (Array.isArray(extra.priorEntries) && !turnHasHuman) {
     const qs = [];
+    // 「被拦」按**同一 toolUseID 有拦截附件**认,不看汇总行文案(红队 7e1392f 轮 BP-1:lanes v2 把被拦 Stop 的汇总行改写成
+    //   「判官拦了一下…」、v1 形态是空数组,两种都不含「阻断」,曾被当成「已放行」截断回扫)。汇总行没有 toolUseID 时退回看文案。
+    const blockedIds = new Set();
+    for (const e of extra.priorEntries) {
+      if (e?.type === "attachment" && e.attachment?.type === "hook_blocking_error" && e.attachment.toolUseID) blockedIds.add(e.attachment.toolUseID);
+    }
+    let sawQuestion = false;
     for (let i = extra.priorEntries.length - 1; i >= 0; i--) {
       const e = extra.priorEntries[i];
-      if (e?.type === "user" && e.origin?.kind === "human") break;
-      // 回扫停在上一次**已放行**的 Stop(那一轮真收尾了,之前排队的话属于旧轮:红队终审 BP-3/6)。
-      //   **被拦**的 Stop 不停——被拦后续跑仍是同一个用户轮,排队问的「X 是什么」、说的「别外审」都还算数
-      //   (红队 d1cae02 轮 BP-1/2:曾把被拦的 Stop 也当边界,ND 漏放、W 误拦)。
-      if (e?.type === "system" && e.hookCount !== undefined && !/阻断|blocking/i.test(JSON.stringify(e.hookErrors || []))) break;
-      if (e?.type === "assistant" && Array.isArray(e.message?.content)) {
-        for (const b of e.message.content) if (b?.type === "tool_use" && /^(Write|Edit|MultiEdit|NotebookEdit)$/.test(String(b.name || "")) && typeof b.input?.file_path === "string") turnPriorWrites.push(b.input.file_path);
+      if (e?.type === "user" && e.origin?.kind === "human") {
+        // 轮的开口也是这一用户轮的话:被拦后续跑时它已在窗口外,补进来(红队 7e1392f 轮 BP-2)
+        const c = e.message?.content;
+        qs.unshift(typeof c === "string" ? c + "\n" : Array.isArray(c) ? c.filter((b) => b?.type === "text").map((b) => (b.text || "") + "\n").join("") : "");
+        break;
       }
-      if (e?.type === "attachment" && e.attachment?.type === "queued_command" && e.attachment.origin?.kind === "human") qs.unshift(queuedText(e.attachment.prompt));
+      // 回扫停在上一次**已放行**的 Stop(那一轮真收尾了,之前排队的话属于旧轮:红队终审 BP-3/6)。
+      //   **被拦**的 Stop 不停——被拦后续跑仍是同一个用户轮,排队问的「X 是什么」、说的「别外审」都还算数。
+      if (e?.type === "system" && e.hookCount !== undefined) {
+        const blocked = e.toolUseID ? blockedIds.has(e.toolUseID) : /阻断|blocking|拦了/i.test(JSON.stringify(e.hookErrors || []));
+        if (!blocked) break;
+      }
+      // 写入只认**比本轮最近一次提问更新**的(倒着扫,见到提问之后的更早写入不算:红队 7e1392f 轮 BP-3——
+      //   先补了 winget 的日记、后又问 scoop,旧写入不得替新问题结账)
+      if (!sawQuestion && e?.type === "assistant" && Array.isArray(e.message?.content)) {
+        for (const b of e.message.content) {
+          if (b?.type !== "tool_use") continue;
+          if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(String(b.name || "")) && typeof b.input?.file_path === "string") turnPriorWrites.push(b.input.file_path);
+          if (/^(Bash|PowerShell)$/.test(String(b.name || "")) && typeof b.input?.command === "string") turnPriorBash.push(b.input.command);
+        }
+      }
+      if (e?.type === "attachment" && e.attachment?.type === "queued_command" && e.attachment.origin?.kind === "human") { qs.unshift(queuedText(e.attachment.prompt)); sawQuestion = true; }
     }
     for (const q of qs) if (q && !userText.includes(q)) userText += q;
   }
@@ -384,7 +406,7 @@ export function buildCtx(entries, extra = {}) {
   //   INV-5 的仪器即该扫描;字段再断线由它报,不靠注释宣称。
   return {
     text, userText, actions, bashCmds, commits, writes, reads, agents, toolNames, skills, written, isNew,
-    window, batchGoal, turnPriorWrites,
+    window, batchGoal, turnPriorWrites, turnPriorBash,
     /** P 的跨批持久计数(2026-08-22 用户亲签「改吧」)。三态与 batchGoal 同构:
      *  `undefined`=通道没接(夹具/旧路径 ⇒ 规则退回窗口式计账);
      *  `null`=接了、账不存在(首跑 ⇒ 计 0,宽限期);对象={carriers:自上轮三通道后累计承重提交数}。
@@ -506,6 +528,20 @@ export function selfTest() {
         A([use("Edit", { file_path: "/repo/docs/noun-diary.md" })]), ATT, SUMB] });
       chk("被拦的 Stop 不是轮边界:同一用户轮里排队问的话仍补(红队 d1cae02 BP-1)", c.userText.includes("winget"), true);
       chk("被拦前已写的日记记进 turnPriorWrites(续跑时 ND 出路认它)", c.turnPriorWrites.some((w) => /noun-diary/.test(w)), true);
+      // 红队 7e1392f 轮 BP-1:lanes v2 形态——汇总行改写成「判官拦了一下」、无「阻断」字样,按同 toolUseID 的拦截附件仍认作被拦
+      const LANES_SUM = (id) => ({ type: "system", subtype: "stop_hook_summary", hookCount: 3, hookErrors: ["判官拦了一下(全文已附给模型;/lanes 看全文)"], toolUseID: id });
+      const ATT2 = (id) => ({ ...ATT, attachment: { ...ATT.attachment, toolUseID: id } });
+      const c2 = buildCtx([A([txt("收工")])], { priorEntries: [H("做甲"), Q("winget 是什么?"), A([txt("做")]), ATT2("s1"), LANES_SUM("s1"), A([txt("补")]), ATT2("s2"), LANES_SUM("s2")] });
+      chk("lanes v2 形态连拦两次仍认作同一用户轮(排队问题不丢)", c2.userText.includes("winget"), true);
+      // BP-2:轮的开口(用户亲口)在被拦后续跑时也补进来
+      const c3 = buildCtx([A([txt("补了 E0,收工")])], { priorEntries: [H("winget 是什么?"), A([txt("答")]), ATT2("s1"), { ...SUMB, toolUseID: "s1" }] });
+      chk("被拦后续跑:轮的开口也补进 userText", c3.userText.includes("winget"), true);
+      // BP-3:先补 winget 的日记、后又排队问 scoop ⇒ 旧写入不替新问题结账
+      const c4 = buildCtx([A([txt("收工")])], { priorEntries: [H("做甲"), Q("winget 是什么?"), A([use("Edit", { file_path: "/repo/docs/noun-diary.md" })]), ATT2("s1"), { ...SUMB, toolUseID: "s1" }, Q("scoop 又是什么?"), A([txt("答")])] });
+      chk("提问之前的日记写入不计入 turnPriorWrites", c4.turnPriorWrites.length, 0);
+      // BP-9:被拦前用 Bash 追加的日记也记进 turnPriorBash
+      const c5 = buildCtx([A([txt("收工")])], { priorEntries: [H("做甲"), Q("winget 是什么?"), A([use("Bash", { command: "printf x >> docs/noun-diary.md" })]), ATT2("s1"), { ...SUMB, toolUseID: "s1" }] });
+      chk("被拦前的 Bash 命令记进 turnPriorBash", c5.turnPriorBash.length, 1);
     }
     chk("数组形态的排队消息也补",
       buildCtx([A([txt("答")])], { priorEntries: [H("先做甲"), { type: "attachment", attachment: { type: "queued_command", prompt: [{ type: "text", text: "winget是什么?" }], origin: { kind: "human" } } }] }).userText.includes("winget"), true);

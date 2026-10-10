@@ -8,6 +8,7 @@
 // 里逐条指名「这正是要修的那个 bug」,不得默认接受。
 
 import fs from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -130,7 +131,7 @@ const EXPECTED_DIVERGENCE = {
   P: "**谓词指名**(见 DIVERGENCE_DIR.P):新有旧无须动作面真提交背书;旧有新无须机器验" +
      "「入参面无承重提交 ∧ 结果/文本面有 commit+承重字样」——旧式从结果面触发是它的伪造洞," +
      "新式刻意不看结果面(反伪造立法核心)。入参面有承重而新没触发的片**不放行**,那是真回归。",
-  Q: "**旧有新无,全量恰 1 条**(1227c702#445,已单片直证):旧 Q 的 defer 词表咬住「留待」,而它在" +
+  Q: "**旧有新无,全量恰 1 条**(某会话#445,已单片直证):旧 Q 的 defer 词表咬住「留待」,而它在" +
      "**引号里**——`按提示词\"库内同类留待后批…\"` 是在**转述正在执行的指令**,不是我在推面出批。" +
      "新 Q 剥引文后不响(窄例外③自签修复,记录在其 detect 注释)。与 E0 的回声修复同族,是修好的证据。",
   // ⚠️ **此处原写着「K/K0 在语料上不可影子比对」,2026-08-20 经 codex 判定不成立,已推翻。**
@@ -176,7 +177,7 @@ const EXPECTED_DIVERGENCE = {
      "⚠️ 反方向(旧有新无)在第一版里确实出现过 —— 那是**我自己引入的 bug**,不是刻意分歧:\n" +
      "回读证据面收了含 `cat` 的命令,而 `cat >> x.md` 本身就含 `cat` ⇒ **写命令成了自己的回读凭证**。\n" +
      "已按段判定修掉(见 gate-rules.mjs 里 `readCmdsFor` 的头注),并加了配对用例钉住。\n" +
-     "**旧有新无**方向 2026-08-20 已单独查清并登记为刻意(全语料仅 1 条,a891142e#186):\n" +
+     "**旧有新无**方向 2026-08-20 已单独查清并登记为刻意(全语料仅 1 条,某会话#186):\n" +
      "命令是 `sed -i 's/const payload = { node_ids/…/' s3.mjs`。旧 M 的 sed 提取按**位置数 token**\n" +
      "(`sed\\s+-i[^\\s]*\\s+[^\\s]+\\s+([\\w./-]+)`),而这条 sed 脚本**含空格** ⇒ `[^\\s]+` 只吃到 `'s/const`,\n" +
      "捕获组抓到的是 **`payload`** —— sed 脚本内部的一个变量名。旧 M 于是要求回读一个**不存在的文件**。\n" +
@@ -442,16 +443,30 @@ if (process.argv.includes("--migrate-check")) {
   process.exit(go ? 0 : 1);
 }
 
-// 公开树(0.5.0):按设计在某个仓内脚本缺席时整条沉默的规则,正例在缺席的树里无从命中。
-//   这时不跑「正例应命中」,改核反方向——正例**全部沉默**,沉默本身就是设计行为;反例与出路照跑。
-//   脚本在场(源项目)时照常逐条核正例,本表不放宽任何东西。
+// 公开树(custodiet 0.5.0 起):按设计在某个仓内脚本缺席时整条沉默的规则(其在场判定只经 toolPresent,按 cwd 相对)。
+//   缺席时先核**设计行为**——正例在真实树里全部沉默;再 chdir 进一个只放了该脚本桩的临时目录,
+//   正例/反例/出路/变异照常跑,鉴别力不丢。
+//   红队 a27628dd BP-8:旧做法是「正例改核全沉默 + 变异 SKIP」,把 detect 换成恒空也全绿,反例与出路成了空 PASS。
+//   脚本在场(本仓)时 withTool 直接执行,本表不放宽任何东西。同步进公开仓时本段原样带过去(wash-custodiet.mjs)。
 const DORMANT_WITHOUT = { DP: "scripts/verify-prod.mjs" };
-for (const r of RULES) {
+const dormantOf = (r) => {
   const needs = Object.hasOwn(DORMANT_WITHOUT, r.id) ? DORMANT_WITHOUT[r.id] : null;
-  if (needs && !toolPresent(needs)) {
-    say(r.cases.pos.every((c) => runRules([r], mkCtx(c)).length === 0),
-      `${r.id} 正例 ${r.cases.pos.length} 条全沉默(${needs} 不在场,本项按设计退场)`);
-  } else for (const c of r.cases.pos) {
+  return needs && !toolPresent(needs) ? needs : null;
+};
+const withTool = (r, fn) => {
+  const needs = dormantOf(r);
+  if (!needs) return fn();
+  const here = process.cwd(), stub = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "gate-dormant-"));
+  fs.mkdirSync(path.join(stub, path.dirname(needs)), { recursive: true });
+  fs.writeFileSync(path.join(stub, needs), "// gate-migrate-check 桩:只为让 toolPresent 判在场\n");
+  try { process.chdir(stub); return fn(); } finally { process.chdir(here); fs.rmSync(stub, { recursive: true, force: true }); }
+};
+for (const r of RULES) {
+  const needs = dormantOf(r);
+  if (needs) say(r.cases.pos.every((c) => runRules([r], mkCtx(c)).length === 0),
+    `${r.id} 正例 ${r.cases.pos.length} 条在本树全沉默(${needs} 不在场,按设计退场);以下各项在桩目录里照常核`);
+  withTool(r, () => {
+  for (const c of r.cases.pos) {
     const f = runRules([r], mkCtx(c));
     say(f.length === 1, `${r.id} 正例应命中:${c.text.slice(0, 24)}…`);
   }
@@ -576,6 +591,7 @@ for (const r of RULES) {
     say(f.length === 0, tag);
   }
   }
+  });
 }
 
 // ── 2a″. **死指针普查**(2026-08-27,四眼 Q4 逼出来的)。────────────────────
@@ -644,13 +660,8 @@ const sig = (rule, c) => {
 for (const r of RULES) {
   const muts = r.mutations || [];
   if (!muts.length) { say(false, `${r.id} **未声明任何变异** —— 无法证明其用例有鉴别力`); continue; }
-  // 按设计退场的规则(见 DORMANT_WITHOUT):原规则与变异在本树里同样沉默,鉴别力无从在此证明;
-  //   不记 PASS 也不记 FAIL,出声跳过——鉴别力由依赖脚本在场的源项目验收台核。
-  const needsM = Object.hasOwn(DORMANT_WITHOUT, r.id) ? DORMANT_WITHOUT[r.id] : null;
-  if (needsM && !toolPresent(needsM)) {
-    console.log(`  SKIP  ${r.id} 变异 ${muts.length} 条:${needsM} 不在场,本项按设计退场,鉴别力在依赖脚本在场的仓里核`);
-    continue;
-  }
+  // 按设计退场的规则(见 DORMANT_WITHOUT):变异在桩目录里跑,与正反例同口径。
+  withTool(r, () => {
   for (const m of muts) {
     const mutated = m.apply({ ...r });
     const all = [...r.cases.pos, ...r.cases.neg];
@@ -659,6 +670,7 @@ for (const r of RULES) {
     say(!!witness, `${r.id} 变异「${m.name}」被原用例逮住` +
       (witness ? `(证人:${String(witness.text).slice(0, 18)}…)` : ""));
   }
+  });
 }
 
 // ── [切换 2026-08-22 亲签] §3 并行 diff / §4 影子流量 / §5-6 切换判定 **退役** ──

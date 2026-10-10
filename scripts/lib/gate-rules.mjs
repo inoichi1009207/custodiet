@@ -3792,7 +3792,8 @@ const RULE_P = {
      *  只看这三样——它们是判据本体;夹具/文档/agent 定义改动不在此列(那些仍走 grill 口径)。 */
     //   红队 182 BP-8:`cd scripts/lib && git add gate-rules.mjs` 的相对形躲过全前缀 ⇒ 裸文件名也认(库文件按名枚举,
     //   与 gate-carriers 的机件专名同一思路;顶层 `scripts/gate-*.mjs` 与 session-triage 刻意不在——法条口径)。
-    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard)\.mjs|scripts\/lib\/gate-[\w-]+\.mjs|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|gate-(?:rules|ctx|carriers|registry|cmd|slice))\.mjs\b/i,
+    //   红队 3112024 轮 BP-2:裸名名单漏了 gate-difftier(P 分档的唯一实现)——补上。
+    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard)\.mjs|scripts\/lib\/gate-[\w-]+\.mjs|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs\b/i,
     /** 红队 182 BP-9:起一次空 prompt 的 `_gate-bypass-hunter` 也满足收紧 ⇒ 与 W 的 reviewedOne 同法,
      *  入参须提及闸引擎文件名 / 规则 id / diff 文件——只证发起,不证采纳(与另两通道同一 CEILING)。 */
     hunterBound(a) {
@@ -3822,9 +3823,13 @@ const RULE_P = {
       // codex 185「你没问到」2(High):承重件经 **Bash** 改 + `git add -A` ⇒ writes 空、参数面无路径 ⇒ 原式不触发,
       //   于是 gateEngineTouched 为真也走不到红队检查。Bash 写目标与 I/D11 同一实现。
       const cmds = [...(ctx.bashCmds || []), ...((w && w.bashCmds) || [])];
-      return cmds.some((cmd) => {
+      if (cmds.some((cmd) => {
         try { return bashWriteTargets(cmd, CARRIER_SURFACE).some((t) => isCarrierPath(CARRIER_SURFACE, t)); } catch { return false; }
-      });
+      })) return true;
+      // 红队 3112024 轮 BP-1:`cd scripts/lib && sed -i … gate-rules.mjs` 再 `git add -A` 提交——bashWriteTargets 不解析 cd,
+      //   取到裸名不算承重 ⇒ 不触发;而 gateEngineTouched 用裸名分支认得出它。两个判据对同一命令不得相反:
+      //   已提交且闸引擎被动过 ⇒ 触发。
+      return RULE_P._p.gateEngineTouched(ctx);
     },
 
     win(c) { try { return c && typeof c.window === "function" ? c.window() : null; } catch { return null; } },
@@ -3908,12 +3913,12 @@ const RULE_P = {
       try { facts = ctx.diffTier(); } catch { facts = null; }
       const isC = (p) => isCarrierPath(CARRIER_SURFACE, p);
       if (!classifyDiffTier(facts, isC).light) return out;
-      // 写入只取**本批**的(codex 终审 F1:上一批已提交的法典写入还在 400 条窗口里,会取消本批纯测试的豁免):
-      //   批武装时刻在 ⇒ 窗口动作只取带时间戳且不早于武装时刻的;取不到武装时刻 ⇒ 整个窗口都算(偏严)
+      // 写入取**整个窗口**,不按批武装时刻切(红队 d1cae02 轮 BP-3/4/5):P 的义务按 `.p-ledger.json` 跨批累计,
+      //   上一批没过三通道的承重改动也在这笔义务里——只看本批会把累计来的义务一并免掉;按时间切还会被「晚武装」
+      //   「缺时间戳」绕开。代价:上一批改过法典、本批只改测试的批次拿不到分档(codex 终审 F1 的误拦,接受:偏严)。
       const w = H.win(ctx);
-      const armed = Date.parse(String((ctx.batchGoal && ctx.batchGoal.armedAt) || ""));
       const wa = (w && Array.isArray(w.actions)) ? w.actions : [];
-      const acts = [...(Number.isFinite(armed) ? wa.filter((a) => Number.isFinite(a.at) && a.at >= armed) : wa), ...(ctx.actions || [])];
+      const acts = [...wa, ...(ctx.actions || [])];
       const writes = [];
       for (const a of acts) {
         const name = String(a && a.name || ""), inp = (a && a.input) || {};
@@ -3922,7 +3927,7 @@ const RULE_P = {
           try { writes.push(...bashWriteTargets(inp.command, CARRIER_SURFACE)); } catch { return out; }
         }
       }
-      if (!Number.isFinite(armed) && w && Array.isArray(w.writes)) writes.push(...w.writes);
+      if (w && Array.isArray(w.writes)) writes.push(...w.writes);
       return coversWrites(facts, writes, isC) ? out.filter((h) => !H.SOFT_CH.test(String(h.ch))) : out;
     },
 
@@ -4343,6 +4348,27 @@ const RULE_P = {
         bash: ["git add -A scripts/lib/ledger-chain.mjs && git commit -m x"], agent: "grill:edge-cases",
         diffFacts: { root: "/repo", files: [{ path: "scripts/lib/ledger-chain.mjs", status: "M", readable: true }] } },
       // 红队 c3 BP-7:主树 diff 只有测试文件,但承重件写在别的 checkout(worktree / 别的仓)⇒ 事实不全 ⇒ 不分档,照欠
+      // 红队 d1cae02 轮 BP-3/4:义务跨批累计 ⇒ 窗口里武装之前的承重写入(上一批 / 晚武装)同样要覆盖,不能按武装时刻切掉
+      // 红队 3112024 轮 BP-1:cd 相对形 Bash 改闸引擎 + `git add -A` 提交 ⇒ 仍触发,且欠红队
+      { name: "cd 相对形 Bash 改闸引擎 + git add -A ⇒ 触发",
+        text: "收工。", pLedger: { carriers: 0 },
+        bash: ["cd scripts/lib && sed -i s/a/b/ gate-rules.mjs", "git add -A && git commit -m x"] },
+      // 红队 3112024 轮 BP-2:裸名 gate-difftier.mjs 也是闸引擎 ⇒ 独立视角只认红队,grill 不顶
+      { name: "cd 相对改 gate-difftier、只 grill ⇒ 仍欠红队",
+        text: "第五笔。", pLedger: { carriers: 4 }, write: "docs/laws/collab.md",
+        bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "cd scripts/lib && sed -i s/a/b/ gate-difftier.mjs",
+               "cd scripts/lib && git add gate-difftier.mjs && cd ../.. && git commit -m x"], agent: "grill:testing", web: "先例" },
+      // 红队 3112024 轮 BP-5:P 这一层要有「只改法典 ⇒ 重档」的证人
+      { name: "条件3:只改法典 ⇒ 重档",
+        text: "第五笔,改法典。", pLedger: { carriers: 4 },
+        bash: ["git add -A docs/laws/collab.md && git commit -m x"], agent: "grill:edge-cases",
+        diffFacts: { root: "/repo", files: [{ path: "docs/laws/collab.md", status: "M", readable: true }] } },
+      { name: "条件3:武装之前的承重写入也算,不分档",
+        text: "第五笔,改测试。", pLedger: { carriers: 4 },
+        batchGoal: { armedAt: "2026-10-10T08:00:00Z", conditions: ["甲"] },
+        prior: [{ text: "武装前在 worktree 改宪法", write: "/repo/.claude/worktrees/w1/AGENTS.md", at: "2026-10-10T07:50:00Z" }],
+        bash: ["git add -A scripts/lib/ledger-chain.test.mjs && git commit -m x"], agent: "grill:edge-cases",
+        diffFacts: { root: "/repo", files: [{ path: "scripts/lib/ledger-chain.test.mjs", status: "M", readable: true }] } },
       { name: "条件3:承重写入在别的 checkout ⇒ 不分档",
         text: "第五笔,在 worktree 改宪法。", pLedger: { carriers: 4 }, write: "E:/elsewhere/AGENTS.md",
         bash: ["cd E:/elsewhere && git add -A && git commit -m x"], agent: "grill:edge-cases",
@@ -4352,13 +4378,6 @@ const RULE_P = {
       // 批 257 条件 3 分档的接受侧证人:只改测试文件 ⇒ 轻档 ⇒ 只欠独立视角,grill 在场即放行。
       { name: "条件3:只改测试文件 ⇒ 轻档,免跨模型与联网",
         text: "第五笔,改测试。", pLedger: { carriers: 4 },
-        bash: ["git add -A scripts/lib/ledger-chain.test.mjs && git commit -m x"], agent: "grill:edge-cases",
-        diffFacts: { root: "/repo", files: [{ path: "scripts/lib/ledger-chain.test.mjs", status: "M", readable: true }] } },
-      // codex 终审 F1:上一批(武装时刻之前)写过法典,本批只改测试 ⇒ 上一批的写入不取消本批豁免
-      { name: "条件3:上一批的承重写入不连累本批纯测试的豁免",
-        text: "第五笔,改测试。", pLedger: { carriers: 4 },
-        batchGoal: { armedAt: "2026-10-10T08:00:00Z", conditions: ["甲"] },
-        prior: [{ text: "上一批改法典", write: "docs/laws/collab.md", at: "2026-10-10T07:00:00Z" }],
         bash: ["git add -A scripts/lib/ledger-chain.test.mjs && git commit -m x"], agent: "grill:edge-cases",
         diffFacts: { root: "/repo", files: [{ path: "scripts/lib/ledger-chain.test.mjs", status: "M", readable: true }] } },
       // 真调用集:三条通道各真跑一遍 ⇒ 放行。**这是唯一的接受侧证人**,
@@ -6145,8 +6164,11 @@ const RULE_ND = {
     const m = ut.match(/(是什么|是啥|什么意思|啥意思|到底是啥|什么东西)/);
     if (!m) return [];
     // 出路1(动作面):本轮真动过日记——Write/Edit 面或 Bash 面都认
+    // Bash 面只认**写**到日记(红队 7e1392f 轮 BP-5:`grep -n winget docs/noun-diary.md` 查一下没查到也算「动过」);
+    //   被拦链上之前跑的 Bash 同样认(BP-9)
+    const ND_BASH_WRITE = /(>>?|\btee\b(\s+-a)?|\bsed\s+-i\b[^|;&]*|\bAdd-Content\b|\bSet-Content\b|\bOut-File\b)[^|;&]*noun-diary\.md/i;
     const touched = [...(ctx.writes || []), ...(ctx.turnPriorWrites || [])].some((w) => /docs\/noun-diary\.md$/.test(String(w).replace(/\\/g, "/"))) ||
-      (ctx.bashCmds || []).some((c) => /noun-diary\.md/.test(c));
+      [...(ctx.bashCmds || []), ...(ctx.turnPriorBash || [])].some((c) => ND_BASH_WRITE.test(c));
     if (touched) return [];
     // 出路2(文本出路,按 INV-1 写进判据受正反例与变异约束):就地声明不适用+理由
     const at = maskQuoted(String(ctx.text || ""));
@@ -6181,10 +6203,14 @@ const RULE_ND = {
       { user: "winget 到底是啥?", text: "winget 是 Windows 官方包管理器。" },
       // 提了日记但既没动也没按格式声明 ⇒ 照拦(光嘴上说不算)
       { user: "SVC 是什么?", text: "SVC 是歌声音色转换。名词日记我回头再补。" },
+      // 红队 7e1392f 轮 BP-5:只读地 grep 一下日记(没查到)不算动过 ⇒ 照拦
+      { user: "winget 是什么?", text: "winget 是 Windows 包管理器。", bash: "grep -n winget docs/noun-diary.md" },
     ],
     neg: [
       // 动作面出路:真追加了日记
       { user: "RVC 是什么?", text: "RVC 是检索式声音转换,已补日记。", write: "/repo/docs/noun-diary.md" },
+      // Bash 追加写进日记同样算
+      { user: "scoop 是什么?", text: "scoop 是 Windows 的命令行包管理器,已补日记。", bash: "printf '%s\\n' '| scoop | 包管理器 |' >> docs/noun-diary.md" },
       // 文本出路:就地声明不适用+理由
       { user: "你刚说的到底是啥意思?", text: "名词日记:不适用,因这是对上文指代的追问,不是名词问。" },
       // 全角冒号(2026-09-11 红队 202 附节二②:与 DP BP-11 同一个 `[::]` 半角重复 bug)

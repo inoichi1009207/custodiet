@@ -635,7 +635,7 @@ function checkA(entries) {
 //   **规则不追溯**:生效时刻(`CODEX_A_SINCE`)之前发起的作业不入账。提示里的 poll 用这次发起用的那支 runner,能力按它判。
 // 残余(照实列):
 //   ①历史转录没有 BODY 块:旧 runner 发起、用 cat 等 shell 读法读 R 的会判待读(v5 接受的代价;出路一条 `--poll J` 或 Read R)。
-//   ②Read R 不证读全:任意一段成功即算(裁定 v5 第 2 条原文)。显式 `--out` 复用同一路径不占位,旧件可能被当成新件读。
+//   ②Read R 不证读全:读到第 10 行起的任意一段正文即算(10-10 收紧:只读到 9 行头部不算)。显式 `--out` 复用同一路径不占位,旧件可能被当成新件读。
 //   ③R 读不到(超过 2MB、已移走)时 BODY 块只比 J 不比正文。
 //   ④别的会话发起、本会话只 poll 的作业不入账。
 //   ⑤hook 进程 os.tmpdir() 未直证;一个 CODEX_LOG 都没留下的作业,目录不一致时只能落「未知」。
@@ -656,6 +656,8 @@ const CODEX_SKEW_MS = 2000;                      // 下界容差:runner 的 star
 export const CODEX_A_SINCE = Date.parse("2026-10-10T06:33:44Z");
 // runner 的发起占位行(与 codex-run.mjs 的 PLACEHOLDER_RE 同一正则,自测核两边一致):Read 到它永不算读回
 export const CODEX_PLACEHOLDER_RE = /^\(codex-run 作业 \S+ 运行中,结果未产出——占位\)\s*$/;
+// runner 写的结果件头部固定 8 行 `---…---` 加 1 空行,正文从第 10 行起;Read 只读到头部不算读回(红队 7e1392f 轮 BP-4)
+export const CODEX_BODY_FIRST_LINE = 10;
 const CODEX_ARG_ERROR = /缺 --task|任务文件不存在|拒绝入参|未知参数|参数 \S+ 缺值/;
 
 /** tool_result 的正文(字符串或 text 块数组)。 */
@@ -905,7 +907,12 @@ export function codexLedger(entries, env = {}) {
       if (p) {
         // 读到的是 runner 的发起占位 ⇒ 永不算读回(v7,按内容判,不靠时间戳)
         const plain = text.split(/\r?\n/).map((l) => l.replace(/^\s*\d+[\t→]/, "")).join("\n").trim();
-        reads.push({ seq: ev.seq, ts: ev.ts, p, ph: CODEX_PLACEHOLDER_RE.test(plain) });
+        // 一行带行号的内容都没有(越界 offset 只回一句提示)也不算读到(红队 d1cae02 轮 BP-6);
+        //   只读到 runner 写的 9 行头部(`---` 包着的版本/模型/沙箱…)也不算——正文从第 10 行起(红队 7e1392f 轮 BP-4:
+        //   Read limit:10 看一眼头部就被判读回)
+        const lineNos = [...text.matchAll(/^\s*(\d+)[\t→]/gm)].map((m) => Number(m[1]));
+        const reachesBody = lineNos.some((n) => n >= CODEX_BODY_FIRST_LINE);
+        reads.push({ seq: ev.seq, ts: ev.ts, p, ph: CODEX_PLACEHOLDER_RE.test(plain) || !lineNos.length, head: !reachesBody });
         // 分页 Read 同一文件:按行号拼接后取块(v6,codex v5 第 4 条:BODY 跨页时单页都不完整)。
         //   v7(codex v6 第 5 条):每段连续行号各自拼——前面有没读到的空档,不连累后面完整的块;不用 Math.min(...) 展开(红队附二-4)
         const pg = pages.get(p) || new Map();
@@ -1122,7 +1129,7 @@ export function codexLedger(entries, env = {}) {
       const afterDone = (r) => (doneTs != null ? (r.ts != null && r.ts >= doneTs)
         : ledger && doneSeq != null ? r.seq > doneSeq : true);
       const readBack = mine("BODY").some((d) => typeof rBody !== "string" || codexNormBody(d.text) === codexNormBody(rBody)) ||
-        reads.some((r) => r.seq > job.launchSeq && job.R.has(r.p) && !r.ph && afterDone(r));
+        reads.some((r) => r.seq > job.launchSeq && job.R.has(r.p) && !r.ph && !r.head && afterDone(r));
       status = readBack ? "read" : kind === "done" ? "pending-read" : kind === "running" ? "running" : "unknown";
     }
     const label = J || `codex 作业(tool_use …${job.id.slice(1)})`;
@@ -2794,6 +2801,13 @@ function selfTest() {
       const runPoll = call("Bash", { command: pollCmd("J1") }, "CODEX_JOB=J1\nCODEX_STATE=running\nCODEX_END=J1\nrunning\n");
       cx("终审 BP-8:台账已清、只剩旧 running 观测,完整 Read R ⇒ 已读回", st([...launchBg(), ...runPoll, ...jm("J1"), ...readR()], stEnv(null)), "read");
       cx("终审 BP-8 对照:台账仍说 running ⇒ 运行中(读到的是占位/旧件不算)", st([...launchBg(), ...runPoll, ...readR()], stEnv({ state: "running", startedAt: new Date(now).toISOString(), timeoutMs: 900000 })), "running");
+      // 红队 d1cae02 轮 BP-6:Read 只回一句提示(越界 offset),一行文件内容都没有 ⇒ 不算读回
+      // 红队 7e1392f 轮 BP-4:Read limit 只读到头部(前 9 行)⇒ 不算读回;读到第 10 行起的正文才算
+      cx("7e1392f BP-4:只读到结果件头部 ⇒ 不算读回", st([...launchDone(), ...call("Read", { file_path: R, limit: 9 }, numbered(HEAD))], stEnv(null)), "pending-read");
+      cx("7e1392f BP-4 对照:分页读到正文 ⇒ 已读回", st([...launchDone(), ...call("Read", { file_path: R, limit: 9 }, numbered(HEAD)),
+        ...call("Read", { file_path: R, offset: 10 }, numbered(BODY, 10))], stEnv(null)), "read");
+      cx("d1cae02 BP-6:Read 没返回任何文件行 ⇒ 不算读回", st([...launchDone(),
+        ...call("Read", { file_path: R, offset: 999 }, "<system-reminder>Warning: the file exists but is shorter than the provided offset (999).</system-reminder>")], stEnv(null)), "pending-read");
       // 红队 v6 BP-4:规则不追溯——生效时刻之前发起的作业不入账
       cx("v7 BP-4:生效之前发起的作业不入账", codexLedger([...launchDone()], { ...env0, since: T0 + 86_400_000 }).jobs.length, 0);
       cx("v7 BP-4 对照:生效之后发起的照入账", codexLedger([...launchDone()], { ...env0, since: T0 - 1000 }).jobs.length, 1);
@@ -2858,7 +2872,8 @@ function selfTest() {
 
     // ① 只读一段(Read offset/limit)⇒ 已读回;v5:Read R 任一段成功都算,包括只到固定头(残余②)
     cx("①只读一段正文 ⇒ 已读回", st([...launchDone(), ...readR(R, 10, BODY)]), "read");
-    cx("①v5:Read R 只读到固定头 ⇒ 已读回(Read R 成功即算)", st([...launchDone(), ...readR(R, 1, HEAD.slice(0, 8))]), "read");
+    // 7e1392f 轮红队 BP-4 收紧:v5 曾接受「Read R 只读到固定头也算」(残余②),现改为须读到第 10 行起的正文
+    cx("①收紧:Read R 只读到固定头 ⇒ 待读(须读到正文)", st([...launchDone(), ...readR(R, 1, HEAD.slice(0, 8))]), "pending-read");
     cx("①变异:Read 的是别的文件 ⇒ 待读", st([...launchDone(), ...readR("\\repo\\clipboard\\codex\\t-r9.md", 10, BODY)]), "pending-read");
     // ② 读失败后重读成功;变异:只有那次失败
     const failRead = call("Read", { file_path: R }, "<tool_use_error>File content (40000 tokens) exceeds maximum allowed tokens</tool_use_error>", true);
@@ -3140,11 +3155,11 @@ function selfTest() {
     // v4 (b) 的「零特征行读头即算」随特征行一起删除:v5 Read R 成功即算
     cx("v5 回件只回「无发现」⇒ Read R 即已读回", st([...launchDone(), ...readR(R, 1, [...HEAD, "无发现"])], { resultBody: () => [...HEAD, "无发现"].join("\n") }), "read");
     cx("v5 回件只回「无发现」⇒ runner BODY 块即已读回", st([...launchDone5("J1", [...HEAD, "无发现"].join("\n"))], { resultBody: () => [...HEAD, "无发现"].join("\n") }), "read");
-    // 回放实撞(5a8d9bff):`until … --poll J | grep -q …; do sleep; done; … --poll J | tail -1` 是同一个 J ⇒ 照常归属
+    // 回放实撞(某会话):`until … --poll J | grep -q …; do sleep; done; … --poll J | tail -1` 是同一个 J ⇒ 照常归属
     cx("回放 同一命令里两次 poll 同一个 J ⇒ 照常归属,得到结果路径后 Read 读回", st([...call("Bash", { command: `${launchCmd} 2>&1 | tail -1` }, "CODEX_END=J1\n"), ...call("Bash",
       { command: `until node codex-run.mjs --poll J1 | grep -qE "^done"; do sleep 20; done; node codex-run.mjs --poll J1 | tail -1` }, `done ${R}\n`),
       ...readR(R, 10, BODY)], stEnv(null)), "read");
-    // 回放实撞(8761f62e):`--poll $(grep …)` 剥壳得 `grep`,无台账 ⇒ 不认领占位
+    // 回放实撞(某会话):`--poll $(grep …)` 剥壳得 `grep`,无台账 ⇒ 不认领占位
     cx("回放 --poll $(grep …) 不把 grep 当 J 认领占位", (() => { const j = codexLedger([...redir,
       ...call("Bash", { command: "node scripts/codex-run.mjs --poll $(grep -o J5 outputs/x.log)" }, "done E:/x.md\n")], { ...env0, jobState: () => null }).jobs;
       return j.length === 1 && j[0].label !== "grep" && j[0].id.startsWith("@"); })(), true);
