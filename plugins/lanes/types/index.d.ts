@@ -13,6 +13,6 @@ export type SubLane = { tools: number; files: number; gates: number; last: strin
 
 declare module 'claude-code' {
   interface PluginState {
-    lanes: { lanes: Lanes; showAll: boolean; relay: boolean; relayRun: number; relayPending: string }
+    lanes: { lanes: Lanes; showAll: boolean; relay: boolean; relayLast: string; autoBg: boolean }
   }
 }

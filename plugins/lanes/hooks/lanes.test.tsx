@@ -60,25 +60,59 @@ test('旧形状的状态不让记账崩', async ($, on) => {
   }
 })
 
-// 闸转投(默认关):开了之后,settings Stop hooks 的拦截不交给引擎画,而是以插件消息原文转给模型
-test('闸转投:关时原样拦,开时改投插件消息并清掉引擎的拦截;连撞到顶交回引擎', async ($, on) => {
-  const sent: string[] = []
-  on('ui.render', async ($, e) => { const { Box } = $.ui.resolve(e); return <Box /> })
+// 闸转投 v2:关时原样拦;开时仍然拦,但引擎显示的拦截文本换成一行短句(保留首行与规则号),全文以 isMeta 行附给模型
+test('闸转投 v2:短句留给引擎、全文附给模型、照样拦', async ($, on) => {
   mock.clock(on)
-  on('turn.complete', async () => ({ text: '' }) as never)
-  on('classic.Stop', async () => ({ block: '收尾闸阻断 1 项:\n  [E0] 裸因果断言' }) as never)
-  on('prompt.submit', async ($, e) => { sent.push(String((e as { text: string }).text)); return { text: (e as { text: string }).text } as never })
-  // 收尾 = classic.Stop,随后这一轮结束 = turn.complete(转投在这时才发出)
-  const stop = async () => { const r = await ($.classic.Stop({} as never) as Promise<{ block?: string }>); await ($.turn as unknown as { complete: (e: unknown) => Promise<unknown> }).complete({ answer: '', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' }); return r }
-  expect((await stop()).block).toMatch(/收尾闸阻断/)          // 默认关:原样拦
-  expect(sent.length).toBe(0)
-  await $.command.run({ command: 'lanes-relay' } as never)
-  for (let i = 1; i <= 5; i++) {
-    const r = await stop()
-    expect(r.block).toBeUndefined()                             // 引擎不再画拦截
-    expect(sent.length).toBe(i)
-    expect(sent[i - 1]).toMatch(/^Stop hook feedback:\n收尾闸阻断/) // 模型拿到全文,开头让收尾闸认得是续轮
-  }
-  expect((await stop()).block).toMatch(/收尾闸阻断/)          // 第 6 次:交回引擎,让闸自己的连撞降级生效
-  expect(sent.length).toBe(5)
+  const rows = mock.session(on)
+  const FULL = '收尾闸阻断 2 项:\n  [E0] 裸因果断言\n  [E2] 没问机械判据\n'.repeat(3)
+  on('classic.Stop', async () => ({ block: FULL }) as never)
+  const stop = () => $.classic.Stop({} as never) as Promise<{ block?: string }>
+  const r = await stop()                                         // 默认开(会话重启后也是开)
+  expect(r.block).toMatch(/^收尾闸阻断 2 项: \[E0 E2\]/)          // 仍然拦;首行与规则号保留,收尾闸的轮次边界/连撞计数认得
+  expect(r.block!.length).toBeLessThan(80)                       // 输出框只剩一行
+  const appended = JSON.stringify(rows.appended())
+  expect(appended).toMatch(/裸因果断言/)                            // 全文到了模型那边
+  await $.command.run({ command: 'lanes-relay' } as never)       // 切成关:原样
+  expect((await stop()).block).toBe(FULL)
+})
+
+// 转投来的插件消息在对话里只画一行;ctrl+o 全文视图照常;别的插件的消息不碰
+test('转投行折成一行,全文视图与他人消息不动', async ($, on) => {
+  on('ui.render', async ($, e) => { const { Text } = $.ui.resolve(e); return <Text>ENGINE</Text> })
+  const row = (origin: object, isExpanded = false) => $.ui.mount({ plugin: 'lanes', surface: 'terminal', component: 'UserMessage', props: { text: 'Stop hook feedback:\n收尾闸阻断 1 项', origin, isExpanded } as never })
+  const t = async (h: { find: (q: never) => Promise<{ text?: string } | undefined> }) => (await h.find({ type: 'Text' } as never))?.text ?? ''
+  expect(await t(await row({ kind: 'plugin', name: 'lanes' }))).toMatch(/闸拦了一下/)
+  expect(await t(await row({ kind: 'plugin', name: 'lanes' }, true))).toBe('ENGINE')
+  const other = await $.ui.mount({ plugin: 'lanes', surface: 'terminal', component: 'UserMessage', props: { text: '普通的一句话', origin: { kind: 'plugin', name: 'other' }, isExpanded: false } as never })
+  expect(await t(other)).toBe('ENGINE')
+})
+
+// 模型能调的开关工具:control 改 relay
+test('control 工具能开关闸转投', async ($, on) => {
+  on('tool.call', async () => ({ result: 'ok' }) as never)
+  const r = await $.tool.call({ tool: 'mcp__lanes__control', setting: 'relay', value: true } as never) as { text?: string; result?: string }
+  expect(JSON.stringify(r)).toMatch(/闸转投已开/)
+})
+
+// 工具行不论是否在跑都藏(10 秒自动转后台之后,用户:「工具行还是隐蔽掉吧」)
+test('工具行运行中与跑完都藏', async ($, on) => {
+  on('ui.render', async ($, e) => { const { Text } = $.ui.resolve(e); return <Text>ENGINE</Text> })
+  const t = async (h: { find: (q: never) => Promise<{ text?: string } | undefined> }) => (await h.find({ type: 'Text' } as never))?.text ?? ''
+  const row = (isRunning: boolean) => $.ui.mount({ plugin: 'lanes', surface: 'terminal', component: 'ToolUse', props: { tool: 'Bash', input: { command: 'sleep 99' }, isRunning, isErrored: false, isInterrupted: false } as never })
+  expect(await t(await row(true))).toBe('')
+  expect(await t(await row(false))).toBe('')
+})
+
+// 前台 Bash/PowerShell 的 timeout 压到 10 秒(撞到即自动转后台);显式后台的、关掉开关后的不动
+test('长命令 10 秒自动转后台', async ($, on) => {
+  const seen: unknown[] = []
+  on('tool.call', async ($, e) => { seen.push((e as { timeout?: number }).timeout); return { result: 'ok' } as never })
+  await $.tool.call({ tool: 'Bash', command: 'sleep 99', description: 'x' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'sleep 99', description: 'x', timeout: 600000 } as never)
+  await $.tool.call({ tool: 'Bash', command: 'ls', description: 'x', timeout: 3000 } as never)
+  await $.tool.call({ tool: 'Bash', command: 'sleep 99', description: 'x', run_in_background: true } as never)
+  await $.tool.call({ tool: 'Bash', command: 'sleep 99', description: 'x', timeout: 600000, agentId: 'agentWAIT' } as never)   // 子代理不压
+  await $.tool.call({ tool: 'mcp__lanes__control', setting: 'autoBg', value: false } as never)
+  await $.tool.call({ tool: 'Bash', command: 'sleep 99', description: 'x', timeout: 600000 } as never)
+  expect(seen).toEqual([10000, 10000, 3000, undefined, 600000, 600000])   // control 由插件自己应答,不落到底层
 })

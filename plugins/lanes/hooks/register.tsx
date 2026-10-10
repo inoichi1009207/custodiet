@@ -15,15 +15,17 @@ const bumpSub = (l: Lanes, id: string, f: (s: SubLane) => SubLane): Lanes => ({ 
 const lanes = atom({ plugin: 'lanes', key: 'lanes' } as const, empty)
 const showAll = atom({ plugin: 'lanes', key: 'showAll' } as const, false)
 // 闸转投(用户 2026-10-09:「我只需要知道你被闸拦了,细节去 lanes 看,而非在输出框里看」)。
-// settings 里的 Stop hooks(收尾闸、判官)照常跑;它们的拦截与提示不交给引擎画成「Stop hook feedback」长段,
-// 改由本插件以插件消息原文转给模型——那一行是 UserMessage,本插件能把它画成一行灰字,全文进 /lanes 面板。
-// 默认关:收尾闸靠「Stop hook feedback:」开头认续轮(hook-stop-closure.mjs lastTurn)、靠 system 行的 hookErrors 数连撞,
-// 转投后这两处要先认得插件消息才安全。RELAY_CAP:连续转投到这一轮就不再转、交回引擎原样处理,让闸自己的连撞降级生效。
-const relay = atom({ plugin: 'lanes', key: 'relay' } as const, false)
-const relayRun = atom({ plugin: 'lanes', key: 'relayRun' } as const, 0)
-const RELAY_CAP = 5
-// 引擎规矩(host check):classic.Stop 里不能 prompt.submit——会等本 hook 正把持着的那一轮。先暂存,turn.complete 再发。
-const relayPending = atom({ plugin: 'lanes', key: 'relayPending' } as const, '')
+// settings 里的 Stop hooks(收尾闸、判官)照常跑、照常拦;本插件只把拦截/提示的**显示文本**换成一行短句,
+// 全文另以 isMeta 用户行附给模型,全文同时进 /lanes 面板。做法细节见下方 classic.Stop 处的「转投 v2」注释。
+// 默认开(10-09:$.state 是会话级,进程重启后回到默认值,用户开过的转投被重置成关,Stop hook error 又整段回到输出框)。
+const relay = atom({ plugin: 'lanes', key: 'relay' } as const, true)
+// 诊断:最近一次收尾时转投走了哪条分支(10-09 实测开关已开、拦截仍走引擎原路,先看清分支再修)
+// 长命令自动转后台(用户 10-09:「如何保证你把长命令塞进背景?10s 合适」)。Claude Code 自带:命令撞到 timeout 即自动转后台
+// (本机 changelog:「a command hits its timeout and is auto-backgrounded」)。本插件把每条前台 Bash/PowerShell 的 timeout 压到 10s,
+// 于是超过 10 秒的命令一律转后台、跑完通知,不靠模型记得。显式 run_in_background 的不动。默认开。
+const autoBg = atom({ plugin: 'lanes', key: 'autoBg' } as const, true)
+const AUTO_BG_MS = 10000
+const relayLast = atom({ plugin: 'lanes', key: 'relayLast' } as const, '')
 const RELAY_HEAD = 'Stop hook feedback:\n'
 
 const textOf = (content: unknown): string => {
@@ -37,6 +39,14 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'lanes', description: '开/关分道面板:本轮闸提示 / 改过的文件 / 工具调用' })
     await $.command.register({ name: 'lanes-show', description: '切换:对话框里显示或隐藏工具调用与闸反馈' })
+    // 给模型一个开关工具(用户 10-09:「这些东西你不能自己敲吗?」——斜杠命令只有人能敲,模型能调的是工具)
+    try {
+      await $.tool.register({
+        name: 'control',
+        description: 'lanes 设置开关。setting=relay:闸转投(闸的拦截与提示由插件转给模型,输出框只留一行);setting=showAll:对话框里显示工具行与闸反馈;setting=autoBg:前台 Bash/PowerShell 超过 10 秒自动转后台。value=true/false。',
+        inputSchema: { type: 'object', properties: { setting: { type: 'string', enum: ['relay', 'showAll', 'autoBg'] }, value: { type: 'boolean' } }, required: ['setting', 'value'] },
+      })
+    } catch { /* 注册失败不挡会话 */ }
     await $.command.register({ name: 'lanes-relay', description: '切换:闸的拦截与提示改由插件转给模型,输出框只留一行(实验,默认关)' })
     // 开场自动打开面板(用户 2026-10-09:「下次对话一开始自动给我看 lanes」)。
     // 引擎规矩:不是人点开的面板,终端宽 ≥144 列才落座,窄了就等着——那时敲 /lanes 照样能开。
@@ -60,39 +70,44 @@ export const register: Register = on => {
     if ((e.origin as { kind?: string } | undefined)?.kind === 'plugin') return next(e)
     try {
       await update($, lanes, l => ({ ...empty, turn: norm(l).turn + 1 }))
-      await update($, relayRun, () => 0)
     } catch { /* 记账失败不挡用户发消息 */ }
     return next(e)
   })
 
+  // 转投 v2(10-09 用户实测 v1「The lanes plugin sent a message」整条仍显示——插件消息带引擎画的来源标签,mod 盖不掉):
+  //   不再另发插件消息。拦截照常由引擎执行,但 block 文本换成一行短句(保留首行「收尾闸阻断 N 项:」与规则编号,
+  //   让收尾闸自己的轮次边界与连撞计数照常认得);全文以 isMeta 用户行 append 给模型——模型读得到,人不当作消息看。
+  //   提示(additionalContext)同理:短句留给引擎,全文 append。
   on('classic.Stop', async ($, e, next) => {
     const r = await next(e)
+    const note = async (s: string) => { try { const ts = new Date(await $.clock.now()).toISOString().slice(11, 19); await update($, relayLast, () => `${ts} ${s}`) } catch { /* 诊断失败不影响 */ } }
     try {
-      if (!(await read($, relay))) return r
-      const parts = [...(r.block ? [r.block] : []), ...(r.additionalContext ?? [])]
-      if (!parts.length) { await update($, relayRun, () => 0); return r }
-      const run = (await read($, relayRun)) + 1
-      if (run > RELAY_CAP) return r   // 连撞到顶:交回引擎原样画、原样计数
-      const text = RELAY_HEAD + parts.join('\n\n')
+      if (!(await read($, relay))) { await note(`关;block=${!!r.block} ctx=${(r.additionalContext ?? []).length}`); return r }
+      const ctx = r.additionalContext ?? []
+      if (!r.block && !ctx.length) { await note('开;本次无拦截无提示'); return r }
+      const full = [...(r.block ? [r.block] : []), ...ctx].join('\n\n')
+      await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: RELAY_HEAD + full }] } })
       const at = await $.clock.now()
-      await update($, lanes, l0 => (l => ({ ...l, gates: [...l.gates, { at, text: text.slice(0, 600), blocking: !!r.block }].slice(-20) }))(norm(l0)))
-      await update($, relayRun, () => run)
-      await update($, relayPending, () => text)
-      return { ...r, block: undefined, additionalContext: undefined }
-    } catch { return r }   // 转投任何一步失败:原样交回引擎,闸照常生效
+      await update($, lanes, l0 => (l => ({ ...l, gates: [...l.gates, { at, text: full.slice(0, 4000), blocking: !!r.block }].slice(-20) }))(norm(l0)))
+      const ids = (s: string) => [...new Set([...s.matchAll(/\[([A-Z][A-Z0-9]{0,3})\]/g)].map(m => m[1]))].join(' ')
+      const head = (s: string) => s.split('\n')[0].slice(0, 40)
+      const short = (s: string) => {
+        const h = head(s)
+        const id = ids(s)
+        return /^\[只查一件事/.test(s) ? '判官拦了一下(全文已附给模型;/lanes 看全文)' : `${h}${id ? ' [' + id + ']' : ''}(全文已附给模型;/lanes 看全文)`
+      }
+      await note(`开;已附全文 ${full.length} 字,block=${!!r.block} ctx=${ctx.length}`)
+      return { ...r, ...(r.block ? { block: short(r.block) } : {}), ...(ctx.length ? { additionalContext: ctx.map(short) } : {}) }
+    } catch (err) { await note(`开;出错交回引擎:${String(err).slice(0, 120)}`); return r }   // 转投任何一步失败:原样交回引擎,闸照常生效
   })
 
-  on('turn.complete', async ($, e, next) => {
-    const out = await next(e)
-    if (e.agentId) return out   // 子代理的一轮结束不发:转投只给主线
-    try {
-      const text = await read($, relayPending)
-      if (text) {
-        await update($, relayPending, () => '')
-        await $.prompt.submit({ text })
-      }
-    } catch { /* 发不出:闸这一轮就漏了,下一次 Stop 会重新判 */ }
-    return out
+  on('tool.call', { tool: 'mcp__lanes__control' }, async ($, e) => {
+    const input = e as unknown as { setting?: string; value?: unknown }
+    const v = input.value === true
+    if (input.setting === 'relay') { await update($, relay, () => v); return { result: v ? '闸转投已开' : '闸转投已关' } as never }
+    if (input.setting === 'showAll') { await update($, showAll, () => v); $.ui.invalidate('ui.render'); return { result: v ? '对话框显示工具行与闸反馈' : '对话框只显示正文' } as never }
+    if (input.setting === 'autoBg') { await update($, autoBg, () => v); return { result: v ? '长命令 10 秒自动转后台:开' : '长命令自动转后台:关' } as never }
+    return { result: 'setting 只接受 relay / showAll / autoBg' } as never
   })
 
   on('command.run', { command: 'lanes-relay' }, async $ => {
@@ -100,6 +115,18 @@ export const register: Register = on => {
     await update($, relay, () => now)
     return { text: now ? '闸转投已开:拦截与提示改由插件转给模型,输出框只留一行。' : '闸转投已关:闸的反馈恢复由引擎直接显示。' }
   })
+
+  for (const tool of ['Bash', 'PowerShell'] as const) {
+    on('tool.call', { tool }, async ($, e, next) => {
+      const input = e as unknown as { run_in_background?: boolean; timeout?: number; agentId?: string }
+      try {
+        // 子代理本来就在后台跑,前台等不挡用户;它要等 codex 作业到终态(`--poll J --wait-ms`),转后台反而等不成
+        if (input.run_in_background || input.agentId || !(await read($, autoBg))) return next(e)
+        const timeout = Math.min(typeof input.timeout === 'number' && input.timeout > 0 ? input.timeout : AUTO_BG_MS, AUTO_BG_MS)
+        return next({ ...e, timeout } as typeof e)
+      } catch { return next(e) }
+    })
+  }
 
   on('tool.call', async ($, e, next) => {
     const input = e as unknown as Record<string, unknown>
@@ -128,7 +155,7 @@ export const register: Register = on => {
         const blocking = /阻断|blocking error/i.test(text)
         await update($, lanes, l0 => (l => e.agentId
           ? bumpSub(l, e.agentId, s => ({ ...s, gates: s.gates + 1 }))
-          : ({ ...l, gates: [...l.gates, { at, text: text.slice(0, 600), blocking }].slice(-20) }))(norm(l0)))
+          : ({ ...l, gates: [...l.gates, { at, text: text.slice(0, 4000), blocking }].slice(-20) }))(norm(l0)))
       }
     } catch { /* 记账失败不挡写会话行 */ }
     return next(e)
@@ -136,10 +163,11 @@ export const register: Register = on => {
 
   // 主对话框只留「我真正想跟你说的话」(用户 2026-10-09):工具调用行、工具结果、闸的反馈一律不在对话里画,
   // 改进右侧 /lanes 面板。/lanes-show 切换回显示(排查时用)。
-  const isGateText = (t: string) => /^(Stop hook feedback|Stop hook blocking error|收尾闸阻断|收尾闭环闸命中|\[只查一件事)/.test(t.trim())
+  const isGateText = (t: string) => /^(The lanes plugin sent a message:\s*)?(Stop hook feedback|Stop hook blocking error|收尾闸阻断|收尾闭环闸命中|\[只查一件事)/.test(t.trim())
   for (const component of ['ToolUse', 'ToolResult', 'ToolGroup', 'ToolProgress'] as const) {
     on('ui.render', { component }, async ($, e, next) => {
       if (await read($, showAll)) return next(e)
+      // 运行中的调用也藏(10-09 用户:有了 10 秒自动转后台,「工具行还是隐蔽掉吧」;0.6.1 曾为手动切后台放出运行中行)。
       const { Box } = $.ui.resolve(e)
       return <Box />
     })
@@ -148,11 +176,15 @@ export const register: Register = on => {
     on('ui.render', { component }, async ($, e, next) => {
       const props = e.props as { text?: unknown; output?: unknown; content?: unknown }
       const text = String(props.text ?? props.output ?? props.content ?? '')
-      if (!isGateText(text)) return next(e)
+      // 本插件转投的闸消息(origin=plugin:lanes)一律按闸画;用户 10-09:「The lanes plugin sent a message 依然发出来了」
+      const origin = (e.props as { origin?: { kind?: string; name?: string } }).origin
+      const fromRelay = origin?.kind === 'plugin' && origin?.name === 'lanes'
+      if (!fromRelay && !isGateText(text)) return next(e)
+      if ((e.props as { isExpanded?: boolean }).isExpanded) return next(e)   // ctrl+o 全文视图照常画
       try {
         const at = await $.clock.now()
         const blocking = /阻断|blocking error/i.test(text)
-        await update($, lanes, l0 => (l => l.gates.some(g => g.text === text.slice(0, 600)) ? l : ({ ...l, gates: [...l.gates, { at, text: text.slice(0, 600), blocking }].slice(-20) }))(norm(l0)))
+        await update($, lanes, l0 => (l => l.gates.some(g => g.text === text.slice(0, 4000)) ? l : ({ ...l, gates: [...l.gates, { at, text: text.slice(0, 4000), blocking }].slice(-20) }))(norm(l0)))
       } catch { /* 记账失败不影响画 */ }
       if (await read($, showAll)) return next(e)
       const { Text } = $.ui.resolve(e)
@@ -187,12 +219,15 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const l = norm(await read($, lanes))
+    const rl = await read($, relayLast)
     const toolLine = Object.entries(l.tools).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join('  ')
     return (
       <Box flexDirection="column">
         <Text bold>第 {l.turn} 轮</Text>
+        <Text dimColor>闸转投:{rl || '(本会话还没收尾过)'}</Text>
         <Text bold color="red">■ 闸({l.gates.length})</Text>
         {l.gates.length === 0 && <Text dimColor>  本轮无闸提示</Text>}
+        {/* 每条画前 3 行(用户 10-09:「画三行够了」);存储留 4000 字备查 */}
         {l.gates.slice(-6).map(g => <Text color={g.blocking ? 'red' : 'yellow'}>  {g.blocking ? '[阻断] ' : '[提示] '}{g.text.split('\n').slice(0, 3).join(' / ').slice(0, 220)}</Text>)}
         <Text bold color="cyan">■ 改过的文件({l.files.length})</Text>
         {l.files.length === 0 && <Text dimColor>  本轮没改文件</Text>}

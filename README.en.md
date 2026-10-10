@@ -82,10 +82,12 @@ Batch-goal order: arm → work → write `条件N: 达成/未达成/不适用` (
 
 | Capability | One line | Command |
 |---|---|---|
-| Pane | One lane each for this turn's gate notices, edited files and tool calls, plus a separate bucket for subagents; run again to close | `/lanes` |
+| Pane | One lane each for this turn's gate notices (first three lines of each), edited files and tool calls, plus a separate bucket for subagents; opens by itself at session start (terminals ≥144 columns), run again to close | `/lanes` |
 | Summary line | When the turn has activity, one line above the prompt: gates (blocks) · files edited · tool calls · subagents | no command |
-| Text-only transcript | By default tool-call rows are not drawn in the conversation and gate feedback shrinks to one dim line; toggle back to see them | `/lanes-show` |
-| Gate relay (experimental, off by default) | The plugin forwards gate blocks and notices to the model itself and the transcript keeps one line; after 5 consecutive relays it hands back to the engine. Whether it is safe alongside custodiet's Stop gate is **not verified** | `/lanes-relay` |
+| Text-only transcript | Tool-call rows are not drawn in the conversation (running ones included) and gate feedback shrinks to one dim line; toggle back to see them | `/lanes-show` |
+| Gate relay (on by default) | For Stop-hook blocks and additional context, the transcript keeps one short line and the full text goes to the model as a session row the model can read but the person does not see; custodiet's Stop gate recognises that row and does not treat it as a new user turn | `/lanes-relay` |
+| Long commands to background (on by default) | In the main session, foreground Bash / PowerShell timeouts are capped at 10 seconds, so a long command moves to the background instead of blocking the conversation; subagents are not capped | no command |
+| Switches for the model | The model can call `mcp__lanes__control` to flip the three settings above (relay / showAll / autoBg) | no command |
 
 ## Why
 
