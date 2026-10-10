@@ -4,7 +4,7 @@
 >
 > [中文版 →](README.md)
 
-**custodiet** is a governance system for Claude Code built from two parts: **Stop-time gates** and a **constitution + law-code** layout. Each time the agent says it is done, a Stop hook runs deterministic predicates over the turn's tool-call record and blocks if something it said it did never happened there; every blocking rule must point to a clause a human signed.
+**custodiet** is a **whole-process** governance system for Claude Code: from understanding the request, through design and execution, to the final report, every stage is watched by deterministic predicates. They read the turn's real tool-call record, not what the agent says about it, and every blocking rule must point to a clause a human signed. The last checkpoint sits at the moment the agent says it is done (a Stop hook): if any stage fell short, the turn does not end.
 **lanes** is its companion UI: it moves gate notices, tool calls and edited files out of the transcript into their own lanes.
 
 Just want to install it? Jump to [Hand it to your agent](#hand-it-to-your-agent). The sections below first explain why it exists and what it catches.
@@ -30,17 +30,30 @@ Upstream, the fabrication problem was reported and the issue **closed as not pla
 | LLM reviews LLM | another model's opinion | judge AUROC ≤ 0.65 on this task family |
 | **This repo** | **deterministic predicates over tool-call records** | only where a rule's stated ceiling says so |
 
-The 26 engine rules read a **structured context** built only from `assistant` text blocks and `tool_use` **inputs** — tool *outputs* never enter their evidence window, so *reading a file that mentions `git commit` cannot count as having committed* (that exact exploit is a regression test). The two not-yet-migrated built-in rules (A delegation-closure, R past-tense claims) still scan raw text including tool outputs; that ceiling is documented in their header comments.
+The 26 engine rules read a **structured context** built only from `assistant` text blocks and `tool_use` **inputs** — tool *outputs* never enter their evidence window, so *reading a file that mentions `git commit` cannot count as having committed* (that exact exploit is a regression test). The two not-yet-migrated built-in rules (A delegation-closure, R past-tense## What it watches at each stage (selection of the 28 rules: 26 engine + 2 built-in; `gate:accept` output is authoritative — hand counts drift)
 
-## What it catches (selection of the 28 rules: 26 engine + 2 built-in; `gate:accept` output is authoritative — hand counts drift)
+Checking at "done" is only the last checkpoint; the standard starts the moment a request arrives.
 
-- **B / R — promise vs. deed**: "I'll go fix X" / "I fixed X" with no matching action in the turn ⇒ flagged. Future-tense promises and past-tense claims are separate rules.
-- **A / U — delegation must close the loop**: a background task you launched and never read back is debt, not progress.
-- **K / K0 — batch goals**: arm machine-checkable completion conditions at start (`batch-goal --arm`); committing without a verdict on each condition blocks the turn.
-- **M — write-backs need read-backs**: `node -e`/`sed -i`/redirects that fail silently still exit 0; only an actual re-read (Read/Grep/diff of the same path) counts.
+**Input: understand before acting**
+- **K / K0 — set acceptance conditions first**: before a batch of work starts, write down machine-checkable completion conditions (`batch-goal --arm`, optionally with a check command); at the end each condition gets a verdict, and the batch cannot be cleared until all of them have one.
+- **ND — clear up unknown terms**: when the user asks "what is X", the term goes into the noun diary, or the agent states why it does not apply.
+
+**Design: search before you build, and let someone else check the conclusion**
 - **I — search before you build**: creating a new tool/script without evidence of having scanned for existing implementations (local registry **and** web) blocks.
-- **P — load-bearing commits owe three independent checks**: cross-model review, read-only subagent, and external precedent — counted from tool actions only; *saying* you ran them counts zero. When the commit touches gate-engine files, the independent-view check accepts only the bundled red-team agent `_gate-bypass-hunter`.
+- **P — load-bearing changes owe three independent checks**: cross-model review, read-only subagent, and external precedent — counted from tool actions only; *saying* you ran them counts zero. When the commit touches gate-engine files, the independent-view check accepts only the bundled red-team agent `_gate-bypass-hunter`.
 - **E0/E1/E2 — causal claims need mechanical evidence** or an independent check; a bare "the root cause is…" doesn't leave the room.
+- **W — deliverables get an outside review**: finished work meant for other readers needs one external check before the turn ends.
+
+**Execution: do what you said**
+- **B — promise vs. deed**: "I'll go fix X" with no matching action in the turn ⇒ flagged.
+- **M — write-backs need read-backs**: `node -e`/`sed -i`/redirects that fail silently still exit 0; only an actual re-read (Read/Grep/diff of the same path) counts.
+- **A / U — delegation must close the loop**: a background task or subagent you launched and never read back is debt, not progress.
+
+**Output: no inflated reports**
+- **R — past-tense claims must be in the record**: "I fixed X" with no action on X in the record ⇒ blocked.
+- **F / X — "done" rests on checks, not assertions**; completion claims must agree with the not-covered section.
+- **S / Q — no unexplained stopping or pushing work out of the batch**: the only legitimate stops are irreversible actions, items a human must sign, and hard blockers, and a stop must say which one.
+ms need mechanical evidence** or an independent check; a bare "the root cause is…" doesn't leave the room.
 
 Since 0.4.2 the CW rule (re-checking concurrent writer sessions at Stop) is gone — concurrent writes are isolated with git worktrees/branches instead; see [CHANGELOG](CHANGELOG.md).
 
