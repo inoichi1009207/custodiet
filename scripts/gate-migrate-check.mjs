@@ -16,7 +16,7 @@ import path from "node:path";
 //   会比 block 的比对器一直躺在注册表里没被调用。
 import { validateRules, runRules } from "./lib/gate-registry.mjs";
 import { buildCtx } from "./lib/gate-ctx.mjs";
-import { RULES } from "./lib/gate-rules.mjs";
+import { RULES, toolPresent } from "./lib/gate-rules.mjs";
 // ⚠️ 别删:DIVERGENCE_DIR.P 的成因谓词用。缺它 ⇒ 谓词 ReferenceError ⇒ 被 fail-closed 的
 //   catch 吞成「不放行」⇒ 42 条全报未指名——与四个 RULE_P 候选当年**同一个病**,
 //   且同样是 eslint no-undef 一跑就报,我改完没跑(第二次)。
@@ -279,9 +279,11 @@ console.log("正反例:");
 //   第九次:`preExisted`(2026-09-06,D100)—— 与 `tracked` 同族的注入通道:
 //   「写前那一刻实测存在」的路径集(生产上由 hook-guard 量出);没它,I 的
 //   「追加既有 memory 文件不算新建」这条反例根本写不出来。
-//   第十次:`bgTasks`(2026-09-06,D104(a) S 的动作面)与 `concurrentWriters`(D95 CW 项,0.4.2 随 CW 撤下移除)——两条都是
+//   第十次:`bgTasks`(2026-09-06,D104(a) S 的动作面)与 `concurrentWriters`(D95 CW 项,2026-10-09 随 CW 裁撤移除)——两条都是
 //   **注入通道**(官方 background_tasks[] 载荷 / 收尾时点三查①结果),不进 entries。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "at"]);
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "at"]);
+//   第十二次:`diffFacts`(2026-10-10 批 257 条件 3,P 的 diff 分档事实)——注入通道,夹具给对象,这里包成惰性函数交 ctx.diffTier。
+//   第十一次:`debtFacts`(2026-09-12 批 202,DP 的部署欠账事实)——注入通道,不进 entries。
 //   第七次:`at`(ISO 时间 ⇒ 条目 `timestamp`)—— D107(191):P 的凭证池主路径按 `batchGoal.armedAt`
 //   切动作,而 gate-ctx 的 `at` 只从条目 `timestamp` 来;夹具不给时间戳 ⇒ 所有用例只走回退路径,
 //   主路径零机器证人(「验过而没钉住」的形态,与上面六次同族)。
@@ -380,6 +382,8 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...(c.preExisted ? { preExisted: new Set(c.preExisted) } : {}),
   ...("batchGoal" in c ? { batchGoal: c.batchGoal } : {}),
   ...("bgTasks" in c ? { bgTasks: c.bgTasks } : {}),
+  ...("debtFacts" in c ? { debtFacts: c.debtFacts } : {}),
+  ...("diffFacts" in c ? { diffTier: () => c.diffFacts } : {}),
   // `pLedger` = P 的跨批持久账注入(2026-08-22 亲签)。与 batchGoal 同族:注入通道非动作。
   ...("pLedger" in c ? { pLedger: c.pLedger } : {}),
   // `prior` = [{text, write?, …}, …] ⇒ 拼成 assistant entries 交给 priorEntries。
@@ -438,8 +442,16 @@ if (process.argv.includes("--migrate-check")) {
   process.exit(go ? 0 : 1);
 }
 
+// 公开树(0.5.0):按设计在某个仓内脚本缺席时整条沉默的规则,正例在缺席的树里无从命中。
+//   这时不跑「正例应命中」,改核反方向——正例**全部沉默**,沉默本身就是设计行为;反例与出路照跑。
+//   脚本在场(源项目)时照常逐条核正例,本表不放宽任何东西。
+const DORMANT_WITHOUT = { DP: "scripts/verify-prod.mjs" };
 for (const r of RULES) {
-  for (const c of r.cases.pos) {
+  const needs = Object.hasOwn(DORMANT_WITHOUT, r.id) ? DORMANT_WITHOUT[r.id] : null;
+  if (needs && !toolPresent(needs)) {
+    say(r.cases.pos.every((c) => runRules([r], mkCtx(c)).length === 0),
+      `${r.id} 正例 ${r.cases.pos.length} 条全沉默(${needs} 不在场,本项按设计退场)`);
+  } else for (const c of r.cases.pos) {
     const f = runRules([r], mkCtx(c));
     say(f.length === 1, `${r.id} 正例应命中:${c.text.slice(0, 24)}…`);
   }
@@ -491,6 +503,14 @@ for (const r of RULES) {
     const mergeBash = (a, b) => [a, b].filter(Boolean).join("\n");
     const withFields = { ...base, ...rest };
     if (base.bash && rest.bash) withFields.bash = mergeBash(base.bash, rest.bash);
+    // `debtFacts`(DP 事实通道,2026-09-12):出路「跑探针」的真实效果是**刷新探针标记**,样例用
+    //   `debtFacts: {lastProbeTs: 很晚}` 表达。只**合并进本来就有事实的正例**;正例没有事实(走命令解析路径)时
+    //   不注入——否则解析路径的正例会被样例偷偷切到事实路径,出路自证变成空证明。
+    if ("debtFacts" in rest) {
+      if (base.debtFacts && typeof base.debtFacts === "object") withFields.debtFacts = { ...base.debtFacts, ...rest.debtFacts };
+      else if ("debtFacts" in base) withFields.debtFacts = base.debtFacts;
+      else delete withFields.debtFacts;
+    }
     const merged = isReplace
       ? { ...withFields, text: replaceText }
       : { ...withFields, text: `${base.text || ""}${e.sample.text ? " " + e.sample.text : ""}` };
@@ -624,6 +644,13 @@ const sig = (rule, c) => {
 for (const r of RULES) {
   const muts = r.mutations || [];
   if (!muts.length) { say(false, `${r.id} **未声明任何变异** —— 无法证明其用例有鉴别力`); continue; }
+  // 按设计退场的规则(见 DORMANT_WITHOUT):原规则与变异在本树里同样沉默,鉴别力无从在此证明;
+  //   不记 PASS 也不记 FAIL,出声跳过——鉴别力由依赖脚本在场的源项目验收台核。
+  const needsM = Object.hasOwn(DORMANT_WITHOUT, r.id) ? DORMANT_WITHOUT[r.id] : null;
+  if (needsM && !toolPresent(needsM)) {
+    console.log(`  SKIP  ${r.id} 变异 ${muts.length} 条:${needsM} 不在场,本项按设计退场,鉴别力在依赖脚本在场的仓里核`);
+    continue;
+  }
   for (const m of muts) {
     const mutated = m.apply({ ...r });
     const all = [...r.cases.pos, ...r.cases.neg];

@@ -39,10 +39,14 @@ const FILES = [
   "scripts/lib/gate-carriers.mjs",
   "scripts/lib/gate-cmd.mjs",
   "scripts/lib/gate-slice.mjs",
+  // gate-rules.mjs 顶部 import 它(P 项按 diff 分档的唯一实现);不随包装 ⇒ 新仓一装闸就崩。
+  "scripts/lib/gate-difftier.mjs",
   "scripts/lib/ledger-chain.mjs",
   "AGENTS.md",
   "docs/laws/collab.md",
   "docs/laws/reporting.md",
+  // DP 项的 law 锚点所在(DP 本身在仓里没有欠账探针脚本时沉默,但锚点自测照核)。
+  "docs/laws/production.md",
   // 名词日记是 ND 项的 law 锚点所在;缺席时 ND 静默退场,但 law 锚点自测会报该锚点无目标。
   "docs/noun-diary.md",
   // P 在「提交触及闸引擎文件」时,独立视角通道只认这个红队 agent。不随包装 ⇒ 新仓的装闸提交无出路阻断(第一刀 B1 实测)。

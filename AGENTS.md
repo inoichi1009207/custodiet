@@ -2,8 +2,8 @@
 
 > 本文件是**示例**:收尾闸的每条规则都必须带一个 `law:` 锚点,指回一份人签署过的
 > 规范条款——规则引擎在装载期与自测里核「锚点可解析」(INV-2 + law 锚点自测)。
-> 换成你自己的项目时,把这**三份**——本文件、`docs/laws/collab.md`、`docs/laws/reporting.md`
-> ——换成你真实的规范,锚点跟着改。
+> 换成你自己的项目时,把这**四份**——本文件、`docs/laws/collab.md`、`docs/laws/reporting.md`、
+> `docs/laws/production.md`——换成你真实的规范,锚点跟着改。
 > 设计理由见 `docs/playbook.md` 第 3 步:**没有法源的规则是无主判据,谁都可以删。**
 
 ## 恒定条款

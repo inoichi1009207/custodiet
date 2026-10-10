@@ -43,6 +43,10 @@ export function quoteUntrusted(s, cap = 160) {
  * @param entries 本回合的条目(已由 lastTurn 切好,**不含**闸自己上一轮的输出)
  * @param extra   官方 payload 提供的结构化字段(last_assistant_message / background_tasks 等)
  */
+/** 排队消息(queued_command)的文字:字符串或 text 块数组,一条消息一行收尾。窗口内与窗口前补收共用。 */
+const queuedText = (p) => typeof p === "string" ? p + "\n"
+  : Array.isArray(p) ? p.filter((b) => b?.type === "text").map((b) => (b.text || "") + "\n").join("") : "";
+
 export function buildCtx(entries, extra = {}) {
   /** 助理说的话。**只取 assistant 的 text 块**——不含工具输出、不含用户输入、
    *  不含被读文件的内容。想判「他说了什么」只能用这个。 */
@@ -56,15 +60,31 @@ export function buildCtx(entries, extra = {}) {
   const actions = [];
 
   for (const e of entries) {
+    // 模型忙时用户插的话以 queued_command 附件落盘,没有对应的 user 行(批 257 v5 红队 BP-3/10:
+    //   语料 519 条 origin=human 的排队消息里 518 条只有附件)——同样是用户亲口,收。
+    if (e?.type === "attachment" && e.attachment?.type === "queued_command" && e.attachment.origin?.kind === "human") {
+      userText += queuedText(e.attachment.prompt);
+      continue;
+    }
     if (e?.type === "user") {
+      // 压缩摘要是模型转述,不是用户原话(红队 BP-11:摘要里的「用户问过 X 是什么」误拦 ND)
+      if (e.isCompactSummary === true) continue;
       const uc = e.message?.content;
-      // 红队 182 BP-6:字符串型 user 条目里混着 harness 回灌的文本(「Stop hook feedback:」「[SYSTEM NOTIFICATION」
-      //   「<task-notification>」)——那是闸/后台任务在说话,不是用户;W 的用户豁免、ND 的名词问都不得从它们取证。
+      // **按结构认人**(2026-10-09 热修红队 BP-1/3/5/9):userText 只收用户亲自打的字——
+      //   有 origin 的行只认 origin.kind==="human";没有 origin 的老转录行,isMeta(技能/命令正文、提醒)一律不收。
+      //   此前靠「harness 前缀黑名单」:/kplan 正文里的「免 battle」被当用户原话白送 W 豁免、/codex 正文的「是什么」误拦 ND;
+      //   前缀又会把用户贴来的、恰以该前缀开头的真话整条删掉。前缀只留作无 origin 老行的兜底。
+      //   转录实测(bc9cf8c1):human 77 / peer 55 / task-notification 44 / plugin 17 / 无 origin+isMeta 195。
+      const human = e.origin?.kind ? e.origin.kind === "human" : e.isMeta !== true;
+      if (!human) continue;
+      // `!` 命令与本地斜杠命令的输出行也没有 origin、也不是 isMeta——那是程序输出,不是用户的话(红队附二-7)
+      const HARNESS = /^\s*(Stop hook (feedback|additional context)|\[SYSTEM NOTIFICATION|<task-notification>|<cross-session-message|Another Claude session sent a message|<bash-(stdout|stderr)>|<local-command-(stdout|stderr)>)/;
+      const fromHuman = e.origin?.kind === "human";
       if (typeof uc === "string") {
-        if (!/^\s*(Stop hook (feedback|additional context)|\[SYSTEM NOTIFICATION|<task-notification>|<cross-session-message)/.test(uc)) userText += uc + "\n";
+        if (fromHuman || !HARNESS.test(uc)) userText += uc + "\n";
       }
       else if (Array.isArray(uc)) for (const b of uc) {
-        if (b?.type === "text") userText += (b.text || "") + "\n";
+        if (b?.type === "text" && (fromHuman || !HARNESS.test(b.text || ""))) userText += (b.text || "") + "\n";
       }
       continue;
     }
@@ -196,14 +216,56 @@ export function buildCtx(entries, extra = {}) {
   //   「无记录仍算新建」那侧塌掉(接缝自测 D56 反向钉当场变红)。比对**只认全路径**;
   //   `~/…` 形的目标由记录方(hook-guard)同时记 raw 与展开形解决,不在这里放宽。
   const preExisted = extra.preExisted instanceof Set ? extra.preExisted : null;
+  // ── 批 255(2026-09-17):**按目标文件所属 checkout 取追踪集**。修两件事中的第一件
+  //   (第二件「SubagentStop 缺证据」在 hook-stop-closure.mjs 的 `isNewEvidence`):
+  //   `tracked` 是 **hook 进程所在 checkout** 的 `git ls-files`,不随目标文件所属 worktree 切换。
+  //   批 253 代理在 `.claude/worktrees/<名>/` 里改该 worktree 已追踪的既有文件 ⇒ `relOf` 剥不出
+  //   主树里的键 ⇒ 判新建 ⇒ I 误拦。**不做字符串剥前缀**(两路审查一致否决):剥了会让主树索引
+  //   替另一个 worktree 里新出生的同名文件担保「既有」(漏放),且有嵌套/大小写/祖先目录名撞
+  //   `docs/` 等缺口。改为调用方注入两件实测证据:
+  //     `extra.checkoutOf(p)` → 目标所属 checkout 根(正斜杠绝对路径)或 null;
+  //     `extra.trackedIn(root)` → 该 checkout 的追踪集(仓根相对、正斜杠)或 null;
+  //     `extra.hookCheckout`(可选)→ hook 所在 checkout 根,`justAdded` 只在同根时参与。
+  //   两函数**任一未注入 ⇒ 逐字走原判据**(夹具与旧测试不受影响)。
+  //   代价模型(用户签):误拦与漏放同价;蓄意规避不计;拿不准回到改前判定。
+  //   ⇒ root 为 null / 根不是目标的前缀 / 两函数抛错 ⇒ 回到原判据;set 取不到 ⇒ 新建(与原 tracked=null 同向)。
+  //   残余:①比较根是否同一 checkout 用大小写不敏感(Windows 盘符大小写不一),Linux 上只差大小写的两个
+  //   checkout 会被当成同根——只影响 `justAdded` 参与与否;②`hookCheckout` 未注入时 `justAdded` 照旧参与
+  //   (原判据);③`justAdded` 名不副实(实为可达历史最近一次新增提交,红队 254 附节二①),本批不改;
+  //   ④`window()` 仍只传 `tracked`,窗口 ctx 的 isNew 不吃本支(现无规则在窗口上调 isNew)。
+  const checkoutOf = typeof extra.checkoutOf === "function" ? extra.checkoutOf : null;
+  const trackedIn = typeof extra.trackedIn === "function" ? extra.trackedIn : null;
+  const normRoot = (r) => String(r).replace(/\\/g, "/").replace(/\/+$/, "");
+  const hookCheckout = typeof extra.hookCheckout === "string" && extra.hookCheckout ? normRoot(extra.hookCheckout) : null;
+  const isNewInCheckout = (p) => {
+    let root;
+    try { root = checkoutOf(p); } catch { root = null; }
+    if (typeof root !== "string" || !root) return undefined;           // 说不上话 ⇒ 调用方走原判据
+    const r = normRoot(root);
+    const full = String(p).replace(/\\/g, "/");
+    if (!r || full.slice(0, r.length + 1).toLowerCase() !== (r + "/").toLowerCase()) return undefined;
+    const rel = full.slice(r.length + 1);
+    let set;
+    try { set = trackedIn(r); } catch { set = null; }
+    if (!(set instanceof Set)) return true;                             // 取不到该 checkout 的索引 ⇒ fail-closed
+    const sameAsHook = hookCheckout === null || hookCheckout.toLowerCase() === r.toLowerCase();
+    if (sameAsHook && justAdded && justAdded.has(rel)) return true;     // justAdded 是 hook 那个 checkout 的 git log
+    if (set.has(rel)) return false;
+    if (preExisted && preExisted.has(full)) return false;
+    return true;
+  };
   const isNew = (p) => {
+    if (checkoutOf && trackedIn) {
+      const v = isNewInCheckout(p);
+      if (v !== undefined) return v;
+    }
     const rel = relOf(p);
     if (tracked === null) return true;
     if (justAdded && justAdded.has(rel)) return true;   // 本轮刚加进来的,仍算新建
     if (tracked.has(rel)) return false;
     // 仓外/未跟踪:git 说不上话,只能看写前那一刻的实测。
     // ⚠️ 原式还认 `preExisted.has(rel)`(相对形)。codex 复核(2026-09-06)逮到:Bash 面记录可以是相对形,
-    //   于是一条 `.claude/projects/D--test/memory/n.md` 记录能让**另一用户目录**下同名文件判「已存在」
+    //   于是一条 `.claude/projects/example-project/memory/n.md` 记录能让**另一用户目录**下同名文件判「已存在」
     //   ——与当轮撤回的 relOf 放宽是同一个洞换了个入口。现只认全路径;
     //   记录方(hook-guard)已按 cwd 解析并同时记 raw 原形,对不上就退回「新建」(误报侧)。
     if (preExisted && preExisted.has(String(p).replace(/\\/g, "/"))) return false;
@@ -225,6 +287,29 @@ export function buildCtx(entries, extra = {}) {
    *  懒构造:绝大多数规则不需要窗口,不该为它们付解析成本(全语料回放 6604 片)。
    *  没给 `extra.priorEntries` 时返回 null —— 规则须自己判 null,不得当空窗口用
    *  (「没窗口」与「窗口里什么都没有」是两件事,后者才是「未跑」的证据)。 */
+  // 排队消息被别的边界切到窗口前面(v7,codex v6 接缝 2):用户排队问了一句,随后子代理回报到达、lastTurn 从回报起窗,
+  //   那句问话就落在 priorEntries 尾部。从窗口尾往前收到上一条用户亲口的行为止,把其间 origin=human 的排队消息补进 userText。
+  //   v7 修(codex 终审「没问到的」1/2):①本轮若以用户亲口的行开头,窗口前的排队消息属于**更早**的轮,不补——
+  //   否则旧的「别外审了」会压过本轮新说的「必须外审」(W 豁免串轮);②数组形态的 prompt 同样收(与窗口内同一提取函数)。
+  const turnHasHuman = entries.some((e) => e?.type === "user" && e.origin?.kind === "human" && e.isCompactSummary !== true);
+  /** 同一用户轮里、被拦的 Stop 之前已做的写入(ND 等出路要认:日记在被拦前已补,续跑时不该再要一遍)。 */
+  const turnPriorWrites = [];
+  if (Array.isArray(extra.priorEntries) && !turnHasHuman) {
+    const qs = [];
+    for (let i = extra.priorEntries.length - 1; i >= 0; i--) {
+      const e = extra.priorEntries[i];
+      if (e?.type === "user" && e.origin?.kind === "human") break;
+      // 回扫停在上一次**已放行**的 Stop(那一轮真收尾了,之前排队的话属于旧轮:红队终审 BP-3/6)。
+      //   **被拦**的 Stop 不停——被拦后续跑仍是同一个用户轮,排队问的「X 是什么」、说的「别外审」都还算数
+      //   (红队 d1cae02 轮 BP-1/2:曾把被拦的 Stop 也当边界,ND 漏放、W 误拦)。
+      if (e?.type === "system" && e.hookCount !== undefined && !/阻断|blocking/i.test(JSON.stringify(e.hookErrors || []))) break;
+      if (e?.type === "assistant" && Array.isArray(e.message?.content)) {
+        for (const b of e.message.content) if (b?.type === "tool_use" && /^(Write|Edit|MultiEdit|NotebookEdit)$/.test(String(b.name || "")) && typeof b.input?.file_path === "string") turnPriorWrites.push(b.input.file_path);
+      }
+      if (e?.type === "attachment" && e.attachment?.type === "queued_command" && e.attachment.origin?.kind === "human") qs.unshift(queuedText(e.attachment.prompt));
+    }
+    for (const q of qs) if (q && !userText.includes(q)) userText += q;
+  }
   let _window;
   const window = () => {
     if (_window !== undefined) return _window;
@@ -276,6 +361,19 @@ export function buildCtx(entries, extra = {}) {
        *  与 `conditionCount` 严格分开:「当前武装着」与「刚关掉过」是两件事,
        *  混了 K 会在结清后继续追着要对照。K0 用它判「这次 --clear 是不是真的关了个批」。 */
       closedCount: Array.isArray(g.closedConditions) ? g.closedConditions.length : 0,
+      /** 批 253:**本批武装之前刚关掉的那一批**(台账末尾是「结清 X → 武装本批」时由 hook 补)。
+       *  K 在「同一轮关旧批、开新批」时拿它核对旧批是否逐条对照;与 closedCount 分开(那个是盘上已结清时的本批)。 */
+      priorClosedBatch: typeof g.priorClosedBatch === "string" ? g.priorClosedBatch : null,
+      priorClosedCount: Array.isArray(g.priorClosedConditions) ? g.priorClosedConditions.length : 0,
+      /** 批 256:批基点(第一次 --arm 时的 HEAD;旧批无 ⇒ null)与已登记决定数(AD 项判「决定清单为空」)。 */
+      baseCommit: typeof g.baseCommit === "string" && /^[0-9a-f]{7,64}$/i.test(g.baseCommit) ? g.baseCommit : null,
+      decisionCount: Array.isArray(g.decisions) ? g.decisions.length : 0,
+      /** 批 256:`git log <baseCommit>..HEAD` 的**完整提交信息**(每条一项),由 hook 在实时路径读一次注入
+       *  (`.batch-goal.json` 里没有这个键,离线回放与验收台快照不供 ⇒ null ⇒ AD 不判)。
+       *  只供 AD 做模式匹配;回显时 AD 自己过 quoteUntrusted。条数与单条长度封顶,防一次巨型合并撑爆。 */
+      batchLog: Array.isArray(g.batchLog)
+        ? g.batchLog.slice(0, 300).map((m) => String(m ?? "").slice(0, 8000))
+        : null,
     };
   })();
 
@@ -286,7 +384,7 @@ export function buildCtx(entries, extra = {}) {
   //   INV-5 的仪器即该扫描;字段再断线由它报,不靠注释宣称。
   return {
     text, userText, actions, bashCmds, commits, writes, reads, agents, toolNames, skills, written, isNew,
-    window, batchGoal,
+    window, batchGoal, turnPriorWrites,
     /** P 的跨批持久计数(2026-08-22 用户亲签「改吧」)。三态与 batchGoal 同构:
      *  `undefined`=通道没接(夹具/旧路径 ⇒ 规则退回窗口式计账);
      *  `null`=接了、账不存在(首跑 ⇒ 计 0,宽限期);对象={carriers:自上轮三通道后累计承重提交数}。
@@ -296,6 +394,24 @@ export function buildCtx(entries, extra = {}) {
         ? { carriers: Number.isFinite(+extra.pLedger.carriers) ? Math.max(0, Math.floor(+extra.pLedger.carriers)) : 0 }
         : null),
     bgTasks: Array.isArray(extra.bgTasks) ? extra.bgTasks : null,
+    /** 部署欠账事实(DP 项,2026-09-12 批 202):`{lastPushTs, pushRef, lastProbeTs}`,由 hook 经
+     *  `lib/debt-facts.mjs` 读一次注入(reflog 最后一次 `update by push` vs 欠账探针标记)。三态同 pLedger:
+     *  undefined=通道没接(夹具/离线回放 ⇒ DP 退回命令解析判法)/ null=接了但读取故障(同样退回)/ 对象=事实。 */
+    debtFacts: extra.debtFacts === undefined ? undefined
+      : (extra.debtFacts && typeof extra.debtFacts === "object"
+        ? {
+          lastPushTs: Number.isFinite(+extra.debtFacts.lastPushTs) && extra.debtFacts.lastPushTs !== null ? +extra.debtFacts.lastPushTs : null,
+          pushRef: extra.debtFacts.pushRef ? String(extra.debtFacts.pushRef) : null,
+          lastProbeTs: Number.isFinite(+extra.debtFacts.lastProbeTs) && extra.debtFacts.lastProbeTs !== null ? +extra.debtFacts.lastProbeTs : null,
+        }
+        : null),
+    /** 承重面改动的 diff 事实(P 项分档,批 257 条件 3):惰性函数,只在 P 要判档时才调(要跑 git);
+     *  返回 `{ files:[{path,status,old,new}] }` 或 null(取不到)。未接(夹具/离线回放)⇒ undefined ⇒ P 不分档。
+     *  只调一次,结果缓存。 */
+    diffTier: typeof extra.diffTier === "function" ? (() => {
+      let done = false, v = null;
+      return () => { if (!done) { done = true; try { v = extra.diffTier(); } catch { v = null; } } return v; };
+    })() : undefined,
     /** 便捷谓词。规则应当优先用这些,而不是自己写正则去扫 `text`。 */
     didCommit: () => commits.length > 0,
     wroteAny: (re) => writes.some((p) => re.test(p)),
@@ -360,6 +476,41 @@ export function selfTest() {
     chk("text 受 SCAN_CAP 约束", t.length <= SCAN_CAP, true);
     // 注:文本块之间 join("\n"),故尾部可能有一个换行——用 includes 而不是 endsWith。
     chk("截断**留尾不留头**(改回 slice(0,CAP) 必须被逮住)", t.includes(tailMark), true);
+  }
+
+  // ── userText 按来源认人(热修 10-09 + 批 257 v5 红队 BP-3/10/11、附二-7)──
+  {
+    const ut = (es) => buildCtx(es).userText;
+    const H = (s) => ({ type: "user", origin: { kind: "human" }, message: { content: s } });
+    chk("用户亲口的话收", ut([H("winget 是什么?")]).includes("winget"), true);
+    chk("用户贴的话恰以 Stop hook feedback: 开头 ⇒ 仍收", ut([H("Stop hook feedback: 这条为什么拦")]).includes("为什么拦"), true);
+    chk("技能正文(无 origin 的 isMeta)不收", ut([{ type: "user", isMeta: true, message: { content: [txt("免 battle")] } }]).includes("免 battle"), false);
+    chk("插件消息不收", ut([{ type: "user", isMeta: true, origin: { kind: "plugin" }, message: { content: "别外审了" } }]).includes("别外审"), false);
+    chk("排队消息(queued_command,human)收",
+      ut([{ type: "attachment", attachment: { type: "queued_command", prompt: "这篇别外审了", origin: { kind: "human" } } }]).includes("别外审"), true);
+    chk("压缩摘要不收", ut([{ type: "user", isCompactSummary: true, message: { content: "用户先前问过 X 是什么" } }]).includes("是什么"), false);
+    chk("`!` 命令输出不收", ut([{ type: "user", message: { content: "<bash-stdout>xx 是什么</bash-stdout>" } }]).includes("是什么"), false);
+    // v7(codex v6 接缝 2):排队问题之后来了子代理回报,窗口从回报起 ⇒ 问题在 priorEntries 尾部,仍要收
+    const Q = (s) => ({ type: "attachment", attachment: { type: "queued_command", prompt: s, origin: { kind: "human" } } });
+    chk("窗口前的排队问题(上一条用户行之后)补进 userText",
+      buildCtx([A([txt("答")])], { priorEntries: [H("先做甲"), A([txt("在做")]), Q("winget 是什么?")] }).userText.includes("winget"), true);
+    chk("本轮以用户亲口开头 ⇒ 窗口前的旧排队消息不补(旧「别外审」不得压过新指令)",
+      buildCtx([H("新报告必须外审"), A([txt("写")])], { priorEntries: [H("旧活"), Q("别外审了"), A([txt("做完")])] }).userText.includes("别外审"), false);
+    chk("上一次 Stop 之前的排队消息不补(子代理回报开的新轮,红队终审 BP-3)",
+      buildCtx([A([txt("README 落盘,收工")])], { priorEntries: [H("先做 changelog"), Q("changelog 那份别外审了"), A([txt("好")]),
+        { type: "system", subtype: "stop_hook_summary", hookCount: 1, hookErrors: [] }] }).userText.includes("别外审"), false);
+    {
+      const ATT = { type: "attachment", attachment: { type: "hook_blocking_error", hookEvent: "Stop", toolUseID: "s1", blockingError: "收尾闸阻断 1 项" } };
+      const SUMB = { type: "system", subtype: "stop_hook_summary", hookCount: 1, hookErrors: ["收尾闸阻断 1 项"], toolUseID: "s1" };
+      const c = buildCtx([A([txt("补了 K,收工")])], { priorEntries: [H("先做甲"), Q("winget 是什么?"),
+        A([use("Edit", { file_path: "/repo/docs/noun-diary.md" })]), ATT, SUMB] });
+      chk("被拦的 Stop 不是轮边界:同一用户轮里排队问的话仍补(红队 d1cae02 BP-1)", c.userText.includes("winget"), true);
+      chk("被拦前已写的日记记进 turnPriorWrites(续跑时 ND 出路认它)", c.turnPriorWrites.some((w) => /noun-diary/.test(w)), true);
+    }
+    chk("数组形态的排队消息也补",
+      buildCtx([A([txt("答")])], { priorEntries: [H("先做甲"), { type: "attachment", attachment: { type: "queued_command", prompt: [{ type: "text", text: "winget是什么?" }], origin: { kind: "human" } } }] }).userText.includes("winget"), true);
+    chk("上一条用户行之前的排队消息不补",
+      buildCtx([A([txt("答")])], { priorEntries: [Q("旧问 X 是什么"), H("新话"), A([txt("在做")])] }).userText.includes("旧问"), false);
   }
 
   // ── 跨轮窗口:核心是**它没有把污染放回来** ────────────────────────────────
@@ -427,6 +578,44 @@ export function selfTest() {
     // ② 结构化而非裸 JSON —— 只交出四个字段,别的一律拿不到
     const sneaky = buildCtx(base, { batchGoal: { batch: "x", conditions: [], secret: "不该出现" } }).batchGoal;
     chk("只交出约定字段(裸 JSON 的其余键拿不到)", sneaky.secret, undefined);
+    // 批 256:基点/决定数/提交信息三个新键
+    const g256 = buildCtx(base, { batchGoal: { batch: "256", conditions: ["x"], baseCommit: "abc1234", decisions: [{ id: "256-D1" }], batchLog: ["a", "b".repeat(9000)] } }).batchGoal;
+    chk("批 256:基点透传", g256.baseCommit, "abc1234");
+    chk("批 256:决定数", g256.decisionCount, 1);
+    chk("批 256:提交信息单条封顶 8000", g256.batchLog[1].length, 8000);
+    chk("批 256:基点不是 sha 形 ⇒ null(不透传任意串)", buildCtx(base, { batchGoal: { batch: "x", conditions: [], baseCommit: "HEAD; rm -rf" } }).batchGoal.baseCommit, null);
+    chk("批 256:没注入提交信息 ⇒ null(AD 不判)", buildCtx(base, { batchGoal: { batch: "x", conditions: [] } }).batchGoal.batchLog, null);
+  }
+
+  // ── 批 255:isNew 按目标 checkout 取追踪集 ──────────────────────────────────
+  //   夹具世界:主树 M=E:/r(追踪 docs/a.md、docs/shared.md),worktree W=E:/r/.claude/worktrees/w1
+  //   (追踪 docs/a.md,**不**追踪 docs/shared.md)。hook 跑在 M。
+  {
+    const M = "E:/r", W = "E:/r/.claude/worktrees/w1";
+    const idx = { [M]: new Set(["docs/a.md", "docs/shared.md"]), [W]: new Set(["docs/a.md"]) };
+    const checkoutOf = (p) => { const s = String(p).replace(/\\/g, "/"); return s.startsWith(W + "/") ? W : s.startsWith(M + "/") ? M : null; };
+    const trackedIn = (root) => idx[root] || null;
+    const inj = (more = {}) => buildCtx([A([txt("x")])],
+      { tracked: idx[M], checkoutOf, trackedIn, hookCheckout: M, ...more });
+    // ① 批 253 实撞形:worktree 里改该 worktree 已追踪的既有文件 ⇒ 不是新建
+    chk("255① worktree 已追踪的既有文件 ⇒ 非新建", inj().isNew(`${W}/docs/a.md`), false);
+    // ② codex 反例:目标 worktree 未追踪、主树追踪同名路径 ⇒ 仍新建(主树索引不替别的 checkout 担保)
+    chk("255② worktree 未追踪、主树追踪同名 ⇒ 仍新建", inj().isNew(`${W}/docs/shared.md`), true);
+    // ② 的另一半:主树里同一路径照旧判既有(按目标 checkout 取,不是一律判新)
+    chk("255② 对照:主树里同名路径 ⇒ 非新建", inj().isNew(`${M}/docs/shared.md`), false);
+    // justAdded 只在同根参与:hook checkout 的 git log 不替别的 checkout 作证
+    chk("255 justAdded 同根参与 ⇒ 新建", inj({ justAdded: new Set(["docs/a.md"]) }).isNew(`${M}/docs/a.md`), true);
+    chk("255 justAdded 异根不参与 ⇒ 非新建", inj({ justAdded: new Set(["docs/a.md"]) }).isNew(`${W}/docs/a.md`), false);
+    // 取不到该 checkout 的索引 ⇒ fail-closed 当新建
+    chk("255 trackedIn 取不到 ⇒ 新建", inj({ trackedIn: () => null }).isNew(`${W}/docs/a.md`), true);
+    // checkoutOf 说不上话(相对路径)⇒ 走原判据(主树 tracked)
+    chk("255 checkoutOf 为 null ⇒ 原判据", inj().isNew("docs/shared.md"), false);
+    // ④ 未注入两函数 ⇒ 旧行为逐字不变:worktree 路径经 relOf 只剥到 `.claude/worktrees/w1/docs/a.md`,
+    //   主树 tracked 里没有 ⇒ 判新建(这正是批 253 实撞的误拦;钉住它,证明未注入时一个字节都没动)
+    const legacy = buildCtx([A([txt("x")])], { tracked: idx[M] });
+    chk("255④ 未注入 ⇒ 原判据(worktree 既有文件仍判新建)", legacy.isNew(`${W}/docs/a.md`), true);
+    chk("255④ 未注入 ⇒ 原判据(主树既有 ⇒ 非新建)", legacy.isNew(`${M}/docs/shared.md`), false);
+    chk("255④ 只注入一个函数 ⇒ 原判据", buildCtx([A([txt("x")])], { tracked: idx[M], checkoutOf }).isNew(`${W}/docs/a.md`), true);
   }
 
   let pass = 0;

@@ -60,7 +60,7 @@
 ## 宪法法典制
 
 - 每条规则都带一个 `law:` 锚点,指回一份人签过的规范条款(如 J 项 → `AGENTS.md#承重规则的载体门槛`);引擎在装载期与自测里核锚点可解析。没有法源的规则是无主判据,谁都可以删。
-- 示例宪法 `AGENTS.md` 放每会话默认动作、决策边界、永久红线这类短句,并标明它是哪条规则的法源;细则住示例法典 `docs/laws/collab.md`、`docs/laws/reporting.md`。
+- 示例宪法 `AGENTS.md` 放每会话默认动作、决策边界、永久红线这类短句,并标明它是哪条规则的法源;细则住示例法典 `docs/laws/collab.md`、`docs/laws/reporting.md`、`docs/laws/production.md`。
 - 安装器拷过去的这三份是**示例**:你的仓要换成你自己签过的条款,锚点跟着改。
 
 ## 闸自己也被闸
@@ -144,7 +144,7 @@ node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
 
 它做的事:
 
-- 把闸件(`scripts/hook-stop-closure.mjs`、`scripts/batch-goal.mjs`、`scripts/lib/` 下的引擎件)、示例宪法 `AGENTS.md`、示例法典 `docs/laws/collab.md` 与 `docs/laws/reporting.md`、`docs/noun-diary.md`、红队 agent `.claude/agents/_gate-bypass-hunter.md` 拷进目标仓,并生成 `CLAUDE.md`(内容为 `@AGENTS.md`)。
+- 把闸件(`scripts/hook-stop-closure.mjs`、`scripts/batch-goal.mjs`、`scripts/lib/` 下的引擎件)、示例宪法 `AGENTS.md`、示例法典 `docs/laws/collab.md`、`docs/laws/reporting.md` 与 `docs/laws/production.md`、`docs/noun-diary.md`、红队 agent `.claude/agents/_gate-bypass-hunter.md` 拷进目标仓,并生成 `CLAUDE.md`(内容为 `@AGENTS.md`)。
 - 把 `Stop` 与 `SubagentStop` 两个 hook 合并进目标的 `.claude/settings.json`(按命令去重)。
 - 把闸的运行时台账路径追加进目标的 `.gitignore`。
 - **已存在的文件一律不覆盖**:内容不同时写旁件 `<名>.custodiet<扩展名>`,stdout 末行的 JSON 清单逐个报出。不提交、不联网、不碰 `~/.claude/`。

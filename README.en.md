@@ -62,7 +62,7 @@ Full tour and build order: [`docs/playbook.md`](docs/playbook.md) (the construct
 ## Constitution and law code
 
 - Every rule carries a `law:` anchor pointing back to a human-signed clause (e.g. rule J → `AGENTS.md#承重规则的载体门槛`); the engine checks at load time and in self-tests that each anchor resolves. A rule with no source of law is an unowned predicate anyone can delete.
-- The example constitution `AGENTS.md` holds short standing clauses — per-session defaults, decision boundaries, permanent red lines — and marks which rule each one is the source of law for; details live in the example law files `docs/laws/collab.md` and `docs/laws/reporting.md`.
+- The example constitution `AGENTS.md` holds short standing clauses — per-session defaults, decision boundaries, permanent red lines — and marks which rule each one is the source of law for; details live in the example law files `docs/laws/collab.md`, `docs/laws/reporting.md` and `docs/laws/production.md`.
 - The installer copies these three files as **examples**: replace them with clauses you actually signed and move the anchors with them.
 
 ## The gate gates itself
@@ -143,7 +143,7 @@ node custodiet/scripts/custodiet-init.mjs --target <your-repo-root> --mode copy
 
 What it does:
 
-- Copies the gate files (`scripts/hook-stop-closure.mjs`, `scripts/batch-goal.mjs`, the engine files under `scripts/lib/`), the example constitution `AGENTS.md`, the example law files `docs/laws/collab.md` and `docs/laws/reporting.md`, `docs/noun-diary.md`, and the red-team agent `.claude/agents/_gate-bypass-hunter.md` into the target, and generates `CLAUDE.md` (content: `@AGENTS.md`).
+- Copies the gate files (`scripts/hook-stop-closure.mjs`, `scripts/batch-goal.mjs`, the engine files under `scripts/lib/`), the example constitution `AGENTS.md`, the example law files `docs/laws/collab.md`, `docs/laws/reporting.md` and `docs/laws/production.md`, `docs/noun-diary.md`, and the red-team agent `.claude/agents/_gate-bypass-hunter.md` into the target, and generates `CLAUDE.md` (content: `@AGENTS.md`).
 - Merges two hooks, `Stop` and `SubagentStop`, into the target's `.claude/settings.json` (deduplicated by command).
 - Appends the gate's runtime ledger paths to the target's `.gitignore`.
 - **Never overwrites an existing file**: when contents differ it writes a sidecar `<name>.custodiet<ext>`, and the JSON manifest on the last stdout line lists each one. It does not commit, does not touch the network, and does not touch `~/.claude/`.

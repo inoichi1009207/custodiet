@@ -55,7 +55,11 @@ export const CARRIERS = [
   //   漂移测试当场转红(22/23)——**这正是那条测试该干的事**,不是它误报。
   // `task-brief-check` 于 2026-08-20 加入:`gate:lint` 一进 package.json,
   //   采样面自动纳入它,漂移检查当场转红(24/25)——**第三次在真实新增上生效**。
-  { re: /scripts\/(hook-|verify-laws|batch-goal|session-triage|tool-usage-census|test-freshness|gate-migrate-check|coverage-check|task-brief-check|report-gate|lib\/)/,
+  // `tplan-gate` 于 2026-09-16(批 214)加入:第四次在真实新增上生效。
+  //   与前两次同形——它一进 `gate:self-test`,漂移检查当场转红(29/30)。
+  //   背景:它此前**全库零引用**、自己 exit=1 无人撞上,D59② 那条红因此活了 94 批;
+  //   修完夹具接线,连锁把它抬进承重面 —— 正是这条设计想要的结果。
+  { re: /scripts\/(hook-|verify-laws|batch-goal|session-triage|tool-usage-census|test-freshness|gate-migrate-check|coverage-check|task-brief-check|report-gate|tplan-gate|l4-fast-ruler|lib\/)/,
     creation: true, loadBearing: true,
     why: "闸自身的机件:改它就改了闸的行为" },
   // ⚠️ **不许带 `$` 锚**(2026-08-20 自测当场逮到):派生正则是把各类 `source` 用 `|` 拼起来的,
@@ -77,7 +81,7 @@ export const CARRIERS = [
   //   真正该管它的是**另一道**判据:承重规则不得**仅**落在这里。
   // ⚠️ **不要求前导分隔符**(2026-08-20 grill 报出、我先误标「已修」再真修):
   //   原式 `[/\\]\.claude[/\\]…` 要求路径前面有个 `/` 或 `\`,于是**相对路径逃逸**——
-  //   `.claude/projects/D--test/memory/y.md` 判 false,而 Write/Edit 的 `file_path`
+  //   `.claude/projects/example-project/memory/y.md` 判 false,而 Write/Edit 的 `file_path`
   //   完全可以是相对路径。⇒「写 memory 时 I 一声不吭」这个本次合并的直接动因,
   //   在相对路径下**原样成立**,而自测只放了绝对路径一个样例。
   //   也**不能**改用 `(?:^|[/\\])`:`^` 在拼接后的交替支里会锚到整串开头,
@@ -232,10 +236,10 @@ export function selfTest() {
     [".claude/settings.json",               false, true,  "开关面:决定所有 hook 跑不跑"],
     ["package.json",                        false, true,  "定义 gate:* 命令"],
     ["docs/prod-facts.md",                  false, true,  "事实文档,义务句以索引为准"],
-    ["C:/Users/x/.claude/projects/D--test/memory/y.md", true, false, "**写 memory**(绝对路径)"],
+    ["C:/Users/x/.claude/projects/example-project/memory/y.md", true, false, "**写 memory**(绝对路径)"],
     // ⚠️ 相对路径是 grill 报出的逃逸形态,自测原来只有上面那条绝对路径。
     //   Write/Edit 的 `file_path` 完全可以是相对的。
-    [".claude/projects/D--test/memory/y.md", true, false, "**写 memory**(相对路径,原来逃逸)"],
+    [".claude/projects/example-project/memory/y.md", true, false, "**写 memory**(相对路径,原来逃逸)"],
     ["docs/memory-notes.md", false, false, "名字里有 memory 但不是那个目录(防误扩)"],
     ["src/app/page.tsx",                    false, false, "业务代码:两者都不是"],
     ["content/private/x.md",                false, false, "正文:两者都不是"],
@@ -247,7 +251,7 @@ export function selfTest() {
   }
   // memory 的第三个属性
   chk("memory 被标为「承重规则不得独自落脚」",
-    isIllegalRuleHome("C:/Users/x/.claude/projects/D--test/memory/y.md"), true);
+    isIllegalRuleHome("C:/Users/x/.claude/projects/example-project/memory/y.md"), true);
   chk("法典**不**是非法落脚处(对照)", isIllegalRuleHome("docs/laws/collab.md"), false);
 
   // ── D63 回归钉(2026-08-27,逾期结清):NTFS 上这些**指向同一个真实文件**,

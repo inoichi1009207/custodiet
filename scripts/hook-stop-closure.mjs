@@ -12,13 +12,14 @@
 //
 // 判据:条数以引擎规则表 `RULES.length` 为准——**手写计数禁令**(codex 2026-08-22 逮到本文件
 // 三处手写数字各自漂移:十四/二十/二十一,而真值已是二十二)。阻断项共同特征=结构事实+出路便宜:
-//   A  委派/后台任务未闭环   —— 发起过的 job/task 此后再没被提过。       【阻断】
+//   A  委派/后台任务未闭环   —— 原生后台任务:发起后再没被提过;codex 委派(批 257):
+//                               已产出却没成功读回正文 / 失败了没读日志也没登记。   【阻断;状态未知只提示】
 //   E0 裸因果断言            —— 下了因果断言且三条出路一条没走。         【阻断】
 //   I  新建载体未扫工具面     —— 写了 agents/skills/commands/scripts 而无扫描痕迹。【阻断】
 //   J  立/改法未交代触发层   —— 动了 AGENTS.md 或 docs/laws/ 而没说它靠什么触发。【阻断】
 //   E2 缺「形」那一半      —— 没问过有没有机械判据;自标「推断」不豁免本项。【阻断】
-//   K  完成条件未逐条对照   —— 已提交而条件没逐条写达成/未达成。      【阻断】
-//   K0 动了工作面未武装条件 —— 已提交则拦,未提交则提示。            【阻断/提示】
+//   K  结清没成            —— 本轮跑了 --clear,盘上仍未结清(被拒或出错)。批 250 瘦身。【阻断】
+//   K0 未武装 / 关账漏对照  —— 动了工作面却没批;结清时条件没逐条对照。【阻断/提示】
 //   B 承诺未兑现 / C 缺陷陈述无处置 / D 强制项被降级成征询
 //   E1 缺独立性那一半 / F 完成断言与欠件并存 / G 提交前无自审 / H 自陈「能做」却无落地动作【提示】
 //
@@ -27,7 +28,8 @@
 //            ③讨论某条纪律时会撞上该纪律的关键词。
 //   已知漏报:C/H 的豁免看「本轮有没有写动作」而非「写的是不是那件事」——
 //            **一次无关的 Edit 即可豁免整项**;判「这个写动作是否对应那个自陈」需要语义。
-//   A 只证发起与取回未配对,不证结果被读懂或被采纳。
+//   A 只证发起与取回未配对,不证结果被读懂或被采纳(codex 账:结构配对只证「有正文返回过」,
+//     不证读全、读懂;残余逐条列在 `codexLedger` 头注)。
 //   **所有结构判据的共同天花板:只管「做没做」,管不了「做得对不对」**——
 //   I 证扫过工具面,不证扫的方式对(2026-08-19 实撞:手工 ls 而非跑 census,I 不触发,故补 L 项);
 //   G 证自审过,不证自审到位;K 证条件被逐条对照,不证条件写得对或真达成。
@@ -51,6 +53,7 @@
 //          {"decision":"block","reason":"..."} —— Stop hook 的阻断形态。
 
 import fs from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 
@@ -130,6 +133,88 @@ function readBatchGoal() {
       }
     } catch { /* 台账读不到 ⇒ 维持现状,fail-closed 那侧 */ }
   }
+  // 批 253(红队 BP-2):盘上是武装态时,若台账末尾是「结清某批 → 武装本批」,补上刚关掉那批的条件,
+  //   让 K 在「同一轮关旧批、开新批」时能核对旧批有没有逐条对照。台账读不到或形状对不上 ⇒ 不补(K 报取不到,fail-closed)。
+  if (g && !g.cleared && Array.isArray(g.conditions)) {
+    try {
+      const rows = fs.readFileSync(".claude/.batch-goal.jsonl", "utf8").trim().split("\n");
+      g = priorClosedFromJournal(rows, g);
+    } catch { /* 读不到 ⇒ 不补 */ }
+  }
+  // 批 256:AD 项(候选决定提示)要本批提交的**完整信息**——读提交对象,不读转录里的命令段
+  //   (heredoc / -F / 多行 -m 在命令面看不全,codex 256 回件)。只在「未结清、有基点、决定清单为空」时跑一次 git。
+  return attachBatchLog(g);
+}
+
+/** 给批状态补 `batchLog`(`git log <baseCommit>..HEAD` 的提交全文,每条一项)。纯函数式:git 可注入(自测)。
+ *  不该查 / 取不到 ⇒ 原样返回(不加键 ⇒ ctx 里 batchLog=null ⇒ AD 沉默;提示面 fail-open)。 */
+function attachBatchLog(g, git = (args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] })) {
+  if (!g || typeof g !== "object" || g.cleared || !Array.isArray(g.conditions)) return g;
+  if (typeof g.baseCommit !== "string" || !/^[0-9a-f]{7,64}$/i.test(g.baseCommit)) return g;
+  if (Array.isArray(g.decisions) && g.decisions.length) return g;
+  try {
+    const out = String(git(["log", "--format=%B%x00", "-n", "300", `${g.baseCommit}..HEAD`]) || "");
+    return { ...g, batchLog: out.split("\0").map((s) => s.trim()).filter(Boolean) };
+  } catch { return g; }
+}
+
+/** P 项分档的 diff 事实(批 257 条件 3;判据在 `lib/gate-difftier.mjs`):批基点到 HEAD **并上**基点到工作树的改动文件
+ *  (提交后又在工作树还原的,两边任一处出现都算,红队 c3 BP-7 同族),带状态、改名的旧路径、新内容读不读得到。
+ *  只在 P 真欠跨模型/联网时由 ctx.diffTier 惰性调用;只用 `--name-status`,不取全文(红队 c3 BP-8:逐文件 git show 会撞 hook 超时)。
+ *  取不到(无基点、git 失败、文件过多)⇒ null(不分档)。git / exists 可注入(自测)。 */
+export function readDiffFacts(base, git = (args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] }),
+  exists = (p) => fs.existsSync(p), readText = (p) => fs.readFileSync(p, "utf8")) {
+  if (typeof base !== "string" || !/^[0-9a-f]{7,64}$/i.test(base)) return null;
+  try {
+    const root = String(git(["rev-parse", "--show-toplevel"]) || "").trim();
+    if (!root) return null;
+    const files = [];
+    for (const range of [[base, "HEAD"], [base]]) {
+      const parts = String(git(["-c", "core.quotepath=false", "diff", "--name-status", "-M", "-z", ...range, "--"]) || "").split("\0");
+      for (let k = 0; k < parts.length && parts[k];) {
+        const st = parts[k++];
+        const oldPath = /^[RC]/.test(st) ? parts[k++] : null;
+        const path = parts[k++];
+        if (!path) break;
+        files.push({ path, oldPath, status: st, readable: /^[AM]/.test(st) ? exists(`${root}/${path}`) : false, head: range.length === 2 });
+      }
+    }
+    if (files.length > 600) return null;
+    // 文案类已撤(用户 10-10,D144):分档只看测试文件名,不取前后全文(逐文件 git show 也有撞 hook 超时的风险)。
+    void readText;
+    return { base, root, files };
+  } catch { return null; }
+}
+
+/** 从台账行补「刚关掉那批」的条件。纯函数(不读盘),抽出来供自测直接喂行。
+ *  从最后一条 arm 往回走:
+ *    · 批号与当前批相同的行(重开的 arm、`--arm <同号> --force` 留下的 force-over-checks)⇒ 跳过,继续往回;
+ *    · clear 行:批号≠当前批且带条件数组 ⇒ 补 priorClosed;否则不补。遇到 clear 即停;
+ *    · 其它(别的批号的 arm、读不懂的行、无 action 的链首行)⇒ 停,不补(K 报取不到,fail-closed 那侧)。
+ *  批 253b(红队 BP-14):旧实现只看「最后 arm 行的前一行」,同轮 clear 253 → arm 254 → `--arm 254 --force`
+ *    重开时前一行是 arm 254 ⇒ 补不出 ⇒ K 阻断误报「取不到」。
+ *  残余:最后 arm 与当前批号对不上(盘上状态与台账不同步)⇒ 不补,照旧报取不到。 */
+function priorClosedFromJournal(rows, g) {
+  const cur = g?.batch ?? null;
+  const parse = (s) => { try { return JSON.parse(s); } catch { return undefined; } };
+  let i = rows.length - 1;
+  for (; i >= 0; i--) {
+    const r = parse(rows[i]);
+    if (r === undefined) return g;
+    if (r?.action === "arm") break;
+  }
+  if (i < 0 || (parse(rows[i]).batch ?? null) !== cur) return g;
+  for (let j = i - 1; j >= 0; j--) {
+    const r = parse(rows[j]);
+    if (r === undefined) return g;
+    if (r?.action === "clear") {
+      return Array.isArray(r.conditions) && (r.batch ?? null) !== cur
+        ? { ...g, priorClosedBatch: r.batch ?? null, priorClosedConditions: r.conditions }
+        : g;
+    }
+    if (r?.action && (r.batch ?? null) === cur) continue;
+    return g;
+  }
   return g;
 }
 
@@ -146,7 +231,7 @@ function readBatchGoal() {
  *  ⇒ 派生而非并列。**共用一个环境变量这件事本身仍在**(K/K0 同开关),
  *    但现在它至少是**印出来那个**,不再骗人;要拆成独立开关是另一批。 */
 const BLOCK_ENV = { A: "A", E0: "E", E1: "E", E2: "E", I: "I", J: "J", W: "W",
-  K: "K", K0: "K", M: "M", R: "R", Q: "Q", S: "S", T: "T", U: "U", ND: "ND", X: "X" };
+  K: "K", K0: "K", M: "M", R: "R", Q: "Q", S: "S", T: "T", U: "U", ND: "ND", DP: "DP", X: "X" };
 
 // ⚠️ **由 BLOCK_ENV 计算得出,不再是第二张手写表**(D21 结案,codex 072 裁决原话:
 //   「对账只能发现漂移,不能阻止漂移」——一份表按构造不漂)。
@@ -375,9 +460,10 @@ function perfLine() {
   return `dur=${Date.now() - _T0}ms rt=${_perf.rt}x/${_perf.rtMs}ms/${Math.round(_perf.rtBytes / 1024)}KB`;
 }
 
-// 本「轮」= 最后一条 user 行之后的全部条目。找不到 user 行则取全文件。
-// 「本轮」= 最后一个**轮次边界**之后的全部条目。边界有两种:
-//   ① 真实用户发言;② **本闸自己上一次输出**(hook feedback,落在 type:"system" 的 hookErrors)。
+// 「本轮」= 最后一个**轮次边界**之后的全部条目;找不到边界则取全文件。边界(细则见函数体内各条):
+//   ① 用户发言与 peer / task-notification 行(技能正文等无 origin 的 isMeta 行、插件消息**不算**);
+//   ② **本闸自己上一次输出**(hook feedback:system 汇总行、「Stop hook feedback:」非用户亲口的字符串行,从其后起算);
+//   ③ 已结束的 Stop 拦截附件(hook_blocking_error,从同一 toolUseID 的汇总行之后起算;进行中的不切)。
 // 为什么要 ②:连续几轮都是 system reminder 时,只认 ① 会让「本轮」无限增长,
 //   于是**已经纠正过的旧句被反复重判**(2026-08-19 实撞:同一句完成断言被 F 项连判三轮)。
 //   hook feedback 天然是轮次边界——它之后的输出才是「对上次拦截的回应」。
@@ -385,6 +471,17 @@ export function lastTurn(entries) {
   let start = 0;
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
+    // ⚠️ 边界③(2026-10-09 批 257 实撞,探针直证):Stop 拦截也会以 `type:"attachment"` +
+    //   `attachment.type:"hook_blocking_error"` 的形态落盘、**不再**生成「Stop hook feedback:」用户行
+    //   (开着 lanes 闸转投时观测到;是否还有别的触发条件文档未记载)。边界①②′都认不出它 ⇒
+    //   「本轮」一路回溯到上一条真用户发言,已纠正过的旧句被连拦(同一句 E2 连拦 5 轮,lastTurn 探针:
+    //   本轮 116 条、含被拦旧句)。与②′同理 `i+1`:拦截之后才是「对拦截的回应」。
+    //   只认**已结束**的那次 Stop(其后已有同 toolUseID 的汇总行)——进行中的这一次里别的 hook 先落的附件不得切窗(热修红队 BP-2)。
+    //   起点取那条汇总行之后:汇总行里带着各 hook 的全文(含判官提示词),不得进证据窗(热修红队附节二 4)。
+    if (e.type === "attachment" && e.attachment?.type === "hook_blocking_error" && e.attachment?.hookEvent === "Stop") {
+      const j = entries.findIndex((x, k) => k > i && x?.type === "system" && x.hookCount !== undefined && x.toolUseID === e.attachment.toolUseID);
+      if (j > i) { start = j + 1; break; }
+    }
     if (e.type === "system" && e.hookCount !== undefined) {
       const s = JSON.stringify(e.hookErrors || []) + JSON.stringify(e.hookAdditionalContext || "");
       // ⚠️ `i + 1` 而不是 `i`:本闸自己的输出**不得进入自己的证据窗口**。
@@ -408,7 +505,13 @@ export function lastTurn(entries) {
     //   「真实用户发言」身份**含首**进入证据窗(rawText 消费面被自己上一轮的判词污染,
     //   正是 S7 立 `i+1` 要断的那条洗白链)。同理 `i+1` 排除,反馈之后才是「对拦截的回应」。
     //   真实用户发言也可能是字符串形态 ⇒ 判据锚定 harness 固定前缀,不看正文关键词。
-    if (typeof c === "string" && c.startsWith("Stop hook feedback:")) { start = i + 1; break; }
+    // v7(codex v6 接缝 1):用户亲口打的话恰以这个前缀开头(贴报错来问)⇒ 是用户发言,走边界①,不当 hook 反馈切掉
+    if (typeof c === "string" && c.startsWith("Stop hook feedback:") && e.origin?.kind !== "human") { start = i + 1; break; }
+    // 边界②″ 已撤(2026-10-09):lanes 转投 v1 的插件消息形态已退役;v2 以 isMeta 行附全文、引擎仍落 feedback 行与附件,由②′/③认。
+    //   lanes 附给模型的闸全文(isMeta 且以 Stop hook feedback: 开头)由上一行②′按 `i+1` 当边界(窗口从它之后起),不当边界①。
+    //   热修红队 BP-4/9(10-09):无 origin 的 isMeta 行(技能/命令展开的正文、系统提醒)与插件消息都不是新一轮的起点
+    //   ——轮中调 Skill 曾把本轮先前的 Write/Edit 整段切出窗口(真语料 45 处)。peer/task-notification/human 照旧当边界①。
+    if ((e.isMeta === true && !e.origin?.kind) || e.origin?.kind === "plugin") continue;
     start = i;                                                         // 边界①
     break;
   }
@@ -461,13 +564,15 @@ function checkAFromPayload(tasks, raw, text) {
   return { open, source: "background_tasks[]" };
 }
 
+// 原生后台任务(Bash run_in_background)这一族的正则配对。批 257 起**只管原生这一族**:
+//   codex 委派那一族(CODEX_JOB=)已挪到下面的 `codexLedger`,只从实际工具事件取证——
+//   这里原来对 raw 扫 `CODEX_JOB=` 并认「id 再出现一次」为闭环,于是发车交接块自带的
+//   `CODEX_POLL=… --poll J` 与 `CODEX_LOG=…/J.log` 两行**各自**就足以结清(D141 复核夹具已证)。
 function checkA(entries) {
   const raw = rawText(entries);
   const started = new Set();
   const closed = new Set();
-  // 两种发起形态:codex-run 打印的 CODEX_JOB=,与后台 Bash 的 task id
-  for (const m of raw.matchAll(/CODEX_JOB=([A-Za-z0-9_-]+)/g)) started.add(m[1]);
-  for (const m of raw.matchAll(/running in background with ID:\s*([A-Za-z0-9_-]+)/g)) started.add(m[1]);
+  for (const m of raw.matchAll(CODEX_BG_ID)) started.add(m[1]);
   // 取回形态(四种都算「跟过了」):
   //   ① --poll <id>  ② 完成通知里的 <task-id>  ③ 读了 <id>.output  ④ 该 id 出现在任何 Bash 命令参数里
   // 判据取「有没有跟踪动作」而**不是**「任务是否已完成」——一个还在 running 的任务
@@ -486,6 +591,693 @@ function checkA(entries) {
   }
   const open = [...started].filter((id) => !closed.has(id));
   return { open, started: [...started] };
+}
+
+// ── A 项 · codex 委派这一族(批 257 / D141;v5 = clipboard/257-a-fix-r3-list.md「主会话裁定 v5」)──
+//
+// 原则:**谁发车谁读**;「这段输出是不是 R」由 runner 用带 J 的定界块给出,闸不再从 shell 语法或文本相似推断
+//   (v1–v4 的误拦与漏放都出在那一层,v5 整层删除)。
+//
+// 发起 = 一次 Bash / PowerShell / Monitor 调用以脚本参数跑了 codex-run.mjs 且带 --task(`out=$(…)`、反引号、
+//   `bash -c '…'` 内层都展开再找 runner)。J 取自配对返回里的 CODEX_JOB / CODEX_END / CODEX_POLL / CODEX_LOG,
+//   每个 CODEX_JOB 块各记一笔。返回里没有字段(截尾、重定向、run_in_background、超时被杀)⇒ 每个 --task 记一笔
+//   **无主占位**。之后任一工具返回里出现本账没有的 J 的 CODEX_JOB 块(poll、读后台 `.output` / 重定向文件……),
+//   或旧版 `--poll J` 有状态文件 ⇒ 认领占位:按状态文件的任务认领;没有状态文件(离线)认领同一次发起里最早的未认领占位;
+//   生产态未认领的占位还按「任务 + 发起时刻」或结果路径到作业目录反查(注入面 findJob)。参数错误(缺 --task 等)不是发起。
+// 观测只升不降:终态(done / failed)只能被另一个终态改写;同一终态的重复观测不覆盖首次(CX-3);
+//   running / unknown 不覆盖终态(BP4-2)。最近观测是 running / 未知时仍查状态文件,终态为准。
+// 读回 = 发起之后:某次**成功**工具返回里出现完整的 `CODEX_BODY_BEGIN=J` … `CODEX_BODY_END=J`(runner 在 done 时打出;
+//   块中正文须与 R 的当前正文一致,防旧回件;R 读不到时只认块。Read 返回先剥行号前缀);或 Read 工具的 file_path 就是 R
+//   且成功返回。cat / sed / awk / 管道 / 复合命令一律不再推断——出路是 `--poll J` 一次(正文随结果打出)或 Read R。
+// 失败已处理 = 任一返回里出现完整的 `CODEX_FAIL_BEGIN=J` … `CODEX_FAIL_END=J`(runner 在 failed 时打出日志尾部);
+//   或「得知失败」之后 Read 工具成功读了它的日志(CODEX_LOG / `<J>.log` / `<J>.last.txt`);或同一任务重发。
+//   「得知失败」= 转录里首次观测到 failed;只有状态文件说 failed 时 = 其 endedAt 之后(按条目 timestamp;取不到则不认)。
+//   旧作业 done 了就得读一次——同任务重发、新作业读过,都不替它结账。
+// 状态:运行中待取 / 已产出待读(阻断)/ 已读回 / 失败已处理 / 失败未处理(阻断)/ 状态未知(提示)。运行中先于读回判。
+// 子代理边界(`subagentCodexVerdict`):子代理自己发车的作业,收尾时 **运行中 / 已产出待读 / 失败未处理都阻断**;
+//   运行中的出路 = `codex-run.mjs --poll J --wait-ms N` 等到终态(上限 10 分钟;done 时正文随结果打出即读回,
+//   到期仍在跑退出码 3)。状态未知只提示,且只在本轮有该作业新事件时提示。依据 = 用户亲签代价模型「不接受只记录降级」;
+//   不设按次数自动放行(连撞交给官方连续阻断上限);`STOP_CLOSURE_BLOCK_A=0` 两通道同样生效。
+// 账在**发车方会话转录全量**上算;子代理转录超过整分支预算时,A 只读尾段。其他规则的窗口不动。
+// 注入面(规则不自读磁盘):jobState / findJob / resultBody / bgTasks / now。生产 hook 由 `liveCodexEnv` 读
+//   作业目录与结果件;查找目录 = hook 自己的 os.tmpdir() 作业目录 + 转录里 CODEX_LOG 的目录(归一去重)。
+//
+// v6(同文件「主会话裁定 v6」,两路复核 v5 的修法):占位认领核 startedAt 是否落在该占位发起窗口(旧 J 不认领新占位);
+//   BODY 按块判、不看整次调用退出码;分页 Read 同一文件按行号拼接后取块;Read R 只认作业终态之后的读
+//   (台账 endedAt 比条目 timestamp,取不到退到转录首次观测 done 的位置);`--cwd` 参与解 `--task`;
+//   自动转后台的措辞「moved to the background (ID: …)」与显式后台同认;用户级 runner 不带 BODY 能力时提示只给 Read R。
+//   runner 侧:发起即 `wx` 占住 r<n>;日志读不到不发 FAIL 块。
+//   失败「见即处理」(FAIL 块送达即算处理)是裁定接受的代价,与 BODY「送达即读回」同口径:闸核信息到没到,不核拿它做了什么。
+// v7(同文件「主会话裁定 v7」,两路复核 v6 的修法):**身份靠直连,时间只作筛选**——后台发起的 `.output` 里有 CODEX_JOB
+//   ⇒ 直接定身份;回退认领的窗口只留下界(startedAt ≥ 发起 − 2 秒)、上界 60 分钟,台账缺 startedAt 不认领,反查从最晚的发起往前认。
+//   Read R 的界 = 台账 resultAt(runner 写 R 之前记;旧台账退 endedAt),比较用 ≥;有界而读没时间戳不算;台账读不到 ⇒ 发起之后即可;
+//   读到 runner 占位文字永不算。分页拼块按每段连续行号各自取。job-missing / 台账缺失不是终态观测。
+//   **规则不追溯**:生效时刻(`CODEX_A_SINCE`)之前发起的作业不入账。提示里的 poll 用这次发起用的那支 runner,能力按它判。
+// 残余(照实列):
+//   ①历史转录没有 BODY 块:旧 runner 发起、用 cat 等 shell 读法读 R 的会判待读(v5 接受的代价;出路一条 `--poll J` 或 Read R)。
+//   ②Read R 不证读全:任意一段成功即算(裁定 v5 第 2 条原文)。显式 `--out` 复用同一路径不占位,旧件可能被当成新件读。
+//   ③R 读不到(超过 2MB、已移走)时 BODY 块只比 J 不比正文。
+//   ④别的会话发起、本会话只 poll 的作业不入账。
+//   ⑤hook 进程 os.tmpdir() 未直证;一个 CODEX_LOG 都没留下的作业,目录不一致时只能落「未知」。
+//   ⑥子代理转录超预算时只读尾段:发起早于尾段的作业不入账。
+const CODEX_RUNNERS = /^(node|node\.exe|nodejs|bun)$/i;
+// 后台任务号的三种措辞:显式 run_in_background「running in background with ID: x」,
+//   超时自动转后台「was moved to the background (ID: x)」(v6,红队附二-2;lanes 10 秒转后台后这是主形态),
+//   用户手动转后台「manually backgrounded by user with ID: x」(v7,红队 v6 附二-3)
+const CODEX_BG_ID = /(?:running in background with ID:|moved to the background \(ID:|manually backgrounded by user with ID:)\s*([A-Za-z0-9_-]+)/g;
+// 后台输出文件路径(工具返回里「Output is being written to: <路径>」):v7 起 hook 读它取 CODEX_JOB,直接认领占位
+const CODEX_BG_OUT = /Output is being written to:\s*(\S+?\.output)\b/;
+const CODEX_JOB_GRACE_MS = 2 * 60 * 1000;
+const CODEX_FIND_WINDOW_MS = 60 * 60 * 1000;     // 无主占位反查的上界:发起之后 60 分钟内开跑的(v7:身份主靠 .output 直连,窗口只作回退筛选)
+const CODEX_SKEW_MS = 2000;                      // 下界容差:runner 的 startedAt 不会早于发起 tool_use 超过这么多
+// v7(红队 v6 BP-4):A 账只追这一刻之后发起的作业——规则不追溯,旧判据下诚实做完的作业不按新判据补账
+//   = v7 合并进 master 的提交时刻(b513d68,2026-10-10T14:33:44+08:00)。原先写成 12:00Z(北京 20:00),
+//   比真生效晚 6 小时,合并后发起的新作业也被豁免(codex 终审 L1)——截止只能取真实生效时刻。
+export const CODEX_A_SINCE = Date.parse("2026-10-10T06:33:44Z");
+// runner 的发起占位行(与 codex-run.mjs 的 PLACEHOLDER_RE 同一正则,自测核两边一致):Read 到它永不算读回
+export const CODEX_PLACEHOLDER_RE = /^\(codex-run 作业 \S+ 运行中,结果未产出——占位\)\s*$/;
+const CODEX_ARG_ERROR = /缺 --task|任务文件不存在|拒绝入参|未知参数|参数 \S+ 缺值/;
+
+/** tool_result 的正文(字符串或 text 块数组)。 */
+function codexResultText(b) {
+  const c = b && b.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map((x) => (x && typeof x.text === "string" ? x.text : "")).join("\n");
+  return "";
+}
+
+/** 段内分词:认单/双引号;`ps` = PowerShell(反斜杠是普通字符)。不做变量展开。 */
+export function codexWords(seg, ps = false) {
+  const s = String(seg || "");
+  const out = [];
+  let cur = "", has = false, q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") { if (c === "'") q = null; else cur += c; continue; }
+    if (q === '"') {
+      if (c === '"') { q = null; continue; }
+      if (!ps && c === "\\" && i + 1 < s.length && /["\\$`]/.test(s[i + 1])) { cur += s[++i]; continue; }
+      cur += c; continue;
+    }
+    if (c === "'" || c === '"') { q = c; has = true; continue; }
+    if (/\s/.test(c)) { if (has || cur) out.push(cur); cur = ""; has = false; continue; }
+    if (!ps && c === "\\" && i + 1 < s.length) { cur += s[++i]; has = true; continue; }
+    cur += c; has = true;
+  }
+  if (has || cur) out.push(cur);
+  return out;
+}
+
+/** 剥命令替换外壳:`out=$(node` ⇒ `node`、`` `node `` ⇒ `node`,替换体收尾的 `)`/反引号去掉;
+ *  剥过壳且带空白的词(`"$(node a b)"`)再按空白拆。引号里本来就带空格的普通参数保持一个词。 */
+export function codexUnwrapSubst(words, ps = false) {
+  const out = [];
+  let depth = 0;
+  for (const w of words) {
+    let x = String(w);
+    const k = x.lastIndexOf("$(");
+    const opened = k >= 0 || x.startsWith("`");
+    if (k >= 0) { x = x.slice(k + 2); depth++; }
+    else if (x.startsWith("`")) { x = x.slice(1); depth++; }
+    if (depth > 0 && /[)`]$/.test(x)) { x = x.replace(/[)`]+$/, ""); depth = Math.max(0, depth - 1); }
+    if (opened && /\s/.test(x.trim())) out.push(...codexWords(x, ps));
+    else if (x) out.push(x);
+  }
+  return out;
+}
+
+/** 一条命令拆成分词后的段;`bash|sh|zsh -c '…'`、`pwsh|powershell -Command '…'` 的内层展开成更多段(BP4-12);
+ *  `segments` 不切单个 `&`(后台并发),这里按独立的 `&` 词再切一次(BP4-3:`… --task a & … --task b; wait`)。 */
+function codexCommandSegs(cmd, ps, depth = 0) {
+  const out = [];
+  const groups = [];
+  for (const seg of segments(cmd)) {
+    const ws = codexUnwrapSubst(codexWords(seg, ps), ps);
+    for (let a = 0, k = 0; k <= ws.length; k++) if (k === ws.length || ws[k] === "&") { if (k > a) groups.push(ws.slice(a, k)); a = k + 1; }
+  }
+  for (const words of groups) {
+    const head = String(words[0]).replace(/^.*[\\/]/, "").toLowerCase();
+    const ci = words.findIndex((w, i) => i > 0 && /^(-l?c|-command)$/i.test(w));
+    if (depth < 2 && /^(bash|sh|zsh|pwsh|powershell)(\.exe)?$/.test(head) && ci > 0 && words[ci + 1] != null) {
+      out.push(...codexCommandSegs(words[ci + 1], /^(pwsh|powershell)/.test(head), depth + 1));
+      continue;
+    }
+    out.push(words);
+  }
+  return out;
+}
+
+/** 路径归一:分隔符、`/d/…`、`~/…`、相对 → 绝对(给了 cwd 时)、消 `.`/`..`;盘符路径整体小写。
+ *  解不出(相对且无 cwd)⇒ null。 */
+export function codexNormPath(p, cwd) {
+  let s = String(p || "").trim().replace(/^["']|["']$/g, "").replace(/\\/g, "/");
+  if (!s) return null;
+  const home = String(process.env.USERPROFILE || process.env.HOME || "").replace(/\\/g, "/");
+  if (/^~(\/|$)/.test(s)) { if (!home) return null; s = home + s.slice(1); }
+  let m = /^\/mnt\/([A-Za-z])(\/|$)/.exec(s) || /^\/([A-Za-z])(\/|$)/.exec(s);
+  if (m) s = `${m[1]}:/${s.slice(m[0].length)}`;
+  if (!/^(?:[A-Za-z]:\/|\/)/.test(s)) {
+    if (/^[A-Za-z]:[^/]/.test(s)) return null;                 // `D:foo` 盘符相对:不猜
+    if (!cwd) return null;
+    const base = codexNormPath(cwd, null);
+    if (!base) return null;
+    s = `${base.replace(/\/+$/, "")}/${s}`;
+  }
+  const drive = /^[A-Za-z]:/.test(s) ? s.slice(0, 2) : "";
+  const parts = [];
+  for (const seg of s.slice(drive.length).split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") { parts.pop(); continue; }
+    parts.push(seg);
+  }
+  const out = `${drive}/${parts.join("/")}`;
+  return drive ? out.toLowerCase() : out;
+}
+
+/** 一段命令是否以脚本参数跑了 codex-run.mjs;是则返回 { task, polls:[J] }。 */
+function codexInvocation(words) {
+  const at = words.findIndex((w) => /(^|[\\/])codex-run\.mjs$/.test(w));
+  if (at < 0) return null;
+  if (!words.slice(0, at).some((w) => CODEX_RUNNERS.test(String(w).replace(/^.*[\\/]/, "")))) return null;
+  let task = null, dir = null;
+  const polls = [];
+  for (let k = at + 1; k < words.length; k++) {
+    if (words[k] === "--task" && words[k + 1] != null) task = words[++k];
+    else if (words[k] === "--cwd" && words[k + 1] != null) dir = words[++k];   // runner 按 --cwd 解 --task(v6,红队 BP-5)
+    else if (words[k] === "--poll" && words[k + 1] != null) polls.push(words[++k]);
+  }
+  // runner = 这次发起用的那支脚本路径(v7):闸提示里的 poll 命令用同一支,能力也按这一支判
+  return { task, dir, polls, runner: words[at] };
+}
+
+/** 取出返回里完整的 BODY / FAIL 定界块(BEGIN 与 END 的 J 相同才成块)。块内是数据,里面的 CODEX_ 行不进字段解析。
+ *  numbered = Read 的返回(先剥行号前缀)。只有 BEGIN(被截尾)⇒ 其后都当数据;只有 END(被截头)⇒ 之前都是正文
+ *  残段,只留 `CODEX_END=J` 作 J 的载体。返回 { bodies:[{kind,J,text}], rest }。 */
+export function codexBodies(text, numbered = false) {
+  let lines = String(text || "").split(/\r?\n/);
+  if (numbered) lines = lines.map((l) => l.replace(/^\s*\d+[\t→]/, ""));
+  const bodies = [];
+  let rest = [];
+  let open = null;
+  for (const l of lines) {
+    const m = /^CODEX_(BODY|FAIL)_(BEGIN|END)=([A-Za-z0-9_-]{1,64})\s*$/.exec(l);
+    if (open) {
+      if (m && m[2] === "END" && m[1] === open.kind && m[3] === open.J) { bodies.push({ kind: open.kind, J: open.J, text: open.buf.join("\n") }); open = null; }
+      else open.buf.push(l);
+    } else if (m && m[2] === "BEGIN") open = { kind: m[1], J: m[3], buf: [] };
+    else if (m) rest = [`CODEX_END=${m[3]}`];
+    else rest.push(l);
+  }
+  return { bodies, rest: rest.join("\n") };
+}
+
+/** 把一段返回切成 CODEX_* 字段块(每个 CODEX_JOB= 开一块;没有 JOB 的旧形态整段一块)。Read 的行号前缀先剥。 */
+export function codexBlocks(text) {
+  const blocks = [];
+  let cur = null;
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const m = /^CODEX_([A-Z_]+)=(.*)$/.exec(line.replace(/^\s*\d+[\t→]/, "").trim());
+    if (!m) continue;
+    if (m[1] === "JOB" || !cur || (m[1] in cur && m[1] !== "JOB")) { cur = {}; blocks.push(cur); }
+    cur[m[1]] = m[2].trim();
+  }
+  return blocks;
+}
+
+/** 发起返回字段块里的 J:CODEX_JOB;截尾时退到 CODEX_END / CODEX_POLL 的 `--poll J` / CODEX_LOG 的 `<J>.log`。 */
+function codexIdOf(bk) {
+  if (bk.JOB) return bk.JOB;
+  if (bk.END) return bk.END;
+  if (bk.POLL) { const m = /--poll\s+([A-Za-z0-9_-]{1,64})/.exec(bk.POLL); if (m) return m[1]; }
+  if (bk.LOG) { const m = /([A-Za-z0-9_-]{1,64})\.log$/.exec(bk.LOG); if (m) return m[1]; }
+  return null;
+}
+
+const CODEX_RANK = { unknown: 0, background: 1, running: 1, done: 2, failed: 2 };
+/** 观测只升不降(BP4-2):终态只被另一个终态改写;同一终态的重复观测不覆盖首次(CX-3)。 */
+function codexObserve(job, kind, seq, why = "") {
+  const cur = job.obs ? job.obs.kind : "unknown";
+  if (CODEX_RANK[kind] < CODEX_RANK[cur]) return;
+  if (CODEX_RANK[cur] === 2 && kind === cur) return;
+  if (CODEX_RANK[cur] === 2 && CODEX_RANK[kind] < 2) return;
+  job.obs = { kind, seq, why };
+}
+
+/** 正文比对口径:换行归一、行尾空白与首尾空白不计(工具回显会吃掉这些)。 */
+const codexNormBody = (s) => String(s).replace(/\r/g, "").split("\n").map((l) => l.trimEnd()).join("\n").trim();
+
+/** codex 委派账。entries = 发车方会话转录全量;env = 注入面(见段首),缺省 = 不注入。
+ *  返回 { jobs, open:[…阻断行], unknown:[…提示行], running:[…运行中行] }(unknown 已按本轮门控)。 */
+export function codexLedger(entries, env = {}) {
+  const uses = new Map();
+  const events = [];
+  const notifs = [];   // { ei, text }:后台任务完成通知(只用来刷新占位的「本轮有事件」)
+  let seq = 0;
+  const list = Array.isArray(entries) ? entries : [];
+  const tsOf = (e) => { const t = Date.parse(e && e.timestamp || ""); return Number.isFinite(t) ? t : null; };
+  for (let ei = 0; ei < list.length; ei++) {
+    const e = list[ei];
+    const c = e && e.message && e.message.content;
+    if (e && e.type === "user" && typeof c === "string" && c.includes("<task-id>")) notifs.push({ ei, text: c });
+    if (!Array.isArray(c)) continue;
+    for (const b of c) {
+      seq++;
+      if (e.type === "user" && b && b.type === "text" && typeof b.text === "string" && b.text.includes("<task-id>")) notifs.push({ ei, text: b.text });
+      if (e.type === "assistant" && b && b.type === "tool_use" && b.id) {
+        uses.set(b.id, { name: String(b.name || ""), input: b.input || {}, cwd: e.cwd || null, ts: tsOf(e) });
+      } else if (b && b.type === "tool_result" && b.tool_use_id && uses.has(b.tool_use_id)) {
+        const u = uses.get(b.tool_use_id);
+        events.push({ seq, ei, use: u, useId: b.tool_use_id, text: codexResultText(b), isError: b.is_error === true,
+          cwd: u.cwd || e.cwd || env.cwd || null, ts: tsOf(e) });
+      }
+    }
+  }
+  const jobs = new Map();        // 键 = J 或 `@<tool_use 尾号>[#k]`(无主占位)
+  const delivered = [];          // { seq, J, kind, text }:完整 BODY / FAIL 块(BODY 只收成功返回里的)
+  const reads = [];              // { seq, ts, p }:Read 工具成功读到的路径(归一)
+  const pages = new Map();       // 归一路径 → Map(行号 → 行):分页 Read 拼块用
+  const relaunch = [];           // { seq, ts, task, id }
+  const jobDirs = new Set();     // 返回里 CODEX_LOG 的目录(hook 进程 tmpdir 不一致时兜底查)
+  const mkJob = (o) => ({ R: new Set(), Rraw: null, L: null, err: null, ...o });
+  const byJ = (J) => jobs.get(J) || [...jobs.values()].find((j) => j.foundId === J);
+  const note = (job, bk, cwd) => {
+    if (bk.RESULT) { const r = codexNormPath(bk.RESULT, cwd); if (r) job.R.add(r); job.Rraw = job.Rraw || bk.RESULT; }
+    if (bk.LOG) job.L = job.L || codexNormPath(bk.LOG, cwd);
+    if (bk.ERROR_CODE || bk.ERROR) job.err = bk.ERROR_CODE || bk.ERROR;
+  };
+  // job-missing(台账已被清掉)不是作业的终态,是「查不到」——不得改写已有观测(v7,红队 v6 BP-3:
+  //   照提示 poll 一下,旧作业就从待读翻成「失败未处理」,再也清不掉)
+  const stOf = (bk) => {
+    if (String(bk.ERROR_CODE || "") === "job-missing") return "unknown";
+    const s = String(bk.STATE || "").toLowerCase(); return /^(background|running|done|failed)$/.test(s) ? s : "unknown";
+  };
+  // 本账没有的 J:按状态文件的任务认领占位;台账没记任务(离线 / 旧台账)才认领同一次发起里最早的未认领占位。
+  //   注入了 jobState 而查不到台账 ⇒ 不是作业(`--poll $(grep …)` 剥壳得 `grep`),不认领;台账任务对不上任何占位 ⇒ 不认领。
+  //   v6(红队 BP-1 / codex v5 第 1 条):台账有 startedAt 且占位有发起时刻 ⇒ 只认 startedAt 落在该占位发起窗口内的
+  //   (旧 J——同会话更早一次发起、或历史作业——不得认领新占位,否则新作业的欠账悄悄消失)。
+  //   v7(codex v6 第 1/2 条、红队 v6 BP-2/6):时间只作筛选、不作身份——下界收到 2 秒容差(早于发起的旧作业不认),
+  //   上界放到 60 分钟(发起前有准备步骤也认得上);台账缺 startedAt ⇒ 不认领(原先直接放行)。身份主靠 `.output` 直连(见发起处)。
+  const inWin = (j, sf) => {
+    const t = Date.parse(sf && sf.startedAt || "");
+    if (!Number.isFinite(t)) return false;
+    return !Number.isFinite(j.useTs) || (t >= j.useTs - CODEX_SKEW_MS && t <= j.useTs + CODEX_FIND_WINDOW_MS);
+  };
+  const claim = (J, seq) => {
+    const sf = typeof env.jobState === "function" ? env.jobState(J, [...jobDirs]) : undefined;
+    if (sf === null) return null;
+    const anons = [...jobs.values()].filter((j) => j.anon && j.launchSeq < seq);
+    let pick = sf && sf.task ? [...anons].reverse().find((j) => j.taskNorm && j.taskNorm === codexNormPath(sf.task, null) && inWin(j, sf)) : null;
+    if (!(sf && sf.task) && anons.length && anons.every((j) => j.launchSeq === anons[0].launchSeq)) pick = anons[0];
+    if (pick) { pick.foundId = J; pick.label = J; pick.anon = false; }
+    return pick || null;
+  };
+  for (const ev of events) {
+    const { use, text } = ev;
+    const name = use.name;
+    const inp = use.input || {};
+    const isErr = ev.isError || /^\s*<tool_use_error>/.test(text);
+    const { bodies, rest } = codexBodies(text, name === "Read");
+    // 块按块判(v6,红队 BP-8 / codex v5 第 3 条):同一次调用里别的命令失败,不否掉已完整送达的块——
+    //   块本身带 J、BEGIN/END 成对,BODY 还要与 R 一致,整次调用的退出码对它没有证明力
+    for (const b of bodies) delivered.push({ seq: ev.seq, ...b });
+    if (name === "Read" && typeof inp.file_path === "string" && !isErr) {
+      const p = codexNormPath(inp.file_path, ev.cwd);
+      if (p) {
+        // 读到的是 runner 的发起占位 ⇒ 永不算读回(v7,按内容判,不靠时间戳)
+        const plain = text.split(/\r?\n/).map((l) => l.replace(/^\s*\d+[\t→]/, "")).join("\n").trim();
+        reads.push({ seq: ev.seq, ts: ev.ts, p, ph: CODEX_PLACEHOLDER_RE.test(plain) });
+        // 分页 Read 同一文件:按行号拼接后取块(v6,codex v5 第 4 条:BODY 跨页时单页都不完整)。
+        //   v7(codex v6 第 5 条):每段连续行号各自拼——前面有没读到的空档,不连累后面完整的块;不用 Math.min(...) 展开(红队附二-4)
+        const pg = pages.get(p) || new Map();
+        pages.set(p, pg);
+        for (const l of text.split(/\r?\n/)) { const m = /^\s*(\d+)[\t→](.*)$/.exec(l); if (m) pg.set(Number(m[1]), m[2]); }
+        if (/^\s*\d+[\t→]CODEX_(BODY|FAIL)_BEGIN=/m.test(text)) pg.hasBegin = true;
+        if (pg.hasBegin) {                                       // 没见过 BEGIN 的文件不拼(省得每次 Read 都重扫)
+          const keys = [...pg.keys()].sort((x, y) => x - y);
+          for (let a = 0; a < keys.length;) {
+            let b = a;
+            while (b + 1 < keys.length && keys[b + 1] === keys[b] + 1) b++;
+            const run = keys.slice(a, b + 1).map((k) => pg.get(k)).join("\n");
+            for (const blk of codexBodies(run).bodies) if (!bodies.some((x) => x.J === blk.J && x.kind === blk.kind)) delivered.push({ seq: ev.seq, ...blk });
+            a = b + 1;
+          }
+        }
+      }
+    }
+    for (const bk of codexBlocks(rest)) if (bk.LOG) { const l = codexNormPath(bk.LOG, ev.cwd); if (l) jobDirs.add(l.replace(/\/[^/]*$/, "")); }
+    const launches = [];
+    const polls = [];
+    let cwd = ev.cwd;
+    if (/^(Bash|PowerShell|Monitor)$/.test(name) && typeof inp.command === "string") {
+      const ps = name === "PowerShell";
+      // heredoc 正文是数据不是命令(与 `bashWriteTargets` 同一界符口径)
+      const cmdNoDoc = ps ? inp.command : inp.command.replace(/<<-?\s*(['"]?)(\w+)\1[\s\S]*?^\s*\2\s*$/gm, " ");
+      for (const words of codexCommandSegs(cmdNoDoc, ps)) {
+        if (/^(cd|set-location|sl|pushd|chdir)$/i.test(words[0]) && words[1]) {
+          const p = codexNormPath(words.filter((w, i) => i > 0 && !/^-/.test(w))[0] || words[1], cwd);
+          if (p) cwd = p;
+          continue;
+        }
+        const inv = codexInvocation(words);
+        if (!inv) continue;
+        const base = inv.dir ? codexNormPath(inv.dir, cwd) || cwd : cwd;
+        if (inv.task) launches.push({ task: inv.task, cwd: base, taskNorm: codexNormPath(inv.task, base), runner: inv.runner, shellCwd: cwd });
+        polls.push(...inv.polls);
+      }
+    }
+    const blocks = codexBlocks(rest).filter((bk) => codexIdOf(bk) || bk.STATE || bk.RESULT);
+    if (launches.length) {
+      const base = (l) => ({ launchSeq: ev.seq, lastEi: ev.ei, cwd: l.cwd, task: l.task, taskNorm: l.taskNorm, useTs: use.ts,
+        runner: l.runner, runnerCwd: l.shellCwd });
+      if (!blocks.length) {
+        // 无主占位(每个 --task 一笔):后台 / 重定向 / 超时被杀 / 截尾。参数错误不是发起。
+        if (isErr && CODEX_ARG_ERROR.test(text)) continue;
+        const bgm = new RegExp(CODEX_BG_ID.source).exec(text);
+        // v7 直连:后台发起的输出文件里就有 runner 打的 CODEX_JOB——读出来直接定身份,不靠时间窗(codex v6 第 1 条)。
+        //   只取身份与路径,不取 BODY(那份正文发车方没看过,不算送达);一次发起只认一个 J 时才直连
+        const outm = CODEX_BG_OUT.exec(text);
+        let outBk = null;
+        if (outm && launches.length === 1 && typeof env.readOutput === "function") {
+          let ot = null;
+          try { ot = env.readOutput(outm[1]); } catch { ot = null; }
+          const ids = ot ? codexBlocks(codexBodies(ot).rest).filter((bk) => bk.JOB) : [];
+          if (ids.length && ids.every((bk) => bk.JOB === ids[0].JOB) && !byJ(ids[0].JOB)) outBk = ids[0];
+        }
+        if (outBk) {
+          const l = launches[0];
+          const job = mkJob({ ...base(l), id: outBk.JOB, anon: false, bgId: bgm ? bgm[1] : null,
+            obs: { kind: "unknown", seq: ev.seq, why: "后台发起(身份取自后台输出文件;状态以台账为准)" } });
+          jobs.set(outBk.JOB, job);
+          note(job, outBk, l.cwd);
+          if (l.taskNorm) relaunch.push({ seq: ev.seq, ts: ev.ts, task: l.taskNorm, id: job.id });
+          continue;
+        }
+        const bg = inp.run_in_background === true || !!bgm || name === "Monitor";
+        const why = bg ? "以后台 / Monitor 发起,CODEX_ 字段在后台输出里"
+          : isErr ? "发起那次 Bash 报错返回(超时被杀?worker 是 detached 的,作业可能照跑)"
+          : "发起返回里没有 CODEX_ 字段(截尾、重定向或过滤?)";
+        launches.forEach((l, k) => {
+          const id = `@${ev.useId.slice(-8)}${launches.length > 1 ? `#${k}` : ""}`;
+          jobs.set(id, mkJob({ ...base(l), id, anon: true, bgId: bgm ? bgm[1] : null, obs: { kind: "unknown", seq: ev.seq, why } }));
+          if (l.taskNorm) relaunch.push({ seq: ev.seq, ts: ev.ts, task: l.taskNorm, id });
+        });
+        continue;
+      }
+      blocks.forEach((bk, k) => {
+        const l = launches[Math.min(k, launches.length - 1)];
+        const J = codexIdOf(bk);
+        let job = J ? byJ(J) : null;
+        if (!job) {
+          const id = J || `@${ev.useId.slice(-8)}#${jobs.size}`;
+          job = mkJob({ ...base(l), id, anon: !J, obs: { kind: "unknown", seq: ev.seq, why: "" } });
+          jobs.set(id, job);
+        }
+        codexObserve(job, stOf(bk), ev.seq, bk.STATE ? "" : "返回里没有 CODEX_STATE(被截断)");
+        note(job, bk, l.cwd);
+        if (l.taskNorm) relaunch.push({ seq: ev.seq, ts: ev.ts, task: l.taskNorm, id: job.id });
+      });
+      continue;
+    }
+    // 非发起:返回里的 CODEX_JOB 块(poll、读后台 .output / 重定向文件……)按 J 归属;本账没有的 J 认领占位(BP4-3/4)
+    const seen = new Set();
+    for (const bk of blocks) {
+      if (!bk.JOB) continue;
+      const job = byJ(bk.JOB) || claim(bk.JOB, ev.seq);   // 账按事件序建,认领只挑更早的占位 ⇒ job 必在本事件之前发起
+      if (!job) continue;
+      seen.add(bk.JOB);
+      job.lastEi = ev.ei;
+      codexObserve(job, stOf(bk) === "background" ? "running" : stOf(bk), ev.seq, `返回 CODEX_STATE=${bk.STATE || "(缺)"}`);
+      note(job, bk, cwd);
+    }
+    // 旧版 poll(无机器块):一条命令只 poll 一个 J、返回只有一行状态时才归属
+    const uniqPolls = [...new Set(polls)];   // `until … --poll J …; do …; done; … --poll J` 是同一个 J
+    const legacy = [...rest.matchAll(/^(running|done|failed)\b[ \t]*(.*)$/gm)];
+    for (const J of uniqPolls) {
+      if (seen.has(J)) continue;
+      const job = byJ(J) || (typeof env.jobState === "function" && env.jobState(J, [...jobDirs]) ? claim(J, ev.seq) : null);
+      if (!job) continue;
+      job.lastEi = ev.ei;
+      if (uniqPolls.length === 1 && legacy.length === 1) {
+        const [, st, more] = legacy[0];
+        if (st === "failed" && /台账缺失/.test(more)) { codexObserve(job, "unknown", ev.seq, "poll 报台账缺失"); continue; }   // v7,同 stOf 的 job-missing
+        codexObserve(job, st, ev.seq);
+        if (st === "done" && more) note(job, { RESULT: more.trim() }, cwd);
+        if (st === "failed") job.err = more || job.err;
+      } else codexObserve(job, "unknown", ev.seq, "poll 返回无法归属到该 J(一条命令多个 poll 或返回被混入)");
+    }
+  }
+  // 后台任务完成通知:刷新对应占位的「本轮有事件」
+  for (const job of jobs.values()) {
+    if (!job.bgId) continue;
+    for (const n of notifs) if (n.ei > job.lastEi && n.text.includes(`<task-id>${job.bgId}</task-id>`)) job.lastEi = n.ei;
+  }
+
+  const now = Number.isFinite(env.now) ? env.now : Date.now();
+  const claimed = new Set([...jobs.values()].filter((j) => !j.anon).map((j) => j.foundId || j.id));
+  // 无主占位反查(回退路径):**从最晚的发起往前**认——早一次没跑起来的发起不得抢走后一次发起的作业(v7);
+  //   下界 = 发起时刻 − 2 秒容差,反查取 startedAt 不早于下界、离发起最近的一笔(注入面 findJob 取窗口内最早)
+  const found = new Map();
+  if (typeof env.findJob === "function") {
+    for (const job of [...jobs.values()].reverse()) {
+      if (!job.anon) continue;
+      const q = { exclude: claimed, dirs: [...jobDirs] };
+      if (job.Rraw) q.result = codexNormPath(job.Rraw, job.cwd);
+      if (job.taskNorm && Number.isFinite(job.useTs)) { q.task = job.taskNorm; q.from = job.useTs - CODEX_SKEW_MS; q.to = job.useTs + CODEX_FIND_WINDOW_MS; }
+      let f;
+      try { f = (q.result || q.task) ? env.findJob(q) : null; } catch { f = null; }
+      if (f && f.id) { job.label = f.id; claimed.add(f.id); job.anon = false; job.foundId = f.id; found.set(job, f); }
+    }
+  }
+  const since = Number.isFinite(env.since) ? env.since : -Infinity;
+  const out = { jobs: [], open: [], unknown: [], running: [] };
+  for (const job of jobs.values()) {
+    // 规则不追溯(v7,红队 v6 BP-4):v7 生效之前发起的作业不入账——旧判据下诚实做完的,不按新判据补账
+    if (Number.isFinite(job.useTs) && job.useTs < since) continue;
+    let kind = job.obs.kind;
+    let why = job.obs.why || "";
+    let failSeq = kind === "failed" ? job.obs.seq : null;
+    let failTs = null;
+    let f = found.has(job) ? found.get(job) : undefined;
+    if (/^(background|running|unknown)$/.test(kind)) {
+      if (f === undefined && !job.anon && typeof env.jobState === "function") f = env.jobState(job.foundId || job.id, [...jobDirs]);
+      if (f === undefined) {
+        if (kind !== "running") { kind = "unknown"; why = why || "只见到发车 background,作业状态文件未注入(离线回放)"; }
+      } else if (!f || typeof f !== "object") {
+        if (kind !== "running") { kind = "unknown"; why = job.anon ? why : "作业状态文件读不到或半写"; }
+      } else if (f.state === "running") {
+        const t0 = Date.parse(f.startedAt || "");
+        const lim = (Number(f.timeoutMs) || 15 * 60 * 1000) + CODEX_JOB_GRACE_MS;
+        if (Number.isFinite(t0) && now > t0 + lim) { kind = "unknown"; why = "状态文件仍是 running 但已超出其超时(卡住?去 poll 或读日志)"; }
+        else kind = "running";
+      } else if (f.state === "done") {
+        kind = "done";
+      } else if (f.state === "failed") {
+        kind = "failed"; job.err = f.errorCode || f.error || job.err;
+        const te = Date.parse(f.endedAt || "");
+        failTs = Number.isFinite(te) ? te : null;
+        failSeq = null;
+      } else { kind = "unknown"; why = `状态文件 state=${f.state}`; }
+      if (f && typeof f === "object") {
+        if (f.result) note(job, { RESULT: f.result }, job.cwd);
+        if (f.log && !job.L) job.L = codexNormPath(f.log, job.cwd);
+      }
+    }
+    if (kind === "unknown" && job.bgId && Array.isArray(env.bgTasks) &&
+      env.bgTasks.some((t) => String(t && t.id) === job.bgId && BG_RUNNING_STATUS.test(String(t && t.status || "").toLowerCase().trim()))) {
+      kind = "running";
+    }
+    const J = job.label || job.foundId || (job.anon ? null : job.id);
+    const mine = (k) => (J ? delivered.filter((d) => d.J === J && d.kind === k && d.seq >= job.launchSeq) : []);
+    const after = (rec) => (failSeq != null ? rec.seq > failSeq : failTs != null ? rec.ts != null && rec.ts > failTs : false);
+    let status;
+    // 「运行中」只在台账确实说 running 时先于读回判;台账已清(只剩转录里的旧 running 观测)⇒ 读回仍可结账(红队终审 BP-8:
+    //   原先 job-missing 之后又完整 Read 了 R,子代理收尾照拦「运行中」,零出路)
+    const ledgerRunning = !!(f && typeof f === "object" && f.state === "running");
+    if (kind === "running" && ledgerRunning) status = "running";
+    else if (kind === "failed") {
+      const jl = J ? J.toLowerCase() : null;
+      const handled = mine("FAIL").length > 0 ||
+        reads.some((r) => after(r) && ((job.L && r.p === job.L) || (jl && (r.p.endsWith(`/${jl}.log`) || r.p.endsWith(`/${jl}.last.txt`))))) ||
+        relaunch.some((x) => after(x) && x.id !== job.id && x.task && x.task === job.taskNorm);
+      status = handled ? "failed-handled" : "failed-open";
+    } else {
+      // 读回:runner 交付的完整 BODY 块(与 R 当前正文一致;R 读不到只认块),或 Read 工具读 R 成功
+      let rBody = null;
+      if (typeof env.resultBody === "function" && job.Rraw) { try { rBody = env.resultBody(job.Rraw); } catch { rBody = null; } }
+      // Read R 只认作业终态之后的读(v6,红队 BP-2 / codex v5「没问到的」第 1 条):之前读到的是占位或同路径旧件。
+      //   终态时刻 = 台账 endedAt(与条目 timestamp 比);取不到则 = 转录里首次观测到 done 的位置;都没有 ⇒ 发起之后即可
+      //   v7(codex v6 第 3/4 条、红队 v6 BP-8):界 = 台账 resultAt(runner 写 R 之前记;旧台账退到 endedAt),比较用 ≥;
+      //   有界而这次读没有时间戳 ⇒ 不算(原先放行);台账在但没有界 ⇒ 退到转录首次观测 done 的位置;
+      //   台账读不到 ⇒ 发起之后即可(原先退到 doneSeq,收到通知先 Read 再 poll 的诚实节奏被误拦)。
+      //   读到的是 runner 占位文字 ⇒ 永不算(按内容,与时间无关)。
+      let doneTs = null, ledger = null;
+      const doneSeq = job.obs.kind === "done" ? job.obs.seq : null;
+      if (kind === "done") {
+        ledger = f && typeof f === "object" ? f : null;
+        if (!ledger && !job.anon && typeof env.jobState === "function") { try { ledger = env.jobState(job.foundId || job.id, [...jobDirs]); } catch { ledger = null; } }
+        if (ledger && typeof ledger !== "object") ledger = null;
+        const te = Date.parse(ledger && (ledger.resultAt || ledger.endedAt) || "");
+        if (Number.isFinite(te)) doneTs = te;
+      }
+      const afterDone = (r) => (doneTs != null ? (r.ts != null && r.ts >= doneTs)
+        : ledger && doneSeq != null ? r.seq > doneSeq : true);
+      const readBack = mine("BODY").some((d) => typeof rBody !== "string" || codexNormBody(d.text) === codexNormBody(rBody)) ||
+        reads.some((r) => r.seq > job.launchSeq && job.R.has(r.p) && !r.ph && afterDone(r));
+      status = readBack ? "read" : kind === "done" ? "pending-read" : kind === "running" ? "running" : "unknown";
+    }
+    const label = J || `codex 作业(tool_use …${job.id.slice(1)})`;
+    // v7(红队 v6 BP-1 / 附二-5):poll 命令用**这次发起用的那支 runner**,能力也按那一支判——
+    //   注入面 runnerDelivers(path, cwd) 判不了(读不到)⇒ 按旧版提示(只给 Read,不给可能不存在的出路)
+    const runner = job.runner || "~/.claude/scripts/codex-run.mjs";
+    const poll = `node ${runner} --poll ${J || "<J>"}`;
+    out.jobs.push({ id: job.id, label, status, why, R: job.Rraw, L: job.L, err: job.err });
+    let delivers;
+    if (typeof env.runnerDelivers === "function") { try { delivers = env.runnerDelivers(runner, job.runnerCwd || job.cwd); } catch { delivers = undefined; } }
+    const legacy = typeof env.runnerDelivers === "function" ? delivers !== true : env.pollDelivers === false;
+    const bgNote = "(Bash 的 timeout 给到 600000;命令仍被转后台时,等完成通知后用 Read 读它的输出文件,BODY 块在里面;别接 `| tail`)";
+    if (status === "pending-read") {
+      out.open.push(legacy
+        ? `${label}(已产出待读:${job.Rraw || "结果件"}。谁发车谁读——用 Read 工具读结果件;这次发起用的 runner 是旧版(或判不了),poll 不打正文;` +
+          `cat / sed 等 shell 读法不算,子代理读、同任务新作业读过也不替它结账)`
+        : `${label}(已产出待读:${job.Rraw || "结果件"}。谁发车谁读——发车方自己 \`${poll}\` 一次` +
+          `(正文夹在 CODEX_BODY_BEGIN/END=${J || "<J>"} 里随结果打出,这一条就算读回)${bgNote},或用 Read 工具读结果件;` +
+          `cat / sed 等 shell 读法不算,子代理读、同任务新作业读过也不替它结账)`);
+    } else if (status === "failed-open") {
+      out.open.push(`${label}(失败未处理:${String(job.err || "未记录原因").slice(0, 60)};` +
+        (legacy ? "" : `\`${poll}\` 一次(日志尾部夹在 CODEX_FAIL_BEGIN/END 里随结果打出),或`) +
+        `用 Read 读日志${job.L ? " " + job.L : ""},或重发同一任务)`);
+    } else if (status === "running") {
+      out.running.push(legacy
+        ? `${label}(运行中:${job.Rraw || "结果件未知"};等它跑完再用 Read 读结果件——这次发起用的 runner 是旧版(或判不了),poll 不会等待)`
+        : `${label}(运行中:${job.Rraw || "结果件未知"};用 \`${poll} --wait-ms 600000\` 等到终态——` +
+          `done 时正文随结果打出,这一条就算读回;到期仍在跑会以退出码 3 返回)${bgNote}`);
+    } else if (status === "unknown" && (!Number.isInteger(env.turnStart) || job.lastEi >= env.turnStart)) {
+      const hint = J ? `poll 一次(${poll})或用 Read 读结果件${job.Rraw ? " " + job.Rraw : ""}`
+        : job.Rraw ? `用 Read 读结果件 ${job.Rraw}`
+        : `这次发起没留下 J 与结果路径:到 <系统临时目录>/codex-run-jobs/ 按任务名${job.task ? "(" + job.task + ")" : ""}找到它的 J,` +
+          `再 --poll J(后台 / 重定向输出里的 CODEX_JOB 块被读到时也会认领这笔)`;
+      out.unknown.push(`${label}(状态未知:${why || "无法判定"};${hint})`);
+    }
+  }
+  return out;
+}
+
+/** SubagentStop 边界上的 codex 账:子代理自己发车的作业,收尾时 **运行中 / 已产出待读 / 失败未处理** 都阻断;
+ *  状态未知只提示(本轮门控:entries 末轮之前的作业不重报,BP4-11)。`STOP_CLOSURE_BLOCK_A=0` ⇒ 阻断降为提示。 */
+export function subagentCodexVerdict(entries, env = {}) {
+  const turn = lastTurn(Array.isArray(entries) ? entries : []);
+  const r = codexLedger(entries, { turnStart: Math.max(0, (entries || []).length - turn.length), ...env });
+  const block = [...r.open, ...r.running].map((s) => `A:codex 委派未闭环 ${s}`);
+  const notes = r.unknown.map((s) => `A:codex 委派 ${s}`);
+  const off = env.blockOff !== undefined ? env.blockOff : BLOCK_OFF.A === false;   // 与主通道同一开关(自测可注入)
+  if (off) return { block: [], notes: [...block.map((s) => `${s}(STOP_CLOSURE_BLOCK_A=0,降为提示)`), ...notes] };
+  return { block, notes };
+}
+
+/** SubagentStop 分支用的外壳:账抛错 ⇒ 点名 A 的 UNKNOWN 行,不静默(BP3-4)。 */
+export function subagentCodexSafe(entries, env = {}) {
+  try { return subagentCodexVerdict(entries, env); }
+  catch (e) { return { block: [], notes: [`A:UNKNOWN codex 账出错(${safeErrMsg(e).slice(0, 60)})——本项未判,不得读作无欠账`] }; }
+}
+
+/** 读转录尾段(子代理转录超整分支预算时,A 只读尾段,BP4-13):最后 bytes 字节,丢掉第一行残段。 */
+export function readTranscriptTail(p, bytes) {
+  const fd = fs.openSync(p, "r");
+  try {
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, bytes);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString("utf8").split("\n");
+    if (size > len) lines.shift();
+    const out = [];
+    for (const l of lines) { if (!l.trim()) continue; try { out.push(JSON.parse(l)); } catch { /* 残行跳过 */ } }
+    return out;
+  } finally { fs.closeSync(fd); }
+}
+
+/** 生产 hook 的注入面:作业状态文件、反查、结果正文。读不到 ⇒ null(未知),半写有限重试。 */
+export function liveCodexEnv(extra = {}) {
+  const root = `${String(os.tmpdir()).replace(/\\/g, "/")}/codex-run-jobs`;
+  const readJson = (f) => {
+    for (let k = 0; k < 3; k++) {
+      try { return JSON.parse(fs.readFileSync(f, "utf8")); }
+      catch (e) { if (e && e.code === "ENOENT") return null; }
+    }
+    return null;
+  };
+  // 查找目录 = hook 自己的作业目录 + 转录里 CODEX_LOG 显示的作业目录;按归一路径去重(盘符路径不分大小写)
+  const rootsWith = (dirs) => {
+    const seen = new Map();
+    for (const d of [root, ...(Array.isArray(dirs) ? dirs : [])]) {
+      const k = codexNormPath(d, null);
+      if (k && !seen.has(k)) seen.set(k, String(d).replace(/\\/g, "/").replace(/\/+$/, ""));
+    }
+    return [...seen.values()];
+  };
+  // 某支 runner 带不带 v5 交付能力(v7,红队 v6 附二-5):看它的**代码**里有没有导出交付函数(注释里提到不算);
+  //   读不到 ⇒ false(按旧版提示,只给 Read)。按归一路径缓存。
+  const delivCache = new Map();
+  const runnerDelivers = (p, cwd) => {
+    const k = codexNormPath(p, cwd || process.cwd());
+    if (!k) return false;
+    if (!delivCache.has(k)) {
+      let v = false;
+      try { v = /^export function formatDelimited\(/m.test(fs.readFileSync(k, "utf8")); } catch { v = false; }
+      delivCache.set(k, v);
+    }
+    return delivCache.get(k);
+  };
+  return {
+    cwd: process.cwd(),
+    root,
+    roots: rootsWith,
+    since: CODEX_A_SINCE,
+    runnerDelivers,
+    // 后台发起的输出文件(v7 直连身份):只读前 256KB,读不到 ⇒ null
+    readOutput(p) {
+      const k = codexNormPath(p, null);
+      if (!k || !/\.output$/i.test(k)) return null;
+      try {
+        const fd = fs.openSync(k, "r");
+        try { const buf = Buffer.alloc(Math.min(fs.fstatSync(fd).size, 256 * 1024)); fs.readSync(fd, buf, 0, buf.length, 0); return buf.toString("utf8"); }
+        finally { fs.closeSync(fd); }
+      } catch { return null; }
+    },
+    ...extra,
+    jobState(J, dirs) {
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(J)) return null;
+      for (const d of rootsWith(dirs)) { const j = readJson(`${d}/${J}.json`); if (j) return j; }
+      return null;
+    },
+    // 无主占位反查:结果路径相等,或任务文件相等且 startedAt 落在窗口内(取最早一笔);每目录上限 3000 份台账
+    findJob(q) {
+      let best = null;
+      for (const d of rootsWith(q.dirs)) {
+        let names;
+        try { names = fs.readdirSync(d).filter((n) => /^[A-Za-z0-9_-]{1,64}\.json$/.test(n)); } catch { continue; }
+        for (const n of names.slice(-3000)) {
+          const id = n.slice(0, -5);
+          if (q.exclude && q.exclude.has(id)) continue;
+          const j = readJson(`${d}/${n}`);
+          if (!j || typeof j !== "object") continue;
+          if (q.result && j.result && codexNormPath(j.result, null) === q.result) return { ...j, id };
+          if (q.task && j.task && codexNormPath(j.task, null) === q.task) {
+            const t = Date.parse(j.startedAt || "");
+            if (Number.isFinite(t) && t >= q.from && t <= q.to && (!best || t < best.t)) best = { j: { ...j, id }, t };
+          }
+        }
+      }
+      return best ? best.j : null;
+    },
+    resultBody(R) {
+      try {
+        const st = fs.statSync(R);
+        if (st.size > 2_000_000) return null;
+        return fs.readFileSync(R, "utf8");
+      } catch { return null; }
+    },
+  };
 }
 
 // 判 Bash 命令是否真的**写了**某类文件。两处必须先剥掉,否则必然误报
@@ -756,6 +1548,7 @@ export function matchAny(text, pats, echoFrom) {
 }
 
 // ctx 可覆盖三样:text(官方 last_assistant_message)、turn(本轮条目)、bgTasks(官方 background_tasks[])。
+// 批 257 加第四样 codexEnv(A 项 codex 账的注入面:jobState / resultBody / now;live 缺省读盘,其余缺省不注入)。
 // 离线模式(--audit/--dry-run)不传 ctx,全部从 transcript 取。
 // `export` 是为**并行 diff 迁移**加的(2026-08-19):新引擎与本实现对同一批夹具
 // 跑出的 findings 必须逐条一致,才算某条规则搬完。见 scripts/lib/gate-registry.mjs。
@@ -845,6 +1638,75 @@ function preExistedSet(sid) {
 /** `git log -1 --diff-filter=A` 的进程内缓存(同 _trackedCache 的理由)。 */
 let _justAddedCache;
 
+/** 批 255:目标文件所属 checkout 根。从目标所在目录逐级向上,找第一个含 `.git`(文件或目录)的目录。
+ *  只认绝对路径(`X:/…` 或 `/…`);相对形、`~/…` ⇒ null ⇒ `isNew` 走原判据(以 hook cwd 的索引为准)。
+ *  不 import path(本文件刻意保持 import 面不变),纯字符串逐级上溯。 */
+function checkoutOfFs(p, exists = fs.existsSync) {
+  const s = String(p || "").replace(/\\/g, "/");
+  if (!/^(?:[A-Za-z]:\/|\/)/.test(s)) return null;
+  let dir = s.replace(/\/+$/, "");
+  dir = dir.slice(0, dir.lastIndexOf("/"));                    // 目标所在目录("E:/x" ⇒ "E:";"/x" ⇒ "")
+  for (;;) {
+    let hit = false;
+    try { hit = !!exists(`${dir}/.git`); } catch { /* 探不了当没有 */ }
+    if (hit) return dir === "" ? "/" : dir;
+    const i = dir.lastIndexOf("/");
+    if (i < 0) return null;                                     // 到盘根/根了
+    dir = dir.slice(0, i);
+  }
+}
+
+/** 批 255:某 checkout 的追踪集(仓根相对、正斜杠),按根缓存;取不到 ⇒ null(isNew 当新建)。 */
+const _trackedInCache = new Map();
+function trackedInFs(root) {
+  const key = String(root);
+  if (_trackedInCache.has(key)) return _trackedInCache.get(key);
+  let set;
+  try {
+    set = new Set(execFileSync("git", ["-C", key, "-c", "core.quotepath=false", "ls-files", "-z", "--full-name"],
+      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] })
+      .split("\0").filter(Boolean));
+  } catch { set = null; }
+  _trackedInCache.set(key, set);
+  return set;
+}
+
+/** 批 255:`isNew` 的**全部生产证据**,主 Stop 通道与 SubagentStop 通道共用这一份(抽出来,不复制)。
+ *  修的是第二件事:SubagentStop 分支原在 `_trackedCache` 初始化之前构造 ctx ⇒ `tracked` 为 undefined
+ *  ⇒ `isNew` 对一切路径判真(红队 BP-3、codex「你没问到」1)。
+ *  第一件(目标 checkout 与 hook checkout 不同源)的判据在 gate-ctx.mjs `isNewInCheckout`,本函数只供证据。
+ *  残余(照实列,本批不改):
+ *   ①`justAdded` 名不副实——实为 hook checkout **可达历史最近一次**含新增的提交,不是「本轮刚加」
+ *     (红队 254 附节二①),已登记;按目标 checkout 取时它只在同根参与。
+ *   ②相对路径、`~/…` 目标 `checkoutOfFs` 返回 null ⇒ 仍用 hook cwd 的索引(原判据)。
+ *   ③目标 checkout 的 `.git` 指向坏 gitdir / git 不可用 ⇒ `trackedInFs` 为 null ⇒ 判新建(误拦侧)。
+ *   ④`relOf` 的字符串规则与 gate-carriers 的 `normPath`/`NON_CARRIER_AREA` 未动(红队 BP-5/BP-6,另批)。
+ *   ⑤SubagentStop 仍是提示面不阻断;本批只补证据,不改其升档判据。
+ *  @param {string} [sid] 本会话 id(`preExistedSet` 按会话过滤) */
+function isNewEvidence(sid) {
+  let tracked = _trackedCache;
+  if (tracked === undefined) try {
+    tracked = new Set(execFileSync("git", ["ls-files"], { encoding: "utf8", cwd: process.cwd() })
+      .split("\n").map((s2) => s2.trim()).filter(Boolean));
+  } catch { tracked = null; }
+  _trackedCache = tracked;
+  let justAdded = _justAddedCache;
+  if (justAdded === undefined) try {
+    justAdded = new Set(execFileSync("git", ["log", "-1", "--diff-filter=A", "--name-only", "--format="],
+      { encoding: "utf8", cwd: process.cwd() }).split("\n").map((s2) => s2.trim()).filter(Boolean));
+  } catch { justAdded = null; }
+  _justAddedCache = justAdded;
+  const hookCheckout = checkoutOfFs(`${process.cwd()}/.probe`);
+  return {
+    tracked: _trackedCache instanceof Set ? _trackedCache : undefined,
+    justAdded: _justAddedCache instanceof Set ? _justAddedCache : undefined,
+    preExisted: preExistedSet(sid) || undefined,
+    checkoutOf: checkoutOfFs,
+    trackedIn: trackedInFs,
+    ...(hookCheckout ? { hookCheckout } : {}),
+  };
+}
+
 /** P 项的承重面。模块级导出,因为**自测要拿它跑漂移检查**(见 selfTest 的「承重面漂移」一节)。
  *
  *  ⚠️ 这是一份**枚举白名单**,而枚举白名单的病是已知的:每长一个新零件就漏一次。
@@ -884,6 +1746,20 @@ import { RULES, ranClear as ranClearRule, maskQuoted, BG_RUNNING_STATUS } from "
 // 于是 INV-1..4 对真跑的闸完全不生效(grill:recon 查出,`grep -c` = 0)。
 import { runRules, validateRules } from "./lib/gate-registry.mjs";
 import { buildCtx } from "./lib/gate-ctx.mjs";
+import { segments } from "./lib/gate-cmd.mjs";   // 批 257:A 项 codex 账的命令切段(引号外才切,唯一实现)
+// DP 的部署欠账事实源(2026-09-12 批 202)。**动态导入、缺件静默退场**:本文件随公开树 custodiet 分发,
+//   那边未必带 debt-facts.mjs;缺件时注入 undefined,DP 退回命令解析判法(与判活探针三件同一缺件纪律)。
+let readDebtFacts = () => undefined;
+let debtFactsSelfTest = null;
+try { ({ readDebtFacts, selfTest: debtFactsSelfTest } = await import("./lib/debt-facts.mjs")); }
+catch (e) {
+  // 只有**本文件缺席**才静默;文件在而求值失败(含它自己的依赖缺失,错误码同样是 ERR_MODULE_NOT_FOUND)是坏件,必须出声
+  //   (红队 202 第五轮附节 4 + codex 复核 r2:只看错误码会把「依赖缺失」也吞掉)
+  if (fs.existsSync(new URL("./lib/debt-facts.mjs", import.meta.url))) console.error(`[收尾闸] lib/debt-facts.mjs 加载失败,DP 只剩命令解析判法:${e && e.message}`);
+}
+// 批 257 r2:自测核「hook 端作业目录与 codex-run 的 JOB_ROOT 同算法」用。只在 --self-test 形态加载、缺件(公开树)不计。
+const _codexRunForSelfTest = process.argv.includes("--self-test")
+  ? await import("./codex-run.mjs").catch(() => null) : null;
 // D1/批 102:两份台账的追加改走行级 hash 链(完整性告警;担保边界见 ledger-chain 头注)
 import { ledgerAppend, verifyFile as ledgerVerify } from "./lib/ledger-chain.mjs";
 
@@ -969,16 +1845,39 @@ export function run(transcriptPath, ctx = {}) {
   const text = ctx.text !== undefined ? ctx.text : assistantText(turn);
   const tools = toolNames(turn);
 
-  // A 项数据源:官方 background_tasks[] 优先,拿不到才退回正则配对
+  // A 项数据源:原生后台任务 = 官方 background_tasks[] 优先,拿不到才退回正则配对(本轮窗口);
+  //   codex 委派 = `codexLedger`,在**本会话转录全量**上算(跨用户轮与 Stop 反馈轮),
+  //   且**不论 background_tasks 是否为数组(含空数组)都照跑**——空数组只说明此刻没有原生在飞任务,
+  //   不说明过去的 codex 结果读过了(D141 复核「二」)。两路结果合并。
   const a = Array.isArray(ctx.bgTasks)
     ? checkAFromPayload(ctx.bgTasks, rawText(turn), text)
     : checkA(turn);
+  const codexEnv = ctx.codexEnv !== undefined ? ctx.codexEnv : (live ? liveCodexEnv() : {});
+  let cx;
+  try {
+    const cxEntries = entries.length ? entries : turn;
+    // 本轮起点(条目下标):turn 是 entries 的后缀(两条生产路径都由 lastTurn 切出),只供「未知」提示限本轮
+    // bgTasks:后台发起的无主占位若原生载荷说该后台 Bash 仍在飞,按「运行中」等待(BP-4)
+    cx = codexLedger(cxEntries, { ...(Array.isArray(ctx.bgTasks) ? { bgTasks: ctx.bgTasks } : {}), ...(codexEnv || {}),
+      turnStart: Math.max(0, cxEntries.length - turn.length) });
+  }
+  catch (e) { cx = { open: [], unknown: [`codex 账自身出错(${safeErrMsg(e).slice(0, 60)})`] }; }
 
   const findings = [];
-  if (a.open.length) {
+  if (a.open.length || cx.open.length) {
     findings.push({
       id: "A", block: true,
-      msg: `后台/委派任务未闭环:${a.open.join(", ")} —— 发起了但没有取回动作(poll 或读结果)。`,
+      msg: [
+        a.open.length ? `后台/委派任务未闭环:${a.open.join(", ")} —— 发起了但没有取回动作(poll 或读结果)。` : "",
+        cx.open.length ? `codex 委派未闭环:${cx.open.join(";")}` : "",
+        cx.unknown.length ? `(另有状态未知,提示不阻断:${cx.unknown.join(";")})` : "",
+      ].filter(Boolean).join("\n    "),
+    });
+  } else if (cx.unknown.length) {
+    findings.push({
+      id: "A", block: false,
+      // 出路按作业给(红队附节二 3):有 J 的给 poll,无主有结果路径的给 Read,两者都没有的给「按任务名找 J」
+      msg: `codex 委派提示(不阻断):${cx.unknown.join(";")} —— 判不了就照实写明未知。`,
     });
   }
   // ── [切换第二刀 2026-08-22 亲签] 此处原是 B/C/D/E0/E1/E2/F/G/H/I/P/Q 十二条内联实现,
@@ -1067,20 +1966,8 @@ export function run(transcriptPath, ctx = {}) {
   //
   // ── **tracked/justAdded 生产者**(2026-08-22 第二刀时从被删的 I 内联块里救出——
   //   删块当轮自测立刻逮到 I 全误报:引擎经缝拿的就是这两个缓存,删了生产者=断粮)──
-  {
-    let tracked = _trackedCache;
-    if (tracked === undefined) try {
-      tracked = new Set(execFileSync("git", ["ls-files"], { encoding: "utf8", cwd: process.cwd() })
-        .split("\n").map((s2) => s2.trim()).filter(Boolean));
-    } catch { tracked = null; }
-    _trackedCache = tracked;
-    let justAdded = _justAddedCache;
-    if (justAdded === undefined) try {
-      justAdded = new Set(execFileSync("git", ["log", "-1", "--diff-filter=A", "--name-only", "--format="],
-        { encoding: "utf8", cwd: process.cwd() }).split("\n").map((s2) => s2.trim()).filter(Boolean));
-    } catch { justAdded = null; }
-    _justAddedCache = justAdded;
-  }
+  //   批 255:生产者抽成 `isNewEvidence()`(与 SubagentStop 通道共用),此处只调一次、结果交给下面的缝。
+  const newEv = isNewEvidence(ctx.sessionId);
   // 史注(削删前原文):形态选替换不选删除…(2026-08-20)
   //   我原本把它们当「僵尸代码,待清扫」——**那个理解是错的**。它们是**回退路径**:
   //     · `STOP_CLOSURE_ENGINE=0` 时用它们(我一直在宣传的「一行可退」);
@@ -1123,11 +2010,9 @@ export function run(transcriptPath, ctx = {}) {
       //   「收尾闸:全跑,无命中。」——与真·全过逐字节相同。
       //   `gate-ctx.mjs` 早就备好了 `extra.lastAssistantMessage` 这个入口,缝没接。
       const eCtx = buildCtx(turn, {
-        tracked: _trackedCache instanceof Set ? _trackedCache : undefined,
-        // `justAdded` 同样要传:少了它,今天亲签的「取证时机前移」在接管后原样失效(grill A3)
-        justAdded: _justAddedCache instanceof Set ? _justAddedCache : undefined,
-        // D56:写之前实测的「已存在」集合(仓外/未跟踪文件唯一说得上话的证据)
-        preExisted: preExistedSet(ctx.sessionId) || undefined,
+        // tracked / justAdded(grill A3:少了它「取证时机前移」原样失效)/ preExisted(D56)/
+        //   checkoutOf + trackedIn + hookCheckout(批 255:按目标 checkout 取追踪集)——全部来自 `isNewEvidence`
+        ...newEv,
         lastAssistantMessage: typeof ctx.text === "string" ? ctx.text : undefined,
         bgTasks: ctx.bgTasks,
         // 批次状态**在这里读一次、注入进去**,不让规则自己读磁盘 ——
@@ -1138,6 +2023,12 @@ export function run(transcriptPath, ctx = {}) {
         // P 的跨批持久计账(2026-08-22 亲签「改吧」):同 batchGoal 的注入纪律——
         //   hook 读一次、规则纯函数;账文件在 gitignore 面;夹具经 ctx.pLedger 精确控制。
         pLedger: ctx.pLedger !== undefined ? ctx.pLedger : readPLedger(),
+        // DP 的部署欠账事实(2026-09-12 批 202):同一注入纪律——hook 读一次、规则纯函数。
+        //   **只在实时路径读**:离线回放读到的是「现在」的 reflog,套到历史轮上是错配 ⇒ 保持 undefined,DP 退回解析判法。
+        debtFacts: ctx.debtFacts !== undefined ? ctx.debtFacts : (ctx.live ? readDebtFacts(process.cwd()) : undefined),
+        // P 的 diff 分档事实(批 257 条件 3):惰性,只在实时路径接——离线回放拿到的是「现在」的工作树,套到历史轮上是错配。
+        diffTier: ctx.diffTier !== undefined ? ctx.diffTier
+          : (ctx.live ? () => { const g = ctx.batchGoal !== undefined ? ctx.batchGoal : readBatchGoal(); return readDiffFacts(g && g.baseCommit); } : undefined),
         // ⚠️ **跨轮窗口必须真的传进来**(2026-08-20 实撞)。
         //   `ctx.window()` 从落地起就没被生产路径喂过 `priorEntries` ⇒ **恒为 null**,
         //   于是 I 项那条「取证窗口放宽到批窗口」的修法是**死代码**,我改完当轮它照样拦我。
@@ -1267,16 +2158,51 @@ export function run(transcriptPath, ctx = {}) {
 // 这是把阻断消息里那句劝告变成机制——此前它只是一句话,没有任何东西在数。
 function consecutiveBlocks(tp) {
   if (!tp || !fs.existsSync(tp)) return 0;
-  let run = 0;
+  let text;
+  try { text = fs.readFileSync(tp, "utf8"); } catch { return 0; }
+  return consecutiveBlocksText(text);
+}
+
+/** 纯函数本体(自测直接喂转录文本)。 */
+export function consecutiveBlocksText(text) {
+  // 2026-10-09 重写(批 257,热修红队 BP-1/4/5):**以「一次 Stop」为计数单位**,按 toolUseID 归并。
+  //   同一次 Stop 会落 feedback 用户行、hook_blocking_error 附件、stop_hook_summary 汇总行多种载体
+  //   (三者同一个 toolUseID);逐载体计数会把标准形态的每次阻断数两次(3 次连撞即降级),
+  //   或在附件形态下被 `hookErrors:[]` 的汇总行清零(恒为 0)。
+  //   一次 Stop 只要任一载体带本闸阻断即算「被拦」;**只有已出现汇总行的 Stop 才参与计数**(进行中的那次不算),
+  //   连撞 = 从末尾往前连续被拦的已结束 Stop 数。没有 toolUseID 的老行各自成一个单位(与旧实现同口径)。
+  const order = [], unit = new Map();   // id -> { blocked, ended }
+  const touch = (id) => { if (!unit.has(id)) { unit.set(id, { blocked: false, ended: false }); order.push(id); } return unit.get(id); };
+  let anon = 0;
   try {
-    for (const line of fs.readFileSync(tp, "utf8").split("\n")) {
-      if (!line.includes("hookCount")) continue;
+    for (const line of String(text).split("\n")) {
+      // 热修红队 BP-2(10-09):用户亲自发言 = 连撞清零点(否则连拦 5 次、用户打断再问,新一轮第 2 次就降级)。
+      if (line.includes('"kind":"human"')) {
+        let h; try { h = JSON.parse(line); } catch { h = null; }
+        // 模型忙时插话落的是 queued_command 附件,同样是用户亲自发言(批 257 v5 红队 BP-4)
+        const queued = h?.type === "attachment" && h.attachment?.type === "queued_command" && h.attachment.origin?.kind === "human";
+        if ((h?.type === "user" && h.origin?.kind === "human") || queued) { order.length = 0; unit.clear(); continue; }
+      }
+      if (!line.includes("hook_blocking_error") && !line.includes("hookCount")) continue;
       let o; try { o = JSON.parse(line); } catch { continue; }
-      if (o.type !== "system" || o.hookCount === undefined) continue;
-      const blocked = /收尾闸阻断/.test(JSON.stringify(o.hookErrors || []));
-      run = blocked ? run + 1 : 0;
+      // 热修红队 BP-6(10-09):SDK/无头转录不写汇总行 ⇒ 任何 Stop 都「未结束」⇒ 连撞恒 0。
+      //   新的 Stop 单位出现时,把此前所有单位视为已结束(没有汇总行也能计数)。
+      const id0 = o.attachment?.toolUseID || o.toolUseID;
+      if (id0 && !unit.has(id0)) for (const u of unit.values()) u.ended = true;
+      if (o.type === "attachment" && o.attachment?.type === "hook_blocking_error" && o.attachment?.hookEvent === "Stop") {
+        const u = touch(o.attachment.toolUseID || `anon-a${anon++}`);
+        if (/收尾闸阻断/.test(JSON.stringify(o.attachment.blockingError || ""))) u.blocked = true;
+        continue;
+      }
+      if (o.type === "system" && o.hookCount !== undefined) {
+        const u = touch(o.toolUseID || `anon-s${anon++}`);
+        if (/收尾闸阻断/.test(JSON.stringify(o.hookErrors || []))) u.blocked = true;
+        u.ended = true;
+      }
     }
   } catch { return 0; }
+  let run = 0;
+  for (const id of order) { const u = unit.get(id); if (!u.ended) continue; run = u.blocked ? run + 1 : 0; }
   return run;
 }
 
@@ -1481,8 +2407,13 @@ function selfTest() {
   //   codex 判死那条通道(「把验收台的不完整输入固化成规则的放行语义」)之后,假绿现形。
   //   改的是**期望值**,没有改判据、没有改用例输入——这条界线是本次唯一站得住的地方。
   const cases = [
-    { name: "A 命中:发起未取回", lines: [U("go"), A("CODEX_JOB=abc123 已发出")], want: ["A"] },
-    { name: "A 不命中:发起且已 poll", lines: [U("go"), A("CODEX_JOB=abc123"), A("跑 --poll abc123")], want: [] },
+    // 批 257:A 的 codex 族只认实际工具事件。原两条(助理正文写 `CODEX_JOB=abc123` 即入账、正文写 `--poll abc123` 即结清)
+    //   正是被裁撤的判法——改成真 tool_use↔tool_result 配对;正文提及不入账的反例钉在下面「codex 账 ⑨」。
+    { name: "A 命中:codex 前台 done 而未读回", lines: [U("go"),
+      { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_a1", name: "Bash", input: { command: "node ~/.claude/scripts/codex-run.mjs --task t.md" } }] } },
+      { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_a1", content: "CODEX_JOB=abc123\nCODEX_STATE=done\nCODEX_RESULT=\\repo\\clipboard\\codex\\t-r1.md\n" }] } },
+      A("发出去了")], want: ["A"] },
+    { name: "A 不命中:正文只提到 CODEX_JOB(不是发起事件)", lines: [U("go"), A("CODEX_JOB=abc123 已发出")], want: [] },
     { name: "B 命中:承诺句零工具", lines: [U("go"), A("我这就去改,不问,你喊停就停")], want: ["B"] },
     { name: "B 命中:干了别的那件(今日实撞形态)",
       lines: [U("go"), A("我这就去改 `foo.mjs`", [{ name: "Edit", input: { file_path: "/repo/bar.md" } }])], want: ["B", "K0"] },
@@ -1578,6 +2509,10 @@ function selfTest() {
         { name: "Write", input: { file_path: "scripts/zzz-not-tracked-probe.mjs", content: "x" } },
       ])], want: ["I", "K0"] },
     // ── D56(批 109):memory 面误报**二犯**的正反三面。
+    // ⚠️ **批 253b**:K0 的工作面同样不再计 memory 笔记(同一理由:事实登记不是工作面),
+    //   故下面四条的期望从 [K0] 变成 []——写一条笔记不再叫醒任何闸。
+    // ⚠️ **批 253(2026-09-17 用户签「这个不算吧」)**:memory 笔记(`.claude/projects/*/memory/**.md`)整面不再算工具载体,
+    //   下面四条的期望从 [I,K0] 改为 [K0];memory 目录里的脚本(.mjs)仍算,钉在 RULE_I 的 cases 里。
     //   memory 永不入仓 ⇒ git 判据恒判新建 ⇒ 改一行索引也被当造物拦。
     //   修法=`Edit` 语义证明「本轮之前已存在」,**只施于 memory 面**。
     // ⚠️ 本条**记的曾是已知误报**;2026-08-27 D56 结清后语义变了,原注留此为史:
@@ -1586,26 +2521,37 @@ function selfTest() {
     //   而本夹具**不注入**它 ⇒ 落在「无记录」那一支 ⇒ 仍应命中。
     //   这正是修法不开漏放口的那一侧:**没量过就当新建**。
     //   有记录的那一侧由接缝「D56 有 precheck 记录 ⇒ 不算新建」钉住,两侧成对。
-    { name: "I 命中:Edit 改 MEMORY.md 索引行(**无 precheck 记录 ⇒ 按新建**,D56 结清后语义)",
+    { name: "I 不命中:Edit 改 MEMORY.md 索引行(批 253 用户签:memory 笔记不算工具载体)",
       lines: [U("go"), A("加一行索引", [
-        { name: "Edit", input: { file_path: "C:/Users/x/.claude/projects/D--test/memory/MEMORY.md", old_string: "a", new_string: "b" } },
-      ])], want: ["I", "K0"] },
+        { name: "Edit", input: { file_path: "C:/Users/x/.claude/projects/example-project/memory/MEMORY.md", old_string: "a", new_string: "b" } },
+      ])], want: [] },
     // F1 回归钉:非工具面造(Bash)+ Edit 收尾,**必须仍算新建**。
     //   这是 D56 撤回前实测会漏放的那条路径;子代理造+主代理 Edit 是它的同族(且不可见)。
-    { name: "I 命中:Bash 造 memory 文件 + Edit 收尾(F1 漏放回归钉)",
+    //   批 253 起 memory 笔记整面不算载体,原钉(memory 路径)已改为不命中;
+    //   批 253b(第二份红队附节二 2)把钉加回到**非 memory 载体**上,就是这一条。
+    { name: "I 命中:Bash 造 scripts/ 新脚本 + Edit 收尾(F1 漏放回归钉,非 memory 载体)",
       lines: [U("go"), A("造完改", [
-        { name: "Bash", input: { command: "printf '# t' > C:/Users/x/.claude/projects/D--test/memory/zz-f1.md" } },
-        { name: "Edit", input: { file_path: "C:/Users/x/.claude/projects/D--test/memory/zz-f1.md", old_string: "# t", new_string: "# real" } },
-      ])], want: ["I", "K0"] },
-    { name: "I 命中:Write 造一个新 memory 条目(修 D56 不许把这面一并放掉)",
+        { name: "Bash", input: { command: "printf x > scripts/zz-f1.mjs" } },
+        { name: "Edit", input: { file_path: "scripts/zz-f1.mjs", old_string: "x", new_string: "y" } },
+      ])], want: ["I", "K0", "M"] },
+    //   期望里的 `M`(写了没回读)是这条夹具的**真实属性**,不是放水:Bash `>` 写盘 + Edit 收尾、
+    //   全程没有一次读回 ⇒ M 按其定义响。(下面那条同形态的 memory 夹具实测不带 M;
+    //   成因未查,不在本批范围——此处只记读数,不代它下结论。)
+    // 下一条:同形态落在 memory 笔记上 ⇒ 批 253 用户签后不算载体,不命中。
+    { name: "I 不命中:Bash 造 memory 笔记 + Edit 收尾(批 253 用户签:memory 笔记不算工具载体)",
+      lines: [U("go"), A("造完改", [
+        { name: "Bash", input: { command: "printf '# t' > C:/Users/x/.claude/projects/example-project/memory/zz-f1.md" } },
+        { name: "Edit", input: { file_path: "C:/Users/x/.claude/projects/example-project/memory/zz-f1.md", old_string: "# t", new_string: "# real" } },
+      ])], want: [] },
+    { name: "I 不命中:Write 造一个新 memory 条目(批 253 用户签:memory 笔记不算工具载体)",
       lines: [U("go"), A("记一条", [
-        { name: "Write", input: { file_path: "C:/Users/x/.claude/projects/D--test/memory/zzz-new.md", content: "x" } },
-      ])], want: ["I", "K0"] },
-    { name: "I 命中:同轮先 Write 再 Edit 同一 memory 文件(首个动作是 Write,洗不掉触发)",
+        { name: "Write", input: { file_path: "C:/Users/x/.claude/projects/example-project/memory/zzz-new.md", content: "x" } },
+      ])], want: [] },
+    { name: "I 不命中:同轮先 Write 再 Edit 同一 memory 笔记(批 253 用户签)",
       lines: [U("go"), A("造完顺手改", [
-        { name: "Write", input: { file_path: "C:/Users/x/.claude/projects/D--test/memory/zzz-new2.md", content: "x" } },
-        { name: "Edit", input: { file_path: "C:/Users/x/.claude/projects/D--test/memory/zzz-new2.md", old_string: "x", new_string: "y" } },
-      ])], want: ["I", "K0"] },
+        { name: "Write", input: { file_path: "C:/Users/x/.claude/projects/example-project/memory/zzz-new2.md", content: "x" } },
+        { name: "Edit", input: { file_path: "C:/Users/x/.claude/projects/example-project/memory/zzz-new2.md", old_string: "x", new_string: "y" } },
+      ])], want: [] },
     // `2>/dev/null` 的 `>` 曾被当成「写载体」,于是纯读命令被判成新建载体。
     // E2 出路②必须认**全角冒号**——中文正文里「机械判据：」天然是全角,
     // 原判据的字符类两个都是半角,该出路对中文形同虚设。
@@ -1656,6 +2602,591 @@ function selfTest() {
     if (ok) pass++;
   }
   try { fs.unlinkSync(tmp); } catch {}
+
+  // ── A 项 codex 账(批 257 / D141;v5 = clipboard/257-a-fix-r3-list.md「主会话裁定 v5」)──────────
+  //   设计报告表 1 的诚实节奏逐条进夹具,**每条配一个真退回变异**。红队 r1–r4 与 codex 复核 v4 的夹具全部保留,
+  //   v5 只认「runner 交付的带 J 定界块」或「Read 工具读 R / 日志」,各夹具的期望按 v5 重定,改了的名字带「v5:」并写明理由。
+  //   夹具形态照真实转录:tool_use(assistant,带 cwd、timestamp)↔ tool_result(user,tool_use_id 配对)。
+  let cxPass = 0, cxTotal = 0;
+  {
+    const cx = (name, got, want) => {
+      cxTotal++;
+      const ok = got === want;
+      console.log(`${ok ? "PASS" : "FAIL"}  codex 账:${name}${ok ? "" : `  ← 期待 ${want} 实得 ${got}`}`);
+      if (ok) cxPass++;
+    };
+    const CWD = "\\repo";
+    let nid = 0;
+    // 条目带 timestamp(真实转录都有):调用 n 的 tool_use 在 T0+n 秒、返回在其后 0.5 秒
+    const T0 = Date.parse("2026-10-09T11:50:00Z");
+    const call = (name, input, text, isErr = false) => {
+      const id = `toolu_cx${++nid}`;
+      const t = T0 + nid * 1000;
+      return [
+        { type: "assistant", cwd: CWD, timestamp: new Date(t).toISOString(), message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } },
+        { type: "user", cwd: CWD, timestamp: new Date(t + 500).toISOString(), message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text, is_error: isErr }] } },
+      ];
+    };
+    const say = (t) => ({ type: "assistant", cwd: CWD, message: { role: "assistant", content: [{ type: "text", text: t }] } });
+    const userSay = (t) => ({ type: "user", cwd: CWD, message: { role: "user", content: [{ type: "text", text: t }] } });
+    const R = "\\repo\\clipboard\\codex\\t-r1.md";
+    const RF = R.replace(/\\/g, "/");
+    const R2 = "\\repo\\clipboard\\codex\\t-r2.md";
+    const LOGP = (J) => `C:\\Users\\x\\AppData\\Local\\Temp\\codex-run-jobs\\${J}.log`;
+    const HEAD = ["---", "codex 版本: codex-cli 0.153.4", "模型: (codex 默认)", "sandbox: read-only(缺省,写被 OS 拒)",
+      "network: on", "repo_brief: (none)", "复看: codex resume abc", "---", ""];
+    const BODY = ["## 结论", "甲方说得对,乙方的第二条不成立。", "全文报告写在 clipboard/review-A.md。"];
+    const FILE = [...HEAD, ...BODY].join("\n");
+    const numbered = (lines, from = 1) => lines.map((l, i) => `${from + i}\t${l}`).join("\n");
+    const blk = (J, text = FILE, kind = "BODY") => `CODEX_${kind}_BEGIN=${J}\n${text}\nCODEX_${kind}_END=${J}\n`;
+    const launchCmd = "node ~/.claude/scripts/codex-run.mjs --task clipboard/codex/t.md";
+    // 旧 runner(或 BODY 块被截掉)的前台 done:只有机器块 ⇒ 待读;v5 runner 的前台 done:机器块 + BODY 块 ⇒ 当场读回
+    const launchDone = (J = "J1") => call("Bash", { command: launchCmd },
+      `CODEX_JOB=${J}\nCODEX_STATE=done\nCODEX_RESULT=${R}\n\n[exited with code 0]`);
+    const launchDone5 = (J = "J1", text = FILE, cmd = launchCmd) => call("Bash", { command: cmd },
+      `CODEX_JOB=${J}\nCODEX_STATE=done\nCODEX_RESULT=${R}\nCODEX_END=${J}\n${blk(J, text)}\n[exited with code 0]`);
+    const launchBg = (J = "J1", r = R) => call("Bash", { command: launchCmd },
+      `CODEX_JOB=${J}\nCODEX_STATE=background\nCODEX_LOG=${LOGP(J)}\nCODEX_RESULT=${r}\n` +
+      `CODEX_POLL=node scripts/codex-run.mjs --poll ${J}\nCODEX_END=${J}\n\n[exited with code 0]`);
+    const pollCmd = (J = "J1", more = "") => `node ~/.claude/scripts/codex-run.mjs --poll ${J}${more}`;
+    const pollDone5 = (J = "J1", text = FILE, cmd = pollCmd(J)) => call("Bash", { command: cmd },
+      `CODEX_JOB=${J}\nCODEX_STATE=done\nCODEX_RESULT=${R}\nCODEX_END=${J}\n${blk(J, text)}done ${R}\n`);
+    const pollFail5 = (J = "J1") => call("Bash", { command: pollCmd(J) },
+      `CODEX_JOB=${J}\nCODEX_STATE=failed\nCODEX_ERROR=x\nCODEX_LOG=${LOGP(J)}\nCODEX_END=${J}\n${blk(J, "turn.failed: quota", "FAIL")}failed x\n`, true);
+    const readR = (path = R, from = 1, lines = [...HEAD, ...BODY]) => call("Read", { file_path: path }, numbered(lines, from));
+    const catR = (cmd, out = FILE + "\n\n[exited with code 0]") => call("Bash", { command: cmd }, out);
+    const env0 = { resultBody: () => FILE };
+    const NOW = T0 + 3600_000;
+    // 带任务的状态台账夹具都要有 startedAt(v7:缺它不认领,真实台账恒有);T0+30 分钟落在每次发起的认领窗口内
+    const SA = new Date(T0 + 1_800_000).toISOString();
+    const now = Date.parse("2026-10-09T12:00:00Z");
+    const stEnv = (s) => ({ ...env0, now, jobState: () => s });
+    const doneEnv = stEnv({ state: "done", result: R });
+    const st = (entries, env = env0, J = "J1") => {
+      const j = codexLedger(entries, env).jobs.find((x) => x.id === J);
+      return j ? j.status : "(未入账)";
+    };
+    const only = (entries, env = env0) => { const js = codexLedger(entries, env).jobs; return js.length === 1 ? js[0].status : `(${js.length} 个作业)`; };
+    const aOf = (entries, extra = {}) => {
+      const f = run(null, { entries, turn: lastTurn(entries), text: "x", codexEnv: env0, ...extra }).find((x) => x.id === "A");
+      return f ? (f.block ? "A!" : "A") : "-";
+    };
+    const sub = (entries, env = env0) => subagentCodexVerdict(entries, env).block.length;
+
+    // ── v5 本体:runner 交付的定界块 ──
+    cx("v5 前台 done 发起返回带完整 BODY 块 ⇒ 当场读回", st([...launchDone5()]), "read");
+    cx("v5 poll 返回带完整 BODY 块 ⇒ 已读回", st([...launchBg(), ...pollDone5()], stEnv(null)), "read");
+    cx("v5 变异:BODY 块与 R 当前正文不一致(旧回件)⇒ 待读", st([...launchDone5("J1", "## 结论\n上一轮的旧结论。")]), "pending-read");
+    cx("v5 BODY 正文只差行尾空白与换行 ⇒ 仍算一致", st([...launchDone5("J1", FILE.replace(/\n/g, "  \r\n"))]), "read");
+    cx("v5 R 读不到(无注入正文)⇒ 只认块", st([...launchDone5()], {}), "read");
+    cx("v5 变异:BODY 块被 | head 截尾(只有 BEGIN)⇒ 待读", st([...call("Bash", { command: `${launchCmd} | head -12` },
+      `CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=${R}\nCODEX_END=J1\nCODEX_BODY_BEGIN=J1\n${HEAD.join("\n")}`)]), "pending-read");
+    cx("v5 变异:BEGIN 与 END 的 J 不同 ⇒ 不成块、待读", st([...launchDone(), ...call("Bash", { command: pollCmd("J1") },
+      `CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_BODY_BEGIN=J1\n${FILE}\nCODEX_BODY_END=J2\ndone ${R}\n`)]), "pending-read");
+    cx("v5 变异:别的作业 J2 的 BODY 块不替 J1 结账", st([...launchDone(), ...launchDone5("J2")]), "pending-read");
+    // ── v6(clipboard/257-a-fix-r3-list.md「主会话裁定 v6」):两路复核 v5 的夹具,每条配退回变异 ──
+    {
+      const at = (t, name, input, text, isErr = false) => {
+        const id = `toolu_v6${++nid}`;
+        return [
+          { type: "assistant", cwd: CWD, timestamp: new Date(t).toISOString(), message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } },
+          { type: "user", cwd: CWD, timestamp: new Date(t + 500).toISOString(), message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text, is_error: isErr }] } },
+        ];
+      };
+      const bgL = (t, k, cmd = launchCmd) => at(t, "Bash", { command: cmd, run_in_background: true },
+        `Command running in background with ID: bv${k}. Output is being written to: C:/x/bv${k}.output`);
+      const TT = "/repo/clipboard/codex/t.md";
+      const iso = (t) => new Date(t).toISOString();
+      const mkEnv = (tb, extra = {}) => ({
+        now: T0 + 3600_000, resultBody: () => FILE, jobState: (J) => tb[J] || null,
+        findJob: (q) => {
+          let best = null;
+          for (const [id, j] of Object.entries(tb)) {
+            if (q.exclude && q.exclude.has(id)) continue;
+            if (q.result && codexNormPath(j.result, null) === q.result) return { ...j, id };
+            if (q.task && codexNormPath(j.task, null) === q.task) {
+              const t = Date.parse(j.startedAt);
+              if (t >= q.from && t <= q.to && (!best || t < best.t)) best = { j: { ...j, id }, t };
+            }
+          }
+          return best ? best.j : null;
+        },
+        ...extra,
+      });
+      const lbl = (es, env) => codexLedger(es, env).jobs.map((j) => `${j.label}:${j.status}`).sort().join(" ");
+      const pollAt = (t, J, r = R) => at(t, "Bash", { command: pollCmd(J) }, `CODEX_JOB=${J}\nCODEX_STATE=done\nCODEX_RESULT=${r}\nCODEX_END=${J}\n${blk(J)}done ${r}\n`);
+      // 红队 BP-1:同任务后台发两次(隔 10 分钟),只 poll 了早的那份 ⇒ 晚的那份仍待读(旧实现:J1 认领了晚的占位,J2 欠账消失)
+      const tb1 = {
+        J1: { state: "done", task: TT, result: RF, startedAt: iso(T0 + 1000), endedAt: iso(T0 + 60_000) },
+        J2: { state: "done", task: TT, result: R2.replace(/\\/g, "/"), startedAt: iso(T0 + 601_000), endedAt: iso(T0 + 660_000) },
+      };
+      cx("v6 BP-1:读了早的那份,晚的那份仍待读", lbl([...bgL(T0, 1), ...bgL(T0 + 600_000, 2), ...pollAt(T0 + 1_800_000, "J1")], mkEnv(tb1)),
+        "J1:read J2:pending-read");
+      // codex v5 第 1 条:为参考去读同任务一天前的旧作业输出(带完整 BODY)⇒ 旧 J 不得认领新占位
+      const tb2 = {
+        J0: { state: "done", task: TT, result: "/repo/clipboard/codex/t-r0.md", startedAt: iso(T0 - 86_400_000), endedAt: iso(T0 - 86_000_000) },
+        J1: { state: "done", task: TT, result: RF, startedAt: iso(T0 + 1000), endedAt: iso(T0 + 60_000) },
+      };
+      cx("v6 codex-1:读同任务旧作业的输出不替新作业结账", lbl([...bgL(T0, 1),
+        ...at(T0 + 120_000, "Read", { file_path: "C:/x/old.output" }, numbered(`CODEX_JOB=J0\nCODEX_STATE=done\nCODEX_END=J0\n${blk("J0")}`.split("\n")))], mkEnv(tb2)),
+        "J1:pending-read");
+      // 红队 BP-2 / codex「没问到的」1:作业结束前 Read R(读到占位或同路径旧件)不算读回;结束后读才算
+      const launchBgAt = (t) => at(t, "Bash", { command: launchCmd }, `CODEX_JOB=J1\nCODEX_STATE=background\nCODEX_RESULT=${R}\nCODEX_END=J1\n`);
+      const tb3 = { J1: { state: "done", task: TT, result: RF, startedAt: iso(T0 + 100), endedAt: iso(T0 + 60_000) } };
+      cx("v6 BP-2:终态之前的 Read R 不算", st([...launchBgAt(T0), ...at(T0 + 30_000, "Read", { file_path: R }, numbered(["(占位)"]))], mkEnv(tb3)), "pending-read");
+      cx("v6 BP-2 对照:终态之后的 Read R 算", st([...launchBgAt(T0), ...at(T0 + 90_000, "Read", { file_path: R }, numbered([...HEAD, ...BODY]))], mkEnv(tb3)), "read");
+      // codex v5 第 4 条:分页 Read 后台输出,BODY 跨两页 ⇒ 拼起来算
+      const outLines = `CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=${R}\nCODEX_END=J1\n${blk("J1")}`.split("\n");
+      cx("v6 codex-4:分页 Read .output,BODY 跨页 ⇒ 已读回", st([...launchBg(),
+        ...call("Read", { file_path: "C:/x/tasks/bk1.output", limit: 8 }, numbered(outLines.slice(0, 8))),
+        ...call("Read", { file_path: "C:/x/tasks/bk1.output", offset: 9 }, numbered(outLines.slice(8), 9))], stEnv(null)), "read");
+      cx("v6 codex-4 变异:只读了前半页 ⇒ 待读", st([...launchBg(),
+        ...call("Read", { file_path: "C:/x/tasks/bk1.output", limit: 8 }, numbered(outLines.slice(0, 8)))], stEnv(null)), "pending-read");
+      // 红队 BP-5:`--cwd <worktree>` 发起,任务路径按 --cwd 解
+      const W = "/repo/.claude/worktrees/agent-x";
+      const tb5 = { J1: { state: "done", task: `${W}/clipboard/codex/t.md`, result: `${W}/clipboard/codex/t-r1.md`, startedAt: iso(T0 + 1000), endedAt: iso(T0 + 60_000) } };
+      cx("v6 BP-5:--cwd 发起的后台作业能反查到", lbl([...bgL(T0, 1, `node scripts/codex-run.mjs --cwd ${W} --task clipboard/codex/t.md`)], mkEnv(tb5)), "J1:pending-read");
+      // 红队附二-2:超时自动转后台的措辞也认作后台任务号(在飞 ⇒ 运行中,而不是状态未知)
+      const autoBg = at(T0, "Bash", { command: launchCmd },
+        "Command did not complete within its 10s timeout and was moved to the background (ID: bq1). Output is being written to: C:/x/bq1.output.");
+      cx("v6 附二-2:自动转后台的发起在飞 ⇒ 运行中", only(autoBg, { ...env0, bgTasks: [{ id: "bq1", status: "running" }] }), "running");
+      // 红队 BP-7:用户级 runner 没有 v5 交付能力 ⇒ 提示不给 --poll 出路
+      const old = codexLedger([...launchDone()], { ...env0, pollDelivers: false }).open.join("\n");
+      cx("v6 BP-7:旧 runner 时提示只给 Read R", /--poll/.test(old) ? "给了 poll" : /Read 工具读结果件/.test(old) ? "只给 Read" : old, "只给 Read");
+
+      // ── v7(同文件「主会话裁定 v7」)──
+      // codex v6 第 1 条:发起前准备了很久,窗口认不上 ⇒ 后台输出文件里的 CODEX_JOB 直连身份(两小时后开跑也认)
+      const tb7 = { J7: { state: "done", task: TT, result: RF, startedAt: iso(T0 + 7_200_000), endedAt: iso(T0 + 7_300_000) } };
+      const outOf = (J) => (p) => (/bv1\.output$/.test(p) ? `CODEX_JOB=${J}\nCODEX_STATE=background\nCODEX_RESULT=${R}\nCODEX_END=${J}\n` : null);
+      cx("v7 codex-1:后台输出文件直连身份,超出时间窗也认 ⇒ 待读", lbl([...bgL(T0, 1)], mkEnv(tb7, { now: T0 + 9_000_000, readOutput: outOf("J7") })), "J7:pending-read");
+      cx("v7 codex-1 对照:读不到输出文件 ⇒ 窗口外认不上(只剩提示)", lbl([...bgL(T0, 1)], mkEnv(tb7, { now: T0 + 9_000_000 })).includes("unknown"), true);
+      // codex v6 第 2 条:早 5 秒的同任务旧作业 / 缺 startedAt 的台账,读它的输出都不得认领新占位
+      const tbOld = (sa) => ({ J0: { state: "done", task: TT, result: "/repo/clipboard/codex/t-r0.md", ...(sa ? { startedAt: sa } : {}) },
+        J1: { state: "done", task: TT, result: RF, startedAt: iso(T0 + 100), endedAt: iso(T0 + 60_000) } });
+      const readOld = at(T0 + 90_000, "Read", { file_path: "C:/x/old.output" }, numbered(`CODEX_JOB=J0\nCODEX_STATE=done\nCODEX_END=J0\n${blk("J0")}`.split("\n")));
+      cx("v7 codex-2:早 5 秒的旧作业不认领新占位", lbl([...bgL(T0, 1), ...readOld], mkEnv(tbOld(iso(T0 - 5000)))), "J1:pending-read");
+      cx("v7 codex-2:台账缺 startedAt 不认领", lbl([...bgL(T0, 1), ...readOld], mkEnv(tbOld(null))), "J1:pending-read");
+      // codex v6 第 3 条:读没有时间戳、而台账有界 ⇒ 不算;读到的是 runner 占位文字 ⇒ 不算
+      const tb8 = { J1: { state: "done", task: TT, result: RF, startedAt: iso(T0 + 100), resultAt: iso(T0 + 50_000), endedAt: iso(T0 + 60_000) } };
+      const noTs = (es) => es.map((e) => { const { timestamp, ...rest } = e; return rest; });
+      cx("v7 codex-3:读没有时间戳 ⇒ 不算读回", st([...launchBgAt(T0), ...noTs(at(T0 + 90_000, "Read", { file_path: R }, numbered([...HEAD, ...BODY])))], mkEnv(tb8)), "pending-read");
+      cx("v7 codex-3:读到 runner 占位文字 ⇒ 不算读回", st([...launchBgAt(T0),
+        ...at(T0 + 90_000, "Read", { file_path: R }, numbered(["(codex-run 作业 J1 运行中,结果未产出——占位)"]))], mkEnv(tb8)), "pending-read");
+      // codex v6 第 4 条:R 已写好(resultAt 之后)、endedAt 之前的完整读 ⇒ 算
+      cx("v7 codex-4:resultAt 与 endedAt 之间的完整读 ⇒ 已读回", st([...launchBgAt(T0), ...at(T0 + 55_000, "Read", { file_path: R }, numbered([...HEAD, ...BODY]))], mkEnv(tb8)), "read");
+      // codex v6 第 5 条:先读了文件头,再分两页读到完整 BODY(中间有没读的空档)⇒ 算
+      const gapLines = outLines.slice(4);
+      cx("v7 codex-5:BODY 之前有没读到的空档,不连累后面完整的块", st([...launchBg(),
+        ...call("Read", { file_path: "C:/x/tasks/bk1.output", limit: 1 }, numbered(outLines.slice(0, 1))),
+        ...call("Read", { file_path: "C:/x/tasks/bk1.output", offset: 100 }, numbered(gapLines.slice(0, 5), 100)),
+        ...call("Read", { file_path: "C:/x/tasks/bk1.output", offset: 105 }, numbered(gapLines.slice(5), 105))], stEnv(null)), "read");
+      // v7 反查倒序:前一次发起没真跑起来(无作业),后一次发起的作业不得被前一次抢走
+      const tbR = { J2: { state: "done", task: TT, result: RF, startedAt: iso(T0 + 61_000), endedAt: iso(T0 + 120_000) } };
+      cx("v7 反查从最晚的发起往前认:后一次发起认到自己的作业",
+        codexLedger([...bgL(T0, 1), ...bgL(T0 + 60_000, 2)], mkEnv(tbR)).jobs.map((j) => j.label.startsWith("J") ? j.label : "?").join(","), "?,J2");
+      // 红队 v6 BP-3:台账已清的旧作业,poll 返回 job-missing 不得把待读翻成失败;之后 Read R 照常结账
+      const jm = (J) => call("Bash", { command: pollCmd(J) }, `CODEX_JOB=${J}\nCODEX_STATE=failed\nCODEX_ERROR_CODE=job-missing\nCODEX_ERROR=台账缺失\nCODEX_END=${J}\nfailed job ${J} 台账缺失\n`, true);
+      cx("v7 BP-3:job-missing 不改写已有的 done", st([...launchDone(), ...jm("J1")], stEnv(null)), "pending-read");
+      cx("v7 BP-3:旧 runner 的「台账缺失」末行同样不改写", st([...launchDone(),
+        ...call("Bash", { command: pollCmd("J1") }, "failed job J1 台账缺失\n", true)], stEnv(null)), "pending-read");
+      cx("v7 BP-3:之后 Read R 照常结账", st([...launchDone(), ...jm("J1"), ...readR()], stEnv(null)), "read");
+      // 红队终审 BP-8:poll 见过 running,随后台账被清(job-missing),再完整 Read R ⇒ 结账,不再永远「运行中」
+      const runPoll = call("Bash", { command: pollCmd("J1") }, "CODEX_JOB=J1\nCODEX_STATE=running\nCODEX_END=J1\nrunning\n");
+      cx("终审 BP-8:台账已清、只剩旧 running 观测,完整 Read R ⇒ 已读回", st([...launchBg(), ...runPoll, ...jm("J1"), ...readR()], stEnv(null)), "read");
+      cx("终审 BP-8 对照:台账仍说 running ⇒ 运行中(读到的是占位/旧件不算)", st([...launchBg(), ...runPoll, ...readR()], stEnv({ state: "running", startedAt: new Date(now).toISOString(), timeoutMs: 900000 })), "running");
+      // 红队 v6 BP-4:规则不追溯——生效时刻之前发起的作业不入账
+      cx("v7 BP-4:生效之前发起的作业不入账", codexLedger([...launchDone()], { ...env0, since: T0 + 86_400_000 }).jobs.length, 0);
+      cx("v7 BP-4 对照:生效之后发起的照入账", codexLedger([...launchDone()], { ...env0, since: T0 - 1000 }).jobs.length, 1);
+      // 红队 v6 附二-5:提示里的 poll 用这次发起用的那支 runner,能力按那一支判
+      const repoLaunch = call("Bash", { command: "node scripts/codex-run.mjs --task clipboard/codex/t.md" }, `CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=${R}\nCODEX_END=J1\n`);
+      const hintOf = (dl) => codexLedger([...repoLaunch], { ...env0, runnerDelivers: (p) => dl && p === "scripts/codex-run.mjs" }).open.join("\n");
+      cx("v7 附二-5:能交付的那支 runner ⇒ 提示用它 poll", /node scripts\/codex-run\.mjs --poll J1/.test(hintOf(true)), true);
+      cx("v7 附二-5:判不了 / 旧版 ⇒ 不给 poll 出路", /--poll/.test(hintOf(false)), false);
+      // 红队 v6 附二-3:手动转后台的措辞也认作后台任务号
+      const manBg = at(T0, "Bash", { command: launchCmd }, "Command was manually backgrounded by user with ID: bm1. Output is being written to: C:/x/bm1.output");
+      cx("v7 附二-3:手动转后台在飞 ⇒ 运行中", only(manBg, { ...env0, bgTasks: [{ id: "bm1", status: "running" }] }), "running");
+      // runner 的占位正则与闸的同一份(改措辞要两边一起改)
+      const cr7 = _codexRunForSelfTest;
+      if (cr7 && cr7.PLACEHOLDER_RE) cx("v7:闸与 runner 的占位正则一致", cr7.PLACEHOLDER_RE.source, CODEX_PLACEHOLDER_RE.source);
+      if (cr7 && cr7.placeholderText) cx("v7:runner 写出的占位被闸认出", CODEX_PLACEHOLDER_RE.test(cr7.placeholderText("J1").trim()), true);
+    }
+    // v6(红队 BP-8 / codex v5 第 3 条):块按块判,同一次调用里别的命令失败不否掉已完整送达的 BODY
+    cx("v6:报错返回里的完整 BODY 块照算(整次调用退出码对块无证明力)", st([...launchDone(), ...call("Bash", { command: `${pollCmd("J1")}; false` },
+      `CODEX_JOB=J1\nCODEX_STATE=done\n${blk("J1")}done ${R}\nExit code 1`, true)]), "read");
+    cx("v5 变异:发起之前出现的 BODY 块不抵账", st([...catR("cat old-output.txt", blk("J1")), ...launchDone()]), "pending-read");
+    cx("v5 Read 后台 .output(带行号)里的完整 BODY 块 ⇒ 已读回", st([...launchBg(),
+      ...call("Read", { file_path: "C:/x/tasks/bk1.output" }, numbered(`CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_END=J1\n${blk("J1")}`.split("\n")))], stEnv(null)), "read");
+    const QB = `${FILE}\n复现:\nCODEX_JOB=JQ\nCODEX_STATE=done`;
+    cx("v5 BODY 正文里引用的 CODEX_JOB 行是数据,不开新账", codexLedger([...launchDone5("J1", QB)], { resultBody: () => QB }).jobs.map((j) => `${j.label}:${j.status}`).join(),
+      "J1:read");
+    cx("v5 正文里引用 CODEX_JOB 行不被认成 J1 的观测", st([...launchBg(), ...pollDone5("J1", `${FILE}\nCODEX_JOB=J1\nCODEX_STATE=running`)], { resultBody: () => `${FILE}\nCODEX_JOB=J1\nCODEX_STATE=running` }), "read");
+    cx("v5 发起 | tail -1 只剩 CODEX_BODY_END=J ⇒ J 入账,done 未读 ⇒ 待读",
+      st([...call("Bash", { command: `${launchCmd} 2>&1 | tail -1` }, "CODEX_BODY_END=J1\n")], doneEnv), "pending-read");
+    cx("零件:codexBodies 取完整块、剥 Read 行号、余下留给字段解析", (() => {
+      const r = codexBodies(numbered(["CODEX_JOB=J1", "CODEX_BODY_BEGIN=J1", "CODEX_JOB=JQ", "正文", "CODEX_BODY_END=J1", "done x"]), true);
+      return `${r.bodies.length}:${r.bodies[0].J}:${r.bodies[0].text.replace(/\n/g, "|")}:${r.rest.replace(/\n/g, "|")}`;
+    })(), "1:J1:CODEX_JOB=JQ|正文:CODEX_JOB=J1|done x");
+    cx("零件:codexBodies 只有 BEGIN ⇒ 其后都当数据、不成块", (() => { const r = codexBodies("A\nCODEX_FAIL_BEGIN=J1\nCODEX_JOB=JQ"); return `${r.bodies.length}:${r.rest}`; })(), "0:A");
+    // codex 复核 v4 第 1 条:等待到期仍 running、R 不存在 ⇒ 不得结清
+    const runEnv = stEnv({ state: "running", startedAt: "2026-10-09T11:59:00Z", timeoutMs: 900000 });
+    const expired = call("Bash", { command: `${pollCmd("J1", " --wait-ms 1000")} && cat ${RF}` },
+      `CODEX_JOB=J1\nCODEX_STATE=running\nCODEX_END=J1\nrunning\nExit code 3`, true);
+    cx("codex-v4#1 --wait-ms 到期(退出码 3)⇒ 仍运行中、子代理边界阻断", sub([...launchBg(), ...expired], runEnv), 1);
+    cx("codex-v4#1 变异:到期后 `; cat R` 报文件不存在 ⇒ 仍运行中", st([...launchBg(), ...call("Bash", { command: `${pollCmd("J1", " --wait-ms 1000")}; cat ${RF}` },
+      `CODEX_JOB=J1\nCODEX_STATE=running\nCODEX_END=J1\nrunning\ncat: ${RF}: No such file or directory\nExit code 1`, true)], runEnv), "running");
+    cx("codex-v4#1 运行中先于读回:状态文件 running 时 Read 到同路径旧文件 ⇒ 仍运行中", st([...launchBg(), ...readR()], runEnv), "running");
+    // codex 复核 v4 第 2–6 条
+    cx("codex-v4#2 wc -c R; cat other.md(共享片段)⇒ 待读", st([...launchDone(), ...catR(`wc -c ${RF}; cat other.md`, `120 ${RF}\n${BODY.join("\n")}`)]), "pending-read");
+    cx("codex-v4#3 failed 后 wc -c J1.log ⇒ 失败未处理", st([...launchBg(), ...catR(`wc -c "${LOGP("J1").replace(/\\/g, "/")}"`, "812 x.log\n")],
+      stEnv({ state: "failed", error: "x", endedAt: new Date(T0).toISOString() })), "failed-open");
+    cx("codex-v4#3 failed 后 poll J1(带 FAIL 块); cat J1.log ⇒ 失败已处理", st([...launchBg(), ...pollFail5()], stEnv(null)), "failed-handled");
+    cx("codex-v4#4a 后台单独 cat R 再 Read 其 .output ⇒ 待读(v5 不推断,出路 poll)", st([...launchDone(),
+      ...call("Bash", { command: `cat ${RF}`, run_in_background: true }, "Command running in background with ID: bk2. Output is being written to: C:/x/tasks/bk2.output"),
+      ...call("Read", { file_path: "C:/x/tasks/bk2.output" }, numbered([...HEAD, ...BODY]))]), "pending-read");
+    cx("codex-v4#4a 对照:后台 poll J1 再 Read 其 .output(BODY 块)⇒ 已读回", st([...launchDone(),
+      ...call("Bash", { command: pollCmd("J1"), run_in_background: true }, "Command running in background with ID: bk3. Output is being written to: C:/x/tasks/bk3.output"),
+      ...call("Read", { file_path: "C:/x/tasks/bk3.output" }, numbered(`CODEX_JOB=J1\nCODEX_STATE=done\n${blk("J1")}done ${R}`.split("\n")))]), "read");
+    const twoBg = call("Bash", { command: `node ~/.claude/scripts/codex-run.mjs --task clipboard/codex/a.md & node ~/.claude/scripts/codex-run.mjs --task clipboard/codex/b.md; wait`, run_in_background: true },
+      "Command running in background with ID: bk4. Output is being written to: C:/x/tasks/bk4.output");
+    const twoOut = `CODEX_JOB=J8\nCODEX_STATE=done\nCODEX_RESULT=${R}\nCODEX_END=J8\n${blk("J8")}CODEX_JOB=J9\nCODEX_STATE=done\nCODEX_RESULT=${R2}\nCODEX_END=J9\n${blk("J9", "## 结论\nb 的结论。")}`;
+    const twoEnv = { resultBody: (p) => (codexNormPath(p, null) === codexNormPath(R2, null) ? "## 结论\nb 的结论。" : FILE) };
+    cx("codex-v4#4b 同一 .output 两个作业各带完整正文 ⇒ 两笔都已读回", codexLedger([...twoBg, ...call("Read", { file_path: "C:/x/tasks/bk4.output" }, numbered(twoOut.split("\n")))], twoEnv)
+      .jobs.map((j) => `${j.label}:${j.status}`).sort().join(), "J8:read,J9:read");
+    const LISTY = [...HEAD, "- 第一条实质发现:A 段把列表正文全排除了", "- 第二条实质发现:读全文反而不算"].join("\n");
+    cx("codex-v4#5 全列表正文的回件、Read R 全文 ⇒ 已读回", st([...launchDone(), ...readR(R, 1, LISTY.split("\n"))], { resultBody: () => LISTY }), "read");
+    cx("codex-v4#6 分两次 Read(offset/limit)⇒ 已读回(任一段成功即算)", st([...launchDone(), ...readR(R, 10, BODY.slice(1, 2)), ...readR(R, 11, BODY.slice(2, 3))]), "read");
+
+    // ① 只读一段(Read offset/limit)⇒ 已读回;v5:Read R 任一段成功都算,包括只到固定头(残余②)
+    cx("①只读一段正文 ⇒ 已读回", st([...launchDone(), ...readR(R, 10, BODY)]), "read");
+    cx("①v5:Read R 只读到固定头 ⇒ 已读回(Read R 成功即算)", st([...launchDone(), ...readR(R, 1, HEAD.slice(0, 8))]), "read");
+    cx("①变异:Read 的是别的文件 ⇒ 待读", st([...launchDone(), ...readR("\\repo\\clipboard\\codex\\t-r9.md", 10, BODY)]), "pending-read");
+    // ② 读失败后重读成功;变异:只有那次失败
+    const failRead = call("Read", { file_path: R }, "<tool_use_error>File content (40000 tokens) exceeds maximum allowed tokens</tool_use_error>", true);
+    cx("②读失败后重读成功 ⇒ 已读回", st([...launchDone(), ...failRead, ...readR(R, 10, BODY)]), "read");
+    cx("②变异:只有失败那次 ⇒ 已产出待读", st([...launchDone(), ...failRead]), "pending-read");
+    // ③ shell 读法一律不推断(v5)
+    const headR = (n2, lines) => call("Bash", { command: `head -n ${n2} "${RF}"` }, lines.join("\n") + "\n\n[exited with code 0]");
+    cx("③只 head 头部 ⇒ 待读", st([...launchDone(), ...headR(8, HEAD.slice(0, 8))]), "pending-read");
+    cx("③只 head 头部(无注入正文)⇒ 待读", st([...launchDone(), ...headR(8, HEAD.slice(0, 8))], {}), "pending-read");
+    cx("③v5:head -n 30 正文回来了 ⇒ 仍待读(shell 读法不推断)", st([...launchDone(), ...headR(30, [...HEAD, ...BODY])]), "pending-read");
+    cx("③grep -c 只回计数 ⇒ 待读", st([...launchDone(), ...catR(`grep -c 结论 "${RF}"`, "1\n")], {}), "pending-read");
+    cx("③head 头部 + 别的命令混入 ⇒ 待读", st([...launchDone(), ...catR(`head -n 8 "${RF}"; echo 读完`, HEAD.slice(0, 8).join("\n") + "\n读完\n")]), "pending-read");
+    // ④ 读另交付文件:一律不认(谁发车谁读 R)
+    const readA = (p) => call("Read", { file_path: p }, numbered(["# 审计全文", "甲方说得对,乙方的第二条不成立。", "甲方胜。"]));
+    cx("④读结果正文点名的另一份交付(含回件原句)⇒ 待读", st([...launchDone(), ...readA("\\repo\\clipboard\\review-A.md")]), "pending-read");
+    cx("④读没被点名的文件 ⇒ 待读", st([...launchDone(), ...readA("\\repo\\clipboard\\review-B.md")]), "pending-read");
+    // ⑤ 路径归一只剩 Read 工具这一路;shell 读法 v5 一律待读
+    cx("⑤Read 正斜杠绝对路径 ⇒ 已读回", st([...launchDone(), ...readR(RF)]), "read");
+    cx("⑤Read Git Bash /d/ 形态 ⇒ 已读回", st([...launchDone(), ...readR("/repo/clipboard/codex/t-r1.md")]), "read");
+    cx("⑤Read 相对路径按条目 cwd 解 ⇒ 已读回", st([...launchDone(), ...readR("clipboard/codex/t-r1.md")]), "read");
+    cx("⑤v5:cat R ⇒ 待读(预期代价,出路 poll 或 Read)", st([...launchDone(), ...catR(`cat ${RF}`)]), "pending-read");
+    cx("⑤v5:cat R 2>&1 | head -80 ⇒ 待读", st([...launchDone(), ...catR("cat /repo/clipboard/codex/t-r1.md 2>&1 | head -80")]), "pending-read");
+    cx("⑤v5:cd 后相对路径 cat ⇒ 待读", st([...launchDone(), ...catR("cd /repo/clipboard && cat codex/t-r1.md")]), "pending-read");
+    cx("⑤v5:sed -n 1,200p R ⇒ 待读", st([...launchDone(), ...catR("sed -n '1,200p' clipboard/codex/t-r1.md")]), "pending-read");
+    cx("⑤v5:PowerShell Get-Content ⇒ 待读", st([...launchDone(),
+      ...call("PowerShell", { command: "Get-Content -Path '\\repo\\clipboard\\codex\\t-r1.md' -TotalCount 40" }, FILE)]), "pending-read");
+    cx("⑤变异:Read 同 basename 不同目录 ⇒ 待读", st([...launchDone(), ...readR("/repo/other/t-r1.md")]), "pending-read");
+    cx("⑤变异:发起之前 Read 过同一路径 ⇒ 不抵账", st([...readR(), ...launchDone()]), "pending-read");
+    cx("⑤v5:同一命令 发起 && cat R(返回只有 runner 的 BODY 块)⇒ 已读回", st([...launchDone5("J1", FILE, `${launchCmd} && cat ${RF}`)]), "read");
+    cx("⑤v5:同一命令 发起 && cat R(旧 runner,无 BODY 块)⇒ 待读", st([...call("Bash", { command: `${launchCmd} && cat ${RF}` }, `CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=${R}\n${FILE}\n`)]), "pending-read");
+    // ⑥ 跨轮:上一轮发起、用户新发言 + Stop 反馈之后本轮才读 ⇒ 已读回(经 run() 的生产入口)
+    const feedback = { type: "user", cwd: CWD, message: { role: "user", content: "Stop hook feedback:\n收尾闸阻断 ..." } };
+    cx("⑥跨轮:上轮发起、本轮读回 ⇒ A 不响", aOf([userSay("去审"), ...launchDone(), say("发出去了。"), userSay("继续"), feedback, ...readR(R, 10, BODY), say("读完了。")]), "-");
+    cx("⑥变异:跨轮且一直没读 ⇒ A 阻断", aOf([userSay("去审"), ...launchDone(), say("发出去了。"), userSay("继续"), feedback, say("总结一下。")]), "A!");
+    // ⑦ failed(240 实撞原形:旧版无 CODEX_JOB,J 由日志名取)
+    const fail240 = call("Bash", { command: "cd /repo && timeout 900 node ~/.claude/scripts/codex-run.mjs --task clipboard/codex/240-x.md 2>&1 | tail -40" },
+      `CODEX_STATE=failed\nCODEX_ERROR=codex 退出码 1 且无最终消息\nCODEX_LOG=${LOGP("mu3zmwf3-7eb3f8")}`);
+    const J240 = "mu3zmwf3-7eb3f8";
+    const logRead = call("Bash", { command: `grep -iE "quota|limit" "C:/Users/x/AppData/Local/Temp/codex-run-jobs/${J240}.log" 2>/dev/null | head -5; tail -6 "C:/Users/x/AppData/Local/Temp/codex-run-jobs/${J240}.log"` },
+      `{"type":"error","message":"You've hit your usage limit."}\n# heartbeat\n\n[exited with code 0]`);
+    const logReadTool = call("Read", { file_path: `C:/Users/x/AppData/Local/Temp/codex-run-jobs/${J240}.log` }, numbered(["# codex-run worker", '{"type":"error"}']));
+    cx("⑦v5:failed 后 Read 工具读日志 ⇒ 失败已处理", st([...fail240, ...logReadTool], env0, J240), "failed-handled");
+    cx("⑦v5:failed 后 shell grep/tail 日志 ⇒ 失败未处理(shell 读法不推断)", st([...fail240, ...logRead], env0, J240), "failed-open");
+    cx("⑦v5:failed 后 poll 返回 FAIL 块 ⇒ 失败已处理", st([...fail240, ...call("Bash", { command: pollCmd(J240) },
+      `CODEX_JOB=${J240}\nCODEX_STATE=failed\nCODEX_END=${J240}\n${blk(J240, "turn.failed", "FAIL")}failed x\n`, true)], env0, J240), "failed-handled");
+    cx("⑦v5:failed 后只写登记(不再算处理,裁定 v5 第 3 条闭集)⇒ 失败未处理", st([...fail240,
+      ...call("Bash", { command: "cat >> clipboard/.pending-after-limit.md <<'EOF'\n补跑 clipboard/codex/240-x.md\nEOF" }, "\n[exited with code 0]")], env0, J240), "failed-open");
+    cx("⑦变异:failed 后什么都没做 ⇒ 失败未处理", st([...fail240], env0, J240), "failed-open");
+    cx("⑦变异:日志在失败之前 Read 的 ⇒ 不算处理", st([...logReadTool, ...fail240], env0, J240), "failed-open");
+    cx("⑦变异:FAIL 块只有 BEGIN(被截)⇒ 不算处理", st([...fail240, ...call("Bash", { command: `${pollCmd(J240)} | head -6` },
+      `CODEX_JOB=${J240}\nCODEX_STATE=failed\nCODEX_END=${J240}\nCODEX_FAIL_BEGIN=${J240}\nturn.failed`, true)], env0, J240), "failed-open");
+    cx("⑦v5:前台失败当场带 FAIL 块 ⇒ 失败已处理", st([...call("Bash", { command: launchCmd },
+      `CODEX_JOB=J1\nCODEX_STATE=failed\nCODEX_ERROR=x\nCODEX_LOG=${LOGP("J1")}\nCODEX_END=J1\n${blk("J1", "turn.failed", "FAIL")}`, true)]), "failed-handled");
+    // ⑧ 首发 background 未 poll
+    cx("⑧首发 background、状态文件 running ⇒ 运行中", st([...launchBg()], runEnv), "running");
+    cx("⑧变异:状态文件已 done、没人读 ⇒ 待读", st([...launchBg()], doneEnv), "pending-read");
+    cx("⑧变异:running 但超出超时 ⇒ 状态未知", st([...launchBg()], stEnv({ state: "running", startedAt: "2026-10-09T10:00:00Z", timeoutMs: 900000 })), "unknown");
+    cx("⑧状态文件读不到 ⇒ 状态未知", st([...launchBg()], stEnv(null)), "unknown");
+    cx("⑧离线未注入状态文件 ⇒ 状态未知", st([...launchBg()], env0), "unknown");
+    // ⑨ 只认真 poll 的返回;正文提及、读到提及 codex-run 的文件、heredoc 正文都不是事件
+    cx("⑨交接块里的 --poll 文本不算 poll ⇒ 状态文件 done 时待读", st([...launchBg(), say("CODEX_POLL=node scripts/codex-run.mjs --poll J1")], doneEnv), "pending-read");
+    const pollRun = call("Bash", { command: "node scripts/codex-run.mjs --poll J1" }, "CODEX_JOB=J1\nCODEX_STATE=running\nrunning\n\n[exited with code 0]");
+    cx("⑨真 poll 返回 running ⇒ 运行中", st([...launchBg(), ...pollRun], stEnv(null)), "running");
+    cx("⑨旧版 poll 单行 running ⇒ 运行中", st([...launchBg(), ...call("Bash", { command: "node scripts/codex-run.mjs --poll J1" }, "running\n")], stEnv(null)), "running");
+    cx("⑨一条命令两个旧版 poll ⇒ 状态未知", st([...launchBg("J1"), ...launchBg("J2"),
+      ...call("Bash", { command: "node scripts/codex-run.mjs --poll J1; node scripts/codex-run.mjs --poll J2" }, "running\ndone E:/x.md\n")], stEnv(null)), "unknown");
+    cx("⑨poll=done(无 BODY)之后 Read R ⇒ 已读回", st([...launchBg(), ...call("Bash", { command: "node scripts/codex-run.mjs --poll J1" },
+      `CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=${R}\ndone ${R}\n`), ...readR(R, 10, BODY)], stEnv(null)), "read");
+    cx("⑨poll 返回 failed empty-body(旧 runner 无 FAIL 块)、没读日志 ⇒ 失败未处理", st([...launchBg(), ...call("Bash", { command: "node scripts/codex-run.mjs --poll J1" },
+      "CODEX_JOB=J1\nCODEX_STATE=failed\nCODEX_ERROR_CODE=empty-body\nCODEX_ERROR=x\nfailed x\n", true)], stEnv(null)), "failed-open");
+    cx("⑨heredoc 正文里的发起命令不入账", codexLedger([...call("Bash",
+      { command: "cat > clipboard/codex/t.md <<'EOF'\n复现命令:\nnode ~/.claude/scripts/codex-run.mjs --task x.md\nEOF" }, "\n")], env0).jobs.length, 0);
+    const tailCut = call("Bash", { command: `${launchCmd} 2>&1 | tail -1` }, "CODEX_POLL=node scripts/codex-run.mjs --poll J9\n");
+    cx("⑨发起返回被 tail 截到只剩 CODEX_POLL ⇒ J 入账,done 未读 ⇒ 待读", st([...tailCut], doneEnv, "J9"), "pending-read");
+    cx("⑨同上,Read R 之后 ⇒ 已读回", st([...tailCut, ...readR(R, 10, BODY)], doneEnv, "J9"), "read");
+    cx("⑨run_in_background 发起(离线)⇒ 状态未知", only([...call("Bash",
+      { command: launchCmd, run_in_background: true }, "Command running in background with ID: bk1. Output is being written to: C:\\x\\bk1.output")]), "unknown");
+    cx("⑨助理正文里写 CODEX_JOB= 不是发起 ⇒ 不入账", st([say("CODEX_JOB=J1 已发出")]), "(未入账)");
+    cx("⑨读了一个提到 codex-run 的文件不是发起 ⇒ 不入账",
+      st([...call("Read", { file_path: "/repo/a.md" }, "1\tnode codex-run.mjs --task t.md\n2\tCODEX_JOB=J1\nCODEX_STATE=done")]), "(未入账)");
+    // ⑩ 提示门控与 background_tasks
+    const oldBg = [userSay("去审"), ...launchBg(), say("等着。"), userSay("说点别的"), say("好的。")];
+    cx("⑩旧轮的「未知」不在新一轮重报", aOf(oldBg), "-");
+    cx("⑩对照:同一作业本轮有事件 ⇒ 照报", aOf(oldBg.slice(0, 3)), "A");
+    const pend = [userSay("去审"), ...launchDone(), say("收工。")];
+    cx("⑩background_tasks=[] 时 codex 待读照样阻断", aOf(pend, { bgTasks: [] }), "A!");
+    cx("⑩对照:读回之后 background_tasks=[] 不响", aOf([...pend, ...readR(R, 10, BODY)], { bgTasks: [] }), "-");
+    // 零件
+    cx("零件:codexNormPath 反斜杠与正斜杠同一", codexNormPath("\\repo\\a\\..\\b.md") === codexNormPath("/repo/./b.md"), true);
+    cx("零件:codexNormPath 相对且无 cwd ⇒ null", codexNormPath("a/b.md", null), null);
+    cx("零件:codexWords 双引号内反斜杠(bash)保留 Windows 路径", codexWords('cat "\\repo\\x.md"')[1], "\\repo\\x.md");
+    cx("零件:codexUnwrapSubst 剥 $( 与收尾括号", codexUnwrapSubst(["out=$(node", "x.mjs", "2>&1)"]).join(" "), "node x.mjs 2>&1");
+    cx("零件:codexBlocks 两个 JOB 两块", codexBlocks("CODEX_JOB=a\nCODEX_STATE=done\nCODEX_JOB=b\nCODEX_STATE=running").length, 2);
+    const live = liveCodexEnv();
+    cx("零件:liveCodexEnv 读不到作业 ⇒ null", live.jobState(`selftest-none-${process.pid}`), null);
+    cx("零件:liveCodexEnv 非法 J 不读盘 ⇒ null", live.jobState("../../etc/passwd"), null);
+    cx("零件:jobDirs 去重不分盘符大小写(附节二 1)", live.roots([live.root.toUpperCase(), `${live.root}/`]).length, 1);
+
+    // ── 红队 r1 ──
+    const readSrc = call("Read", { file_path: "/repo/scripts/hook-stop-closure.mjs" }, "1\t#!/usr/bin/env node\n2\t// 收尾闸");
+    cx("BP-1 读被审文件(回件点名它)⇒ 待读", st([...launchDone(), ...readSrc]), "pending-read");
+    cx("BP-1 后台变体 ⇒ 待读", st([...launchBg(), ...readSrc], doneEnv), "pending-read");
+    const pr = call("Bash", { command: "node scripts/codex-run.mjs --poll J1" }, "CODEX_JOB=J1\nCODEX_STATE=running\nrunning\n");
+    cx("BP-2 poll=running 后状态文件 done ⇒ 待读", st([...launchBg(), ...pr], doneEnv), "pending-read");
+    cx("BP-2 跨轮也拦", aOf([userSay("审"), ...launchBg(), ...pr, say("先干别的"), userSay("继续"), say("收工")], { codexEnv: doneEnv }), "A!");
+    const subst = call("Bash", { command: `out=$(${launchCmd}); echo $out` }, `CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=${R}\n`);
+    cx("BP-3 $() 发起入账 ⇒ 待读", st([...subst], doneEnv), "pending-read");
+    cx("BP-3 双引号包的 \"$(…)\" 发起入账", st([...call("Bash", { command: `OUT="$(${launchCmd} 2>&1)"; echo "$OUT"` }, `CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=${R}\n`)], doneEnv), "pending-read");
+    cx("BP-3 跨入口:A 阻断", aOf([userSay("审"), ...subst, say("收工")], { codexEnv: doneEnv }), "A!");
+    const TASKN = codexNormPath("clipboard/codex/t.md", CWD);
+    const rib = call("Bash", { command: `${launchCmd} --wait-ms 100000`, run_in_background: true },
+      "Command running in background with ID: bk1. Output is being written to: C:/Users/x/AppData/Local/Temp/claude/tasks/bk1.output");
+    const notif = { type: "user", cwd: CWD, message: { role: "user", content: "<task-notification>\n<task-id>bk1</task-id>\n<status>completed</status>\n</task-notification>" } };
+    const findEnv = (state) => ({ ...env0, now: NOW,
+      findJob: (q) => (q.task === TASKN && Number.isFinite(q.from) && q.to > q.from) || (q.result && q.result === codexNormPath(R, null))
+        ? { id: "J7", state, result: R, startedAt: new Date(T0).toISOString() } : null });
+    cx("BP-4 后台发起、反查到 J 且已 done、没读 ⇒ 待读", only([...rib], findEnv("done")), "pending-read");
+    cx("BP-4 通知轮:没读回件 ⇒ A 阻断", aOf([userSay("审"), ...rib, say("等"), notif, say("收工")], { codexEnv: findEnv("done"), bgTasks: [{ id: "bk1", status: "completed" }] }), "A!");
+    cx("BP-4 反查不到、原生载荷说后台仍在飞 ⇒ 运行中", aOf([userSay("审"), ...rib, say("等着")], { codexEnv: env0, bgTasks: [{ id: "bk1", status: "running" }] }), "-");
+    cx("BP-5 tail -1 只剩 CODEX_RESULT ⇒ 反查到 J,待读", only([...call("Bash", { command: `${launchCmd} 2>&1 | tail -1` }, `CODEX_RESULT=${R}\n`)], findEnv("done")), "pending-read");
+    cx("BP-5 tail -1 只剩 CODEX_END ⇒ J 入账,待读", st([...call("Bash", { command: `${launchCmd} 2>&1 | tail -1` }, "CODEX_END=J1\n")], doneEnv), "pending-read");
+    const rd = call("Bash", { command: `${launchCmd} > outputs/206-codex-run.log 2>&1; echo "exit=$?"` }, "exit=0\n");
+    cx("BP-6 重定向发起 ⇒ 反查到 J,待读", only([...rd], findEnv("done")), "pending-read");
+    cx("BP-6 跨轮也拦", aOf([userSay("审"), ...rd, say("等"), userSay("继续"), say("收工")], { codexEnv: findEnv("done") }), "A!");
+    cx("BP-6 v5:反查不到 ⇒ 未知提示给出按任务名找 J 与「输出里的块会认领」", /按任务名[\s\S]*CODEX_JOB 块被读到时也会认领/.test(codexLedger([...rd], env0).unknown[0] || ""), true);
+    const ln = call("Edit", { file_path: "/repo/clipboard/257-progress.md", old_string: "## 进度", new_string: "## 进度\n- 已发 codex 外审:clipboard/codex/t.md" }, "ok");
+    const failEnv = (endedAt) => stEnv({ state: "failed", errorCode: "empty-body", error: "x", ...(endedAt ? { endedAt } : {}) });
+    cx("BP-7 失败前写的进度笔记不算处理(无 endedAt)", st([...launchBg(), ...ln], failEnv()), "failed-open");
+    cx("BP-7 失败前写的进度笔记不算处理(endedAt 晚于笔记)", st([...launchBg(), ...ln], failEnv(new Date(T0 + 86_400_000).toISOString())), "failed-open");
+    cx("BP-7 v5:失败之后 Read 日志 ⇒ 已处理", st([...launchBg(), ...call("Read", { file_path: LOGP("J1") }, numbered(["turn.failed"]))], failEnv(new Date(T0).toISOString())), "failed-handled");
+    cx("BP-7 v5:失败之后 tail 日志(shell)⇒ 未处理", st([...launchBg(), ...catR(`tail -20 "${LOGP("J1").replace(/\\/g, "/")}"`, "turn.failed\n")],
+      failEnv(new Date(T0).toISOString())), "failed-open");
+    cx("BP-7 v5:无 endedAt 时失败后 Read 日志也不认(不知何时失败)", st([...launchBg(), ...call("Read", { file_path: LOGP("J1") }, numbered(["turn.failed"]))], failEnv()), "failed-open");
+    const shortTask = call("Bash", { command: "cd /repo/clipboard/codex && node ~/.claude/scripts/codex-run.mjs --task t.md" },
+      `CODEX_JOB=J1\nCODEX_STATE=failed\nCODEX_ERROR=x\nCODEX_LOG=${LOGP("J1")}\n`);
+    cx("BP-7 短任务名 t.md 不被 report.md 的写冒充", st([...shortTask, ...call("Write", { file_path: "/repo/clipboard/report.md", content: "见 report.md" }, "ok")]), "failed-open");
+    cx("BP-7 v5:写动作点名同一任务路径 ⇒ 不再算处理(闭集)", st([...shortTask, ...call("Write", { file_path: "/repo/clipboard/pending.md", content: "补跑 clipboard/codex/t.md" }, "ok")]), "failed-open");
+    cx("BP-7/BP4-10 对照:cd 后短任务名失败、在别处按全路径重发同一任务 ⇒ 已处理", st([...shortTask, ...call("Bash", { command: launchCmd },
+      `CODEX_JOB=J2\nCODEX_STATE=background\nCODEX_RESULT=${R2}\n`)]), "failed-handled");
+    const to = call("Bash", { command: `${launchCmd} --wait-ms 560000` }, "Exit code 143\nCommand timed out after 2m 0s", true);
+    cx("BP-8 超时被杀 ⇒ 占位入账(离线未知、提示)", aOf([userSay("审"), ...to, say("超时了,收工")], { codexEnv: {} }), "A");
+    cx("BP-8 超时被杀、反查到 done ⇒ A 阻断", aOf([userSay("审"), ...to, say("超时了,收工")], { codexEnv: findEnv("done") }), "A!");
+    cx("BP-8 对照:参数错误不是发起", codexLedger([...call("Bash", { command: launchCmd }, "任务文件不存在:clipboard/codex/t.md", true)], {}).jobs.length, 0);
+    // BP-9 / BP2-2 / BP3-2 / BP3-6 / CX-5 / BP3-3:子代理边界——自己发车就自己读;运行中也阻断;不设按次数放行
+    cx("BP-9 子代理边界:自己发了没读 ⇒ 阻断", sub([...launchDone()], doneEnv), 1);
+    cx("BP-9 子代理边界:Read 读回了 ⇒ 不阻断", sub([...launchDone(), ...readR(R, 10, BODY)], doneEnv), 0);
+    cx("BP-9 v5 子代理边界:poll 带回 BODY 块 ⇒ 不阻断", sub([...launchBg(), ...pollDone5()], doneEnv), 0);
+    cx("BP3-2 子代理边界:后台作业仍在跑就收尾 ⇒ 阻断", sub([...launchBg()], runEnv), 1);
+    cx("BP2-2 子代理边界:状态未知 ⇒ 只提示不阻断", sub([...launchBg()], env0), 0);
+    const markFb = { type: "user", cwd: CWD, message: { role: "user", content: "SubagentStop hook feedback:\n⟦子代理闸·A 阻断⟧ x" } };
+    cx("CX-5/BP3-3 已连阻 3 次仍阻断(不设按次数放行)", sub([...launchDone(), markFb, markFb, markFb], doneEnv), 1);
+    cx("BP3-6 子代理只发车、留给主会话读 ⇒ 子代理边界阻断", sub([...launchDone(), say("回件留给主会话读。")], doneEnv), 1);
+    const throwing = { ...env0, jobState: () => { throw new Error("盘坏了"); } };
+    const safe = subagentCodexSafe([...launchBg()], throwing);
+    cx("BP3-4 子代理边界账抛错 ⇒ 点名 A 的 UNKNOWN 行,不静默", safe.block.length === 0 && /A:UNKNOWN/.test(safe.notes.join("")), true);
+    // BP3-5:主会话不为子代理代发的作业记账(没有本会话发起,转报里的块无占位可认领)
+    const ag = call("Agent", { subagent_type: "general-purpose", prompt: "go" }, [{ type: "text", text: `CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=${R}` }]);
+    cx("BP3-5 主会话收到子代理转报 ⇒ 不入账、不提示", aOf([userSay("审"), ...ag, say("收工")], { codexEnv: doneEnv }), "-");
+    cx("BP2-2 主会话转报跨轮 ⇒ 不提示", aOf([userSay("审"), ...ag, say("收到"), userSay("继续"), say("收工")], { codexEnv: doneEnv }), "-");
+    // BP-11 / CX-2:复合命令的输出不推断
+    cx("BP-11 v5:cat R && grep(非 0 退出但正文已回显)⇒ 待读", st([...launchDone(), ...catR(`cat ${RF} && grep -n BP- ${RF}`, `Exit code 1\n${FILE}`)]), "pending-read");
+    cx("BP-11 对照:非 0 退出且只有报错 ⇒ 待读", st([...launchDone(), ...call("Bash", { command: `cat ${RF}` }, "Exit code 1\ncat: no such file", true)]), "pending-read");
+    cx("CX-2 cat R > copy.md; cat other.md(输出含回件标题)⇒ 待读", st([...launchDone(), ...catR(`cat ${RF} > copy.md; cat other.md`, "## 结论\n别的文件内容\n")]), "pending-read");
+    cx("CX-2 cat R > copy.md(stdout 去向文件)⇒ 待读", st([...launchDone(), ...catR(`cat ${RF} > copy.md`, "")]), "pending-read");
+    // BP-12 / BP2-1 / CX-1 / BP3-1 / BP3-7:委派读不认——子代理返回意译、引用、表格都不是 runner 交付
+    const ar = call("Agent", { subagent_type: "Explore", prompt: `读 ${R} 并逐条摘要` }, [{ type: "text", text: "回件结论:甲方对。" }]);
+    cx("BP2-1 委派读(意译摘要)⇒ 待读", st([...launchDone(), ...ar]), "pending-read");
+    cx("BP2-1 待读消息写明谁发车谁读与 poll / Read 出路", /谁发车谁读[\s\S]*--poll J1[\s\S]*Read/.test(codexLedger([...launchDone(), ...ar], env0).open[0] || ""), true);
+    const arQ = call("Agent", { subagent_type: "Explore", prompt: `读 ${R},引用原句` }, [{ type: "text", text: "回件原句:\n甲方说得对,乙方的第二条不成立。" }]);
+    cx("BP2-1/CX-1 子代理返回引用回件原句 ⇒ 待读", st([...launchDone(), ...arQ]), "pending-read");
+    cx("BP3-1 子代理返回只含表格分隔行 ⇒ 待读", st([...launchDone(), ...call("Agent", { subagent_type: "Explore", prompt: "审别的" }, [{ type: "text", text: "|---|---|---|" }])]), "pending-read");
+    cx("BP3-7 发车方自己 Read R、返回是引用块形态 ⇒ 已读回", st([...launchDone(), ...call("Read", { file_path: R }, numbered(BODY.map((l) => `> ${l}`), 10))]), "read");
+    // BP-13:empty-body 失败当场返回
+    const fl = call("Bash", { command: `${launchCmd} 2>&1 | tail -8` },
+      `CODEX_JOB=J1\nCODEX_STATE=failed\nCODEX_ERROR_CODE=empty-body\nCODEX_ERROR=x\nCODEX_LOG=${LOGP("J1")}\nCODEX_RESULT=${R}\n`);
+    cx("BP-13 v5:empty-body 失败后 Read R(只有头)⇒ 不算处理(裁定 v5 第 3 条不含 R)", st([...fl, ...readR(R, 1, HEAD)]), "failed-open");
+    cx("BP-13 v5 对照:失败后 Read 日志 ⇒ 失败已处理", st([...fl, ...call("Read", { file_path: LOGP("J1") }, numbered(["turn.failed"]))]), "failed-handled");
+    cx("BP-13 对照:失败后什么都没做 ⇒ 失败未处理", st([...fl]), "failed-open");
+    // CX-3:失败已处理之后再 poll 一次同一 failed ⇒ 不撤销已处理
+    cx("CX-3 已处理后再 poll 到 failed ⇒ 仍失败已处理", st([...fl, ...call("Read", { file_path: LOGP("J1") }, numbered(["turn.failed"])),
+      ...call("Bash", { command: "node scripts/codex-run.mjs --poll J1" }, "CODEX_JOB=J1\nCODEX_STATE=failed\nCODEX_ERROR=x\nfailed x\n", true)]), "failed-handled");
+    // BP-14:Grep 工具不算读
+    cx("BP-14 Grep 目录搜命中 R ⇒ 待读", st([...launchDone(), ...call("Grep", { pattern: "结论", path: "/repo/clipboard/codex", output_mode: "content" },
+      "/repo/clipboard/codex/t-r1.md:10:## 结论")]), "pending-read");
+    // BP-15 / BP2-3 / BP3-8:取代删除——旧作业 done 就得读一次
+    const r2 = call("Read", { file_path: R2 }, numbered(BODY, 10));
+    const e2 = { ...env0, now: NOW, jobState: (J) => (J === "J1" ? { state: "done", result: R } : { state: "done", result: R2 }),
+      resultBody: (p) => (codexNormPath(p, null) === codexNormPath(R2, null) ? `${FILE}\n本次为 J1 超时后的重跑。` : FILE) };
+    const bg2 = call("Bash", { command: launchCmd }, `CODEX_JOB=J2\nCODEX_STATE=background\nCODEX_RESULT=${R2}\n`);
+    cx("BP3-8 重发同任务、新作业读过 ⇒ 旧作业仍待读", st([...launchBg("J1"), ...bg2, ...r2], e2), "pending-read");
+    cx("BP-15 新作业 ⇒ 已读回", st([...launchBg("J1"), ...bg2, ...r2], e2, "J2"), "read");
+    cx("BP-15/BP2-3 旧作业未读 ⇒ A 阻断", aOf([userSay("审"), ...launchBg("J1"), ...bg2, ...r2, say("收工")], { codexEnv: e2 }), "A!");
+    cx("BP3-8 对照:旧回件也读一次 ⇒ 不响", aOf([userSay("审"), ...launchBg("J1"), ...bg2, ...r2, ...readR(R, 10, BODY), say("收工")], { codexEnv: e2 }), "-");
+    // BP-16 / BP2-5 / BP4-8 / BP4-10:变量读、awk、Select-String、全围栏 cat ——v5 都是 shell 读法 ⇒ 待读
+    cx("BP-16/BP4-10 v5:变量读 r=…; sed \"$r\" ⇒ 待读", st([...launchDone(), ...catR(`r=${RF}; sed -n 1,200p "$r"`, FILE)]), "pending-read");
+    cx("BP-16/BP4-8 v5:awk 'NR>8' R ⇒ 待读", st([...launchDone(), ...catR(`awk 'NR>8' ${RF}`, BODY.join("\n"))]), "pending-read");
+    cx("BP-16 v5:Select-String ⇒ 待读", st([...launchDone(), ...call("PowerShell", { command: `Select-String -Path ${RF} -Pattern .` }, BODY.join("\n"))]), "pending-read");
+    cx("BP-16 对照:cat 被审文件(输出含回件原句)⇒ 待读", st([...launchDone(), ...catR("cat /repo/scripts/x.mjs", BODY.join("\n"))]), "pending-read");
+    const FENCED = [...HEAD, "```", "if (r.seq <= job.launchSeq) continue;", "return lines.some(Boolean);", "```"].join("\n");
+    cx("BP2-5 v5:全围栏正文 cat R ⇒ 待读;Read R ⇒ 已读回", [st([...launchDone(), ...catR(`cat ${RF}`, FENCED)], { resultBody: () => FENCED }),
+      st([...launchDone(), ...readR(R, 1, FENCED.split("\n"))], { resultBody: () => FENCED })].join(), "pending-read,read");
+    cx("BP2-5 v5:全围栏正文经 runner BODY 块交付 ⇒ 已读回", st([...launchDone5("J1", FENCED)], { resultBody: () => FENCED }), "read");
+    // BP2-4:另交付一律不认
+    cx("BP2-4 附件含回件原句 ⇒ 仍待读", st([...launchDone(), ...readA("\\repo\\clipboard\\review-A.md")]), "pending-read");
+    // CX-4:后台发起的 .output——v5 只看里面有没有完整 BODY 块(块自带 J,不需绑定)
+    const OUTP = "C:/Users/x/AppData/Local/Temp/claude/tasks/bk1.output";
+    const outText = `CODEX_JOB=J8\nCODEX_STATE=done\nCODEX_RESULT=${R}\nCODEX_END=J8\n${blk("J8")}`;
+    const bgDone = { ...env0, now: NOW, jobState: (J) => (J === "J8" ? { state: "done", result: R, task: "/repo/clipboard/codex/t.md", startedAt: SA } : null) };
+    cx("CX-4 Read 后台 .output、含 J8 的机器块与 BODY 块 ⇒ 认领占位、已读回", only([...rib, ...call("Read", { file_path: OUTP }, numbered(outText.split("\n")))], bgDone), "read");
+    cx("CX-4 v5:cat 后台 .output(返回含完整 BODY 块)⇒ 已读回", only([...rib, ...catR(`cat "${OUTP}"`, outText)], bgDone), "read");
+    cx("CX-4 .output 只有 CODEX_ 字段、没有正文 ⇒ 认领 J8,done 未读 ⇒ 待读", only([...rib,
+      ...call("Read", { file_path: OUTP }, numbered(`CODEX_JOB=J8\nCODEX_STATE=done\nCODEX_RESULT=${R}`.split("\n")))], bgDone), "pending-read");
+    cx("CX-4 v5:.output 里的 R 正文没有定界(旧 runner)⇒ 认领 J8、待读", only([...rib,
+      ...call("Read", { file_path: OUTP }, numbered(`CODEX_JOB=J8\nCODEX_STATE=done\nCODEX_RESULT=${R}\n${FILE}`.split("\n")))], bgDone), "pending-read");
+    cx("CX-4 v5 对照:块里的任务与占位不同 ⇒ 不认领,占位仍未知", only([...rib, ...call("Read", { file_path: OUTP }, numbered(outText.split("\n")))],
+      { ...bgDone, jobState: (J) => (J === "J8" ? { state: "done", result: R, task: "/repo/clipboard/codex/other.md", startedAt: SA } : null) }), "unknown");
+    // tmpdir 一致性:hook 端作业目录与 codex-run 同一算法;hook 自己的目录查不到时按 CODEX_LOG 的目录兜底
+    {
+      const cr = _codexRunForSelfTest;
+      cx("tmpdir:hook 端作业目录 = os.tmpdir()/codex-run-jobs", codexNormPath(live.root, null), codexNormPath(`${os.tmpdir()}/codex-run-jobs`, null));
+      if (cr && cr.JOB_ROOT) cx("tmpdir:hook 端作业目录与 codex-run 的 JOB_ROOT 同算法同值", codexNormPath(live.root, null), codexNormPath(cr.JOB_ROOT, null));
+      const alt = fs.mkdtempSync(`${os.tmpdir()}/stop-closure-altjobs-`).replace(/\\/g, "/");
+      try {
+        fs.writeFileSync(`${alt}/JALT1.json`, JSON.stringify({ state: "done", result: R }));
+        cx("tmpdir:按 CODEX_LOG 目录兜底查到", (liveCodexEnv().jobState("JALT1", [alt]) || {}).state, "done");
+        cx("tmpdir:不给兜底目录 ⇒ 查不到", liveCodexEnv().jobState("JALT1"), null);
+        const altLaunch = call("Bash", { command: launchCmd }, `CODEX_JOB=JALT1\nCODEX_STATE=background\nCODEX_LOG=${alt}/JALT1.log\nCODEX_RESULT=${R}\n`);
+        cx("tmpdir:账里自动带上 CODEX_LOG 目录 ⇒ done、待读", st([...altLaunch], { ...liveCodexEnv(), since: undefined, resultBody: () => FILE }, "JALT1"), "pending-read");
+      } finally { fs.rmSync(alt, { recursive: true, force: true }); }
+    }
+    // ── r3b 钉(v5 期望):shell 读法一律不推断 ⇒ 待读(预期代价) ──
+    cx("r3b 112 实撞原形 v5:sed -n '/^## Q5/,$p' R | head -40 ⇒ 待读", st([...launchDone(), ...catR(`sed -n '/^## 结论/,$p' clipboard/codex/t-r1.md | head -40`, BODY.join("\n"))]), "pending-read");
+    cx("r3b v5:cat R | tail -n +9 | cut -c1-900 ⇒ 待读", st([...launchDone(), ...catR(`cat ${RF} | tail -n +9 | cut -c1-900`, BODY.join("\n"))]), "pending-read");
+    cx("r3b v5:管道后接 | grep ⇒ 待读", st([...launchDone(), ...catR(`cat ${RF} | grep -v xyz`, BODY.join("\n"))]), "pending-read");
+    cx("r3b v5:管道后接 | sort ⇒ 待读", st([...launchDone(), ...catR(`cat ${RF} | sort`, BODY.join("\n"))]), "pending-read");
+    cx("r3b 裁剪段重定向到文件(返回为空)⇒ 待读", st([...launchDone(), ...catR(`cat ${RF} | head -40 > copy.md`, "")]), "pending-read");
+    cx("r3b v5:cat R; head -5 ⇒ 待读", st([...launchDone(), ...catR(`cat ${RF}; head -5`, FILE)]), "pending-read");
+    cx("r3b v5:awk '{print}' R ⇒ 待读", st([...launchDone(), ...catR(`awk '{print}' ${RF}`, FILE)]), "pending-read");
+    cx("r3b awk 程序带 > 写文件(返回为空)⇒ 待读", st([...launchDone(), ...catR(`awk '{print > "copy.md"}' ${RF}`, "")]), "pending-read");
+    cx("零件:codexUnwrapSubst 不拆引号里带空格的普通参数", codexUnwrapSubst(["sed", "-n", "/^## 结论/,$p", "R.md"]).length, 4);
+    // ── 红队 r4(审 d7b56d3)钉,v5 期望 ──
+    const RX = "E:/tmp/copy-of-review.md";
+    cx("BP4-6 v5:cp R X 之后读 X ⇒ 待读(副本不推断)", st([...launchDone(), ...catR(`cp ${RF} ${RX}`, ""), ...catR(`sed -n 1,200p ${RX}`, FILE)]), "pending-read");
+    cx("BP4-6 v5:cp R X 之后 Read X ⇒ 待读(只认 Read R 本身)", st([...launchDone(), ...catR(`cp ${RF} ${RX}`, ""), ...readR(RX)]), "pending-read");
+    cx("BP4-6 对照:读一个不是 R 副本的文件 ⇒ 待读", st([...launchDone(), ...catR(`sed -n 1,200p E:/tmp/other.md`, FILE)]), "pending-read");
+    cx("BP4-6 v5:复合读 wc -c R; sed | cut ⇒ 待读", st([...launchDone(), ...catR(`cd /repo; wc -c ${RF}; sed -n 1,12p ${RF} | cut -c1-120`, `7961 ${RF}\n${FILE}`)]), "pending-read");
+    cx("BP4-6 v5:复合读 ls | grep; echo; sed ⇒ 待读", st([...launchDone(), ...catR(`ls clipboard/codex | grep t-r1; echo ===; sed -n 1,80p ${RF}`, `t-r1.md\n===\n${FILE}`)]), "pending-read");
+    cx("BP4-5 部分读:Read R 只回两行 ⇒ 已读回(残余②)", st([...launchDone(), ...readR(R, 10, BODY.slice(1, 3))]), "read");
+    cx("BP4-5 v5:Read R 只回一行 ⇒ 已读回(Read R 成功即算)", st([...launchDone(), ...readR(R, 10, BODY.slice(1, 2))]), "read");
+    cx("BP4-9 v5:cat -n R | sed / head -n -2 R ⇒ 待读", [st([...launchDone(), ...catR(`cat -n ${RF} | sed 's/^/  /'`, numbered(BODY))]),
+      st([...launchDone(), ...catR(`head -n -2 ${RF}`, FILE)])].join(), "pending-read,pending-read");
+    cx("BP4-9 v5:PowerShell & Get-Content R ⇒ 待读", st([...launchDone(), ...call("PowerShell", { command: `& { Get-Content '${RF}' }` }, FILE)]), "pending-read");
+    // BP4-1 / BP4-7:运行中的出路是 --poll J --wait-ms,done 时正文随结果打出
+    cx("BP4-1 子代理边界运行中的阻断消息写明 --poll J --wait-ms 与退出码 3", /--poll J1 --wait-ms 600000[\s\S]*退出码 3/.test(subagentCodexVerdict([...launchBg()], runEnv).block.join("")), true);
+    cx("BP4-7 v5:poll --wait-ms 等到 done、返回带 BODY 块 ⇒ 子代理边界不再阻断", sub([...launchBg(), ...pollDone5("J1", FILE, pollCmd("J1", " --wait-ms 600000"))], runEnv), 0);
+    // BP4-2:终态不被之后无法归属的 poll 改写
+    cx("BP4-2 done 之后一条无法归属的 poll ⇒ 仍是已产出待读", st([...launchDone(),
+      ...call("Bash", { command: "node scripts/codex-run.mjs --poll J1; node scripts/codex-run.mjs --poll J2" }, "running\ndone E:/x.md\n")]), "pending-read");
+    cx("BP4-2 running 不覆盖 failed", st([...launchBg(), ...call("Bash", { command: "node scripts/codex-run.mjs --poll J1" }, "CODEX_JOB=J1\nCODEX_STATE=failed\nCODEX_ERROR=x\nfailed x\n", true),
+      ...call("Bash", { command: "node scripts/codex-run.mjs --poll J1" }, "CODEX_JOB=J1\nCODEX_STATE=running\nrunning\n")], stEnv(null)), "failed-open");
+    // BP4-3:一条后台命令并发两次发车 ⇒ 两个占位;.output 里两个 CODEX_JOB 块各认领一个
+    const two = `CODEX_JOB=J8\nCODEX_STATE=done\nCODEX_RESULT=${R}\nCODEX_END=J8\nCODEX_JOB=J9\nCODEX_STATE=done\nCODEX_RESULT=${R2}\nCODEX_END=J9\n`;
+    cx("BP4-3 .output 里两个 CODEX_JOB 块(无正文)⇒ 两笔都入账、都待读", codexLedger([...twoBg, ...call("Read", { file_path: "C:/x/tasks/bk4.output" }, numbered(two.split("\n")))], { ...env0, now: NOW })
+      .jobs.map((j) => `${j.label}:${j.status}`).sort().join(), "J8:pending-read,J9:pending-read");
+    cx("BP4-3 v5:两个占位按状态文件任务各认领各的", codexLedger([...twoBg, ...call("Read", { file_path: "C:/x/tasks/bk4.output" }, numbered(two.split("\n")))],
+      { ...env0, now: NOW, jobState: (J) => ({ state: "done", result: J === "J8" ? R : R2, task: J === "J8" ? "/repo/clipboard/codex/b.md" : "/repo/clipboard/codex/a.md", startedAt: SA }) })
+      .jobs.map((j) => `${j.id.slice(-2)}:${j.label}`).sort().join(), "#0:J9,#1:J8");
+    // BP4-4:重定向发车,之后 poll / 读到本账没有的 J ⇒ 认领占位
+    const redir = call("Bash", { command: `${launchCmd} > outputs/x.log 2>&1` }, "");
+    const claimEnv = { ...env0, jobState: (J) => (J === "J5" ? { state: "done", result: R, task: "/repo/clipboard/codex/t.md", startedAt: SA } : null) };
+    const one = (entries, env) => { const j = codexLedger(entries, env).jobs; return j.length === 1 ? `${j[0].label}:${j[0].status}` : `${j.length} 笔`; };
+    cx("BP4-4 重定向发车后 poll J5(无 BODY)⇒ 认领占位、done 未读 ⇒ 待读",
+      one([...redir, ...call("Bash", { command: "node scripts/codex-run.mjs --poll J5" }, `CODEX_JOB=J5\nCODEX_STATE=done\nCODEX_RESULT=${R}\ndone ${R}\n`)], claimEnv), "J5:pending-read");
+    cx("BP4-4 v5:重定向发车后 poll J5 带 BODY 块 ⇒ 认领并已读回", one([...redir, ...pollDone5("J5")], claimEnv), "J5:read");
+    cx("BP4-4 旧 runner 的 poll J5(只有末行 done)有状态文件 ⇒ 认领占位、待读", one([...redir, ...call("Bash", { command: "node scripts/codex-run.mjs --poll J5" }, `done ${R}\n`)], claimEnv), "J5:pending-read");
+    cx("BP4-4 重定向文件被读到、带 CODEX_JOB 块 ⇒ 认领 J(离线)", one([...redir, ...catR("cat outputs/x.log", `CODEX_JOB=J6\nCODEX_STATE=done\nCODEX_RESULT=${R}\n`)], env0), "J6:pending-read");
+    cx("BP4-4 v5 变异对照:块里的 J 在生产态查不到台账 ⇒ 不认领,占位仍无主", (() => { const j = codexLedger([...redir,
+      ...catR("cat notes.md", `CODEX_JOB=J6\nCODEX_STATE=done\nCODEX_RESULT=${R}\n`)], { ...env0, jobState: () => null }).jobs; return j.length === 1 && j[0].id.startsWith("@") && j[0].label.startsWith("codex 作业"); })(), true);
+    // v4 (b) 的「零特征行读头即算」随特征行一起删除:v5 Read R 成功即算
+    cx("v5 回件只回「无发现」⇒ Read R 即已读回", st([...launchDone(), ...readR(R, 1, [...HEAD, "无发现"])], { resultBody: () => [...HEAD, "无发现"].join("\n") }), "read");
+    cx("v5 回件只回「无发现」⇒ runner BODY 块即已读回", st([...launchDone5("J1", [...HEAD, "无发现"].join("\n"))], { resultBody: () => [...HEAD, "无发现"].join("\n") }), "read");
+    // 回放实撞(5a8d9bff):`until … --poll J | grep -q …; do sleep; done; … --poll J | tail -1` 是同一个 J ⇒ 照常归属
+    cx("回放 同一命令里两次 poll 同一个 J ⇒ 照常归属,得到结果路径后 Read 读回", st([...call("Bash", { command: `${launchCmd} 2>&1 | tail -1` }, "CODEX_END=J1\n"), ...call("Bash",
+      { command: `until node codex-run.mjs --poll J1 | grep -qE "^done"; do sleep 20; done; node codex-run.mjs --poll J1 | tail -1` }, `done ${R}\n`),
+      ...readR(R, 10, BODY)], stEnv(null)), "read");
+    // 回放实撞(8761f62e):`--poll $(grep …)` 剥壳得 `grep`,无台账 ⇒ 不认领占位
+    cx("回放 --poll $(grep …) 不把 grep 当 J 认领占位", (() => { const j = codexLedger([...redir,
+      ...call("Bash", { command: "node scripts/codex-run.mjs --poll $(grep -o J5 outputs/x.log)" }, "done E:/x.md\n")], { ...env0, jobState: () => null }).jobs;
+      return j.length === 1 && j[0].label !== "grep" && j[0].id.startsWith("@"); })(), true);
+    cx("回放 v5 对照:--poll $(grep …) 的返回带真 J5 的块 ⇒ 按块认领 J5", one([...redir,
+      ...call("Bash", { command: "node scripts/codex-run.mjs --poll $(grep -o J5 outputs/x.log)" }, `CODEX_JOB=J5\nCODEX_STATE=done\nCODEX_RESULT=${R}\ndone ${R}\n`)], claimEnv), "J5:pending-read");
+    // BP4-10:cd 取第一个非旗标参数,不取最后一个词(经「同任务重发」验)
+    cx("BP4-10 cd X 2>/dev/null && 发车 ⇒ 任务路径按 X 解,同路径重发算处理", st([
+      ...call("Bash", { command: "cd /repo/clipboard/codex 2>/dev/null && node ~/.claude/scripts/codex-run.mjs --task t.md" }, `CODEX_JOB=J1\nCODEX_STATE=failed\nCODEX_ERROR=x\n`),
+      ...call("Bash", { command: launchCmd }, `CODEX_JOB=J2\nCODEX_STATE=background\nCODEX_RESULT=${R2}\n`)]), "failed-handled");
+    cx("BP4-10 变异对照:cd 到别处后同名短任务 ⇒ 不是同一任务", st([
+      ...call("Bash", { command: "cd /repo/other 2>/dev/null && node ~/.claude/scripts/codex-run.mjs --task t.md" }, `CODEX_JOB=J1\nCODEX_STATE=failed\nCODEX_ERROR=x\n`),
+      ...call("Bash", { command: launchCmd }, `CODEX_JOB=J2\nCODEX_STATE=background\nCODEX_RESULT=${R2}\n`)]), "failed-open");
+    // BP4-11:子代理边界的「未知」提示本轮门控
+    cx("BP4-11 子代理:旧轮的未知不再提示", subagentCodexVerdict([userSay("审"), ...launchBg(), say("等"), userSay("继续"), say("收尾")], env0).notes.length, 0);
+    cx("BP4-11 对照:本轮的未知照提示", subagentCodexVerdict([userSay("审"), ...launchBg(), say("等")], env0).notes.length, 1);
+    // BP4-12:bash -c 内层、Monitor 发车都入账
+    cx("BP4-12 bash -c 内层发车 ⇒ 入账、待读", st([...call("Bash", { command: `bash -c "${launchCmd}"` }, `CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=${R}\n`)]), "pending-read");
+    cx("BP4-12 Monitor 发车 ⇒ 占位入账,反查到 done ⇒ 待读", only([...call("Monitor", { command: `${launchCmd} --wait-ms 600000`, description: "x" }, "Monitor started")], findEnv("done")), "pending-read");
+    // BP4-13:子代理转录超预算 ⇒ A 只读尾段
+    {
+      const tdir = fs.mkdtempSync(`${os.tmpdir()}/stop-closure-tail-`);
+      try {
+        const p = `${tdir}/agent.jsonl`;
+        const rows = [{ type: "user", message: { content: "x".repeat(5000) } }, ...launchDone()];
+        fs.writeFileSync(p, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+        const tail = readTranscriptTail(p, 2000);
+        cx("BP4-13 readTranscriptTail 只取尾段、残行跳过", tail.length, 2);
+        cx("BP4-13 尾段上的 A 账照样阻断", sub(tail, doneEnv), 1);
+      } finally { fs.rmSync(tdir, { recursive: true, force: true }); }
+    }
+    // 头注 6:STOP_CLOSURE_BLOCK_A=0 子代理边界同样生效(注入同一开关)
+    const offV = subagentCodexVerdict([...launchDone()], { ...doneEnv, blockOff: true });
+    cx("STOP_CLOSURE_BLOCK_A=0:子代理边界阻断降为提示并写明", offV.block.length === 0 && /STOP_CLOSURE_BLOCK_A=0/.test(offV.notes.join("")), true);
+    // r1 附节二 5 / 3
+    cx("附节二5 v5:rg -L / grep -L 都是 shell 读法 ⇒ 待读", [st([...launchDone(), ...catR(`rg -L 结论 ${RF}`, FILE)], {}),
+      st([...launchDone(), ...catR(`grep -L 结论 ${RF}`, RF)], {})].join(), "pending-read,pending-read");
+    const anonE = [userSay("审"), ...call("Bash", { command: `${launchCmd} > /tmp/x.log 2>&1` }, ""), say("收工")];
+    const anonF = run(null, { entries: anonE, turn: lastTurn(anonE), text: "x", codexEnv: {} }).find((x) => x.id === "A");
+    const anonMsg = anonF ? (Array.isArray(anonF.msg) ? anonF.msg.join(" ") : String(anonF.msg)) : "";
+    cx("附节二3 无主作业的 A 提示不给挂不上的「poll 一次」", /poll 一次/.test(anonMsg), false);
+    cx("附节二3 v5:无主作业的 A 提示给出按任务名找 J(重定向文件不再单独推断)", /按任务名/.test(anonMsg) && anonMsg.includes("clipboard/codex/t.md"), true);
+  }
 
   // ── ranProbe 的回归守卫:正确性 + **不许再变成灾难性回溯** ──────────────────
   // 2026-08-20 实撞:原式 `(?:[^"]|\\")*` 在 400KB 上要 16.7 秒,而 hook 超时 30 秒、
@@ -1807,6 +3338,32 @@ function selfTest() {
         { tracked: new Set(["scripts/x.mjs"]), ...(pre ? { preExisted: new Set([memP]) } : {}) });
       sc("D56 有 precheck 记录 ⇒ 不算新建", mkNew(true).isNew(memP), false);
       sc("D56 无 precheck 记录 ⇒ 仍算新建(不开漏放口)", mkNew(false).isNew(memP), true);
+      // ── 批 255:isNew 生产证据(`isNewEvidence`)——主 Stop 与 SubagentStop 共用 ─────────────
+      {
+        const ev = isNewEvidence(undefined);
+        // ③ SubagentStop 缺证据的钉:共用函数交出的 tracked 必须是非空 Set(原分支拿到的是 undefined)
+        sc("255③ isNewEvidence 交出非空 tracked", ev.tracked instanceof Set && ev.tracked.size > 0, true);
+        sc("255③ isNewEvidence 交出 checkoutOf/trackedIn", typeof ev.checkoutOf === "function" && typeof ev.trackedIn === "function", true);
+        // ③ 接线钉:SubagentStop 分支必须经 isNewEvidence 构造 ctx(退回旧的 `{ tracked: _trackedCache … }` 即红)
+        const srcSelf = fs.readFileSync(fileURLToPath(import.meta.url), "utf8");
+        // lastIndexOf:本行自己的字面量也含这串,分支本体在文件末尾那一处
+        const subIdx = srcSelf.lastIndexOf('if (hookInput.hook_event_name === "SubagentStop") {');
+        const subBody = subIdx < 0 ? "" : srcSelf.slice(subIdx, srcSelf.indexOf("runRules(", subIdx));
+        sc("255③ SubagentStop 分支经 isNewEvidence 取证", /buildCtx\(entries,\s*isNewEvidence\(/.test(subBody), true);
+        // checkoutOfFs:逐级上溯找 .git(假 exists,不碰磁盘)
+        const fake = (set) => (q) => set.has(q);
+        const tree = fake(new Set(["E:/r/.git", "E:/r/.claude/worktrees/w1/.git"]));
+        sc("255 checkoutOfFs:worktree 内文件 ⇒ worktree 根", checkoutOfFs("E:\\r\\.claude\\worktrees\\w1\\docs\\a.md", tree), "E:/r/.claude/worktrees/w1");
+        sc("255 checkoutOfFs:主树文件 ⇒ 主树根", checkoutOfFs("E:/r/docs/a.md", tree), "E:/r");
+        sc("255 checkoutOfFs:新目录下的新文件 ⇒ 仍上溯到根", checkoutOfFs("E:/r/.claude/worktrees/w1/new/deep/x.md", tree), "E:/r/.claude/worktrees/w1");
+        sc("255 checkoutOfFs:相对路径 ⇒ null(走原判据)", checkoutOfFs("scripts/x.mjs", tree), null);
+        sc("255 checkoutOfFs:无 .git ⇒ null", checkoutOfFs("C:/elsewhere/x.md", tree), null);
+        // 真 git:本进程 cwd 所在 checkout 的既有文件,用 cwd 绝对路径问 ⇒ 非新建
+        //   (在 worktree 里跑时这正是批 253 实撞形:原判据经 relOf 剥成 `.claude/worktrees/…` ⇒ 判新建)
+        const own = `${process.cwd().replace(/\\/g, "/")}/scripts/hook-stop-closure.mjs`;
+        sc("255 真 git:trackedInFs 含本文件(--full-name 仓根相对)", (trackedInFs(checkoutOfFs(own)) || new Set()).has("scripts/hook-stop-closure.mjs"), true);
+        sc("255 真 git:cwd 绝对路径下的既有文件 ⇒ 非新建", buildCtx([], ev).isNew(own), false);
+      }
       // ── D100 消费者侧(codex 复核 2026-09-06「你没问到」①):按会话、按路径**首笔**。
       //   台账改道临时文件;探完把缓存与环境变量复原,不影响本进程后面的真读取。
       {
@@ -1816,7 +3373,7 @@ function selfTest() {
           { ts: "1", sid: "S", path: "scripts/new181.mjs", existed: false },     // 本会话首次创建前:不存在
           { ts: "2", sid: "S", path: "scripts/new181.mjs", existed: true },      // 第二次追加前:存在(不得覆盖首笔)
           { ts: "3", sid: "OTHER", path: "scripts/old.mjs", existed: true },     // 别的会话的记录
-          { ts: "4", sid: "S", path: "C:/u/.claude/projects/D--test/memory/m.md", raw: "~/.claude/projects/D--test/memory/m.md", existed: true },
+          { ts: "4", sid: "S", path: "C:/u/.claude/projects/example-project/memory/m.md", raw: "~/.claude/projects/example-project/memory/m.md", existed: true },
           { ts: "5", sid: "S", path: "scripts/old2.mjs", existed: true },       // D104(b):先存在……
           { ts: "6", sid: "S", path: "scripts/old2.mjs", existed: false },      // ……rm 后重建前不存在 ⇒ 本会话新建
         ];
@@ -1832,7 +3389,7 @@ function selfTest() {
         sc("D100 消费者:本会话首笔 false ⇒ 后续 true 不算已存在", mine.has("scripts/new181.mjs"), false);
         sc("D104(b) 消费者:先 true 后 false(rm+重建)⇒ 判新建", mine.has("scripts/old2.mjs"), false);
         sc("D100 消费者:别的会话的 true 不进本会话集合", mine.has("scripts/old.mjs"), false);
-        sc("D100 消费者:raw 原形随首笔一起收", mine.has("~/.claude/projects/D--test/memory/m.md") && mine.has("C:/u/.claude/projects/D--test/memory/m.md"), true);
+        sc("D100 消费者:raw 原形随首笔一起收", mine.has("~/.claude/projects/example-project/memory/m.md") && mine.has("C:/u/.claude/projects/example-project/memory/m.md"), true);
         sc("D100 消费者:无 sid ⇒ 退回全量旧口径(首笔仍生效)", none.has("scripts/old.mjs") && !none.has("scripts/new181.mjs"), true);
         sc("D100 消费者:本会话零记录 ⇒ 退回全量旧口径", stranger.has("scripts/old.mjs"), true);
       }
@@ -1987,6 +3544,37 @@ function selfTest() {
       console.log(`${ok ? "PASS" : "FAIL"}  零件用例:${name}` + (ok ? "" : `  ← 期待 ${JSON.stringify(want)} 实得 ${JSON.stringify(got)}`));
       if (ok) hpPass++;
     };
+    // ── attachBatchLog(批 256):AD 项的提交全文注入 ──
+    {
+      const g = { batch: "256", conditions: ["甲"], baseCommit: "abc1234" };
+      const fake = (out) => () => out;
+      hp("batchLog:有基点、无决定 ⇒ 按 NUL 切出每条提交全文",
+        attachBatchLog(g, fake("feat: 甲\n\n用户签\n\0fix: 乙\n\0")).batchLog, ["feat: 甲\n\n用户签", "fix: 乙"]);
+      hp("batchLog:已登记决定 ⇒ 不跑 git、不加键", attachBatchLog({ ...g, decisions: [{ id: "256-D1" }] }, () => { throw new Error("不该调"); }).batchLog, undefined);
+      hp("batchLog:无基点(旧批)⇒ 不加键", attachBatchLog({ batch: "255", conditions: ["x"] }, () => { throw new Error("不该调"); }).batchLog, undefined);
+      hp("batchLog:已结清 ⇒ 不加键", attachBatchLog({ ...g, cleared: true }, () => { throw new Error("不该调"); }).batchLog, undefined);
+      hp("batchLog:git 失败 ⇒ 原样返回(提示面 fail-open)", attachBatchLog(g, () => { throw new Error("bad revision"); }).batchLog, undefined);
+      hp("batchLog:基点不是 sha 形 ⇒ 不进命令行", attachBatchLog({ ...g, baseCommit: "--output=x" }, () => { throw new Error("不该调"); }).batchLog, undefined);
+    }
+    // ── priorClosedFromJournal(批 253b,红队 BP-14):同轮关旧批→开新批→同号 --force 重开 ──
+    {
+      const J = (...os) => os.map((o) => JSON.stringify(o));
+      const g254 = { batch: "254", conditions: ["丙"] };
+      const pc = (rows) => { const r = priorClosedFromJournal(rows, g254); return [r.priorClosedBatch ?? null, (r.priorClosedConditions || []).length]; };
+      hp("priorClosed:clear 253 → arm 254 ⇒ 补 253/2 条",
+        pc(J({ action: "clear", batch: "253", conditions: ["甲", "乙"] }, { action: "arm", batch: "254" })), ["253", 2]);
+      hp("priorClosed:clear 253 → arm 254 → force-over-checks 254 → arm 254 ⇒ 跳过同号仍补(BP-14)",
+        pc(J({ action: "clear", batch: "253", conditions: ["甲", "乙"] }, { action: "arm", batch: "254" },
+          { action: "force-over-checks", batch: "254", newBatch: "254" }, { action: "arm", batch: "254" })), ["253", 2]);
+      hp("priorClosed:clear 253 → arm 252 → arm 254 ⇒ 遇别批 arm 即停,不补",
+        pc(J({ action: "clear", batch: "253", conditions: ["甲"] }, { action: "arm", batch: "252" }, { action: "arm", batch: "254" })), [null, 0]);
+      hp("priorClosed:clear 254 → arm 254 ⇒ 同号 clear 不补",
+        pc(J({ action: "clear", batch: "254", conditions: ["甲"] }, { action: "arm", batch: "254" })), [null, 0]);
+      hp("priorClosed:最后 arm 批号≠盘上批 ⇒ 不补",
+        pc(J({ action: "clear", batch: "253", conditions: ["甲"] }, { action: "arm", batch: "255" })), [null, 0]);
+      hp("priorClosed:台账有坏行 ⇒ 不补(fail-closed)",
+        pc([...J({ action: "clear", batch: "253", conditions: ["甲"] }), "{bad", ...J({ action: "arm", batch: "254" })]), [null, 0]);
+    }
     // ── lastTurn 边界②′:hook 反馈的**真实形态**是 user+字符串(2026-08-25,D46)──
     //   生产 21717 条实测:边界②认的 `type:"system"+hookCount` 一次都没出现过,
     //   反馈全长成 `type:"user"` + 字符串 content、首行 "Stop hook feedback:"。
@@ -2004,6 +3592,44 @@ function selfTest() {
       const sysFb = { type: "system", hookCount: 1, hookErrors: ["收尾闸阻断 1 项"] };
       const t3 = lastTurn([U("真用户"), A2("回应甲"), sysFb, A2("回应乙")]);
       hp("lastTurn:旧 system+hookCount 形态仍认(排除含首)", t3.length, 1);
+    }
+    // ── 热修 10-09 + 批 257 v5 红队:lastTurn 按来源认边界、consecutiveBlocks 按一次 Stop 计 ──
+    {
+      const H = (s) => ({ type: "user", origin: { kind: "human" }, message: { content: s } });
+      const A2 = (t) => ({ type: "assistant", message: { content: [{ type: "text", text: t }] } });
+      const skill = { type: "user", isMeta: true, message: { content: [{ type: "text", text: "技能正文" }] } };
+      const plug = { type: "user", isMeta: true, origin: { kind: "plugin" }, message: { content: "插件消息" } };
+      const peer = { type: "user", isMeta: true, origin: { kind: "peer" }, message: { content: "子代理回报" } };
+      hp("lastTurn:技能正文(无 origin 的 isMeta)不切窗", lastTurn([H("做"), A2("甲"), skill, A2("乙")]).length, 4);
+      hp("lastTurn:插件消息不切窗", lastTurn([H("做"), A2("甲"), plug, A2("乙")]).length, 4);
+      hp("lastTurn:peer 回报仍是边界①", lastTurn([H("做"), A2("甲"), peer, A2("乙")]).length, 2);
+      // v7(codex v6 接缝 1):用户亲口贴的话以「Stop hook feedback:」开头 ⇒ 是用户发言(含首),不当反馈切掉
+      hp("lastTurn:用户亲口以反馈前缀开头的话含首", lastTurn([A2("旧"), H("Stop hook feedback: 这条为什么拦?"), A2("答")]).length, 2);
+      const att = (id) => ({ type: "attachment", attachment: { type: "hook_blocking_error", hookEvent: "Stop", toolUseID: id, blockingError: "收尾闸阻断 1 项" } });
+      const sum = (id) => ({ type: "system", subtype: "stop_hook_summary", hookCount: 1, hookErrors: [], toolUseID: id });
+      hp("lastTurn:已结束的 Stop 从汇总行之后起算", lastTurn([H("做"), A2("甲"), att("s1"), sum("s1"), A2("乙")]).length, 1);
+      hp("lastTurn:进行中的附件(无汇总行)不切窗", lastTurn([H("做"), A2("甲"), att("s1"), A2("乙")]).length, 4);
+      const L = (o) => JSON.stringify(o);
+      const blk = (id) => [L(att(id)), L({ ...sum(id), hookErrors: ["收尾闸阻断 1 项:x"] })];
+      const q = L({ type: "attachment", attachment: { type: "queued_command", prompt: "改做 X", origin: { kind: "human" } } });
+      const cb = (...xs) => consecutiveBlocksText(xs.flat().join("\n"));
+      hp("连撞:三次标准形态阻断计 3(不按载体重复计)", cb(blk("s1"), blk("s2"), blk("s3")), 3);
+      hp("连撞:用户打字清零", cb(blk("s1"), blk("s2"), L(H("停")), blk("s3")), 1);
+      hp("连撞:排队消息同样清零(v5 红队 BP-4)", cb(blk("s1"), blk("s2"), blk("s3"), q, blk("s4")), 1);
+      hp("连撞:进行中的那次不计", cb(blk("s1"), [L(att("s2"))]), 1);
+    }
+    // ── 批 257 条件 3:diff 分档事实的读取(git 注入)──
+    {
+      // 两次 diff:基点..HEAD 与 基点..工作树(后者只多出一个未提交的 D)
+      const git = (a) => a[0] === "rev-parse" ? "/repo\n"
+        : a[2] === "diff" ? "M\0docs/laws/collab.md\0R100\0scripts/a.mjs\0scripts/b.mjs\0A\0scripts/x.test.mjs\0" + (a.includes("HEAD") ? "" : "D\0AGENTS.md\0")
+        : "";
+      const f = readDiffFacts("66803b1b2b", git, (p) => !/AGENTS/.test(p));
+      hp("diff 事实:两段范围并起来、改名取新路径并留旧路径", f && f.files.map((x) => `${x.status}:${x.path}${x.oldPath ? "<" + x.oldPath : ""}`).join(" "),
+        "M:docs/laws/collab.md R100:scripts/b.mjs<scripts/a.mjs A:scripts/x.test.mjs M:docs/laws/collab.md R100:scripts/b.mjs<scripts/a.mjs A:scripts/x.test.mjs D:AGENTS.md");
+      hp("diff 事实:带仓根、A/M 记新内容读不读得到", f && `${f.root}|${f.files[2].readable}|${f.files[6].readable}`, "/repo|true|false");
+      hp("diff 事实:基点不合法 ⇒ null(不分档)", readDiffFacts("HEAD~1; rm", git), null);
+      hp("diff 事实:git 失败 ⇒ null", readDiffFacts("66803b1b2b", () => { throw new Error("x"); }), null);
     }
     // ── ranClear:参数面 vs 文本面(2026-08-20 实撞,写完当天被自己绊倒)──────────
     //   原写法 `[\s\S]*` 横跨整条命令 ⇒ 把 `--cond "K 的 --clear 阻断…"` 判成跑过结清。
@@ -2205,10 +3831,18 @@ function selfTest() {
     const r = carriersSelfTest();
     if (r && typeof r === "object") { carrPass = r.pass; carrTotal = r.total; }
   } catch (e) { console.log(`FAIL  载体分类自测跑不起来:${e && e.message}`); carrTotal = 1; }
+  // DP 事实源自测(2026-09-12 批 202;红队第五轮附节 1:原是孤儿,gate:accept 从不真读 git)。缺件(公开树)⇒ 不计。
+  let dfPass = 0, dfTotal = 0;
+  if (typeof debtFactsSelfTest === "function") {
+    try { const r = debtFactsSelfTest({ quiet: true }); dfPass = r.pass; dfTotal = r.total; }
+    catch (e) { console.log(`FAIL  debt-facts 自测跑不起来:${e && e.message}`); dfTotal = 1; }
+  }
 
   console.log(`\n自测 ${pass}/${cases.length}` +
     (carrTotal ? ` · 载体分类 ${carrPass}/${carrTotal}` : "") +
+    (dfTotal ? ` · 欠账事实 ${dfPass}/${dfTotal}` : "") +
     (seamTotal ? ` · 接缝 ${seamPass}/${seamTotal}` : "") +
+    (cxTotal ? ` · codex 账 ${cxPass}/${cxTotal}` : "") +
     (escTotal ? ` · 逃生口 ${escPass}/${escTotal}` : "") +
     (probeTotal ? ` · ranProbe ${probePass}/${probeTotal}` : "") +
     (hpTotal ? ` · 零件用例 ${hpPass}/${hpTotal}` : "") +
@@ -2217,7 +3851,8 @@ function selfTest() {
     (lawTotal ? ` · law锚点 ${lawPass}/${lawTotal}` : ""));
   return (pass === cases.length && driftPass === driftTotal && probePass === probeTotal
     && partPass === partTotal && hpPass === hpTotal && seamPass === seamTotal && escPass === escTotal
-    && lawPass === lawTotal && carrPass === carrTotal) ? 0 : 1;
+    && cxPass === cxTotal
+    && lawPass === lawTotal && carrPass === carrTotal && dfPass === dfTotal) ? 0 : 1;
 }
 
 // ── main
@@ -2448,8 +4083,9 @@ try { hookInput = JSON.parse(payload || "{}"); } catch {}
 //   · 现有 23 条规则一条不改(两家通道一致要求的规模纪律);
 //   · P 的满足侧永不吃后代动作 ⇒ 本分支不碰 P;
 //   · 首版走 additionalContext 提示面,先量误报再谈升阻断。
-// 失效条件:`agent_transcript_path` 是 harness 内部字段、无文档承诺;缺字段 ⇒ 报 UNKNOWN
-//   提示行,**不得静默跳过**(fail-closed 的提示面版本)。
+// 失效条件:`agent_transcript_path` 缺席 ⇒ 报 UNKNOWN 提示行,**不得静默跳过**(fail-closed 的提示面版本)。
+//   (旧注称该字段「harness 内部、无文档承诺」——已过时:官方 hooks 页 SubagentStop 节已列出该字段,
+//    2026-10-09 主会话取页核实。缺字段的兜底照留,防日后改名。)
 if (hookInput.hook_event_name === "SubagentStop") {
   const say = (s) => process.stdout.write(JSON.stringify({
     hookSpecificOutput: { hookEventName: "SubagentStop", additionalContext: s },
@@ -2457,20 +4093,26 @@ if (hookInput.hook_event_name === "SubagentStop") {
   const at = hookInput.agent_transcript_path;
   const who = `${hookInput.agent_type || "?"}/${String(hookInput.agent_id || "?").slice(0, 8)}`;
   if (typeof at !== "string" || !at) {
-    say(`⟦子代理闸 UNKNOWN⟧ ${who}:payload 里没有 agent_transcript_path——该字段是 harness 内部实现、`
-      + `无文档承诺,可能已改名。判不了 ⇒ 按 fail-closed 报出来,不当作「没问题」。`);
+    say(`⟦子代理闸 UNKNOWN⟧ ${who}:payload 里没有 agent_transcript_path(官方 SubagentStop 字段,可能已改名)。`
+      + `本分支全部项(含 A 的 codex 账)判不了 ⇒ 按 fail-closed 报出来,不当作「没问题」。`);
     process.exit(0);
   }
   let out = "";
+  let aBlock = [];   // A 的 codex 账在子代理边界上的阻断行(v3:运行中 / 已产出待读 / 失败未处理)
   try {
     const st = fs.statSync(at);
     const CAP = 4_000_000;                       // 字节预算:超了报 UNKNOWN,不截断继续
     if (st.size > CAP) {
       out = `⟦子代理闸 UNKNOWN⟧ ${who}:转录 ${(st.size / 1e6).toFixed(1)}MB 超预算 `
-        + `${CAP / 1e6}MB,不截断继续(截断=fail-open)。`;
+        + `${CAP / 1e6}MB,I/M/L/B 不截断继续(截断=fail-open)。A 项(codex 账)只读尾段照跑(BP4-13)。`;
+      const v = subagentCodexSafe(readTranscriptTail(at, CAP), liveCodexEnv());
+      aBlock = v.block;
+      if (v.notes.length) out += `\n  · ${v.notes.join("\n  · ")}`;
     } else {
       const entries = readTranscript(at);
-      const sCtx = buildCtx(entries, { tracked: _trackedCache instanceof Set ? _trackedCache : undefined });
+      // 批 255:原为 `{ tracked: _trackedCache … }`,而本分支跑在 `run()` 之前、缓存从未初始化
+      //   ⇒ tracked 恒为 undefined ⇒ isNew 对一切路径判真(红队 BP-3)。现与主 Stop 通道同口径取证。
+      const sCtx = buildCtx(entries, isNewEvidence(hookInput.session_id));
       // ── D60 余项裁决(2026-08-27,批 119)。判据=**每条规则的触发门依赖什么**:
       //   · `G`(造物没入册)门是 `didCommit` —— **子代理不提交** ⇒ 那道门永远开不了,
       //     接进来只会制造「跑了但从不响」的假覆盖。**不接入**。
@@ -2490,6 +4132,12 @@ if (hookInput.hook_event_name === "SubagentStop") {
           const m = Array.isArray(f.msg) ? f.msg.join(" ") : String(f.msg || "");
           return `${f.id}:${m.replace(/\s+/g, " ").trim().slice(0, 110)}`;
         });
+      // A 的 codex 账在子代理自己的边界上跑(批 257 v3):子代理自己发车的作业,运行中 / 已产出待读 / 失败未处理
+      //   都**阻断**(谁发车谁读;作业没结束不得收尾)。依据 = 用户亲签代价模型「不接受只记录降级」,
+      //   不另走 D60 升档门(D60 管 I/M/L/B 的提示面)。账出错 ⇒ 点名 A 的 UNKNOWN 行,不静默(BP3-4)。
+      const v = subagentCodexSafe(entries, liveCodexEnv());
+      aBlock = v.block;
+      hits.push(...v.notes);
       if (hits.length) {
         out = `⟦子代理闸⟧ ${who} 收尾时命中 ${hits.length} 项(提示面,不阻断):\n  · `
           + hits.join("\n  · ")
@@ -2501,7 +4149,15 @@ if (hookInput.hook_event_name === "SubagentStop") {
       }
     }
   } catch (e) {
-    out = `⟦子代理闸 UNKNOWN⟧ ${who}:读转录失败(${String(e.message).slice(0, 60)})——报出来不静默。`;
+    out = `⟦子代理闸 UNKNOWN⟧ ${who}:读转录失败(${String(e.message).slice(0, 60)})——本分支全部项(含 A 的 codex 账)未跑,报出来不静默。`;
+  }
+  if (aBlock.length) {
+    // 阻断形态与主 Stop 通道同口径(stdout decision:block + stderr 同文 + exit 2)。
+    const reason = `⟦子代理闸·A 阻断⟧ ${who}:你自己发起的 codex 作业还没闭环,读回再收尾:\n  · ${aBlock.join("\n  · ")}` +
+      (out ? `\n同时提示:${out}` : "");
+    try { process.stdout.write(JSON.stringify({ decision: "block", reason })); } catch { /* 空 */ }
+    try { process.stderr.write(reason + "\n"); } catch { /* 空 */ }
+    process.exit(2);
   }
   if (out) say(out);
   process.exit(0);
@@ -2542,9 +4198,8 @@ try {
 const lastMsg = typeof hookInput.last_assistant_message === "string" ? hookInput.last_assistant_message : "";
 const bgTasks = hookInput.background_tasks;
 const tp = hookInput.transcript_path || "";
-// 0.4.2(分支 b-init-cut1):撤下 CW「收尾时点并发写会话」——源项目已裁撤「同一时刻只许一个写会话」检查,
-//   并发写改由 git 隔离(各写会话在自己的 worktree 与分支上干活)。规则 CW 与 Stop 时点的判活探针注入一并删除。
-
+// 2026-10-09 用户裁撤「同一时刻只许一个写会话」的会话判活检查(「没看到这个查写会话带来的任何好处;真正应该解决的是工作树和 branch」):
+//   规则 CW 与 Stop 时点的 session-triage 注入一并删除;并发写改由 git 隔离(各写会话在自己的 worktree 与分支上干活),见 docs/laws/collab.md。
 try {
   let findings;
   if (lastMsg) {
