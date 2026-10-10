@@ -7,87 +7,7 @@
 **custodiet** is a governance system for Claude Code built from two parts: **Stop-time gates** and a **constitution + law-code** layout. Each time the agent says it is done, a Stop hook runs deterministic predicates over the turn's tool-call record and blocks if something it said it did never happened there; every blocking rule must point to a clause a human signed.
 **lanes** is its companion UI: it moves gate notices, tool calls and edited files out of the transcript into their own lanes.
 
-This repository is also a Claude Code plugin marketplace (`.claude-plugin/marketplace.json`).
-
-| Component | Current form | Install |
-|---|---|---|
-| custodiet | Gate scripts + example constitution/law files + red-team agent + copy-mode installer. **Not a plugin yet** | `node scripts/custodiet-init.mjs --target <repo> --mode copy` |
-| lanes | Claude Code plugin (a mod: a plugin with a hooks module), in `plugins/lanes/` | `/plugin install lanes --marketplace inoichi1009207/custodiet` |
-
-## Install
-
-### custodiet (copy mode)
-
-Requirements: node ≥ 20; the target must be the **root of a git repository** (the script will not `git init` for you).
-
-```bash
-git clone https://github.com/inoichi1009207/custodiet
-node custodiet/scripts/custodiet-init.mjs --target <your-repo-root> --mode copy
-```
-
-What it does:
-
-- Copies the gate files (`scripts/hook-stop-closure.mjs`, `scripts/batch-goal.mjs`, the engine files under `scripts/lib/`), the example constitution `AGENTS.md`, the example law files `docs/laws/collab.md` and `docs/laws/reporting.md`, `docs/noun-diary.md`, and the red-team agent `.claude/agents/_gate-bypass-hunter.md` into the target, and generates `CLAUDE.md` (content: `@AGENTS.md`).
-- Merges two hooks, `Stop` and `SubagentStop`, into the target's `.claude/settings.json` (deduplicated by command).
-- Appends the gate's runtime ledger paths to the target's `.gitignore`.
-- **Never overwrites an existing file**: when contents differ it writes a sidecar `<name>.custodiet<ext>`, and the JSON manifest on the last stdout line lists each one. It does not commit, does not touch the network, and does not touch `~/.claude/`.
-
-After installing:
-
-1. Self-test inside the target: `node --no-warnings scripts/hook-stop-closure.mjs --self-test`.
-   Known: 2 rule-I cases read the target's **real git history**; they are red while the installed files are uncommitted, or while the install commit is HEAD, and turn green after one more commit.
-2. **Start a new session before you commit the install.** Whether a newly written agent can be invoked in the same session has not been tested, and the install commit triggers rule P, which on gate-engine files accepts only that red-team agent. A new session sidesteps the untested case.
-
-Current limits:
-
-- The text-based rules match Chinese sentence patterns, so for now they only fit repositories where the collaboration happens in Chinese. In an English repository they do not misfire, but they also stay silent.
-- Plugin install is not built yet: `/plugin install custodiet` **does not work** today, and `--mode plugin` exits with code 5.
-- Dev-only files the installer does not copy: `scripts/coverage-check.mjs`, `scripts/gate-migrate-check.mjs`, `scripts/lib/ledger-anchor.mjs`. They work inside this repository only.
-
-### lanes (plugin marketplace)
-
-Inside a Claude Code session (requires Claude Code v2.1.275 or later):
-
-```text
-/plugin install lanes --marketplace inoichi1009207/custodiet
-```
-
-From your shell (requires v2.1.292 or later):
-
-```bash
-claude plugin install lanes --marketplace inoichi1009207/custodiet
-```
-
-Or in two steps: `/plugin marketplace add inoichi1009207/custodiet`, then `/plugin install lanes@custodiet`.
-Third-party marketplaces do not auto-update by default; update with `claude plugin update lanes@custodiet`.
-The lanes UI text is currently in Chinese; its tests (`claude plugin test plugins/lanes`) were run on Claude Code 2.1.295.
-
-## Capabilities and commands
-
-### custodiet
-
-| Capability | One line | Command |
-|---|---|---|
-| Stop gate | At Stop, runs 26 engine rules + 2 built-in rules over the turn's tool-call record; a hit on a blocking rule keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
-| Batch goals | Arm checkable completion conditions at the start; a condition may carry a machine check that `--clear` runs, refusing to clear on failure | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "render is out" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
-| Rule acceptance | Per-rule positive/negative fixtures + mutation acceptance; a fixture set that cannot kill its mutants does not ship (run inside this repo) | `npm run gate:accept` |
-| Ledger integrity chain | The alert-denominator, false-positive and batch-goal ledgers carry a per-row hash chain; rewrites, insertions and mid-chain deletions go red | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
-| External anchor (this repo) | Snapshots a prefix fingerprint of the ledgers to `~/.custodiet/`; rewrites or truncation before the anchor go red. Limits below | `node scripts/lib/ledger-anchor.mjs snapshot` |
-| Escape hatches | Each blocking rule can be switched off on its own (rule P deliberately has none) | `STOP_CLOSURE_BLOCK_<id>=0` |
-| Red-team agent | After you change gate-engine files, it looks for ways not to be caught by a rule, each with a minimal fixture | invoke the subagent `_gate-bypass-hunter` in a session |
-
-Batch-goal order: arm → work → write `条件N: 达成/未达成/不适用` (achieved / not achieved / not applicable) for each condition → **commit** → only then `node --no-warnings scripts/batch-goal.mjs --clear`. Clearing before the commit is what rule K0 blocks.
-
-### lanes
-
-| Capability | One line | Command |
-|---|---|---|
-| Pane | One lane each for this turn's gate notices (first three lines of each), edited files and tool calls, plus a separate bucket for subagents; opens by itself at session start (terminals ≥144 columns), run again to close | `/lanes` |
-| Summary line | When the turn has activity, one line above the prompt: gates (blocks) · files edited · tool calls · subagents | no command |
-| Text-only transcript | Tool-call rows are not drawn in the conversation (running ones included) and gate feedback shrinks to one dim line; toggle back to see them | `/lanes-show` |
-| Gate relay (on by default) | For Stop-hook blocks and additional context, the transcript keeps one short line and the full text goes to the model as a session row the model can read but the person does not see; custodiet's Stop gate recognises that row and does not treat it as a new user turn | `/lanes-relay` |
-| Long commands to background (on by default) | In the main session, foreground Bash / PowerShell timeouts are capped at 10 seconds, so a long command moves to the background instead of blocking the conversation; subagents are not capped | no command |
-| Switches for the model | The model can call `mcp__lanes__control` to flip the three settings above (relay / showAll / autoBg) | no command |
+Just want to install it? Jump to [Hand it to your agent](#hand-it-to-your-agent). The sections below first explain why it exists and what it catches.
 
 ## Why
 
@@ -112,12 +32,6 @@ Upstream, the fabrication problem was reported and the issue **closed as not pla
 
 The 26 engine rules read a **structured context** built only from `assistant` text blocks and `tool_use` **inputs** — tool *outputs* never enter their evidence window, so *reading a file that mentions `git commit` cannot count as having committed* (that exact exploit is a regression test). The two not-yet-migrated built-in rules (A delegation-closure, R past-tense claims) still scan raw text including tool outputs; that ceiling is documented in their header comments.
 
-## Constitution and law code
-
-- Every rule carries a `law:` anchor pointing back to a human-signed clause (e.g. rule J → `AGENTS.md#承重规则的载体门槛`); the engine checks at load time and in self-tests that each anchor resolves. A rule with no source of law is an unowned predicate anyone can delete.
-- The example constitution `AGENTS.md` holds short standing clauses — per-session defaults, decision boundaries, permanent red lines — and marks which rule each one is the source of law for; details live in the example law files `docs/laws/collab.md` and `docs/laws/reporting.md`.
-- The installer copies these three files as **examples**: replace them with clauses you actually signed and move the anchors with them.
-
 ## What it catches (selection of the 28 rules: 26 engine + 2 built-in; `gate:accept` output is authoritative — hand counts drift)
 
 - **B / R — promise vs. deed**: "I'll go fix X" / "I fixed X" with no matching action in the turn ⇒ flagged. Future-tense promises and past-tense claims are separate rules.
@@ -131,6 +45,12 @@ The 26 engine rules read a **structured context** built only from `assistant` te
 Since 0.4.2 the CW rule (re-checking concurrent writer sessions at Stop) is gone — concurrent writes are isolated with git worktrees/branches instead; see [CHANGELOG](CHANGELOG.md).
 
 Full tour and build order: [`docs/playbook.md`](docs/playbook.md) (the construction manual, written for an agent to follow: each build step ships the artifact shape, an executable checkpoint and the incident behind it; currently in Chinese).
+
+## Constitution and law code
+
+- Every rule carries a `law:` anchor pointing back to a human-signed clause (e.g. rule J → `AGENTS.md#承重规则的载体门槛`); the engine checks at load time and in self-tests that each anchor resolves. A rule with no source of law is an unowned predicate anyone can delete.
+- The example constitution `AGENTS.md` holds short standing clauses — per-session defaults, decision boundaries, permanent red lines — and marks which rule each one is the source of law for; details live in the example law files `docs/laws/collab.md` and `docs/laws/reporting.md`.
+- The installer copies these three files as **examples**: replace them with clauses you actually signed and move the anchors with them.
 
 ## The gate gates itself
 
@@ -175,6 +95,102 @@ As of our survey we have **not observed** this combination elsewhere (*not obser
 **Why is everything in Chinese?** This is a reference implementation extracted from the project that built it, comments and verdict messages included. The architecture (structured ctx / rules / registry / acceptance harness) is language-neutral; an English message pack is a welcome first contribution.
 
 **Are the war-story numbers audited?** They are the author's own ledgers (git log, alert ledger, debt table). The playbook marks them as author-attested. Read them the way you'd read any postmortem.
+
+## Hand it to your agent
+
+Everything above is for people. The "How to use" part below is written for an agent to follow: install steps, the self-checks to run, and the exact form of every command, all written so a machine can copy them.
+
+The easiest path is to give this repository's address to your Claude Code and let it read and install:
+
+```text
+Read the "How to use" section of the README at https://github.com/inoichi1009207/custodiet, install custodiet into the current repository (copy mode), then install the lanes plugin; afterwards run the self-check and report the JSON list on the last stdout line and the self-check result to me.
+```
+
+After installing, replace the example constitution `AGENTS.md` and the example law files with clauses you have signed yourself (see "Constitution and law code" above). That step is yours; an agent cannot sign for you.
+
+## How to use (for agents)
+
+This repository is also a Claude Code plugin marketplace (`.claude-plugin/marketplace.json`).
+
+| Component | Current form | Install |
+|---|---|---|
+| custodiet | Gate scripts + example constitution/law files + red-team agent + copy-mode installer. **Not a plugin yet** | `node scripts/custodiet-init.mjs --target <repo> --mode copy` |
+| lanes | Claude Code plugin (a mod: a plugin with a hooks module), in `plugins/lanes/` | `/plugin install lanes --marketplace inoichi1009207/custodiet` |
+
+### Install
+
+#### custodiet (copy mode)
+
+Requirements: node ≥ 20; the target must be the **root of a git repository** (the script will not `git init` for you).
+
+```bash
+git clone https://github.com/inoichi1009207/custodiet
+node custodiet/scripts/custodiet-init.mjs --target <your-repo-root> --mode copy
+```
+
+What it does:
+
+- Copies the gate files (`scripts/hook-stop-closure.mjs`, `scripts/batch-goal.mjs`, the engine files under `scripts/lib/`), the example constitution `AGENTS.md`, the example law files `docs/laws/collab.md` and `docs/laws/reporting.md`, `docs/noun-diary.md`, and the red-team agent `.claude/agents/_gate-bypass-hunter.md` into the target, and generates `CLAUDE.md` (content: `@AGENTS.md`).
+- Merges two hooks, `Stop` and `SubagentStop`, into the target's `.claude/settings.json` (deduplicated by command).
+- Appends the gate's runtime ledger paths to the target's `.gitignore`.
+- **Never overwrites an existing file**: when contents differ it writes a sidecar `<name>.custodiet<ext>`, and the JSON manifest on the last stdout line lists each one. It does not commit, does not touch the network, and does not touch `~/.claude/`.
+
+After installing:
+
+1. Self-test inside the target: `node --no-warnings scripts/hook-stop-closure.mjs --self-test`.
+   Known: 2 rule-I cases read the target's **real git history**; they are red while the installed files are uncommitted, or while the install commit is HEAD, and turn green after one more commit.
+2. **Start a new session before you commit the install.** Whether a newly written agent can be invoked in the same session has not been tested, and the install commit triggers rule P, which on gate-engine files accepts only that red-team agent. A new session sidesteps the untested case.
+
+Current limits:
+
+- The text-based rules match Chinese sentence patterns, so for now they only fit repositories where the collaboration happens in Chinese. In an English repository they do not misfire, but they also stay silent.
+- Plugin install is not built yet: `/plugin install custodiet` **does not work** today, and `--mode plugin` exits with code 5.
+- Dev-only files the installer does not copy: `scripts/coverage-check.mjs`, `scripts/gate-migrate-check.mjs`, `scripts/lib/ledger-anchor.mjs`. They work inside this repository only.
+
+#### lanes (plugin marketplace)
+
+Inside a Claude Code session (requires Claude Code v2.1.275 or later):
+
+```text
+/plugin install lanes --marketplace inoichi1009207/custodiet
+```
+
+From your shell (requires v2.1.292 or later):
+
+```bash
+claude plugin install lanes --marketplace inoichi1009207/custodiet
+```
+
+Or in two steps: `/plugin marketplace add inoichi1009207/custodiet`, then `/plugin install lanes@custodiet`.
+Third-party marketplaces do not auto-update by default; update with `claude plugin update lanes@custodiet`.
+The lanes UI text is currently in Chinese; its tests (`claude plugin test plugins/lanes`) were run on Claude Code 2.1.295.
+
+### Capabilities and commands
+
+#### custodiet
+
+| Capability | One line | Command |
+|---|---|---|
+| Stop gate | At Stop, runs 26 engine rules + 2 built-in rules over the turn's tool-call record; a hit on a blocking rule keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
+| Batch goals | Arm checkable completion conditions at the start; a condition may carry a machine check that `--clear` runs, refusing to clear on failure | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "render is out" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
+| Rule acceptance | Per-rule positive/negative fixtures + mutation acceptance; a fixture set that cannot kill its mutants does not ship (run inside this repo) | `npm run gate:accept` |
+| Ledger integrity chain | The alert-denominator, false-positive and batch-goal ledgers carry a per-row hash chain; rewrites, insertions and mid-chain deletions go red | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
+| External anchor (this repo) | Snapshots a prefix fingerprint of the ledgers to `~/.custodiet/`; rewrites or truncation before the anchor go red. Limits below | `node scripts/lib/ledger-anchor.mjs snapshot` |
+| Escape hatches | Each blocking rule can be switched off on its own (rule P deliberately has none) | `STOP_CLOSURE_BLOCK_<id>=0` |
+| Red-team agent | After you change gate-engine files, it looks for ways not to be caught by a rule, each with a minimal fixture | invoke the subagent `_gate-bypass-hunter` in a session |
+
+Batch-goal order: arm → work → write `条件N: 达成/未达成/不适用` (achieved / not achieved / not applicable) for each condition → **commit** → only then `node --no-warnings scripts/batch-goal.mjs --clear`. Clearing before the commit is what rule K0 blocks.
+
+#### lanes
+
+| Capability | One line | Command |
+|---|---|---|
+| Pane | One lane each for this turn's gate notices (first three lines of each), edited files and tool calls, plus a separate bucket for subagents; opens by itself at session start (terminals ≥144 columns), run again to close | `/lanes` |
+| Summary line | When the turn has activity, one line above the prompt: gates (blocks) · files edited · tool calls · subagents | no command |
+| Text-only transcript | Tool-call rows are not drawn in the conversation (running ones included) and gate feedback shrinks to one dim line; toggle back to see them | `/lanes-show` |
+| Gate relay (on by default) | For Stop-hook blocks and additional context, the transcript keeps one short line and the full text goes to the model as a session row the model can read but the person does not see; custodiet's Stop gate recognises that row and does not treat it as a new user turn | `/lanes-relay` |
+| Long commands to background (on by default) | In the main session, foreground Bash / PowerShell timeouts are capped at 10 seconds, so a long command moves to the background instead of blocking the conversation; subagents are not capped | no command |
+| Switches for the model | The model can call `mcp__lanes__control` to flip the three settings above (relay / showAll / autoBg) | no command |
 
 ## License
 

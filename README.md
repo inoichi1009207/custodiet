@@ -7,87 +7,7 @@
 **custodiet** 是给 Claude Code 的「收尾闸 + 宪法法典制」治理系统:agent 每次说「做完了」时,Stop hook 对本轮的工具调用记录跑确定性判据,说过的事没在记录里发生就拦;每条阻断规则都要指向一条人签过的法条。
 **lanes** 是它的配套界面:把闸的提示、工具调用、改过的文件从输出框里分出去,各进一道。
 
-本仓同时是一个 Claude Code 插件市场(`.claude-plugin/marketplace.json`)。
-
-| 组件 | 当前形态 | 怎么装 |
-|---|---|---|
-| custodiet | 闸脚本 + 示例宪法/法典 + 红队 agent + 拷贝模式安装器。**还不是插件** | `node scripts/custodiet-init.mjs --target <仓> --mode copy` |
-| lanes | Claude Code 插件(mod:带 hooks 模块),在 `plugins/lanes/` | `/plugin install lanes --marketplace inoichi1009207/custodiet` |
-
-## 安装
-
-### custodiet(拷贝模式)
-
-前提:node ≥ 20;目标是一个 **git 仓的根目录**(脚本不会替你 `git init`)。
-
-```bash
-git clone https://github.com/inoichi1009207/custodiet
-node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
-```
-
-它做的事:
-
-- 把闸件(`scripts/hook-stop-closure.mjs`、`scripts/batch-goal.mjs`、`scripts/lib/` 下的引擎件)、示例宪法 `AGENTS.md`、示例法典 `docs/laws/collab.md` 与 `docs/laws/reporting.md`、`docs/noun-diary.md`、红队 agent `.claude/agents/_gate-bypass-hunter.md` 拷进目标仓,并生成 `CLAUDE.md`(内容为 `@AGENTS.md`)。
-- 把 `Stop` 与 `SubagentStop` 两个 hook 合并进目标的 `.claude/settings.json`(按命令去重)。
-- 把闸的运行时台账路径追加进目标的 `.gitignore`。
-- **已存在的文件一律不覆盖**:内容不同时写旁件 `<名>.custodiet<扩展名>`,stdout 末行的 JSON 清单逐个报出。不提交、不联网、不碰 `~/.claude/`。
-
-装完以后:
-
-1. 在目标仓里自检:`node --no-warnings scripts/hook-stop-closure.mjs --self-test`。
-   已知:有 2 条 I 类用例读的是目标仓**真实的 git 历史**,装闸件还没提交、或装闸那次提交正好是 HEAD 时会红;之后再有一次提交即转绿。
-2. **装完新开会话再提交。** 新写入的红队 agent 能否在同一会话里被调起没有实测;而装闸的提交会触发 P 项,P 在闸引擎文件上只认这个 agent。新开会话可以绕开这个没测过的情形。
-
-目前的限制:
-
-- 文本类规则的判据是中文句式,目前只适用于用中文协作的仓。英文仓里这些规则不会误拦,但也不会响。
-- 插件安装方式还没做:`/plugin install custodiet` 现在**装不了**,`--mode plugin` 会以退出码 5 拒绝。
-- 不随安装器拷出的开发件:`scripts/coverage-check.mjs`、`scripts/gate-migrate-check.mjs`、`scripts/lib/ledger-anchor.mjs`。它们只在本仓里能用。
-
-### lanes(插件市场)
-
-在 Claude Code 会话里(需要 Claude Code v2.1.275 或更高):
-
-```text
-/plugin install lanes --marketplace inoichi1009207/custodiet
-```
-
-在终端里(需要 v2.1.292 或更高):
-
-```bash
-claude plugin install lanes --marketplace inoichi1009207/custodiet
-```
-
-也可以分两步:先 `/plugin marketplace add inoichi1009207/custodiet`,再 `/plugin install lanes@custodiet`。
-第三方市场默认不自动更新,更新用 `claude plugin update lanes@custodiet`。
-lanes 的界面文字目前是中文;本仓在 Claude Code 2.1.295 上跑过它的测试(`claude plugin test plugins/lanes`)。
-
-## 能力与命令
-
-### custodiet
-
-| 能力 | 一句话 | 命令 |
-|---|---|---|
-| 收尾闸 | Stop 时对本轮的工具调用记录跑 26 条引擎规则 + 2 条内建规则,命中阻断规则就不让本轮结束 | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
-| 批级完成条件 | 开工先立可核的验收条件,条件可带机器判据;`--clear` 时自己跑判据,不过即拒清 | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "成片已出" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
-| 规则验收 | 每条规则的正反例 + 变异验收,变异杀不死的用例不许上线(在本仓里跑) | `npm run gate:accept` |
-| 台账完整性链 | 报警分母、误报账、批目标史三份台账带行级 hash 链,改写/插行/删中间行会红 | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
-| 外部锚(本仓内) | 把台账的前缀指纹快照到 `~/.custodiet/`,锚点之前的改写/截断会红;担保边界见下文 | `node scripts/lib/ledger-anchor.mjs snapshot` |
-| 逃生口 | 每条阻断规则可单独关(P 项刻意没有) | `STOP_CLOSURE_BLOCK_<id>=0` |
-| 红队 agent | 改了闸引擎文件后,用它找「怎样不被这条规则拦住」,每条绕法带最小夹具 | 会话里调用子代理 `_gate-bypass-hunter` |
-
-批级完成条件的次序:武装 → 干活 → 逐条写「条件N: 达成/未达成/不适用」→ **提交** → 最后才 `node --no-warnings scripts/batch-goal.mjs --clear`。先 `--clear` 再提交会被 K0 拦。
-
-### lanes
-
-| 能力 | 一句话 | 命令 |
-|---|---|---|
-| 面板 | 本轮的闸提示(每条画前三行)、改过的文件、工具调用各一道,子代理的另记一桶;会话开始时自动打开(终端 ≥144 列),再敲一次关闭 | `/lanes` |
-| 汇总行 | 本轮有动静时,输入框上方一行:闸几次(阻断几次)· 改文件几个 · 工具几次 · 子代理几个 | 无需命令 |
-| 输出框只留正文 | 不在对话里画工具调用行(运行中的也不画),闸的反馈缩成一行灰字;要看原样就切回 | `/lanes-show` |
-| 闸转投(默认开) | Stop hook 的拦截与附加上下文:输出框只留一行短句,全文以模型看得见、人看不见的会话行附给模型;custodiet 收尾闸认得这一行,不会把它当成新的用户发言 | `/lanes-relay` |
-| 长命令转后台(默认开) | 主会话里前台 Bash / PowerShell 的超时压到 10 秒,超过就自动转后台,不再堵住对话;子代理不压 | 无需命令 |
-| 给模型的开关 | 模型可调 `mcp__lanes__control` 切换上面三项(relay / showAll / autoBg) | 无需命令 |
+想直接装:跳到 [交给你的 agent](#交给你的-agent)。下面先讲它为什么存在、逮什么。
 
 ## 为什么需要它
 
@@ -109,12 +29,6 @@ lanes 的界面文字目前是中文;本仓在 Claude Code 2.1.295 上跑过它�
 
 引擎的 26 条规则读的是**结构化上下文**:只取 assistant 文本块与 `tool_use` **入参**——工具**输出**进不了它们的证据窗,所以「读到一个提到 `git commit` 的文件」不可能被算成「提交过」(这个攻击形态本身就是一条回归用例)。仅存两条未迁入引擎的内建规则(A 委派闭环、R 完成时陈述)仍扫含工具输出的全文,这条天花板登记在它们的头注里。
 
-## 宪法法典制
-
-- 每条规则都带一个 `law:` 锚点,指回一份人签过的规范条款(如 J 项 → `AGENTS.md#承重规则的载体门槛`);引擎在装载期与自测里核锚点可解析。没有法源的规则是无主判据,谁都可以删。
-- 示例宪法 `AGENTS.md` 放每会话默认动作、决策边界、永久红线这类短句,并标明它是哪条规则的法源;细则住示例法典 `docs/laws/collab.md`、`docs/laws/reporting.md`。
-- 安装器拷过去的这三份是**示例**:你的仓要换成你自己签过的条款,锚点跟着改。
-
 ## 它逮什么(28 条规则选摘:26 条引擎 + 2 条内建;以 `gate:accept` 输出为准,手写计数会漂)
 
 - **B / R——承诺 vs 行动**:「我这就去改 X」/「已修 X」而本轮动作面上没有 X ⇒ 拦。将来时的承诺与完成时的陈述分开两条规则。
@@ -128,6 +42,12 @@ lanes 的界面文字目前是中文;本仓在 Claude Code 2.1.295 上跑过它�
 0.4.2 起不再带 CW(收尾时点复查并发写会话)——并发写改由 git worktree/分支隔离,见 [CHANGELOG](CHANGELOG.md)。
 
 完整巡览与建造顺序:[`docs/playbook.md`](docs/playbook.md)(建闸作业本,写给 agent 照着做:每个建造步带产物形状、可执行检查点和当初的事故记录)。
+
+## 宪法法典制
+
+- 每条规则都带一个 `law:` 锚点,指回一份人签过的规范条款(如 J 项 → `AGENTS.md#承重规则的载体门槛`);引擎在装载期与自测里核锚点可解析。没有法源的规则是无主判据,谁都可以删。
+- 示例宪法 `AGENTS.md` 放每会话默认动作、决策边界、永久红线这类短句,并标明它是哪条规则的法源;细则住示例法典 `docs/laws/collab.md`、`docs/laws/reporting.md`。
+- 安装器拷过去的这三份是**示例**:你的仓要换成你自己签过的条款,锚点跟着改。
 
 ## 闸自己也被闸
 
@@ -175,6 +95,102 @@ lanes 的界面文字目前是中文;本仓在 Claude Code 2.1.295 上跑过它�
 完整教程在 [`docs/playbook.md`](docs/playbook.md) 第 3–4 步。
 
 **战报数字审计过吗?** 是作者自己的台账(git log、报警台账、债务表)。作业本里明确标注「作者自述」,请按读事后复盘的方式读。
+
+## 交给你的 agent
+
+上面是写给人看的。往下的「怎么用」写给 agent 照着做:安装步骤、要跑的自检、每条命令的确切写法,都按机器能照抄的方式写。
+
+最省事的用法是把这个仓的地址交给你的 Claude Code,让它自己读、自己装:
+
+```text
+读 https://github.com/inoichi1009207/custodiet 的 README「怎么用」一节,把 custodiet 装进当前仓(拷贝模式),再装 lanes 插件;装完跑自检,把 stdout 末行的 JSON 清单和自检结果报给我。
+```
+
+装完以后,示例宪法 `AGENTS.md` 和示例法典要换成你自己签过的条款(见上文「宪法法典制」)。这一步得你来做,agent 替你签不了。
+
+## 怎么用(写给 agent)
+
+本仓同时是一个 Claude Code 插件市场(`.claude-plugin/marketplace.json`)。
+
+| 组件 | 当前形态 | 怎么装 |
+|---|---|---|
+| custodiet | 闸脚本 + 示例宪法/法典 + 红队 agent + 拷贝模式安装器。**还不是插件** | `node scripts/custodiet-init.mjs --target <仓> --mode copy` |
+| lanes | Claude Code 插件(mod:带 hooks 模块),在 `plugins/lanes/` | `/plugin install lanes --marketplace inoichi1009207/custodiet` |
+
+### 安装
+
+#### custodiet(拷贝模式)
+
+前提:node ≥ 20;目标是一个 **git 仓的根目录**(脚本不会替你 `git init`)。
+
+```bash
+git clone https://github.com/inoichi1009207/custodiet
+node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
+```
+
+它做的事:
+
+- 把闸件(`scripts/hook-stop-closure.mjs`、`scripts/batch-goal.mjs`、`scripts/lib/` 下的引擎件)、示例宪法 `AGENTS.md`、示例法典 `docs/laws/collab.md` 与 `docs/laws/reporting.md`、`docs/noun-diary.md`、红队 agent `.claude/agents/_gate-bypass-hunter.md` 拷进目标仓,并生成 `CLAUDE.md`(内容为 `@AGENTS.md`)。
+- 把 `Stop` 与 `SubagentStop` 两个 hook 合并进目标的 `.claude/settings.json`(按命令去重)。
+- 把闸的运行时台账路径追加进目标的 `.gitignore`。
+- **已存在的文件一律不覆盖**:内容不同时写旁件 `<名>.custodiet<扩展名>`,stdout 末行的 JSON 清单逐个报出。不提交、不联网、不碰 `~/.claude/`。
+
+装完以后:
+
+1. 在目标仓里自检:`node --no-warnings scripts/hook-stop-closure.mjs --self-test`。
+   已知:有 2 条 I 类用例读的是目标仓**真实的 git 历史**,装闸件还没提交、或装闸那次提交正好是 HEAD 时会红;之后再有一次提交即转绿。
+2. **装完新开会话再提交。** 新写入的红队 agent 能否在同一会话里被调起没有实测;而装闸的提交会触发 P 项,P 在闸引擎文件上只认这个 agent。新开会话可以绕开这个没测过的情形。
+
+目前的限制:
+
+- 文本类规则的判据是中文句式,目前只适用于用中文协作的仓。英文仓里这些规则不会误拦,但也不会响。
+- 插件安装方式还没做:`/plugin install custodiet` 现在**装不了**,`--mode plugin` 会以退出码 5 拒绝。
+- 不随安装器拷出的开发件:`scripts/coverage-check.mjs`、`scripts/gate-migrate-check.mjs`、`scripts/lib/ledger-anchor.mjs`。它们只在本仓里能用。
+
+#### lanes(插件市场)
+
+在 Claude Code 会话里(需要 Claude Code v2.1.275 或更高):
+
+```text
+/plugin install lanes --marketplace inoichi1009207/custodiet
+```
+
+在终端里(需要 v2.1.292 或更高):
+
+```bash
+claude plugin install lanes --marketplace inoichi1009207/custodiet
+```
+
+也可以分两步:先 `/plugin marketplace add inoichi1009207/custodiet`,再 `/plugin install lanes@custodiet`。
+第三方市场默认不自动更新,更新用 `claude plugin update lanes@custodiet`。
+lanes 的界面文字目前是中文;本仓在 Claude Code 2.1.295 上跑过它的测试(`claude plugin test plugins/lanes`)。
+
+### 能力与命令
+
+#### custodiet
+
+| 能力 | 一句话 | 命令 |
+|---|---|---|
+| 收尾闸 | Stop 时对本轮的工具调用记录跑 26 条引擎规则 + 2 条内建规则,命中阻断规则就不让本轮结束 | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
+| 批级完成条件 | 开工先立可核的验收条件,条件可带机器判据;`--clear` 时自己跑判据,不过即拒清 | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "成片已出" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
+| 规则验收 | 每条规则的正反例 + 变异验收,变异杀不死的用例不许上线(在本仓里跑) | `npm run gate:accept` |
+| 台账完整性链 | 报警分母、误报账、批目标史三份台账带行级 hash 链,改写/插行/删中间行会红 | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
+| 外部锚(本仓内) | 把台账的前缀指纹快照到 `~/.custodiet/`,锚点之前的改写/截断会红;担保边界见下文 | `node scripts/lib/ledger-anchor.mjs snapshot` |
+| 逃生口 | 每条阻断规则可单独关(P 项刻意没有) | `STOP_CLOSURE_BLOCK_<id>=0` |
+| 红队 agent | 改了闸引擎文件后,用它找「怎样不被这条规则拦住」,每条绕法带最小夹具 | 会话里调用子代理 `_gate-bypass-hunter` |
+
+批级完成条件的次序:武装 → 干活 → 逐条写「条件N: 达成/未达成/不适用」→ **提交** → 最后才 `node --no-warnings scripts/batch-goal.mjs --clear`。先 `--clear` 再提交会被 K0 拦。
+
+#### lanes
+
+| 能力 | 一句话 | 命令 |
+|---|---|---|
+| 面板 | 本轮的闸提示(每条画前三行)、改过的文件、工具调用各一道,子代理的另记一桶;会话开始时自动打开(终端 ≥144 列),再敲一次关闭 | `/lanes` |
+| 汇总行 | 本轮有动静时,输入框上方一行:闸几次(阻断几次)· 改文件几个 · 工具几次 · 子代理几个 | 无需命令 |
+| 输出框只留正文 | 不在对话里画工具调用行(运行中的也不画),闸的反馈缩成一行灰字;要看原样就切回 | `/lanes-show` |
+| 闸转投(默认开) | Stop hook 的拦截与附加上下文:输出框只留一行短句,全文以模型看得见、人看不见的会话行附给模型;custodiet 收尾闸认得这一行,不会把它当成新的用户发言 | `/lanes-relay` |
+| 长命令转后台(默认开) | 主会话里前台 Bash / PowerShell 的超时压到 10 秒,超过就自动转后台,不再堵住对话;子代理不压 | 无需命令 |
+| 给模型的开关 | 模型可调 `mcp__lanes__control` 切换上面三项(relay / showAll / autoBg) | 无需命令 |
 
 ## License
 
