@@ -15,6 +15,8 @@
 
 这些数字衡量的是论文自己的统计分类器,**不衡量本仓**。custodiet 是另一类方法:对工具调用记录跑确定性谓词,不用训练数据,也没在论文的基准上评测过。论文支持的是一个方向——轻量、领域专用的检测比 LLM 裁判更适合当主信号——不是本仓的具体做法;它还明说自己的检测器只是分诊信号、不能自主当闸,开放式代码生成上的情况仍是开放问题。
 
+和本仓路线直接同类的是另外两篇 2026 年的论文,都对 agent 的轨迹做**确定性**检查。[arXiv 2608.02464](https://arxiv.org/abs/2608.02464) 在统计监控之外加了一层确定性核验——用 agent 实际收到的工具结果重算它报告的结果,并核对该调的工具都调了;摘要原文:*"Head-to-head it catches 60% of failures (96% with the coverage check) at 0 of 63 false positives against the monitor's 54% at 17%"*,在 1825 个正常运行上一次没误报。[AgentLTL](https://arxiv.org/abs/2607.02599)(arXiv 2607.02599)用时序逻辑在工具调用轨迹上写流程规则,原文:*"It yields a deterministic, judge-free compliance score."*;规则可以在工具执行前拦截,「拦截 + 提示」让 7 个模型里 5 个的合规率上升。两篇都在各自的基准上测,核的东西也和本仓不同(前者核数值复算与必需调用,本仓核「说做过的事有没有真做」),所以它们同样只支持方向,不衡量本仓。
+
 上游:「agent 忽略失败测试、伪造成功报告」的 issue 被官方标为 **closed as not planned**([anthropics/claude-code#2969](https://github.com/anthropics/claude-code/issues/2969))。
 
 <p>
