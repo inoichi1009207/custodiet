@@ -149,8 +149,9 @@ What it does:
 
 After installing:
 
-1. Self-test in the target: `node --no-warnings scripts/hook-stop-closure.mjs --self-test`. Two I-rule cases read the target's real git history: they are red while the gate files are uncommitted or the install commit is HEAD, and turn green after one more commit.
-2. Open a new session before committing. The install commit triggers P, and on gate-engine files P accepts only the red-team agent; a newly written agent is guaranteed to be callable only in a new session.
+1. Install the parser for write-effect analysis: `npm --prefix scripts/gate-deps install` (tree-sitter-bash, kept in that subdirectory; your repo's `package.json` is untouched). Without it the gate still runs: I / J fall back to a coarser older judgment of which files a Bash command writes, with more false blocks and more misses.
+2. Self-test in the target: `node --no-warnings scripts/hook-stop-closure.mjs --self-test`. Two I-rule cases read the target's real git history: they are red while the gate files are uncommitted or the install commit is HEAD, and turn green after one more commit.
+3. Open a new session before committing. The install commit triggers P, and on gate-engine files P accepts only the red-team agent; a newly written agent is guaranteed to be callable only in a new session.
 
 Limits:
 

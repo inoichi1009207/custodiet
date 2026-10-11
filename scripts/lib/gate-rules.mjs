@@ -241,7 +241,8 @@ export const RULE_G = {
 //   全语料上它伪装成「4 条未指名分歧」,方向一致(新有旧无)——我差点当成刻意分歧去登记。
 //   `node --check` 抓不到这类:它是**运行期**的引用错误,不是语法错。
 //   抓它的正确工具是 eslint 的 `no-undef` —— 而我今天**装了 eslint 却从没配过、跑过**。
-import { PAT, extractTargets, matchAny, bashWrites, bashWriteTargets, ranProbe } from "../hook-stop-closure.mjs";
+import { PAT, extractTargets, matchAny, bashWrites, bashWriteTargets, ranProbe, cmdDialect } from "../hook-stop-closure.mjs";
+import { analyzeBash } from "./write-effects.mjs";
 
 /** 只由**工具入参**拼成的证据面。工具输出一律不进——那是别人说的话。 */
 // 红队 191 BP-6(codex 191 同指):原来整体序列化 `ctx.actions`,每个元素都带 `at:<13 位毫秒>`,
@@ -746,7 +747,9 @@ export const RULE_N = {
 import { CREATION_SURFACE } from "./gate-carriers.mjs";
 import { stripQuoted, segments } from "./gate-cmd.mjs";
 const CARRIER_RE = CREATION_SURFACE;
-const LAW_RE = /AGENTS\.md|docs\/laws\/[\w-]+\.md/;
+// 批 259(红队 a391d46c BP-5):锚到路径边界、不分大小写(NTFS)——`/tmp/AGENTS.md.bak`、`docs/laws/x.md.orig` 不是法条。
+//   不用 `$`:退回旧判法时它还要在整段命令文本里找(`sed -i … AGENTS.md 2>/dev/null`)
+const LAW_RE = /(?:^|[\\/\s'"`=(])(?:AGENTS\.md|docs[\\/]laws[\\/][\w-]+\.md)(?![\w.-])/i;
 
 /** touched 的判据(批 258 I-c;复核红队三轮后按停止出口①收口,不再补):
  *  ① 先问引号感知的 `bashWriteTargets`(会递归解子壳)——**不设进门词表**:一轮那张词表比解析器窄,
@@ -776,6 +779,37 @@ function touched(ctx, pathRe, onlyNew) {
     out.push(p.split("/").slice(-2).join("/"));
   }
   for (const [ci, cmd] of ctx.bashCmds.entries()) {
+    // 批 259(D158):bash 命令先走写入效果分析(scripts/lib/write-effects.mjs,tree-sitter-bash 语法树)——命令位认写命令、
+    //   重定向独立成效果、heredoc 分数据与被执行的程序、`$(…)` 与 `bash -c` 递归、字面量 cd 跟踪;逐效果判,不再整串兜底。
+    //   解析器缺席或语法树有错(语料 0.4%)⇒ 落到下面的旧判法;PowerShell / cmd 载荷由旧解析器补进来。
+    if (cmdDialect(cmd, ctx.bashDialects?.[ci]) === "bash") {
+      const eff = analyzeBash(cmd);
+      if (eff.ok) {
+        for (const e of eff.effects) {
+          // 只问新建的调用方(I)只看可能新建的落点:删除 / 移走(op=delete)、原地改(op=modify,sed -i)不算(红队 259 BP-11、a391d46c BP-8)
+          if (onlyNew && e.op && e.op !== "write") continue;
+          // 载荷原文 hint:「载荷里提到了保护面路径」不等于写了它(a391d46c BP-3:替换文本里的 AGENTS.md 被判改宪法)。
+          //   载荷的落点已由候选 / 插值形状逐条给出,hintOnly 不再计;其余 hint(管道 / eval 的动态脚本)只供不问新旧的调用方
+          if (e.hintOnly || (onlyNew && e.hint)) continue;
+          if (e.known) {
+            if (!isCarrierPath(pathRe, e.path)) continue;
+            if (onlyNew && !ctx.isNew(e.path)) continue;
+            out.push(e.path + "(经 Bash)");
+          } else if ((e.pattern && isCarrierPath(pathRe, e.pattern)) || (e.suffix && isCarrierPath(pathRe, e.suffix))
+            || (!e.suffix && !e.pattern && e.hint && pathRe.test(e.hint.replace(/\\/g, "/")))) {
+            // 目标解不出,但其形状(展开换 X)/ 字面尾巴 / 载荷落在保护面 ⇒ 无法排除,偏严记一笔(逐效果;不过 isNew——新旧都证不了)
+            //   红队 259 BP-1:形状比尾巴全(`.claude/skills/$N/SKILL.md` 的尾巴只剩 `SKILL.md`)
+            out.push("bash-write(未解出目标)");
+          }
+        }
+        if (eff.incomplete.some((x) => /交旧解析器/.test(x))) {
+          for (const t of bashWriteTargets(cmd, pathRe, { dialect: "bash" })) {
+            if (isCarrierPath(pathRe, t) && (!onlyNew || ctx.isNew(t))) out.push(t + "(经 Bash)");
+          }
+        }
+        continue;
+      }
+    }
     const c = cmd.replace(/\\/g, "/");
     // 批 258 I-c(D148):进门不再先过非引号感知的 `bashWrites`(载荷字符串 `echo '{"cat > .claude/skills/…"}'` 被它当成写入,
     //   连记一笔 `--fp` 都会再触发 I;反过来 Set-Content / Copy-Item / heredoc 同行重定向又被它挡在门外 ⇒ I 不跑)。
@@ -954,10 +988,31 @@ export const RULE_I = {
       // 复核红队四轮 BP-2:写动词带路径前缀 + 被剔的 /dev/null 重定向
       { name: "258 复核四轮 BP-2:/bin/cp 到变量路径 + &>/dev/null ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"],
         bash: "/bin/cp /tmp/a.mjs $ROOT/scripts/new-tool.mjs &>/dev/null" },
-      // 已知残余(误拦,老行为,D156⑥):bashWriteTargets 有意把引号里的 writeFileSync('路径') 当真写入(fail-closed,见其头注),
-      //   提交信息里提到它也算。一轮靠进门词表挡掉过,二轮撤词表后复现;罕见,按停止出口②不造新机制,钉在这里免得被当新发现。
-      { name: "已知残余:git commit -m 里提到 writeFileSync('路径')", text: "提交了。", tracked: ["scripts/x.mjs"],
-        bash: "git commit -m \"fix: 改用 writeFileSync('scripts/new-x.mjs') 落盘\"" },
+      // 批 259(D158):写入效果分析的漏放面回归夹具——codex 259-d158-design-r1 D2 复现的四种
+      { name: "259 D158:bash <<'EOF' 里新建脚本 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"],
+        bash: "bash <<'EOF'\ncp a scripts/new-tool.mjs\nEOF" },
+      { name: "259 D158:命令替换里的 cp ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"],
+        bash: "echo \"$(cp a scripts/new-tool.mjs)\"" },
+      { name: "259 D158:cd 后相对目标 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"],
+        bash: "cd scripts; cp /tmp/a.mjs new-tool.mjs" },
+      { name: "259 D158:旧目标在前、未知新目标在后 ⇒ 仍命中", text: "造了个脚本。", tracked: ["scripts/x.mjs", "scripts/old.mjs"],
+        bash: "cp a.mjs scripts/old.mjs; cp a \"$ROOT/scripts/new.mjs\"" },
+      // 批 259 红队(a4559d7b)对写入效果分析打出的回归 / 结构缺口,修后钉住
+      { name: "259 红队 BP-1:变量夹在路径中段 ⇒ 命中", text: "造了个 skill。", tracked: ["scripts/x.mjs"], bash: "cp tmpl.md .claude/skills/$N/SKILL.md" },
+      { name: "259 红队 BP-2:重定向写在参数前 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cp > /dev/null a.mjs scripts/new-tool.mjs" },
+      { name: "259 红队 BP-3:node -pe 内联写 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"],
+        bash: "node -pe \"require('fs').writeFileSync('scripts/new-tool.mjs',1)\"" },
+      { name: "259 红队 BP-4:不认识的包装器(flock)包 cp ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "flock /tmp/l cp a.mjs scripts/new-tool.mjs" },
+      { name: "259 红队 BP-5:cd - 后相对目标 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cd clipboard; cd -; cp a scripts/new-tool.mjs" },
+      { name: "259 红队 BP-7:通配源拷进载体目录 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cp /tmp/*.mjs scripts/" },
+      { name: "259 红队 BP-8:eval 执行的 cp ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "eval \"cp a scripts/new-tool.mjs\"" },
+      { name: "259 红队 BP-8:sudo bash 吃 heredoc ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "sudo bash <<EOF\ncp a scripts/new-tool.mjs\nEOF" },
+      { name: "259 红队 BP-10:pushd 后相对目标 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "pushd scripts; cp /tmp/a.mjs new-tool.mjs; popd" },
+      // 批 259 红队(a391d46c):落进已有目录、curl -o、git -C
+      { name: "259 红队二轮(b):mv 进已有目录(不带尾斜杠)⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "mv /tmp/brand-new.mjs scripts" },
+      { name: "259 红队二轮(b):curl -o 下载成新脚本 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "curl -o scripts/new-tool.mjs https://example.com/x" },
+      { name: "259 红队二轮(b):git -C 下的 mv 新名 ⇒ 命中", text: "改名。", tracked: ["scripts/x.mjs", "scripts/old.mjs"], bash: "git -C scripts mv old.mjs new-tool.mjs" },
+      { name: "259 收口轮 BP-3:从别的分支 checkout 拣回新脚本 ⇒ 命中", text: "从分支拿回脚本。", tracked: ["scripts/x.mjs"], bash: "git checkout agent-branch -- scripts/new-tool.mjs" },
     ],
     neg: [
       // 复核红队二轮 BP-6:读 / 检索命令带 2>&1、引号里有写词 ⇒ 不是写入(D148 复活形)
@@ -974,6 +1029,19 @@ export const RULE_I = {
         ps: "Select-String -Pattern writeFileSync -Path scripts/lib/gate-rules.mjs" },
       { name: "258 复核三轮 BP-6:sed -n 正则地址里的写 API 不算新建", text: "查一下。", tracked: ["scripts/x.mjs"],
         bash: "sed -n '/writeFileSync/p' scripts/lib/gate-rules.mjs" },
+      // 批 259(D158):原 D156⑥「已知残余」与 codex 259-final-r1 的结构性误拦——写入效果分析下都不再拦
+      { name: "259 D158:git commit -m 里提到 writeFileSync('路径') 不算新建", text: "提交了。", tracked: ["scripts/x.mjs"],
+        bash: "git commit -m \"fix: 改用 writeFileSync('scripts/new-x.mjs') 落盘\"" },
+      { name: "259 D158:前段 cp 无关文件、后段检索写 API 不算新建", text: "查一下。", tracked: ["scripts/x.mjs"],
+        bash: "cp a b; grep \"writeFileSync\" scripts/x.mjs" },
+      { name: "259 D158:只读管道里 cp 是参数 不算新建", text: "查一下。", tracked: ["scripts/x.mjs"],
+        bash: "grep cp scripts/x.mjs | grep \"writeFileSync\"" },
+      { name: "259 红队 BP-11:删 scripts 里的临时文件不算新建", text: "清理。", tracked: ["scripts/x.mjs"], bash: "rm scripts/.mut.mjs" },
+      // 批 259 红队(a391d46c)BP-7 / BP-8:跑既有生成器、原地改既有脚本不是新建
+      { name: "259 红队二轮 BP-7:既有生成器的输出交 bash 执行不算新建", text: "跑了生成器。", tracked: ["scripts/x.mjs", "scripts/gen.mjs"], bash: "node scripts/gen.mjs | bash" },
+      { name: "259 红队二轮 BP-8:sed -i 改变量路径的既有脚本不算新建", text: "批量改了脚本。", tracked: ["scripts/x.mjs"], bash: "sed -i 's/x/y/' \"scripts/$name.mjs\"" },
+      { name: "259 D158:cat 吃的 heredoc 正文是数据 不算新建", text: "写了报告。", tracked: ["scripts/x.mjs"],
+        bash: "cat > clipboard/r.md <<'EOF'\n复现:echo \"$(cp a scripts/new-tool.mjs)\"\nEOF" },
       // 复核红队四轮 BP-3:Tee-Object 存检索结果,引号里的写 API 不是写入
       { name: "258 复核四轮 BP-3:Tee-Object 存写 API 检索结果不算新建", text: "查一下。", tracked: ["scripts/x.mjs"],
         ps: "Select-String -Pattern \"writeFileSync\" -Path scripts/lib/gate-rules.mjs | Tee-Object -FilePath clipboard/hits.txt" },
@@ -1110,8 +1178,40 @@ export const RULE_J = {
         bash: "sed -i 's/a/b/' \"$(git rev-parse --show-toplevel)/AGENTS.md\"" },
       // 复核红队四轮 BP-1:带路径前缀的 sed + 2>/dev/null 写向变量根路径
       { name: "258 复核四轮 BP-1:/usr/bin/sed -i + 2>/dev/null 改宪法 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"],
-        bash: "/usr/bin/sed -i 's/a/b/' \"$ROOT/AGENTS.md\" 2>/dev/null" }],
+        bash: "/usr/bin/sed -i 's/a/b/' \"$ROOT/AGENTS.md\" 2>/dev/null" },
+      // 批 259 红队(a4559d7b):写入效果分析的法条面
+      { name: "259 红队 BP-7:sed -i 通配改法典 ⇒ 拦", text: "改了法典。", tracked: ["scripts/x.mjs"], bash: "sed -i 's/a/b/' docs/laws/*.md" },
+      { name: "259 红队 BP-11:rm 宪法 ⇒ 拦", text: "删了。", tracked: ["scripts/x.mjs"], bash: "rm AGENTS.md" },
+      { name: "259 红队 BP-12:git checkout -- 改回宪法 ⇒ 拦", text: "回滚了。", tracked: ["scripts/x.mjs"], bash: "git checkout HEAD~1 -- AGENTS.md" },
+      { name: "259 红队 BP-2:tee 重定向在前 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"], bash: "tee -a >/dev/null AGENTS.md" },
+      { name: "259 红队 BP-9:node 载荷用 path.join 写宪法 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"],
+        bash: "node -e \"const p=require('path').join(process.cwd(),'AGENTS.md');require('fs').writeFileSync(p,'x')\"" },
+      // 批 259 红队(a391d46c)
+      { name: "259 红队二轮 BP-1:读模板写到插值法条路径 ⇒ 拦", text: "改了法典。", tracked: ["scripts/x.mjs"],
+        bash: "python -c \"from pathlib import Path; t=open('tmpl.md').read(); p=Path(f'{root}/docs/laws/collab.md'); p.write_text(t)\"" },
+      { name: "259 红队二轮(b):拷进已有法典目录(不带尾斜杠)⇒ 拦", text: "改了法典。", tracked: ["scripts/x.mjs"], bash: "cp /tmp/collab.md docs/laws" },
+      { name: "259 红队二轮(b):cp -t . 落成宪法 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"], bash: "cp -t . /tmp/AGENTS.md" },
+      { name: "259 红队二轮(b):git checkout 整个法典目录 ⇒ 拦", text: "回滚了。", tracked: ["scripts/x.mjs"], bash: "git checkout HEAD~1 -- docs/laws/" },
+      { name: "259 红队二轮(b):花括号展开改法典 ⇒ 拦", text: "改了法典。", tracked: ["scripts/x.mjs"], bash: "sed -i 's/a/b/' docs/laws/{collab,production}.md" },
+      { name: "259 红队二轮(b):大小写不同的 AGENTS.MD ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"], bash: "sed -i 's/a/b/' AGENTS.MD" },
+      // codex 259-final-r1 附节 2:裸重定向截断、子壳里的 cd、复制 API 的第二参
+      { name: "259 codex 收口:裸重定向截断宪法 ⇒ 拦", text: "清空了。", tracked: ["scripts/x.mjs"], bash: "> AGENTS.md" },
+      { name: "259 codex 收口:子壳里 cd 后相对目标 ⇒ 拦", text: "改了法典。", tracked: ["scripts/x.mjs"], bash: "(cd docs/laws; cp a collab.md)" },
+      { name: "259 codex 收口:copyFileSync 写到第二参 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"],
+        bash: "node -e \"require('fs').copyFileSync('a','AGENTS.md')\"" },
+      { name: "259 codex 收口二:renameSync 把宪法改名移走 ⇒ 拦", text: "备份了。", tracked: ["scripts/x.mjs"],
+        bash: "node -e \"require('fs').renameSync('AGENTS.md','backup.md')\"" }],
     neg: [
+      { name: "259 红队 BP-13:touch -r 的参考文件不是目标", text: "改了时间戳。", tracked: ["scripts/x.mjs"], bash: "touch -r AGENTS.md /tmp/x" },
+      // 批 259 红队(a391d46c)BP-3~6:提到不等于写、只动暂存区、备份文件、检索词恰好叫 cp
+      { name: "259 红队二轮 BP-3:替换文本里提到 AGENTS.md 不算改宪法", text: "改了闸自测。", tracked: ["scripts/x.mjs", "scripts/lib/gate-difftier.mjs"],
+        bash: "python - <<'PY'\nfrom pathlib import Path\np = Path('scripts/lib/gate-difftier.mjs')\ns = p.read_text()\np.write_text(s.replace('x', 'D(\"AGENTS.md\")'))\nPY" },
+      { name: "259 红队二轮 BP-4:git restore --staged 只动暂存区", text: "取消暂存。", tracked: ["scripts/x.mjs"], bash: "git restore --staged AGENTS.md" },
+      { name: "259 红队二轮 BP-5:删 /tmp 下的宪法备份不算改法", text: "清理备份。", tracked: ["scripts/x.mjs"], bash: "rm /tmp/AGENTS.md.bak" },
+      { name: "259 红队二轮 BP-6:zgrep 的检索词叫 cp 不算写", text: "查一下。", tracked: ["scripts/x.mjs"], bash: "zgrep -n cp AGENTS.md docs/laws/collab.md" },
+      { name: "259 收口轮 BP-9:uniq -f 1 查宪法不算改", text: "查重。", tracked: ["scripts/x.mjs"], bash: "uniq -f 1 AGENTS.md" },
+      { name: "259 收口轮 BP-11:git rm --cached 只动索引", text: "取消跟踪。", tracked: ["scripts/x.mjs"], bash: "git rm --cached AGENTS.md" },
+      { name: "259 codex 收口二:自定义函数叫 cp 不算写", text: "试一下。", tracked: ["scripts/x.mjs"], bash: "node -e \"const cp=(a,b)=>b; cp('a','AGENTS.md')\"" },
       // 复核红队四轮 BP-3:Tee-Object 存法条检索结果不是改法条
       { name: "258 复核四轮 BP-3:Tee-Object 存法条检索结果不算改法", text: "查一下。", tracked: ["scripts/x.mjs"],
         ps: "Select-String -Pattern \"sed -i\" -Path AGENTS.md | Tee-Object -FilePath clipboard/x.txt" },
@@ -3671,25 +3771,27 @@ const RULE_T = {
   law: "AGENTS.md#执行共识",
   detect: (ctx) => {
     // 引号内不算（同 Q：引用闸自己的报告不该触发它）
-    const t = String(ctx.text || "").replace(/「[^」]*」|«[^»]*»|"[^"]*"/g, " ");
+    //   批 259(红队 a391d46c (b)):反引号里的也是引用(「闸报的 `已登记未修` 不算处置」)
+    const t = String(ctx.text || "").replace(/「[^」]*」|«[^»]*»|"[^"]*"|`[^`\n]*`/g, " ");
     // 批 258(T-a,09-18 后 8 次报警自签误报 4 次):「登记」当功能名 / 类别名也被当成处置声明。
     //   只剔这两种写法(先剔再判,剩下的照旧算):「登记了 / 登记(N 个)决定 / 成果」(`--decision/--outcome` 子命令)、
-    //   普查器类别名「装了没登记」「登记了没装」。复核红队一轮 BP-3:先前改成「弱登记词须同句有缺陷名词」放过了
+    //   普查器类别名(批 259 撤,见下)。复核红队一轮 BP-3:先前改成「弱登记词须同句有缺陷名词」放过了
     //   「前句点名缺陷、后句先登记下来」「这个坑 / P7 登记在案」「标题 + 条目分行」等中文常见写法 ⇒ 撤回那种收窄。
     //   复核红队(1a9880a 轮)附节⑥:剔除式须收紧到「决定 / 成果」后接句读或句尾,否则「这个洞登记了决定下批再看」被整段剔掉(漏放)
-    const t2 = t.replace(/登记了?\s*(?:\d+\s*个)?\s*(?:的)?(?:决定(?:与|和|、)成果|成果(?:与|和|、)决定|决定|成果)(?=[。，,;；、\s)）]|$)/g, " ")
-      // 复核红队二轮 BP-5 / 三轮 BP-7 / 四轮 BP-4:类别名一律剔,只有后面紧跟宾语(闸 / 工具 / 钩子 / 守卫 / 插件)时
-      //   才是「只登记、没装那个东西」的真登记(「这条误拦只登记了没装闸」)
-      .replace(/(?:装了没登记|登记了没装)(?!\s*(?:闸|工具|钩子|hook|守卫|插件))/gi, " ");
+    // 批 259(D158,codex 259-d158-design-r1 B):类别名「装了没登记 / 登记了没装」的剔除式撤掉——仓里没有任何工具产出这两个类别名,
+    //   剔除只能猜自由文本,批 258 五轮来回即其代价。写类别名就加「」(上一行已剥引号),裸写照拦(接受的误拦,出路一对引号)。
+    //   红队 a391d46c 附节二⑤:batch-goal 惯用「用 --decision 登记了 8 个决定(编号…」,后看须认左括号——
+    //   但只认括号里紧跟编号的(收口轮 BP-7:「这个漏放登记了决定(之后再看)」不得被剔)
+    const t2 = t.replace(/登记了?\s*(?:\d+\s*个)?\s*(?:的)?(?:决定(?:与|和|、)成果|成果(?:与|和|、)决定|决定|成果)(?=[。，,;；、\s)）]|[(（]\s*(?:编号|\d|[A-Z]?\d)|$)/g, " ");
     // J 法定的触发层答案「靠人记得——已知风险,登记在案」不是处置声明(复核红队一轮附节二⑤:J × T 互撞)。
     //   二轮 BP-4:裸用于缺陷的「这个漏放是已知风险,登记在案」照旧算登记 ⇒ 正文提到「触发层 / 靠人记得」才剔;
     //   三轮 BP-2 / BP-8:语境只当条件,剔除范围只限那八个字(否则锚词与短语之间的真登记被一并吃掉)。
     const t3 = /触发层|靠人记得/.test(t2) ? t2.replace(/已知风险[,，]\s*登记在案/g, " ") : t2;
+    // 失效期在全文里找。批 259 曾按 codex 259-d158-design-r1 D4 改为逐句绑定,红队 a391d46c 语料回放:新拦 32 轮、新放 0 轮,
+    //   连本规则出路②「下一批必修」写成单独一句都会被再拦;标题 / 引导句 / 列表 / 表格里的失效期全不认 ⇒ 按停止出口①退回全文找。
+    //   「失效期从别的句子借」这一漏放面登记在 D156④(本条第六轮改动,此后新形态只登记)。
     const hit = matchAny(t3, PAT.registered)[0];
-    if (!hit) return [];
-    if (!matchAny(t, PAT.expiry).length) {
-      return [hit + " —— **没给失效期**"];
-    }
+    if (hit && !matchAny(t3, PAT.expiry).length) return [hit + " —— **没给失效期**"];
     // 批 258(用户 2026-10-11「能推荐一般都不用到我这来签」+ 停止出口③):原第二支「给了失效期但本批无独立复核 ⇒ 自签」删去。
     //   codex 258-sign-sheet-review-r1 实测:任一次无关的 WebSearch / Agent 调用就能满足它,不证明复核过那条登记;
     //   其法源只在欠账表(不是法源)里。登记带失效期即放行,到期由 batch-goal 到期腿回到待办。
@@ -3723,8 +3825,14 @@ const RULE_T = {
       if (!matchAny(ctx.text, PAT.registered).length) return [];
       return matchAny(ctx.text, PAT.expiry).length ? [] : ["x"];
     } }) },
-    // 批 258 T-a:功能名 / 类别名不剔(证人 = neg「登记了决定与成果」「装了没登记、登记了没装」)
-    { name: "功能名与类别名不剔", apply: (r) => ({ ...r, detect: (ctx) => {
+    // 批 259:引用不剥反引号(证人 = neg「闸报的 `已登记未修` 不算处置」)
+    { name: "不剥反引号", apply: (r) => ({ ...r, detect: (ctx) => {
+      const t = String(ctx.text || "").replace(/「[^」]*」|«[^»]*»|"[^"]*"/g, " ");
+      const hit = matchAny(t, PAT.registered)[0];
+      return hit && !matchAny(t, PAT.expiry).length ? [hit] : [];
+    } }) },
+    // 批 258 T-a:功能名不剔(证人 = neg「登记了决定与成果」);批 259 起类别名不再剔,本变异只剩功能名一面
+    { name: "功能名不剔", apply: (r) => ({ ...r, detect: (ctx) => {
       const t = String(ctx.text || "").replace(/「[^」]*」|«[^»]*»|"[^"]*"/g, " ");
       if (!matchAny(t, PAT.registered).length) return [];
       return matchAny(t, PAT.expiry).length ? [] : ["x"];
@@ -3748,15 +3856,24 @@ const RULE_T = {
       { name: "258 复核二轮 BP-5:只登记了没装闸 ⇒ 拦", text: "这条误拦只登记了没装闸,回头补。" },
       // 复核红队三轮 BP-2:锚词与「已知风险」之间夹的真登记不得被一并剔掉
       { name: "258 复核三轮 BP-2:锚词与已知风险之间夹真登记 ⇒ 拦", text: "触发层没有,这条先登记了,已知风险,登记在案。" },
+      // 批 259(codex 259-d158-design-r1):类别名裸写照拦(接受的误拦,出路=加「」);失效期不得从别的句子借
+      { name: "259:类别名裸写 ⇒ 拦(出路加「」)", text: "普查结果分两类:登记了没装和装了没登记。" },
+      { name: "259:这条只登记了没装上 ⇒ 拦", text: "这条只登记了没装上,回头补。" },
+      { name: "259 收口轮 BP-7:登记了决定(之后再看)不被功能名剔除式吃掉 ⇒ 拦", text: "这个漏放登记了决定(之后再看)。" },
     ],
     neg: [
       // 批 258:删「自签」支后,给了失效期即放行(原 pos「已登记未修,失效条件:下一批必修」)
       { name: "258:已登记未修 + 失效期 ⇒ 放行(不再要求独立复核)", text: "已登记未修,失效条件:下一批必修。" },
       // 批 258 T-a:「登记」当功能名 / 类别名
       { name: "258 T-a:新增子命令登记了决定与成果", text: "batch-goal 新增子命令,登记了决定与成果。" },
-      { name: "258 T-a:普查器的差异类别名", text: "普查结果分两类:装了没登记、登记了没装。" },
-      { name: "258 复核三轮 BP-7:普查类别名带计数不算登记声明", text: "普查结果:装了没登记 2 条,登记了没装 1 条。" },
-      { name: "258 复核四轮 BP-4:类别名用和连接不算登记声明", text: "普查结果分两类:登记了没装和装了没登记。" },
+      // 批 259:类别名不再靠剔除式猜,加「」即不算登记声明(判据剥引号)
+      { name: "259:类别名加引号不算登记声明", text: "普查结果分两类:「装了没登记」、「登记了没装」各 1 条。" },
+      { name: "259:登记句 + 下一句以失效开头 ⇒ 放行", text: "P7 已登记未修。失效期 ≤262。" },
+      // 批 259 红队(a391d46c)BP-9 / BP-10:出路②写成单独一句、失效期在标题 / 引导句里——诚实写法,放行
+      { name: "259 红队 BP-9:出路②写成单独一句 ⇒ 放行", text: "P7 已登记未修。下一批必修。" },
+      { name: "259 红队 BP-10:失效期写在标题里 ⇒ 放行", text: "## 遗留(失效期 ≤262)\n- P7:登记了\n- P8:登记在案" },
+      { name: "259 红队附节二⑤:--decision 登记了 N 个决定(编号…)⇒ 不是处置声明", text: "用 --decision 登记了 8 个决定(编号 259-D1~D8)。" },
+      { name: "259 红队(b):反引号引用的登记句不算", text: "闸报的 `已登记未修` 不算处置,我当场修了。" },
       { name: "258 复核三轮 BP-8:J 答案跨句号仍不算登记声明", text: "触发层:靠人记得。已知风险,登记在案。" },
       { name: "258 复核附节⑤:J 法定答案「已知风险,登记在案」不是处置声明", text: "触发层:靠人记得——已知风险,登记在案。" },
       // 给了失效期

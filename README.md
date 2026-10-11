@@ -149,8 +149,9 @@ node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
 
 装完以后:
 
-1. 在目标仓里自检:`node --no-warnings scripts/hook-stop-closure.mjs --self-test`。有 2 条 I 类用例读目标仓的真实 git 历史：闸件还没提交、或装闸那次提交正好是 HEAD 时会红，再有一次提交就转绿。
-2. 新开一个会话再提交。装闸的提交会触发 P 项，而 P 在闸引擎文件上只认红队 agent;新写入的 agent 在新会话里才保证调得起来。
+1. 装写入效果分析的解析依赖:`npm --prefix scripts/gate-deps install`(tree-sitter-bash,装在这个子目录里，不碰你仓的 `package.json`)。不装也能跑:I / J 判「这条 Bash 命令写了哪些文件」时退回较粗的旧判法，误拦与漏放都更多。
+2. 在目标仓里自检:`node --no-warnings scripts/hook-stop-closure.mjs --self-test`。有 2 条 I 类用例读目标仓的真实 git 历史：闸件还没提交、或装闸那次提交正好是 HEAD 时会红，再有一次提交就转绿。
+3. 新开一个会话再提交。装闸的提交会触发 P 项，而 P 在闸引擎文件上只认红队 agent;新写入的 agent 在新会话里才保证调得起来。
 
 限制:
 

@@ -41,6 +41,13 @@ const FILES = [
   "scripts/lib/gate-slice.mjs",
   // gate-rules.mjs 顶部 import 它(P 项按 diff 分档的唯一实现);不随包装 ⇒ 新仓一装闸就崩。
   "scripts/lib/gate-difftier.mjs",
+  // 同理:gate-rules.mjs 顶部 import 它(I / J / G / L 的写入效果分析)。解析依赖 tree-sitter 由 gate-deps 清单另装;
+  //   没装时它报「解析器缺席」,规则退回旧判法,不崩。
+  "scripts/lib/write-effects.mjs",
+  "scripts/gate-deps/package.json",
+  "scripts/gate-deps/package-lock.json",
+  // 自签误报的 codex 盲审;batch-goal --clear 在场才后台发车(需本机有 codex 与 scripts/codex-run.mjs,缺席则只提示)。
+  "scripts/fp-audit.mjs",
   "scripts/lib/ledger-chain.mjs",
   "AGENTS.md",
   "docs/laws/collab.md",

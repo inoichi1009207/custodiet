@@ -37,12 +37,15 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { ledgerAppend } from "./lib/ledger-chain.mjs";
 import { quoteUntrusted } from "./lib/gate-ctx.mjs";
 const JOURNAL = path.join(".claude", ".batch-goal.jsonl");
+// 盲审日志(fpAudit / fpAuditLast 用)。须在顶部定义:--clear / --arm 分支在文件中段执行并 exit,
+//   定义在函数旁边时落在暂时性死区,发车与读结论都会失败(codex 259-final-r1 附节 1 实测)
+const FP_AUDIT_LOG = path.join("clipboard", "codex", "fp-audit-last.log");
 
 // ── 可执行判据(D98-③,2026-09-04 用户「趁这个功夫把闸修了」;同日 codex + grill 双审后加固)──────
 //   `--cond "…" --check "<命令>" [--expect "<子串>" | --expect-re "<正则>"]`:check 挂在**它前面最近的那条** --cond 上。
@@ -993,6 +996,9 @@ if (argv.includes("--clear")) {
     // 批 258 条件 4:收尾自动出一张报警量 × 误报率表(按规则),待修行下一批 --arm 会再列一次
     const rep = fpReport();
     if (rep) console.log("\n── 收尾误报率表 ──\n" + rep.trim());
+    // 2026-10-12:自签误报交 codex 盲审(scripts/fp-audit.mjs)——独立核对由另一个模型做,不靠用户按按钮
+    //   (用户:「有问题不应该自己解决嘛」)。审不了 ⇒ 说出来,不拦结清。
+    fpAudit();
   } catch (e) {
     // ⚠️ 失败必须走 stderr + 非零退出。原实现打 stdout 且 exit 0,
     //   调用方检查 $? 会以为清账成功,而陈旧条件还留在盘上(grill:error-handling 报出)。
@@ -1139,6 +1145,7 @@ if (argv.includes("--arm")) {
   // ── 误报率待修腿(批 258 条件 4)──
   //   误报率 ≥15% 且报警 ≥20 的规则在开工时刻列出,与上面的到期债同一结构点:不靠人记得去翻报表。
   //   报表由 hook-stop-closure `--fp-report --hot` 算(唯一实现);跑不出来 ⇒ 只提示,不拦开工。
+  fpAuditLast();
   const hotRep = fpReport(["--hot"]);
   // 报表自己的完整性告警(台账断链 / 坏行)原样转出——开批只留「待修」行会把它们滤掉(codex 258-cond34-r1 附节)
   for (const l of hotRep.split("\n")) if (/^(🔴|⚠)/.test(l)) console.log(l);
@@ -1148,6 +1155,31 @@ if (argv.includes("--arm")) {
     for (const l of hot) console.log("  " + l.replace(/^待修 /, "").replace(/\s*← 下一批待修\s*$/, ""));
   }
   process.exit(0);
+}
+
+/** 结清时后台发车 scripts/fp-audit.mjs(自签误报的 codex 盲审)。grill 259 F11:同步跑最长约 16 分钟,Bash 工具 2 分钟就转后台,
+ *  结论没人读到、被杀时还留孤儿作业 ⇒ 改为脱离父进程跑,输出写 FP_AUDIT_LOG;下次 --arm 把日志里的结论行打出来(开批必经)。
+ *  脚本缺席 ⇒ 不提(本仓未装);发不了车 ⇒ 说出来。 */
+function fpAudit() {
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "fp-audit.mjs");
+  if (!fs.existsSync(script)) return;
+  try {
+    fs.mkdirSync(path.dirname(FP_AUDIT_LOG), { recursive: true });
+    const fd = fs.openSync(FP_AUDIT_LOG, "w");
+    fs.writeSync(fd, `# 发车 ${new Date().toISOString()}(batch-goal --clear)\n`);
+    const child = spawn(process.execPath, ["--no-warnings", script], { detached: true, stdio: ["ignore", fd, fd], windowsHide: true });
+    child.unref();
+    fs.closeSync(fd);
+    console.log(`\n── 自签误报盲审(codex)──\n已在后台发车(pid ${child.pid}),结论写 ${FP_AUDIT_LOG},下次 --arm 时列出`);
+  } catch (e) { console.log(`⚠ 盲审发不了车(${String(e && e.message || e).slice(0, 160)})`); }
+}
+/** --arm 时转出上一次盲审的结论行(日志没有结论行 ⇒ 说它还没跑完或失败了)。 */
+function fpAuditLast() {
+  let txt; try { txt = fs.readFileSync(FP_AUDIT_LOG, "utf8"); } catch { return; }
+  const lines = txt.split("\n").filter((l) => /^(FP-AUDIT|⚠|  拦对了)/.test(l));
+  const head = (txt.split("\n")[0] || "").replace(/^#\s*/, "");
+  console.log(lines.length ? `── 上一次自签误报盲审(${head})──\n${lines.join("\n")}`
+    : `⚠ 上一次自签误报盲审(${head})日志里没有结论行——还在跑,或中途失败(看 ${FP_AUDIT_LOG})`);
 }
 
 /** 跑 hook-stop-closure `--fp-report [extra…]`,返回 stdout;跑不出 ⇒ 空串,**并说出来**(提示层 fail-open,但不静默——

@@ -195,16 +195,39 @@ function gitNameStatus(git, range) {
  *      `{sha:HEAD, at, files:范围净差, aggregated:true, count}`,见函数内注。
  *  取不到(基点不合法、git 失败/超时)⇒ null ⇒ P 回退命令语法判据(fail-closed,不静默放行),
  *  且 hook 不推进基点(BP-2)。git 可注入(自测)。pathspecs = 闸引擎 pathspec(由 P 提供,与 ENGINE_REL 同一口径)。 */
-/** 批 258 条件 4:按规则的报警量 × 误报率表(纯函数,自测直接调)。误报 = 自签 + 用户加签 − 撤回(按规则 id 扣,不低于 0);
+/** 批 258 条件 4:按规则的报警量 × 误报率表(纯函数,自测直接调)。误报 = 自签 − 撤回(按规则 id 扣,不低于 0;撤回含 codex 盲审判拦对了的);
  *  待修 = 误报率 ≥ 15% 且报警 ≥ 20。按报警量降序。台账行形状:alerts `{ids:[…]}`;ledger `{kind, id}`。 */
+/** 按规则的净误报(批 259,grill F1 / F8):自签 claimed_fp +1;执行方人工撤回(retraction,by≠codex)−1;
+ *  codex 盲审判「拦对了」的**每一笔**(fp_audit 的 ref 去重)−1,该笔若已标「已人工撤回」则不再扣。
+ *  r1 那次 fp-audit 另写过 by:codex 的 retraction 行——现由 fp_audit 推导,那种行不计(否则同一笔扣两次)。
+ *  confirmed_fp(用户加签,已撤)是对已有自签的加签,不另计。 */
+export function fpNetById(ledger) {
+  // codex 259-final-r1 A3:人工撤回也按笔去重——带 ref 的撤回行(或「已人工撤回」标记)每笔只扣一次,
+  //   撤回行写成功、标记行没写成功的半截情形照样认出这一笔已人工撤回,不再被 codex 结论二次扣
+  const fp = {}, manual = new Map(), right = new Map();
+  for (const x of ledger || []) {
+    if (!x || !x.id) continue;
+    if ((x.kind === "fp_audit" && x.verdict === "已人工撤回") || (x.kind === "retraction" && x.by !== "codex")) { if (x.ref) manual.set(x.ref, x.id); }
+    if (x.kind === "fp_audit" && x.ref && x.by === "codex" && x.verdict === "拦对了") right.set(x.ref, x.id);
+  }
+  for (const x of ledger || []) {
+    if (!x || !x.id) continue;
+    if (x.kind === "claimed_fp") fp[x.id] = (fp[x.id] || 0) + 1;
+    else if (x.kind === "retraction" && x.by !== "codex" && !x.ref) fp[x.id] = (fp[x.id] || 0) - 1;   // 老式不带 ref 的撤回:逐行扣(无从去重)
+  }
+  for (const [ref, id] of manual) {
+    // 老式无 ref 撤回已经逐行扣过的那几笔(批 259 迁移补的「已人工撤回」标记 by:fp-audit-migration)不再重复扣
+    const migrated = (ledger || []).some((x) => x && x.kind === "fp_audit" && x.ref === ref && x.by === "fp-audit-migration");
+    if (!migrated) fp[id] = (fp[id] || 0) - 1;
+  }
+  for (const [ref, id] of right) if (!manual.has(ref)) fp[id] = (fp[id] || 0) - 1;
+  return fp;
+}
+
 export function fpTable(alerts, ledger, { minAlerts = 20, minRate = 0.15 } = {}) {
   const per = {}, fp = {};
   for (const a of alerts || []) for (const id of (a && a.ids) || []) per[id] = (per[id] || 0) + 1;
-  for (const x of ledger || []) {
-    if (!x || !x.id) continue;
-    if (x.kind === "claimed_fp" || x.kind === "confirmed_fp") fp[x.id] = (fp[x.id] || 0) + 1;
-    else if (x.kind === "retraction") fp[x.id] = (fp[x.id] || 0) - 1;
-  }
+  for (const [id, d] of Object.entries(fpNetById(ledger))) fp[id] = d;
   return Object.keys(per).map((id) => {
     const f = Math.max(0, fp[id] || 0), rate = per[id] ? f / per[id] : 0;
     return { id, alerts: per[id], fp: f, rate, hot: per[id] >= minAlerts && rate >= minRate };
@@ -4413,6 +4436,22 @@ function selfTest() {
         hp("误报率表:报警 20 次、误报 3 笔(15%)⇒ 进待修", fpTable(al, lg.filter((x) => x.kind !== "retraction")).find((r) => r.id === "S").hot, true);
         hp("误报率表:撤回多于误报 ⇒ 不低于 0", fpTable([{ ids: ["V"] }], [{ kind: "retraction", id: "V" }])[0].fp, 0);
         hp("误报率表:按报警量降序", tb.map((r) => r.id).join(","), "S,K");
+        // 2026-10-12:confirmed_fp 是对已有自签的加签,不另计一笔(原先 K 会计 3)
+        hp("误报率表:加签行不重复计数(K 自签 2 + 加签 1 = 2)", k.fp, 2);
+        // 批 259(grill F1 / F8):撤回按笔推导——codex 判拦对了的每笔扣一次;同笔重复判、旧 by:codex 撤回行都不多扣;
+        //   已人工撤回的那笔不再被 codex 结论二次扣
+        const lg2 = [{ kind: "claimed_fp", id: "V", h: "a" }, { kind: "claimed_fp", id: "V", h: "b" }, { kind: "claimed_fp", id: "V", h: "c" },
+          { kind: "fp_audit", ref: "a", id: "V", by: "codex", verdict: "拦对了" }, { kind: "fp_audit", ref: "a", id: "V", by: "codex", verdict: "拦对了" },
+          { kind: "retraction", id: "V", by: "codex", ref: "a" },
+          { kind: "retraction", id: "V", by: "assistant" }, { kind: "fp_audit", ref: "b", id: "V", verdict: "已人工撤回", by: "fp-audit-migration" },
+          { kind: "fp_audit", ref: "b", id: "V", by: "codex", verdict: "拦对了" }];
+        hp("误报率表:撤回按笔推导,不双扣(3 − 人工 1 − codex 按笔 1 = 1)", fpNetById(lg2).V, 1);
+        // codex 259-final-r1 A3:同笔人工撤两次只扣一次;撤回行写成功、标记行没写成的半截情形不被 codex 结论二次扣
+        const c1 = { kind: "claimed_fp", id: "V", h: "h1" }, c2 = { kind: "claimed_fp", id: "V", h: "h2" };
+        const rr = { kind: "retraction", id: "V", ref: "h1", by: "assistant" }, mm = { kind: "fp_audit", id: "V", ref: "h1", by: "assistant", verdict: "已人工撤回" };
+        const aa = { kind: "fp_audit", id: "V", ref: "h1", by: "codex", verdict: "拦对了" };
+        hp("误报率表:同笔人工撤两次只扣一次", fpNetById([c1, c2, rr, mm, rr, mm]).V, 1);
+        hp("误报率表:人工撤回半截 + codex 拦对了只扣一次", fpNetById([c1, c2, aa, rr]).V, 1);
       }
       // codex 258-cond2-r2:本轮开始时开着的那批的起点
       const T = (h, m, s = 0) => `2026-10-10T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}Z`, ms = (x) => Date.parse(x);
@@ -4839,11 +4878,13 @@ if (argv.includes("--self-test")) process.exit(selfTest());
 //   · 分母 = `.gate-alerts.jsonl`,由 emit() 自动记**每一次**命中(不是只记被抱怨的那些);
 //   · 误报判定**自签有效**(2026-08-22 用户亲裁:「没有这回事,我向来允许你自己修改判据」,
 //     与宪法窄例外③「判据过重可自签修其判据」同源)。codex 原药方是 claimed/confirmed 分权
-//     ——**审计的诊断对 ≠ 药方对,用户签过字的授权赢**,分权撤;`--fp-confirm` 保留为
-//     用户可选的加签通道,不再是生效条件;
+//     ——**审计的诊断对 ≠ 药方对,用户签过字的授权赢**,分权撤;
+//     2026-10-12 用户:「为什么我会有『拦错了』按钮——我还能帮你按?有问题不应该自己解决嘛」⇒ `--fp-confirm`(用户加签)
+//     与 lanes 面板按钮一并撤掉,独立核对改由 `scripts/fp-audit.mjs` 交 codex **盲审**(不给它看我的理由),
+//     判「拦对了」的自动记 retraction(by:codex);批次结清时自动跑;
 //   · `miss_review` = 抽查未命中回合的记录({sampled,found}),发现漏报即撤涉事规则「已验收」身份;
 //   · `--fp-report` 永远打印 RECALL=UNKNOWN:本台账量不了漏报率,「没看到漏报」≠「没有漏报」。
-if (["--fp", "--fp-confirm", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
+if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
   const LEDGER = ".claude/.gate-fp-ledger.jsonl";
   // D1/批 102:走 ledger-chain(接线点二)。CLI 语境写失败=任务失败,loud 退出不静默。
   const put = (o) => {
@@ -4864,22 +4905,28 @@ if (["--fp", "--fp-confirm", "--fp-retract", "--fp-miss", "--fp-report"].include
     if (!id || !reason) { console.error('用法: --fp <规则id> <为什么拦错了>(理由不得为空白)'); process.exit(2); }
     ckId(id);
     put({ kind: "claimed_fp", id, why: reason, by: "assistant" });
-    console.log(`已记 误报:${id}(自签有效,2026-08-22 用户亲裁;--fp-confirm 是可选加签,非生效条件)`);
+    console.log(`已记 误报:${id}(自签有效,2026-08-22 用户亲裁;批次结清时交 codex 盲审,判拦对了自动撤回)`);
   } else if (argv[0] === "--fp-retract") {
     // 批 258 条件 4:撤回一笔自己记错的误报(那次其实拦对了)。台账只追加,撤回是新的一行,报表按规则扣。
-    const [, id, ...why] = argv;
+    // 批 259(grill F1):撤回必须指明撤的是哪一笔(`--ref <那笔 claimed_fp 的 h 前缀>`)——不带 ref 的撤回只按规则扣,
+    //   会被之后的 codex 盲审对同一笔再扣一次。同时补一行 fp_audit「已人工撤回」,那笔不再送审。
+    const ri = argv.indexOf("--ref");
+    const refPfx = ri > 0 ? String(argv[ri + 1] || "") : "";
+    const rest = argv.filter((_, i) => i !== ri && i !== ri + 1 || ri < 0);
+    const [, id, ...why] = rest;
     const reason = why.join(" ").trim();
-    if (!id || !reason) { console.error('用法: --fp-retract <规则id> <为什么那次其实拦对了>(理由不得为空白)'); process.exit(2); }
+    if (!id || !reason) { console.error('用法: --fp-retract <规则id> --ref <那笔误报的 h 前缀> <为什么那次其实拦对了>(理由不得为空白)'); process.exit(2); }
     ckId(id);
-    put({ kind: "retraction", id, why: reason, by: "assistant" });
-    console.log(`已记 撤回:${id}`);
-  } else if (argv[0] === "--fp-confirm") {
-    // 用户可选加签通道(非生效条件)。天花板照旧:进程判不出敲键盘的是谁,靠纪律不靠机制。
-    const [, id, ...why] = argv;
-    if (!id) { console.error("用法: --fp-confirm <规则id> [说明] —— 约定只由用户敲"); process.exit(2); }
-    ckId(id);
-    put({ kind: "confirmed_fp", id, why: why.join(" ").trim(), by: "user" });
-    console.log(`已记 confirmed_fp:${id}`);
+    const claims = (() => { try { return fs.readFileSync(LEDGER, "utf8").split("\n").map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((r) => r && r.kind === "claimed_fp" && r.id === id && r.h); } catch { return []; } })();
+    const hit = refPfx.length >= 6 ? claims.filter((r) => r.h.startsWith(refPfx)) : [];
+    if (hit.length !== 1) {
+      console.error(`--fp-retract 须带 --ref 指明撤哪一笔(h 前缀 ≥6 位,且只匹配一笔)。规则 ${id} 最近的自签:`);
+      for (const r of claims.slice(-6).reverse()) console.error(`  ${r.h.slice(0, 8)}  ${r.ts}  ${String(r.why || "").slice(0, 60)}`);
+      process.exit(2);
+    }
+    put({ kind: "retraction", id, why: reason, by: "assistant", ref: hit[0].h });
+    put({ kind: "fp_audit", ref: hit[0].h, id, verdict: "已人工撤回", why: reason, by: "assistant" });
+    console.log(`已记 撤回:${id} @ ${hit[0].h.slice(0, 8)}(该笔不再送盲审)`);
   } else if (argv[0] === "--fp-miss") {
     const [, sampled, found, ...note] = argv;
     const s = +sampled, f = +found;
@@ -4919,20 +4966,25 @@ if (["--fp", "--fp-confirm", "--fp-retract", "--fp-miss", "--fp-report"].include
     const per = {};
     for (const a of alerts) for (const id of (a.ids || [])) per[id] = (per[id] || 0) + 1;
     const claimed = led.filter((x) => x.kind === "claimed_fp").length;
-    const confirmed = led.filter((x) => x.kind === "confirmed_fp").length;
+    const audits = led.filter((x) => x.kind === "fp_audit");
     const reviews = led.filter((x) => x.kind === "miss_review");
     const sampled = reviews.reduce((n, r) => n + (r.sampled || 0), 0);
     const found = reviews.reduce((n, r) => n + (r.found || 0), 0);
     console.log(`报警分母: ${nAlert} 规则次 / ${alerts.length} 轮` +
       (nAlert ? `(${Object.entries(per).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join(" ")})` : ""));
-    const retracted = led.filter((x) => x.kind === "retraction").length;
-    // 总数与 fpTable 同一算法(codex 258-cond34-r1 断言 3):按规则 id 扣撤回、各自不低于 0 再求和;
-    //   含报警台账里没出现过的规则(否则「误报只在 T、报警只有 S」时表合计 0、总数 1)
-    const perFp = {};
-    for (const x of led) if (x && x.id) perFp[x.id] = (perFp[x.id] || 0) + (x.kind === "retraction" ? -1 : (x.kind === "claimed_fp" || x.kind === "confirmed_fp") ? 1 : 0);
-    const net = Object.values(perFp).reduce((n, v) => n + Math.max(0, v), 0);
-    console.log(`误报: ${net}(自签 ${claimed} + 用户加签 ${confirmed} − 撤回 ${retracted})` +
+    // 人工撤回按笔计(codex 259-final2-r1 附节 3:同笔撤两次原先算式里记 2):带 ref 的按 ref 去重,老式无 ref 的逐行
+    const manRows = led.filter((x) => x.kind === "retraction" && x.by !== "codex");
+    const manualRetracted = new Set(manRows.filter((x) => x.ref).map((x) => x.ref)).size + manRows.filter((x) => !x.ref).length;
+    // 总数与 fpTable 同一算法(fpNetById:按规则扣、各自不低于 0 再求和;含报警台账里没出现过的规则)
+    const net = Object.values(fpNetById(led)).reduce((n, v) => n + Math.max(0, v), 0);
+    // 盲审按笔去重计(grill 259 F12:原数 fp_audit 行数,重试与取证失败都算进「已审」)——每笔取最后一个结论
+    const lastByRef = new Map();
+    for (const x of audits) if (x.ref) lastByRef.set(x.ref, x.verdict);
+    const byV = (v) => [...lastByRef.values()].filter((y) => y === v).length;
+    console.log(`误报: ${net}(自签 ${claimed} − 人工撤回 ${manualRetracted} − 盲审判拦对了 ${byV("拦对了")})` +
       (nAlert ? `  (误报/报警 = ${(net / nAlert * 100).toFixed(1)}%)` : ""));
+    // 2026-10-12:自签误报的独立核对 = codex 盲审(scripts/fp-audit.mjs);未审的笔数照实印,不让「自签」冒充「已核」
+    console.log(`独立盲审(codex): 自签 ${claimed} 笔中已审 ${lastByRef.size}——拦错了 ${byV("拦错了")} / 拦对了 ${byV("拦对了")}(计为撤回)/ 判不出 ${byV("判不出")} / 取证失败 ${byV("取证失败")} / 已人工撤回 ${byV("已人工撤回")}`);
     console.log(`未命中抽查: 已审 ${sampled},发现漏报 ${found}${found > 0 ? " ← 涉事规则不得再称「已验收」" : ""}`);
     console.log(`RECALL=UNKNOWN —— 本台账量不了漏报率;「没看到漏报」≠「没有漏报」`);
     // 批 258 条件 4:按规则的报警量 × 误报率表;误报率 ≥15% 且报警 ≥20 ⇒ 下一批待修(`--hot` 只印待修行,供 batch-goal 开批时列出)

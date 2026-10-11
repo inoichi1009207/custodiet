@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 — 2026-10-12
+
+- **I / J / G / L 判「Bash 命令写了哪些文件」改用语法树**(`scripts/lib/write-effects.mjs`,tree-sitter-bash):在命令位认写命令,重定向单独算;heredoc 分「数据」和「被执行的程序」;`$(…)`、`bash -c`、`eval`、管道喂 shell 递归分析;跟踪 `cd` / `pushd` / `git -C` / `env -C`;删除、移走、原地改分开记,只问新建的规则不看删和改。整串正则兜底撤掉。依赖装在 `scripts/gate-deps/`(`npm --prefix scripts/gate-deps install`);没装或语法树有错时退回旧判法。
+- **自签误报由 codex 盲审**(`scripts/fp-audit.mjs`):`batch-goal --clear` 后台发车,下次 `--arm` 列结论。codex 在临时目录里只看报警当时的规则 / 法条、闸提示和当轮动作,不看执行方理由;判「拦对了」按笔计为撤回。`--fp-confirm`(用户加签)撤掉。`--fp-retract` 须用 `--ref` 指明撤哪一笔。
+- **T**:撤掉类别名剔除式(写类别名加引号即可);反引号里的内容也按引用剥掉。
+- **安装器**随拷 `write-effects.mjs`、`fp-audit.mjs` 与 `gate-deps` 清单。
+- 已知限制:PowerShell / cmd 载荷仍走旧解析器;`cat <<EOF | bash` 解析出错时退回旧判法;解释器载荷里「提到路径 ≠ 写它」只能近似;盲审的读取隔离靠任务件约束。
+
 ## 0.5.1 — 2026-10-11
 
 - **P 项改按 git 事实判「本批有没有承重提交、带没带进闸引擎改动」**:取本会话上次结清以来 HEAD 首父链上每个提交对第一父的改动(merge / cherry-pick 合回同样算),取不到再退回命令语法判据;基点只在事实可得且 P 无命中时推进。worktree 子代理改闸、父侧合回,脚本写文件再 `git add -A` 这些形态因此不再漏。
