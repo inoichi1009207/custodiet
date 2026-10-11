@@ -1,12 +1,22 @@
 # Changelog
 
+## 0.6.1 — 2026-10-12
+
+- **补件**:0.6.0 的盲审硬调 `scripts/codex-run.mjs`,而公开包没带它,照安装步骤装完跑不了盲审。现在随包发布,安装器也拷它。
+- **文档改准**:0.6.0 的说明有几处说过头,下面已改正;已知限制补齐。README 规则数改为 28(26 条引擎 + 2 条内建写成了 26)。
+- 盲审自测不再写死盘符(公开版此前 23/24)。
+
 ## 0.6.0 — 2026-10-12
 
-- **I / J / G / L 判「Bash 命令写了哪些文件」改用语法树**(`scripts/lib/write-effects.mjs`,tree-sitter-bash):在命令位认写命令,重定向单独算;heredoc 分「数据」和「被执行的程序」;`$(…)`、`bash -c`、`eval`、管道喂 shell 递归分析;跟踪 `cd` / `pushd` / `git -C` / `env -C`;删除、移走、原地改分开记,只问新建的规则不看删和改。整串正则兜底撤掉。依赖装在 `scripts/gate-deps/`(`npm --prefix scripts/gate-deps install`);没装或语法树有错时退回旧判法。
-- **自签误报由 codex 盲审**(`scripts/fp-audit.mjs`):`batch-goal --clear` 后台发车,下次 `--arm` 列结论。codex 在临时目录里只看报警当时的规则 / 法条、闸提示和当轮动作,不看执行方理由;判「拦对了」按笔计为撤回。`--fp-confirm`(用户加签)撤掉。`--fp-retract` 须用 `--ref` 指明撤哪一笔。
-- **T**:撤掉类别名剔除式(写类别名加引号即可);反引号里的内容也按引用剥掉。
-- **安装器**随拷 `write-effects.mjs`、`fp-audit.mjs` 与 `gate-deps` 清单。
-- 已知限制:PowerShell / cmd 载荷仍走旧解析器;`cat <<EOF | bash` 解析出错时退回旧判法;解释器载荷里「提到路径 ≠ 写它」只能近似;盲审的读取隔离靠任务件约束。
+- **I / J / G / L 判「Bash 命令写了哪些文件」改用语法树**(`scripts/lib/write-effects.mjs`,tree-sitter-bash):重定向单独算;heredoc 分「数据」和「被执行的程序」;`$(…)`、`bash -c`、`eval`、管道喂 shell 递归分析;跟踪 `cd` / `pushd` / `git -C` / `env -C`(只认字面目录);删除、移走、原地改分开记,只问新建的规则不看删和改。写命令主要在命令位认,不认识的命令另在参数里找写命令名(`mylogger cp a b` 会被当成写)。语法树解析成功时不再用整串正则兜底;解析器没装或语法树有错时整条退回旧判法(含整串兜底)。依赖:`tree-sitter` 与 `tree-sitter-bash`,在目标仓根运行 `npm --prefix scripts/gate-deps install`。
+- **自签误报由 codex 盲审**(`scripts/fp-audit.mjs`,经 `scripts/codex-run.mjs` 调本机 codex CLI):`batch-goal --clear` 后台发车,下次 `--arm` 列结论;每次最多审最新 8 笔,「判不出 / 取证失败」两次后不再送审。codex 在临时目录里看规则快照、闸提示与当轮动作;规则快照取**报警时刻之前最近的提交**,不含未提交改动。台账里执行方写的误报理由会被遮掉,但当轮正文里的辩解仍在任务件里。判「拦对了」按笔计为撤回。`--fp-confirm`(用户加签)撤掉。`--fp-retract` 须用 `--ref` 指明撤哪一笔。
+- **T**:撤掉类别名剔除式。类别名用 `「」`、`«»`、英文双引号或反引号包起来即可(中文 `“”` 与单引号不算);反引号里的内容按引用剥掉。
+- **安装器**随拷 `write-effects.mjs`、`fp-audit.mjs` 与 `gate-deps` 清单(不代装 npm 依赖)。
+- 已知限制:
+  - 解析成功也会漏:纯变量目标(`OUT=AGENTS.md; printf x > "$OUT"`)、外部脚本内部的写入不在分析能力内;`cat <<'EOF' | tee …` 这类 heredoc 后接管道 / `&&` 的写命令目前静默放行。
+  - PowerShell / cmd 顶层命令走旧解析器;嵌在 `bash -c` 里的 `pwsh -Command` 不保证交给旧解析器。
+  - 解释器载荷(node / python)里「提到路径 ≠ 写它」只能近似。
+  - 盲审按「自签之前 3 小时内同规则的最新报警」取证,可能配错那次报警;证据有截断;规则快照不含 `hook-stop-closure.mjs` 里的判据实现;codex 的读取范围靠任务件约束,沙箱不拦。
 
 ## 0.5.1 — 2026-10-11
 

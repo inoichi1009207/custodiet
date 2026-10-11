@@ -38,7 +38,7 @@
 
 ## 它逮什么
 
-共 28 条规则(26 条引擎 + 2 条内建，数目以 `npm run gate:accept` 输出为准)。下面按阶段摘一部分。
+共 30 条规则(28 条引擎 + 2 条内建，数目以 `npm run gate:accept` 输出为准)。下面按阶段摘一部分。
 
 **开工：先立验收条件**
 - **K / K0**:一批活开始前写下机器可核的完成条件(`batch-goal --arm`,可带判据命令);收尾时逐条裁「达成 / 未达成」,没裁完不许结清。
@@ -149,7 +149,7 @@ node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
 
 装完以后:
 
-1. 装写入效果分析的解析依赖:`npm --prefix scripts/gate-deps install`(tree-sitter-bash,装在这个子目录里，不碰你仓的 `package.json`)。不装也能跑:I / J 判「这条 Bash 命令写了哪些文件」时退回较粗的旧判法，误拦与漏放都更多。
+1. 在目标仓根目录装写入效果分析的解析依赖:`npm --prefix scripts/gate-deps install`(`tree-sitter` 与 `tree-sitter-bash`,装进 `scripts/gate-deps/node_modules`,不碰你仓的 `package.json`)。不装也能跑:I / J / G / L 判「这条 Bash 命令写了哪些文件」时退回较粗的旧判法。
 2. 在目标仓里自检:`node --no-warnings scripts/hook-stop-closure.mjs --self-test`。有 2 条 I 类用例读目标仓的真实 git 历史：闸件还没提交、或装闸那次提交正好是 HEAD 时会红，再有一次提交就转绿。
 3. 新开一个会话再提交。装闸的提交会触发 P 项，而 P 在闸引擎文件上只认红队 agent;新写入的 agent 在新会话里才保证调得起来。
 
@@ -180,7 +180,7 @@ claude plugin install lanes --marketplace inoichi1009207/custodiet
 
 | 能力 | 一句话 | 命令 |
 |---|---|---|
-| 收尾闸 | Stop 时对本轮的工具调用记录跑 26 条引擎规则 + 2 条内建规则，命中阻断规则就不让本轮结束 | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
+| 收尾闸 | Stop 时对本轮的工具调用记录跑 28 条引擎规则 + 2 条内建规则，命中阻断规则就不让本轮结束 | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
 | 批级完成条件 | 开工先立可核的验收条件，可带机器判据;`--clear` 时自己跑判据，不过就拒清 | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "成片已出" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
 | 规则验收 | 每条规则的正反例 + 变异验收，变异杀不死的用例不许上线(在本仓里跑) | `npm run gate:accept` |
 | 台账完整性链 | 三份台账带行级 hash 链，改写 / 插行 / 删中间行会红 | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |

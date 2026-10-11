@@ -46,8 +46,10 @@ const FILES = [
   "scripts/lib/write-effects.mjs",
   "scripts/gate-deps/package.json",
   "scripts/gate-deps/package-lock.json",
-  // 自签误报的 codex 盲审;batch-goal --clear 在场才后台发车(需本机有 codex 与 scripts/codex-run.mjs,缺席则只提示)。
+  // 自签误报的 codex 盲审;batch-goal --clear 在场才后台发车。它经 scripts/codex-run.mjs 调本机 codex CLI(只读沙箱);
+  //   没装 codex 时盲审只出一行 ⚠,不拦结清。
   "scripts/fp-audit.mjs",
+  "scripts/codex-run.mjs",
   "scripts/lib/ledger-chain.mjs",
   "AGENTS.md",
   "docs/laws/collab.md",

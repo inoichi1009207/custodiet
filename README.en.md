@@ -38,7 +38,7 @@ Rules read assistant text and the **inputs** of `tool_use` blocks, never tool **
 
 ## What it catches
 
-28 rules in total (26 engine + 2 built-in; `npm run gate:accept` prints the count). A selection, by stage:
+30 rules in total (28 engine + 2 built-in; `npm run gate:accept` prints the count). A selection, by stage:
 
 **Start: set acceptance conditions first**
 - **K / K0**: before a batch of work, write machine-checkable completion conditions (`batch-goal --arm`, optionally with a check command); at the end, rule on each one — met / not met. No clearing until all are ruled on.
@@ -149,7 +149,7 @@ What it does:
 
 After installing:
 
-1. Install the parser for write-effect analysis: `npm --prefix scripts/gate-deps install` (tree-sitter-bash, kept in that subdirectory; your repo's `package.json` is untouched). Without it the gate still runs: I / J fall back to a coarser older judgment of which files a Bash command writes, with more false blocks and more misses.
+1. From the target repo root, install the parser for write-effect analysis: `npm --prefix scripts/gate-deps install` (`tree-sitter` and `tree-sitter-bash`, installed into `scripts/gate-deps/node_modules`; your repo's `package.json` is untouched). Without it the gate still runs: I / J / G / L fall back to a coarser older judgment of which files a Bash command writes.
 2. Self-test in the target: `node --no-warnings scripts/hook-stop-closure.mjs --self-test`. Two I-rule cases read the target's real git history: they are red while the gate files are uncommitted or the install commit is HEAD, and turn green after one more commit.
 3. Open a new session before committing. The install commit triggers P, and on gate-engine files P accepts only the red-team agent; a newly written agent is guaranteed to be callable only in a new session.
 
@@ -180,7 +180,7 @@ Or in two steps: `/plugin marketplace add inoichi1009207/custodiet`, then `/plug
 
 | Capability | In one line | Command |
 |---|---|---|
-| Stop gate | At Stop, runs 26 engine rules + 2 built-in rules over the turn's tool-call record; a blocking hit keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
+| Stop gate | At Stop, runs 28 engine rules + 2 built-in rules over the turn's tool-call record; a blocking hit keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
 | Batch completion conditions | Set checkable acceptance conditions up front, optionally with a check command; `--clear` runs the checks and refuses on failure | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "render done" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
 | Rule acceptance | Positive/negative cases + mutation acceptance per rule; cases that do not kill their mutations cannot ship (run in this repo) | `npm run gate:accept` |
 | Ledger integrity chain | Three ledgers with per-line hash chains; rewrite / insert / delete-middle turns red | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |

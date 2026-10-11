@@ -320,7 +320,8 @@ function selfTest() {
   ok("闸提示行:Stop hook feedback 的 user 行认", isGateLine({ type: "user", message: { content: "Stop hook feedback:\n[V] x" } }), true);
   ok("闸提示行:执行方正文引用不认", isGateLine({ type: "assistant", message: { content: [{ type: "text", text: "[V] 收尾闸 这次…" }] } }), false);
   ok("闸提示行:工具输出不认", isGateLine({ type: "user", message: { content: [{ type: "tool_result", content: "[V] 收尾闸" }] } }), false);
-  ok("项目目录:非字母数字一律换 -", projectDir("E:\\my.repo test").endsWith("D--my-repo-test"), true);
+  // 不写死盘符:公开版清洗会改写 `D:` 路径(codex 259-pub-docs-r1 实测公开版 23/24)
+  ok("项目目录:非字母数字一律换 -", /--my-repo-test$/.test(projectDir("X:\\my.repo test")), true);
   ok("待审:已人工撤回的不送审", pendingClaims([{ kind: "claimed_fp", id: "W", by: "assistant", ts: "t", h: "m" }, { kind: "fp_audit", ref: "m", verdict: "已人工撤回" }]).length, 0);
   ok("遮理由:撞上即遮,5 字以下不遮", redactReasons("前文 这一次其实是闸把只读检索当成写入了所以误报 后文", ["这一次其实是闸把只读检索当成写入了所以误报", "短"]),
     { text: "前文 (执行方理由,盲审遮去) 后文", hits: 1 });
