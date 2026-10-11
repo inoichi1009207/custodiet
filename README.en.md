@@ -1,223 +1,204 @@
 # custodiet
 
-> *Quis custodiet ipsos custodes?* — Who watches the watchmen?
+> **Quis custodiet ipsos custodes? — Who watches the watchmen?**
 >
 > [中文版 →](README.md)
 
-**custodiet** is a **whole-process** governance system for Claude Code: from understanding the request, through design and execution, to the final report, every stage is watched by deterministic predicates. They read the turn's real tool-call record, not what the agent says about it, and every blocking rule must point to a clause a human signed. The last checkpoint sits at the moment the agent says it is done (a Stop hook): if any stage fell short, the turn does not end.
-**lanes** is its companion UI: it moves gate notices, tool calls and edited files out of the transcript into their own lanes.
+**custodiet** is a governance gate for Claude Code. It checks every stage — setting the acceptance conditions, doing the work, reporting the result — with deterministic predicates. The predicates read the turn's actual tool-call record, not what the agent says, and every blocking rule points to a clause a human signed. The last checkpoint sits at the moment the agent says "done" (the Stop hook): if a stage falls short, the turn does not end.
 
-Just want to install it? Jump to [Hand it to your agent](#hand-it-to-your-agent). The sections below first explain why it exists and what it catches.
+**lanes** is the companion UI: it moves gate messages, tool calls and edited files out of the output pane into lanes of their own.
+
+To install right away: jump to [Hand it to your agent](#hand-it-to-your-agent).
 
 ## Why
 
-Coding agents produce **false success**: they assert completion the environment doesn't support. A 2026 single-author workshop paper ([arXiv 2606.09863](https://arxiv.org/abs/2606.09863), ICML 2026 FAGEN workshop) quantifies it on two structured benchmarks: among AppWorld self-assessing coding-agent trajectories with explicit status claims, **75.8%** of failures (1,425 / 1,879) are false successes — a subset of the benchmark, as the paper itself notes. LLM judges do poorly: no configuration of 5 judges × 5 prompt strategies exceeds **AUROC 0.65** on tau2-bench (customer-service dialogues), and 3 judges reach only 0.54 on AppWorld; supervised lightweight **TF-IDF classifiers** reach 0.83 (tau2-bench) / 0.95 (AppWorld) on task-disjoint splits at ~3,300× lower latency. The abstract closes: *"These results suggest that production monitoring should use lightweight, domain-calibrated detectors as triage signals rather than relying on LLM judges as the primary monitor for false success."*
+Coding agents report false success: the task failed and the agent says it succeeded. [arXiv 2606.09863](https://arxiv.org/abs/2606.09863) (ICML 2026 FAGEN workshop) measured it on AppWorld: of the failed trajectories that contain an explicit completion claim, **75.8%** (1,425 / 1,879) are false successes. LLM judges catch it poorly — AUROC at most **0.65** on tau2-bench and 0.54 on AppWorld. Lightweight TF-IDF classifiers trained on labelled data reach 0.83 / 0.95.
 
-Those numbers measure the paper's own statistical classifiers, **not this repo**. custodiet is a different kind of method — deterministic predicates over tool-call records, with no training data, never evaluated on the paper's benchmarks. The paper supports a direction (lightweight, domain-specific detection beats LLM judges as the primary signal), not this repo's specific method; it also states that its detector is a triage signal rather than an autonomous gate, and that open-ended code generation remains an open question.
+Two other 2026 papers take this repo's route: deterministic checks over the agent's tool-call trajectory.
+- [arXiv 2608.02464](https://arxiv.org/abs/2608.02464) recomputes the agent's reported results from the tool results it actually received and checks that the required tools were called: it catches 60% of failures (96% with the coverage check) at 0 of 63 false positives.
+- [AgentLTL](https://arxiv.org/abs/2607.02599) writes process rules in temporal logic over tool-call traces and intercepts before a tool runs; compliance rose for 5 of 7 models.
 
-Two other 2026 papers are closer kin to this repo: both run **deterministic** checks over agent traces. [arXiv 2608.02464](https://arxiv.org/abs/2608.02464) adds a deterministic verification layer on top of statistical monitors — it recomputes the agent's stated result from the tool results it actually received and confirms every required call was made: *"Head-to-head it catches 60% of failures (96% with the coverage check) at 0 of 63 false positives against the monitor's 54% at 17%"*, with no false alarm on 1825 healthy episodes. [AgentLTL](https://arxiv.org/abs/2607.02599) (arXiv 2607.02599) writes procedural rules over tool-call traces in temporal logic: *"It yields a deterministic, judge-free compliance score."* Its rules can gate a tool call before it runs, and block-and-warn harnessing raised compliance on 5 of 7 models. Both were measured on their own benchmarks and check different things than this repo does (the first checks numeric recomputation and required calls; this repo checks whether claimed actions actually happened), so they too support the direction, not this repo's numbers.
-
-Upstream, the fabrication problem was reported and the issue **closed as not planned** ([anthropics/claude-code#2969](https://github.com/anthropics/claude-code/issues/2969)).
+Upstream closed the issue "agent ignores failing tests and fabricates success reports" as **not planned** ([anthropics/claude-code#2969](https://github.com/anthropics/claude-code/issues/2969)).
 
 <p>
 <img src="assets/catch-saying-not-doing.jpg" alt="The gate catches the agent describing work instead of doing it" width="640">
 </p>
 
-> *"Are you actually doing it?" — "No. My last message was **saying**, not **doing**. Doing it now."*
-> (real session; the engine's messages are in Chinese — see FAQ)
+## Predicates, not prompts
 
-## Not prompts. Predicates.
-
-| Approach | Enforcement | Fails when |
+| Approach | Enforcement | Weakness |
 |---|---|---|
-| CLAUDE.md instructions | none — the model may ignore them | always, eventually |
-| LLM reviews LLM | another model's opinion | as the primary monitor: the paper above measured judge AUROC ≤ 0.65 (tau2-bench) and 0.54 (AppWorld); the open-ended coding tasks this repo faces are unmeasured |
-| **This repo** | **deterministic predicates over tool-call records** | only where a rule's stated ceiling says so |
+| Rules in CLAUDE.md | None | The model can ignore them |
+| Another LLM reviews | One more model's opinion | Judge AUROC ≤ 0.65 (above) |
+| **This repo** | **Deterministic predicates over the tool-call record** | The ceilings written in each rule's header |
 
-The author's own repo runs both: deterministic gates as the primary check, plus a prompt-type LLM judge for supplementary triage — it catches the kind of problem a keyword predicate cannot read semantically (e.g. treating a self-reported number as a verified fact). custodiet's installer ships only the deterministic gates, not that judge.
+The author's own repo also runs an LLM judge for the semantic cases keyword predicates cannot see. The installer ships only the deterministic gate.
 
-## Evaluation status (read this first)
+Rules read assistant text and the **inputs** of `tool_use` blocks, never tool **outputs** — so "read a file that mentions `git commit`" cannot count as "committed". Two built-in rules, A (delegation closure) and R (completion statements), are the exception and scan the full text.
 
-- **Recall is unknown**: false positives are measured (see FAQ); misses are not, and the report always prints `RECALL=UNKNOWN`.
-- **Narrow deployment**: all usage data comes from one author on one main repo; there is no third-party deployment data.
-- **Text rules match Chinese only**: rules that read wording (causal claims, noun questions, scope-dodging, etc.) match Chinese phrasing, and the verdict messages are in Chinese.
-- **War-story numbers are author-attested**: each carries its date, denominator and how to reproduce it in the same paragraph; there is no third-party audit.
-- **The cited paper's numbers do not measure this repo**: see "Why".
+## What it catches
 
-The 26 engine rules read a **structured context** built only from `assistant` text blocks and `tool_use` **inputs** — tool *outputs* never enter their evidence window, so *reading a file that mentions `git commit` cannot count as having committed* (that exact exploit is a regression test). The two not-yet-migrated built-in rules (A delegation-closure, R past-tense## What it watches at each stage (selection of the 28 rules: 26 engine + 2 built-in; `gate:accept` output is authoritative — hand counts drift)
+28 rules in total (26 engine + 2 built-in; `npm run gate:accept` prints the count). A selection, by stage:
 
-Checking at "done" is only the last checkpoint; the standard starts the moment a request arrives.
+**Start: set acceptance conditions first**
+- **K / K0**: before a batch of work, write machine-checkable completion conditions (`batch-goal --arm`, optionally with a check command); at the end, rule on each one — met / not met. No clearing until all are ruled on.
+- **ND**: when the user asks "what is X", the term goes into the noun diary, or you say why it does not apply.
 
-**Input: understand before acting**
-- **K / K0 — set acceptance conditions first**: before a batch of work starts, write down machine-checkable completion conditions (`batch-goal --arm`, optionally with a check command); at the end each condition gets a verdict, and the batch cannot be cleared until all of them have one.
-- **ND — clear up unknown terms**: when the user asks "what is X", the term goes into the noun diary, or the agent states why it does not apply.
+**Design: search before building; get conclusions reviewed**
+- **I**: building a new tool or script without a trace of searching for existing ones (local registry and web) ⇒ block.
+- **P**: load-bearing changes need three independent reviews — cross-model, read-only sub-agent, external precedent. Only tool actions count; saying you ran one does not. For gate-engine files, the independent-view slot accepts only the bundled red-team agent `_gate-bypass-hunter`.
+- **E0 / E1 / E2**: a causal claim ("the root cause is X") carries a mechanical check or goes through independent review.
+- **W**: deliverables written for other people get an external review before the turn ends.
 
-**Design: search before you build, and let someone else check the conclusion**
-- **I — search before you build**: creating a new tool/script without evidence of having scanned for existing implementations (local registry **and** web) blocks.
-- **P — load-bearing changes owe three independent checks**: cross-model review, read-only subagent, and external precedent — counted from tool actions only; *saying* you ran them counts zero. When the commit touches gate-engine files, the independent-view check accepts only the bundled red-team agent `_gate-bypass-hunter`.
-- **E0/E1/E2 — causal claims need mechanical evidence** or an independent check; a bare "the root cause is…" doesn't leave the room.
-- **W — deliverables get an outside review**: finished work meant for other readers needs one external check before the turn ends.
+**Execute: do what you said**
+- **B**: "I'll change X now" with no action on X this turn ⇒ block.
+- **M**: writes must be read back. `node -e`, `sed -i` and redirects can fail silently; only a real read-back (Read / Grep / diff on the same path) counts.
+- **A / U**: background tasks and delegated sub-agents must be collected and read.
 
-**Execution: do what you said**
-- **B — promise vs. deed**: "I'll go fix X" with no matching action in the turn ⇒ flagged.
-- **M — write-backs need read-backs**: `node -e`/`sed -i`/redirects that fail silently still exit 0; only an actual re-read (Read/Grep/diff of the same path) counts.
-- **A / U — delegation must close the loop**: a background task or subagent you launched and never read back is debt, not progress.
+**Report: no overclaiming**
+- **R**: "Fixed X" with no action on X in the record ⇒ block.
+- **F / X**: "done" rests on checks; completion claims and the uncovered-items column must agree.
+- **S / Q**: there are exactly three legitimate reasons to stop (irreversible / needs a human signature / hard blocker), and a stop names which one.
 
-**Output: no inflated reports**
-- **R — past-tense claims must be in the record**: "I fixed X" with no action on X in the record ⇒ blocked.
-- **F / X — "done" rests on checks, not assertions**; completion claims must agree with the not-covered section.
-- **S / Q — no unexplained stopping or pushing work out of the batch**: the only legitimate stops are irreversible actions, items a human must sign, and hard blockers, and a stop must say which one.
-ms need mechanical evidence** or an independent check; a bare "the root cause is…" doesn't leave the room.
+CW (re-checking concurrent writer sessions at Stop) was removed in 0.4.2; concurrent writes now use git worktrees and branches. See the [CHANGELOG](CHANGELOG.md).
 
-Since 0.4.2 the CW rule (re-checking concurrent writer sessions at Stop) is gone — concurrent writes are isolated with git worktrees/branches instead; see [CHANGELOG](CHANGELOG.md).
+Full tour and build order: [`docs/playbook.md`](docs/playbook.md), a build manual written for agents — each step has the artifact shape, an executable checkpoint, and the incident behind it.
 
-Full tour and build order: [`docs/playbook.md`](docs/playbook.md) (the construction manual, written for an agent to follow: each build step ships the artifact shape, an executable checkpoint and the incident behind it; currently in Chinese).
+## Constitution and codes
 
-## Constitution and law code
+- Every rule carries a `law:` anchor pointing to a signed clause (e.g. J → `AGENTS.md#承重规则的载体门槛`). The engine checks at load time and in self-tests that anchors resolve. A rule with no legal source can be deleted by anyone.
+- The sample constitution `AGENTS.md` holds per-session defaults, decision boundaries and permanent red lines; details live in the sample codes `docs/laws/collab.md`, `docs/laws/reporting.md` and `docs/laws/production.md`.
+- These three are samples. Replace them with clauses you have signed, and update the anchors.
 
-- Every rule carries a `law:` anchor pointing back to a human-signed clause (e.g. rule J → `AGENTS.md#承重规则的载体门槛`); the engine checks at load time and in self-tests that each anchor resolves. A rule with no source of law is an unowned predicate anyone can delete.
-- The example constitution `AGENTS.md` holds short standing clauses — per-session defaults, decision boundaries, permanent red lines — and marks which rule each one is the source of law for; details live in the example law files `docs/laws/collab.md`, `docs/laws/reporting.md` and `docs/laws/production.md`.
-- The installer copies these three files as **examples**: replace them with clauses you actually signed and move the anchors with them.
+## The gate is gated too
 
-## The gate gates itself
-
-As of our survey we have **not observed** this combination elsewhere (*not observed*, not *doesn't exist*):
-
-- **Mutation-tested rules**: a rule cannot ship without ≥2 mutations of its own predicate that its fixtures demonstrably kill (`gate-migrate-check.mjs`). Before this harness existed (measured on 2026-08-19) we saw 40 of 97 mutants survive an all-green suite — the author's same-day record (see the comment in `scripts/gate-migrate-check.mjs`), with no re-run script.
-- **Load-time invariants**: blocking rules must cite a human-signed law anchor, must carry positive *and* negative fixtures, and are checked inside the production hook, not only in CI.
-- **False-positive & miss ledgers**: every alert lands in a denominator ledger; claimed false positives are filed with reasons; the report always prints `RECALL=UNKNOWN` because an absence of complaints is not an absence of misses.
-- **Debt with expiry**: every known limitation is a ledger row with a batch-count expiry; expiry reactivates the debt via `batch-goal --arm`. The mechanism ships; our own debt table stays in the source project.
-- **Ledger integrity chain**: see the table above. It is tamper *alerting*, not tamper *proofing*; limits are in the header of `ledger-chain.mjs` — it does not defend against a deliberate rewrite or whole-suffix truncation.
-- **External anchor** (`ledger-anchor.mjs`, `snapshot | verify | install-task`). **Where the guarantee stops:**
-  "External" means **the same machine, the same user's home directory** (`~/.custodiet/`) — not another host, not another trust domain. Any process that can run commands as you can also rewrite the anchor; the anchor carries no signature and no chain of its own. It is a **soft boundary**: it raises the cost of forgery, it does not isolate.
-  It covers only up to the **last snapshot point**, and only given that the anchor file itself was not rewritten by a same-identity process and that `verify` actually ran.
-  Content appended after that snapshot and then deleted — while the file is still at least as long as the snapshot — is caught by **neither** mechanism.
-  This repo does **not** wire a wake-up path for you, and `install-task` is Windows-only (`schtasks`) so far. See the 0.1.1 entry in CHANGELOG and that file's header.
-- **Fail-closed**: a rule that can't get its required input channel reports UNKNOWN and blocks.
-- **Escape hatches are reconciled**: a self-test checks the escape hatches against the blocking table, so a hatch that doesn't open is caught. Rule P has no escape hatch, by signed-off design.
+- **Mutation acceptance**: every rule ships at least 2 mutations that break its predicate, and its fixtures must kill all of them (`gate-migrate-check.mjs`). On the day this went live, 40 of 97 mutations survived the existing suite.
+- **Load-time invariants**: blocking rules must carry a law anchor and positive/negative cases; the check runs in the production hook, not only in CI.
+- **False-positive ledger**: every alert goes into a denominator ledger; claimed false positives are recorded with a reason. Misses cannot be measured, so the report prints `RECALL=UNKNOWN`.
+- **Debts expire**: each known defect is a ledger row with a batch deadline and returns to the to-do list when it expires (listed by `batch-goal --arm`).
+- **Ledger integrity chain**: the alert, false-positive and batch-goal ledgers carry a per-line hash chain; rewriting, inserting or deleting a middle line turns it red.
+- **External anchor** (`ledger-anchor.mjs`): snapshots ledger prefix fingerprints into `~/.custodiet/`; rewriting or truncating before the anchor turns it red. The anchor lives in the same user's home directory on the same machine, so it does not stop a process running as you; `install-task` is implemented for Windows only.
+- **Fail-closed**: a rule missing a required input reports UNKNOWN and blocks.
+- **Escape hatches are reconciled**: a self-test ties escape hatches to the blocking table. P deliberately has none.
 
 <p>
-<img src="assets/same-shape-errors.jpg" alt="Every error today was the Nth instance of the same shape" width="640">
-<img src="assets/catch-lost-delegation.jpg" alt="Waiting for a review that was never fetched — caught" width="640">
+<img src="assets/same-shape-errors.jpg" alt="Every mistake today is the Nth instance of the same shape" width="640">
+<img src="assets/catch-lost-delegation.jpg" alt="Waiting on a review that was never collected — caught" width="640">
 </p>
 
-## Relation to neighbors
+## Neighbours
 
-- [guardrails-ai](https://github.com/guardrails-ai/guardrails) / [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails) validate **what the model says** (content). We audit **whether what it said it did actually happened** (conduct).
-- [tdd-guard](https://github.com/nizos/tdd-guard) / [probity](https://github.com/nizos/probity) gate **each write** for process compliance (probity also reads transcripts). We gate **the whole turn's claims** at Stop time. They can run together.
-- Claude Code ships a built-in `/goal` (goal tracking) — a **built-in slash command the model cannot invoke; only the user can type it** (tested 2026-08-19), and its Stop-time evaluation is an LLM judge (a session-level prompt hook). `batch-goal --arm/--clear` is the in-repo equivalent: arming is the agent's opening move, the verdict check is the Stop gate's mechanical move.
-- [unlazy](https://github.com/Leonxlnx/unlazy) (surveyed 2026-09; each claim re-checked sentence by sentence by a second model against its README/SKILL) also uses a Stop hook as a wall, but treats **under-effort** (a Depth Tree splits the task by the requested depth; a gates file verifies with `CHECK:` commands + `EXPECT:` tokens); we treat **false claims**. Two ideas worth borrowing: a guard that releases after 6 consecutive blocked stops with no progress, and a failure-style handoff `ABANDON: <id> <non-empty reason>` — our equivalents are the streak cap with auto-downgrade and "⏸ needs your confirmation + one of three legal reasons".
-- Per our survey (2026-08-25, re-checked 2026-09-02), the combination here — promise-vs-action comparison + mutation-tested acceptance + expiring debt ledger — was **not observed** in existing open source. That's an observation, not a proof of absence.
+- [guardrails-ai](https://github.com/guardrails-ai/guardrails) / [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails) validate **what the model says**; this repo audits **whether what it says it did actually happened**.
+- [tdd-guard](https://github.com/nizos/tdd-guard) / [probity](https://github.com/nizos/probity) gate process compliance on every write; this repo gates the whole turn's words and actions at Stop. They can run together.
+- Claude Code's built-in `/goal` is a slash command only the user can type — the model cannot call it — and its end-of-turn evaluation uses an LLM judge. `batch-goal --arm / --clear` is the in-repo equivalent: setting conditions is the agent's opening action, and checking them is the Stop gate's job.
+- [unlazy](https://github.com/Leonxlnx/unlazy) also uses the Stop hook as a wall, against under-effort (it splits work by request depth and checks `CHECK:` commands against `EXPECT:` tokens); this repo targets false claims. Two things worth borrowing: its "release after 6 blocks with no progress" anti-loop valve, and `ABANDON: <id> <reason>` hand-off on failure. Our counterparts are auto-downgrade at the block cap and "⏸ needs your confirmation + one of three reasons".
+
+## Limitations
+
+- Recall is unknown.
+- So far only the author's own repo uses it.
+- Text rules (causal claims, noun questions, pushing work out of a batch, etc.) match Chinese sentence patterns, and judge messages are in Chinese. In an English repo those rules neither fire nor block.
+- Usage numbers come from the author's own ledgers, with no third-party audit.
 
 ## FAQ
 
-**False positives?** Filed in a ledger with reasons and measured against an automatic alert denominator. The author's reading on 2026-10-11: 205 false positives / 2223 rule alerts (1512 turns) = 9.2%; all 205 were claimed by the executing agent itself, with no third-party countersign. Re-run: `node scripts/hook-stop-closure.mjs --fp-report` (the ledger data lives on the author's machine and is not published). Recall cannot be measured, so the report always prints `RECALL=UNKNOWN`. Several rules were narrowed through exactly that loop.
+**False positives?** Claim them into the ledger with a reason. On the author's machine, 2026-10-11: 205 false positives / 2223 rule alerts = 9.2%, all claimed by the agent itself. Recompute with `node scripts/hook-stop-closure.mjs --fp-report`. Several rules were narrowed through this loop.
 
-**Overhead?** Zero dependencies. On the author's machine, 590 Stops from 2026-08-25 to 10-10: median 582 ms, p90 1575 ms, rising with transcript size — median 243 ms under 20 MB, 1037 ms at 20 MB and above (largest transcript ~117 MB). Source: the `dur=` field of CLEAN lines in the heartbeat ledger `.claude/.gate-heartbeat.log` (author-attested, no re-run script; reading the log reproduces it).
+**Overhead?** Zero dependencies. 590 Stops from 2026-08-25 to 10-10: median 582 ms, p90 1575 ms. Time grows with transcript size: median 243 ms under 20 MB, 1037 ms at 20 MB and above. Source: the `dur=` field in the heartbeat ledger `.claude/.gate-heartbeat.log`.
 
-**Infinite loops?** The hook checks `stop_hook_active`, and the engine records its own consecutive-block streak with a pressure valve (`STOP_CLOSURE_BLOCK_CAP`) that demotes to warnings rather than deadlocking — and the demotion is logged as a demotion, never as a pass.
+**Infinite loops?** No. The hook checks `stop_hook_active`, the engine counts its own consecutive blocks, and at the cap (`STOP_CLOSURE_BLOCK_CAP`) it downgrades to a hint and records the downgrade.
 
-**How do I add my own rule?** In `scripts/lib/gate-rules.mjs`, copy the **five parts** of any rule — `detect` (a pure function over the structured ctx; never reads disk itself), `law` (an anchor to a clause you signed), `blocking`, positive/negative `cases`, ≥2 `mutations` — append it to the `RULES` array at the end of the file, and run `npm run gate:accept` in this repo. Load-time invariants reject rules without a law anchor or fixtures; the acceptance harness rejects fixtures that cannot kill their mutants. Then red-team it with `_gate-bypass-hunter`. The full walkthrough is in steps 3–4 of [`docs/playbook.md`](docs/playbook.md).
-
-**Why is everything in Chinese?** This is a reference implementation extracted from the project that built it, comments and verdict messages included. The architecture (structured ctx / rules / registry / acceptance harness) is language-neutral; an English message pack is a welcome first contribution.
-
-**Are the war-story numbers audited?** Not by a third party. They come from the author's own ledgers (git log, alert ledger, debt table); each number carries its date, denominator and how to reproduce it in the same paragraph — a repo command where one exists, "author-attested" where not. The playbook marks them the same way. Read them the way you'd read any postmortem.
+**Adding your own rule?** In `scripts/lib/gate-rules.mjs`, copy any rule's five parts: `detect` (pure function over the structured ctx), `law` (an anchor to a clause you signed), `blocking`, positive/negative `cases`, and at least 2 `mutations`. Append it to the `RULES` array at the end of the file and run `npm run gate:accept`. Rules without a law anchor or cases will not load; cases that do not kill their mutations fail acceptance. Then red-team it with `_gate-bypass-hunter`. Full tutorial: [`docs/playbook.md`](docs/playbook.md), steps 3–4.
 
 ## Hand it to your agent
 
-Everything above is for people. The "How to use" part below is written for an agent to follow: install steps, the self-checks to run, and the exact form of every command, all written so a machine can copy them.
-
-The easiest path is to give this repository's address to your Claude Code and let it read and install:
+The "Usage" section below is written for agents. The easiest path is to give this repo's address to your Claude Code:
 
 ```text
-Read the "How to use" section of the README at https://github.com/inoichi1009207/custodiet, install custodiet into the current repository (copy mode), then install the lanes plugin; afterwards run the self-check and report the JSON list on the last stdout line and the self-check result to me.
+Read the "Usage (for agents)" section of the README at https://github.com/inoichi1009207/custodiet, install custodiet into the current repo (copy mode), then install the lanes plugin; run the self-test afterwards and report the JSON manifest from the last line of stdout plus the self-test result.
 ```
 
-After installing, replace the example constitution `AGENTS.md` and the example law files with clauses you have signed yourself (see "Constitution and law code" above). That step is yours; an agent cannot sign for you.
+After installing, replace the sample constitution `AGENTS.md` and the sample codes with clauses you have signed. That step is yours.
 
-## How to use (for agents)
+## Usage (for agents)
 
-This repository is also a Claude Code plugin marketplace (`.claude-plugin/marketplace.json`).
+This repo is also a Claude Code plugin marketplace (`.claude-plugin/marketplace.json`).
 
-| Component | Current form | Install |
+| Component | Form | Install |
 |---|---|---|
-| custodiet | Gate scripts + example constitution/law files + red-team agent + copy-mode installer. **Not a plugin yet** | `node scripts/custodiet-init.mjs --target <repo> --mode copy` |
-| lanes | Claude Code plugin (a mod: a plugin with a hooks module), in `plugins/lanes/` | `/plugin install lanes --marketplace inoichi1009207/custodiet` |
+| custodiet | Gate scripts + sample constitution / codes + red-team agent + copy-mode installer (not yet a plugin) | `node scripts/custodiet-init.mjs --target <repo> --mode copy` |
+| lanes | Claude Code plugin (with a hooks module) in `plugins/lanes/` | `/plugin install lanes --marketplace inoichi1009207/custodiet` |
 
 ### Install
 
 #### custodiet (copy mode)
 
-Requirements: node ≥ 20; the target must be the **root of a git repository** (the script will not `git init` for you).
+Requires node ≥ 20; the target must be the root of a git repo (the script does not run `git init`).
 
 ```bash
 git clone https://github.com/inoichi1009207/custodiet
-node custodiet/scripts/custodiet-init.mjs --target <your-repo-root> --mode copy
+node custodiet/scripts/custodiet-init.mjs --target <your repo root> --mode copy
 ```
 
 What it does:
 
-- Copies the gate files (`scripts/hook-stop-closure.mjs`, `scripts/batch-goal.mjs`, the engine files under `scripts/lib/`), the example constitution `AGENTS.md`, the example law files `docs/laws/collab.md`, `docs/laws/reporting.md` and `docs/laws/production.md`, `docs/noun-diary.md`, and the red-team agent `.claude/agents/_gate-bypass-hunter.md` into the target, and generates `CLAUDE.md` (content: `@AGENTS.md`).
-- Merges two hooks, `Stop` and `SubagentStop`, into the target's `.claude/settings.json` (deduplicated by command).
+- Copies the gate files (`scripts/hook-stop-closure.mjs`, `scripts/batch-goal.mjs`, the engine files under `scripts/lib/`), the sample constitution `AGENTS.md`, the sample codes (`docs/laws/collab.md`, `docs/laws/reporting.md`, `docs/laws/production.md`), `docs/noun-diary.md` and the red-team agent `.claude/agents/_gate-bypass-hunter.md` into the target, and creates `CLAUDE.md` (content: `@AGENTS.md`).
+- Merges the `Stop` and `SubagentStop` hooks into the target's `.claude/settings.json` (deduplicated by command).
 - Appends the gate's runtime ledger paths to the target's `.gitignore`.
-- **Never overwrites an existing file**: when contents differ it writes a sidecar `<name>.custodiet<ext>`, and the JSON manifest on the last stdout line lists each one. It does not commit, does not touch the network, and does not touch `~/.claude/`.
+- Never overwrites existing files: when contents differ it writes a sibling `<name>.custodiet<ext>` and lists each one in the JSON manifest on the last line of stdout. No commits, no network, no changes under `~/.claude/`.
 
 After installing:
 
-1. Self-test inside the target: `node --no-warnings scripts/hook-stop-closure.mjs --self-test`.
-   Known: 2 rule-I cases read the target's **real git history**; they are red while the installed files are uncommitted, or while the install commit is HEAD, and turn green after one more commit.
-2. **Start a new session before you commit the install.** Whether a newly written agent can be invoked in the same session has not been tested, and the install commit triggers rule P, which on gate-engine files accepts only that red-team agent. A new session sidesteps the untested case.
+1. Self-test in the target: `node --no-warnings scripts/hook-stop-closure.mjs --self-test`. Two I-rule cases read the target's real git history: they are red while the gate files are uncommitted or the install commit is HEAD, and turn green after one more commit.
+2. Open a new session before committing. The install commit triggers P, and on gate-engine files P accepts only the red-team agent; a newly written agent is guaranteed to be callable only in a new session.
 
-Current limits:
+Limits:
 
-- The text-based rules match Chinese sentence patterns, so for now they only fit repositories where the collaboration happens in Chinese. In an English repository they do not misfire, but they also stay silent.
-- Plugin install is not built yet: `/plugin install custodiet` **does not work** today, and `--mode plugin` exits with code 5.
-- Dev-only files the installer does not copy: `scripts/coverage-check.mjs`, `scripts/gate-migrate-check.mjs`, `scripts/lib/ledger-anchor.mjs`. They work inside this repository only.
+- `/plugin install custodiet` does not work yet; `--mode plugin` refuses with exit code 5.
+- The dev files `scripts/coverage-check.mjs`, `scripts/gate-migrate-check.mjs` and `scripts/lib/ledger-anchor.mjs` are not copied by the installer; they work only inside this repo.
 
 #### lanes (plugin marketplace)
 
-Inside a Claude Code session (requires Claude Code v2.1.275 or later):
+Inside a Claude Code session (v2.1.275 or later):
 
 ```text
 /plugin install lanes --marketplace inoichi1009207/custodiet
 ```
 
-From your shell (requires v2.1.292 or later):
+From a terminal (v2.1.292 or later):
 
 ```bash
 claude plugin install lanes --marketplace inoichi1009207/custodiet
 ```
 
-Or in two steps: `/plugin marketplace add inoichi1009207/custodiet`, then `/plugin install lanes@custodiet`.
-Third-party marketplaces do not auto-update by default; update with `claude plugin update lanes@custodiet`.
-The lanes UI text is currently in Chinese; its tests (`claude plugin test plugins/lanes`) were run on Claude Code 2.1.295.
+Or in two steps: `/plugin marketplace add inoichi1009207/custodiet`, then `/plugin install lanes@custodiet`. Third-party marketplaces do not auto-update; update with `claude plugin update lanes@custodiet`. The lanes UI text is Chinese; its tests run with `claude plugin test plugins/lanes` (passing on Claude Code 2.1.295).
 
 ### Capabilities and commands
 
 #### custodiet
 
-| Capability | One line | Command |
+| Capability | In one line | Command |
 |---|---|---|
-| Stop gate | At Stop, runs 26 engine rules + 2 built-in rules over the turn's tool-call record; a hit on a blocking rule keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
-| Batch goals | Arm checkable completion conditions at the start; a condition may carry a machine check that `--clear` runs, refusing to clear on failure | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "render is out" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
-| Rule acceptance | Per-rule positive/negative fixtures + mutation acceptance; a fixture set that cannot kill its mutants does not ship (run inside this repo) | `npm run gate:accept` |
-| Ledger integrity chain | The alert-denominator, false-positive and batch-goal ledgers carry a per-row hash chain; rewrites, insertions and mid-chain deletions go red | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
-| External anchor (this repo) | Snapshots a prefix fingerprint of the ledgers to `~/.custodiet/`; rewrites or truncation before the anchor go red. Limits below | `node scripts/lib/ledger-anchor.mjs snapshot` |
-| Escape hatches | Each blocking rule can be switched off on its own (rule P deliberately has none) | `STOP_CLOSURE_BLOCK_<id>=0` |
-| Red-team agent | After you change gate-engine files, it looks for ways not to be caught by a rule, each with a minimal fixture | invoke the subagent `_gate-bypass-hunter` in a session |
+| Stop gate | At Stop, runs 26 engine rules + 2 built-in rules over the turn's tool-call record; a blocking hit keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
+| Batch completion conditions | Set checkable acceptance conditions up front, optionally with a check command; `--clear` runs the checks and refuses on failure | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "render done" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
+| Rule acceptance | Positive/negative cases + mutation acceptance per rule; cases that do not kill their mutations cannot ship (run in this repo) | `npm run gate:accept` |
+| Ledger integrity chain | Three ledgers with per-line hash chains; rewrite / insert / delete-middle turns red | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
+| External anchor (in this repo) | Snapshots ledger prefix fingerprints into `~/.custodiet/`; rewriting or truncating before the anchor turns red | `node scripts/lib/ledger-anchor.mjs snapshot` |
+| Escape hatches | Each blocking rule can be switched off on its own (P has none) | `STOP_CLOSURE_BLOCK_<id>=0` |
+| Red-team agent | After changing gate-engine files, finds "how to get past this rule", each bypass with a minimal fixture | Call the sub-agent `_gate-bypass-hunter` in a session |
 
-Batch-goal order: arm → work → write `条件N: 达成/未达成/不适用` (achieved / not achieved / not applicable) for each condition → **commit** → only then `node --no-warnings scripts/batch-goal.mjs --clear`. Clearing before the commit is what rule K0 blocks.
+Batch condition order: arm → work → write "Condition N: met / not met / n/a" for each → **commit** → finally `node --no-warnings scripts/batch-goal.mjs --clear`. Clearing before committing is blocked by K0.
 
 #### lanes
 
-| Capability | One line | Command |
+| Capability | In one line | Command |
 |---|---|---|
-| Pane | One lane each for this turn's gate notices (first three lines of each), edited files and tool calls, plus a separate bucket for subagents; opens by itself at session start (terminals ≥144 columns), run again to close | `/lanes` |
-| Summary line | When the turn has activity, one line above the prompt: gates (blocks) · files edited · tool calls · subagents | no command |
-| Text-only transcript | Tool-call rows are not drawn in the conversation (running ones included) and gate feedback shrinks to one dim line; toggle back to see them | `/lanes-show` |
-| Gate relay (on by default) | For Stop-hook blocks and additional context, the transcript keeps one short line and the full text goes to the model as a session row the model can read but the person does not see; custodiet's Stop gate recognises that row and does not treat it as a new user turn | `/lanes-relay` |
-| Long commands to background (on by default) | In the main session, foreground Bash / PowerShell timeouts are capped at 10 seconds, so a long command moves to the background instead of blocking the conversation; subagents are not capped | no command |
-| Switches for the model | The model can call `mcp__lanes__control` to flip the three settings above (relay / showAll / autoBg) | no command |
+| Panel | This turn's gate messages (first three lines each), edited files and tool calls, one lane each, with sub-agents in a separate bucket; opens at session start (terminal ≥ 144 columns), toggle with the same command | `/lanes` |
+| Summary row | When the turn has activity, one row above the input: gates (blocks) · files edited · tool calls · sub-agents | None |
+| Output pane keeps only prose | Tool-call rows are not drawn in the conversation; gate feedback shrinks to one grey line; toggle back for the raw view | `/lanes-show` |
+| Gate relay (on by default) | Stop-hook blocks and extra context: one short line in the output pane, the full text attached as a session line the model sees and the human does not; the Stop gate recognises that line and does not treat it as a new user message | `/lanes-relay` |
+| Long commands to background (on by default) | In the main session, foreground Bash / PowerShell timeouts drop to 10 s and longer commands move to the background instead of blocking; sub-agents are unaffected | None |
+| Model-side switches | The model can call `mcp__lanes__control` to toggle the three items above (relay / showAll / autoBg) | None |
 
 ## License
 
