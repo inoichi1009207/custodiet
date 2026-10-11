@@ -3955,7 +3955,8 @@ const RULE_P = {
     },
 
     /** a2a9f58b BP-4:本轮有提交命令,而本仓范围里**没有本轮的提交** ⇒ 这些提交落在别处(同一调用内
-     *  `cd E:/elsewhere && … && git commit`,或 PowerShell 上一次调用 Set-Location 他仓;Bash 跨调用回置见 commitOutsideRoot 头注)。
+     *  `cd E:/elsewhere && … && git commit`,或 PowerShell 上一次调用 Set-Location 他仓再 PowerShell 提交;
+     *  Bash 跨调用回置、两种 shell 分开记 cwd 见 commitOutsideRoot 头注)。
      *  「本轮的提交」= 提交时刻不早于本轮第一条提交命令的那一秒;时刻缺(夹具 / 本轮动作无时间戳)⇒ 范围里任一提交都算本轮的。
      *  红队 a9af71da BP-5(误拦):原把「本仓范围里没有本轮提交」直接判成落在别处 ⇒ 本仓 `git commit` 因未暂存 / pre-commit 失败 /
      *  权限被拒没落盘时也计 1 笔别处。现须**正向证据**(`commitOutsideRoot`):本轮某次提交执行时 cwd 在本仓根外
@@ -4042,12 +4043,18 @@ const RULE_P = {
      *  跨调用语义(复核红队 a084a536 BP-6 改正;原头注「跨调用保持,与 Bash 工具语义一致」与实情相反):
      *    · Bash:交互会话里 cd 到项目外,调用结束 CC 把 shell cwd 拉回项目根,结果正文末行写「Shell cwd was reset to <路径>」
      *      (本机语料 182 份 822 次,全 Bash、目标全为 \repo;本机 ~/.claude/cache/changelog.md 第 8531 行
-     *      CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR「freeze working directory for bash commands」、第 2408 行
-     *      「non-interactive sessions (-p / SDK / cloud) … a cd now persists across turns」)。
-     *      ⇒ `bashCallEnd`:有回置声明(gate-ctx 的 `cwdReset`)⇒ 下一次起点 = 声明路径;无声明 ⇒ 调用结束时在根外 /
-     *      任一种未知 ⇒ 回本仓根,根内子目录照常跨调用保持。
+     *      CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR「freeze working directory for bash commands」)。
+     *      非交互会话(`-p` / SDK / 云端)cd 跨轮保持(changelog 第 2408 行;该行讲的是「以前每条新用户消息重置工作目录,
+     *      现在不再重置」);是否有「cd 到项目外即回置」,文档未记载。
+     *      ⇒ `bashCallEnd`:调用结束时模型判在根内(含根内子目录)⇒ 照常跨调用保持,**不采信**回置声明
+     *      (复核红队 a56d53db BP-2:CC 只在 cwd 落到项目外时写这行,根内调用的输出末行恰似声明多半是命令自己打印的转录内容);
+     *      在根外 / 任一种未知:有回置声明(gate-ctx 的 `cwdReset`)⇒ 下一次起点 = 声明路径,无声明 ⇒ 回本仓根。
      *    · PowerShell:语料 0 次回置声明,行为文档未记载 ⇒ 维持跨调用保持(PS 跨调用 cwd 语义未证,见下 CEILING)。
-     *    · Bash 与 PowerShell 共用一个 cwd 模型(是否真共用未证,D149⑧ 已登记的现状,未动)。
+     *    · Bash 与 PowerShell **分开记** cwd 状态(loc / prev / pushd 栈 / 盘符上次所在各一份;env 本来就只活在一次调用里),
+     *      Bash 调用边界的回置只作用于 Bash 那一份(复核红队 a56d53db BP-1:原共用一份,Bash 回置把 PS 留下的他仓 cwd 一并抹掉 ⇒ 漏放)。
+     *      依据:两个工具是两个 shell 进程,一个里的 cd 不改另一个的 cwd——这是更贴进程模型的选择,不是实测
+     *      (D149⑧「PS 与 Bash 是否共用 cwd 未证」仍未证;若实为共用 ⇒ PS 切他仓后 Bash 相对提交他仓会漏放,
+     *      Bash 回置后 PS 本仓提交失败会被诚实误拦)。分账键 = `cwdShell`。
      *  去向有两种「未知」(红队 a07e98e9 BP-2,不得混用):
      *    · `UNK_FAIL`:该 cd 所在调用的工具结果报错**且正文带 cd 失败特征**(codex 257-p-agg-r1「没问到」② + 红队 ad3e4f93 BP-1)
      *      ⇒ 生没生效判不出 ⇒ **不算证据**(视为本仓);
@@ -4062,11 +4069,15 @@ const RULE_P = {
      *  `cd ~` 类:本仓根在 Users|home/<名> 下 ⇒ 按该家目录解,否则视为根外。
      *  CEILING(登记):窗口(400 条)之前的 cd 看不见;
      *  **无声明默认「根外/未知即回根」的失效条件**:非交互会话(`-p` / Agent SDK / 云端)里 cd 跨轮保持(changelog 第 2408 行),
-     *  回置不发生、也就没有声明 ⇒ 本默认在那里方向反转成**漏放**(上一次调用 cd 他仓、本次相对路径提交他仓 ⇒ 判本仓);
+     *  若那里也不做「项目外即回置」(文档未记载),回置不发生、也就没有声明 ⇒ 本默认在那里方向反转成**漏放**
+     *  (上一次调用 cd 他仓、本次相对路径提交他仓 ⇒ 判本仓);
+     *  CC 真实回置目标是**会话启动目录**,本实现无声明时默认回 R(git 根)⇒ 会话从仓内子目录启动时默认值偏(回到的是根不是该子目录,
+     *  其后相对 `cd ..` 等会差一层);
      *  选此默认的依据(本机 182 份语料,交互会话):根外 Bash 调用结束有声明 819 次(声明即回置的直证);无声明 430 次
      *  (358 次是 cd 进会话 scratchpad,CC 不写声明),其后下一次调用不自带 cd、用仓相对路径的 56 次成功(唯一一次报错形是 ssh 远端命令的输出,非本地 cwd)
      *  ⇒ 无声明时也回到了根(静默回置)。--add-dir 附加工作目录未在语料里出现,是否回置未证 ⇒ 若不回置,同向漏放。
-     *  回置声明取自工具输出末行,命令自己 echo 一行同样字样即可伪造(代价模型:故意伪造不计);
+     *  回置声明取自工具输出末行,命令自己 echo 一行同样字样即可伪造(代价模型:故意伪造不计);只在调用结束于根外 / 未知时采信
+     *  (a56d53db BP-2)⇒ 模型把实际在根外的 cwd 误判成根内(符号链接 / junction 等)时,真声明会被忽略、照常保持该位置;
      *  Bash 上 UNK_FAIL 的跨调用作用已被回置吸收 ⇒ `CD_FAIL` 在 Bash 上只在同一调用内承重。
      *  PowerShell 跨调用 cwd 语义未证(0 次声明)⇒ 维持保持;若实为回置 ⇒ PS 形 cd 他仓后本仓提交失败会被诚实误拦;
      *  `cd "$(git rev-parse --show-toplevel)"` 后本仓提交失败 ⇒
@@ -4087,9 +4098,8 @@ const RULE_P = {
       const fix = (p) => String(p).replace(/\\/g, "/").replace(/^\/([a-z])(\/|$)/i, "$1:/");
       const abs = (p) => /^([A-Za-z]:)?\//.test(fix(p));
       const driveOf = (l) => (isPath(l) ? (/^([A-Za-z]):/.exec(l)?.[1] || "").toLowerCase() : "");
-      const lastOn = new Map();                      // 盘 ⇒ 该盘上次所在(PowerShell 裸盘符切回用)
+      let lastOn = new Map();                        // 盘 ⇒ 该盘上次所在(PowerShell 裸盘符切回用)
       const note = (l) => { const d = driveOf(l); if (d) lastOn.set(d, l); return l; };
-      note(R);
       /** 一个去向串解成 loc(cd 目标、-C、work-tree、git-dir 共用)。 */
       const dest = (base, raw, ps) => {
         const u = String(raw ?? "").replace(/^(["'])([\s\S]*)\1$/, "$2");
@@ -4112,6 +4122,12 @@ const RULE_P = {
       const w = H.win(ctx);
       const seq = [...((w && Array.isArray(w.actions)) ? w.actions : []).map((a) => [a, false]),
         ...(Array.isArray(ctx.actions) ? ctx.actions : []).map((a) => [a, true])];
+      // a56d53db BP-1:每种 shell 一份 cwd 状态(键 = `cwdShell`);调用开始取出、结束存回
+      const shells = new Map();
+      const stateOf = (k) => {
+        if (!shells.has(k)) { const s = { loc: R, prev: null, stack: [], lastOn: new Map() }; const d = driveOf(R); if (d) s.lastOn.set(d, R); shells.set(k, s); }
+        return shells.get(k);
+      };
       let loc = R, prev = null;
       let stack = [];
       for (const [a, own] of seq) {
@@ -4120,6 +4136,8 @@ const RULE_P = {
         const ps = name === "PowerShell";
         let segs = [];
         try { segs = segments(ps ? a.input.command : H.stripHeredoc(a.input.command), ps); } catch { continue; }
+        const S = stateOf(H.cwdShell(ps));
+        ({ loc, prev, stack, lastOn } = S);
         const frames = [];                           // 子 shell 层:进入前的 {loc, prev, stack, env}
         let env = {};                                // 本调用内设过的 GIT_DIR / GIT_WORK_TREE(原始串,提交时按当时 cwd 解)
         const enter = (n) => { for (let k = 0; k < n; k++) frames.push({ loc, prev, stack: [...stack], env: { ...env } }); };
@@ -4170,21 +4188,27 @@ const RULE_P = {
           const nx = H.bashCallEnd(a, isPath(loc) && !H.outside(loc, R) ? loc : null, R);
           if (nx !== null) { loc = note(nx); prev = null; }
         }
+        Object.assign(S, { loc, prev, stack, lastOn });   // 只存回本 shell 那一份(a56d53db BP-1)
       }
       return false;
     },
+    /** a56d53db BP-1:cwd 状态分账键。Bash 与 PowerShell 是两个 shell 进程 ⇒ 各记一份(依据与未证项见 commitOutsideRoot 头注)。 */
+    cwdShell(ps) { return ps ? "ps" : "bash"; },
     /** a084a536 BP-6:一次 Bash 调用结束后下一次调用的起点。`inRoot` = 调用结束时 cwd(在本仓根内才给,否则 null)。
      *  返回 null = 不动(照常跨调用保持),否则 = 新起点。
-     *  ① 正向证据优先:结果正文末行「Shell cwd was reset to <路径>」(gate-ctx 的 `cwdReset`)⇒ 起点 = 该路径(绝对形才认);
-     *  ② 无声明:调用结束时在根外 / 任一种未知(OUT / UNK_PARSE / UNK_FAIL)⇒ 起点回本仓根;根内(含子目录)照常保持。 */
+     *  ① 调用结束时在根内(含子目录)⇒ 照常保持,**不看**回置声明(a56d53db BP-2:CC 只在 cwd 落到项目外时写声明;
+     *     根内调用输出的末行恰似声明 = 命令自己打印的内容,如 `tail -1` / `jq` 打出转录);
+     *  ② 在根外 / 任一种未知(OUT / UNK_PARSE / UNK_FAIL):结果正文末行「Shell cwd was reset to <路径>」(gate-ctx 的 `cwdReset`)
+     *     ⇒ 起点 = 该路径(绝对形才认);无声明 ⇒ 起点回本仓根。 */
     bashCallEnd(a, inRoot, R) {
       const H = RULE_P._p;
+      if (inRoot !== null) return null;
       const r = typeof (a && a.cwdReset) === "string" ? a.cwdReset.trim().replace(/^(["'])([\s\S]*)\1$/, "$2") : "";
       if (r) {
         const p = r.replace(/\\/g, "/").replace(/^\/([a-z])(\/|$)/i, "$1:/");
         if (/^([A-Za-z]:)?\//.test(p)) return H.resolve(null, p);
       }
-      return inRoot === null ? R : null;
+      return R;
     },
     /** 本轮(不含窗口)的命令语法承重证据:参数面承重提交 / 本轮 Write·Edit 承重件 / 本轮 Bash 写目标(cd 解析后)落承重件。 */
     ownSyntaxCarrier(ctx) {
@@ -4612,6 +4636,8 @@ const RULE_P = {
     { name: "Bash 调用边界不回置(根外 cwd 跨调用保持,a084a536 BP-6)", apply: swapP({ bashCallEnd: () => () => null }) },
     { name: "回置声明不认(只走无声明默认,a084a536 BP-6 对照)", apply: swapP({ bashCallEnd: (orig) => (a, l, R) => orig({ ...a, cwdReset: undefined }, l, R) }) },
     { name: "无声明一律回根(根内子目录也不跨调用保持,a084a536 BP-6)", apply: swapP({ bashCallEnd: (orig) => (a, l, R) => orig(a, null, R) }) },
+    { name: "根内也采信回置声明(输出末行恰似声明即回置,a56d53db BP-2)", apply: swapP({ bashCallEnd: (orig) => (a, l, R) => orig(a, a && a.cwdReset ? null : l, R) }) },
+    { name: "Bash 回置也作用于 PS(两种 shell 共用一份 cwd,a56d53db BP-1)", apply: swapP({ cwdShell: () => () => "bash" }) },
     { name: "段首 ( / { 不剥(cdOf 认不出子 shell 与大括号组里的 cd,a07e98e9 BP-1)", apply: swapP({ scope: () => (seg) => ({ body: String(seg || "").trim(), open: 0, close: 0 }) }) },
     { name: "子 shell 不开层(子 shell 里的 cd 当持久,a07e98e9 BP-1 反)", apply: swapP({ scope: (orig) => (seg, ps) => ({ ...orig(seg, ps), open: 0, close: 0 }) }) },
     { name: "任何报错都抹 cd(不看结果正文的 cd 失败特征,ad3e4f93 BP-1)", apply: swapP({ CD_FAIL: () => /[\s\S]?/ }) },
@@ -4905,13 +4931,16 @@ const RULE_P = {
         headFacts: { root: "/repo", commits: [] } },
       { name: "a07e98e9 BP-2:PS Set-Location -Path:E:\\x(冒号形)后相对路径改宪法并提交 ⇒ 别处",
         text: "第五笔,在隔壁仓改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        // a56d53db BP-1 改形:原为 PS 切仓后 **Bash** 相对提交(依赖两种 shell 共用 cwd;现分开记 ⇒ Bash 那份仍在根)⇒ 改 PS 提交;
+        //   写入单独一次 Bash 调用(根内相对路径),同下方 BP-4 系的写法
         prior: [{ text: "切到他仓", ps: "Set-Location -Path:E:\\x" }],
-        bash: ["sed -i s/a/b/ AGENTS.md && git add -A && git commit -m x"],
+        bash: ["sed -i s/a/b/ AGENTS.md"], ps: ["git add -A; git commit -m x"],
         headFacts: { root: "/repo", commits: [] } },
       { name: "a07e98e9 BP-2:PS 裸盘符 E: 切盘后相对路径改宪法并提交 ⇒ 别处",
         text: "第五笔,在 E 盘改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        // a56d53db BP-1 改形:同上一条(Bash 提交 ⇒ PS 提交)
         prior: [{ text: "切盘", ps: "E:" }],
-        bash: ["sed -i s/a/b/ AGENTS.md && git add -A && git commit -m x"],
+        bash: ["sed -i s/a/b/ AGENTS.md"], ps: ["git add -A; git commit -m x"],
         headFacts: { root: "/repo", commits: [] } },
       //   a084a536 BP-6 改形:原为上一次 Bash 调用 cd 变量(跨调用,真实语义下被回置)⇒ 改同一调用内
       //   写入单独一次调用(根内相对路径)、cd 与提交同一调用:写入若也跟在 cd 后,walk 会解到他仓 ⇒ elsewhereCarrier 抢先命中,cd 追踪没被钉住
@@ -4928,11 +4957,21 @@ const RULE_P = {
         then: [{ text: "提交并看一眼", bash: "cd E:/elsewhere && git add -A && git commit -m x && git log --oneline -1 | grep foo", failed: true }],
         headFacts: { root: "/repo", commits: [] } },
       // 复核红队 a084a536 BP-6 对照:Bash 结果末行回置声明指向的不是本仓根 ⇒ 下一次调用从声明路径起 ⇒ 相对路径提交在别处
-      { name: "a084a536 BP-6 对照:上一次 Bash 回置声明指向他仓 ⇒ 下一次相对路径改宪法并提交算别处",
+      //   a56d53db BP-2 改形:原上一次调用是根内的 `ls`(调用结束在根内 ⇒ 现不采信声明,本条成空证人)⇒ 改为 cd 到根外再 ls
+      { name: "a084a536 BP-6 对照:上一次 Bash cd 根外、回置声明指向他仓 ⇒ 下一次相对路径改宪法并提交算别处",
         text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
-        prior: [{ text: "看一眼", bash: "ls", result: "a.txt\nShell cwd was reset to E:\\elsewhere" }],
+        prior: [{ text: "看一眼", bash: "cd E:/other && ls", result: "a.txt\nShell cwd was reset to E:\\elsewhere" }],
         bash: ["sed -i s/a/b/ AGENTS.md && git add -A && git commit -m x"],
         headFacts: { root: "/repo", commits: [] } },
+      // 复核红队 a56d53db BP-1(52779ec 引入的漏放):Bash 与 PS 共用一份 cwd ⇒ Bash 调用边界回置把 PS 留下的他仓 cwd 一并抹掉
+      { name: "a56d53db BP-1:PS 切他仓、插一次 Bash、PS 相对提交 ⇒ 别处",
+        text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "切", ps: "Set-Location E:/elsewhere" }, { text: "看一眼", bash: "ls" }],
+        ps: ["git add AGENTS.md; git commit -m x"], headFacts: { root: "/repo", commits: [] } },
+      { name: "a56d53db BP-1 变体:前轮 PS 切他仓、本轮先 Bash git status 再 PS 相对提交 ⇒ 别处",
+        text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "切", ps: "Set-Location E:/elsewhere" }],
+        bash: ["git status"], ps: ["git add AGENTS.md; git commit -am x"], headFacts: { root: "/repo", commits: [] } },
       // 红队 a9af71da BP-1:范围超 CAP(60)时 hook 给聚合项(原返回 null ⇒ 恒回退语法面,merge 合回的闸改动看不见)
       { name: "a9af71da BP-1:聚合项(61 笔,净差带闸改动)、merge 合回、无红队 ⇒ 欠",
         text: "合回。", pLedger: { carriers: 0 },
@@ -5124,8 +5163,9 @@ const RULE_P = {
       { name: "a9af71da BP-5:PS 切他仓后又 Set-Location 回本仓根,提交未落盘 ⇒ 放行",
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
         // a084a536 BP-6 改形:原第一步是 Bash `cd E:/elsewhere`(调用结束即被回置,「切回」那步成了空证人)⇒ 改 PowerShell 跨调用形
+        // a56d53db BP-1 改形:原为 Bash 提交(两种 shell 分开记后 Bash 那份始终在根,「切回」又成空证人)⇒ 改 PS 提交
         prior: [{ text: "去他仓看一眼", ps: "Set-Location E:/elsewhere" }, { text: "回来", ps: "Set-Location -Path '\\repo'" }],
-        bash: ["git commit -m law"], headFacts: { root: "/repo", commits: [] } },
+        ps: ["git commit -m law"], headFacts: { root: "/repo", commits: [] } },
       // BP-5 修后「落在别处」那支须有 cd 证据才走到 `ownSyntaxCarrier`;原证人(下方「本次范围无提交、窗口里有已提交过的承重写入」)
       //   不再走到它 ⇒ 补一条带 cd 的:窗口里早已提交过的法典写入,本轮在他仓做一笔非承重提交 ⇒ 只看本轮,不得翻出窗口里的写入
       //   a084a536 BP-6 改形:原为上一次 Bash 调用 cd 他仓(真实语义下被回置 ⇒ 走不到 ownSyntaxCarrier,空证人)⇒ 改同一调用内
@@ -5146,7 +5186,8 @@ const RULE_P = {
         headFacts: { root: "/repo", base: "b".repeat(40), commits: [{ sha: "e".repeat(40), aggregated: true, count: 61, files: ["AGENTS.md"] }] } },
       // codex 257-p-agg-r1「没问到」②:前轮 `Set-Location E:/elsewhere` 失败(is_error),本轮本仓 `git commit` 也失败 ⇒ 不是别处提交
       { name: "codex agg-r1 ②:前轮切仓失败、本轮本仓提交失败 ⇒ 不计别处承重提交",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", bash: ["git commit -m law"],
+        //   a56d53db BP-1 改形:原为 Bash 提交(分开记后 PS 的失败切仓碰不到 Bash 那份,空证人)⇒ 改 PS 提交
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", ps: ["git commit -m law"],
         prior: [{ text: "切", ps: "Set-Location E:/elsewhere", failed: "Set-Location : Cannot find path 'E:\\elsewhere' because it does not exist." }],
         headFacts: { root: "/repo", commits: [] } },
       // ad3e4f93 BP-1 接受侧(bash 形):cd 本身失败的正文 ⇒ cd 记未知、不算证据
@@ -5173,8 +5214,9 @@ const RULE_P = {
         bash: ["git -C ~/repo commit -m law"], headFacts: { root: "C:/Users/me/repo", commits: [] } },
       { name: "a07e98e9 BP-2 反:PS 切到 E: 再切回本仓所在盘 后本仓提交失败 ⇒ 回到本仓,不计别处",
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "C:/w/repo", write: "C:/w/repo/AGENTS.md",
+        // a56d53db BP-1 改形:原为 Bash 提交(分开记后空证人)⇒ 改 PS 提交
         prior: [{ text: "切盘", ps: "E:" }, { text: "切回", ps: "C:" }],
-        bash: ["git commit -m law"], headFacts: { root: "C:/w/repo", commits: [] } },
+        ps: ["git commit -m law"], headFacts: { root: "C:/w/repo", commits: [] } },
       // ══ 复核红队 a084a536 BP-6(本批引入的诚实误拦)═══════════════════════════════════════════════
       //   CC 的 Bash 工具 cd 到项目外后调用结束即把 cwd 拉回项目根(结果正文末行「Shell cwd was reset to \repo」,语料 822 次)
       { name: "a084a536 BP-6:上一次 Bash cd 到变量路径(UNK_PARSE)、本轮本仓提交失败 ⇒ 调用边界回根,不计别处",
@@ -5194,6 +5236,11 @@ const RULE_P = {
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", bash: ["cd .. && git commit -m law"],
         prior: [{ text: "进子目录", bash: "cd docs" }],
         headFacts: { root: "/repo", commits: [] } },
+      // 复核红队 a56d53db BP-2(52779ec 引入的诚实误拦):根内调用输出末行恰似回置声明(命令打印的转录内容)⇒ 不采信
+      { name: "a56d53db BP-2:根内子目录里输出末行恰似回置声明、下一次 cd .. 提交失败 ⇒ 不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        prior: [{ text: "看", bash: "cd docs && tail -1 notes.txt", result: "Shell cwd was reset to \\repo" }],
+        bash: ["cd .. && git commit -m law"], headFacts: { root: "/repo", commits: [] } },
       // BP-1 边界:pLedger=0、4 笔法典提交 ⇒ 仍在宽限内(与 10 笔那条 pos 配对,钉住「按提交数计」而不是「一律越限」)
       { name: "a2a9f58b BP-1 边界:pLedger=0、git add -A 带进 4 笔法典提交 ⇒ 宽限内放行",
         text: "收工。", pLedger: { carriers: 0 }, bash: ["git add -A && git commit -m x"],
