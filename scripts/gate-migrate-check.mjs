@@ -284,7 +284,9 @@ console.log("正反例:");
 //   **注入通道**(官方 background_tasks[] 载荷 / 收尾时点三查①结果),不进 entries。
 //   第十六次:`ps`(2026-10-11 红队 a811daae BP-6)——走 **PowerShell 工具**的命令(顶层与 `prior` 项同写法)。
 //     写目标解析按工具名选方言;平铺夹具只发 Bash ⇒「同一串、不同工具、不同结论」写不出来。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "hookCheckout", "at", "then"]);
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "hookCheckout", "missingDirs", "at", "then"]);
+//   第十七次:`missingDirs`(2026-10-11 codex 257-p-shrink-r1 断言 3)——P 的目录存在性事实,注入通道:列出的路径「此刻不存在」,
+//     其余一律「存在」;不写该键 ⇒ 通道没接(ctx.dirExists=null,规则按「cd 一律生效」)。没它,「cd 他仓失败 && git commit」写不出来。
 //   第十五次:`then`(2026-10-10 红队 a2155edb BP-1;与十三、十四次同日由另一 worktree 并行加,合并时重编号)——**本窗口内**主 assistant 条目之后再接的条目(写法同 `prior` 项),
 //   ND 的「出路要晚于最近一次名词提问」要写出 [问1, 写日记, 排队问2, 说] 这种窗口内时序;平铺夹具只有「一条用户行 + 一条
 //   assistant」,时序根本写不出来——与上面各次同族:夹具支持面不足会让规则「测不出来」。
@@ -373,13 +375,12 @@ const mkEntries = (c) => {
 //   **「夹具支持面不足会让规则『测不出来』,而它长得像规则写错了」**。
 //   第七次仍是照着这句话栽的,故这次连**键名校验**一起补上(下面 PRIOR_KEYS):
 //   静默丢弃拼错的键正是这一族的传播机制。
-// `failed: true`(codex 257-p-agg-r1「没问到」②):该项里的 Bash/PowerShell 调用全部失败——给 tool_use 编 id,
-//   并在其后补一条 `tool_result is_error:true`。没它,「失败的 cd 不算移出本仓」在规则层零证人。
-//   红队 ad3e4f93 BP-1:`failed` 可带结果正文——`true` ⇒ 正文 "Exit code 1"(非 cd 失败 ⇒ cd 照常生效);
-//   `failed: "<正文>"` ⇒ 用该正文(失败行带 cd 失败特征且点名某个 cd 的目标时,P 才把那个 cd 按原地)。
 // (原有 `result: "<正文>"` 键 = 成功结果正文,只为写出 CC 的回置声明供 P 的跨调用 cwd 跟踪;2026-10-11 P 删跨调用跟踪、
 //   gate-ctx 删 `cwdReset`,该键无消费者,一并删除——再写会被键名校验拦下。)
-const PRIOR_ASSISTANT_KEYS = ["text", "write", "skill", "bash", "ps", "agent", "web", "read", "grep", "commit", "mcp", "at", "failed"];
+// (原有 `failed: true | "<正文>"` 键 = 给该项的 Bash/PowerShell 调用补 `tool_result is_error:true`,只供 P 从结果正文推断
+//   「同一调用里哪个 cd 失败」;2026-10-11 P 删 cd 失败推断、gate-ctx 删 `err` / `errText`,且别的规则夹具都不用它 ⇒ 一并删除,
+//   再写同样被键名校验拦下。工具结果正文现在不进 ctx 的任何面。)
+const PRIOR_ASSISTANT_KEYS = ["text", "write", "skill", "bash", "ps", "agent", "web", "read", "grep", "commit", "mcp", "at"];
 // a2155edb(第十三次同族,见 FIXTURE_KEYS 注):非 assistant 的注入面,一项内按固定先后展开——
 //   interrupt(用户打断行)→ user(用户亲口行)→ queued(排队消息附件)→ assistant 条目 → stop(这一轮的 Stop)。
 //   `stop` 取值:"blocked"(同 toolUseID 的 hook_blocking_error 附件 + 汇总行,汇总文案按 lanes v2 不含「阻断」)/
@@ -399,19 +400,7 @@ const mkPriorEntries = (x) => {
   if ("queued" in x) out.push({ type: "attachment", attachment: { type: "queued_command", prompt: String(x.queued), origin: { kind: "human" } } });
   // 只写了非 assistant 面的项不再凭空造一条空 assistant;一个键都没写的项照旧给空 assistant(旧夹具逐字不变)
   const hasAsst = PRIOR_ASSISTANT_KEYS.some((k) => k in x) || !PRIOR_EXTRA_KEYS.some((k) => k in x);
-  if (hasAsst) {
-    const asst = mkPriorAssistant(x);
-    out.push(asst);
-    if (x.failed) {
-      const res = [];
-      for (const b of asst.message.content) {
-        if (b.type !== "tool_use" || !/^(Bash|PowerShell)$/.test(b.name)) continue;
-        b.id = `fx-fail-${++_stopSeq}`;
-        res.push({ type: "tool_result", tool_use_id: b.id, is_error: true, content: typeof x.failed === "string" ? x.failed : "Exit code 1" });
-      }
-      if (res.length) out.push({ type: "user", message: { role: "user", content: res } });
-    }
-  }
+  if (hasAsst) out.push(mkPriorAssistant(x));
   if (x.stop) {
     const id = `fx-stop-${++_stopSeq}`;
     if (x.stop === "blocked") out.push({ type: "attachment", attachment: { type: "hook_blocking_error", hookEvent: "Stop", toolUseID: id, blockingError: "x" } });
@@ -453,6 +442,8 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...("diffFacts" in c ? { diffTier: () => c.diffFacts } : {}),
   ...("headFacts" in c ? { headFacts: () => c.headFacts } : {}),
   ...("hookCheckout" in c ? { hookCheckout: c.hookCheckout } : {}),
+  ...("missingDirs" in c ? { dirExists: ((norm) => { const gone = new Set(c.missingDirs.map(norm)); return (p) => !gone.has(norm(p)); })(
+    (p) => String(p).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()) } : {}),
   // `pLedger` = P 的跨批持久账注入(2026-08-22 亲签)。与 batchGoal 同族:注入通道非动作。
   ...("pLedger" in c ? { pLedger: c.pLedger } : {}),
   // `prior` = [{text, write?, …}, …] ⇒ 拼成 assistant entries 交给 priorEntries。

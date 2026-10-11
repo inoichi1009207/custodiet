@@ -165,27 +165,12 @@ export function buildCtx(entries, extra = {}) {
    *  条目下,但那是工具输出不是用户的字,不进;<system-reminder> 是系统注入,剥掉。
    *  2026-08-31 加(用户亲签名词日记闸项):此前 ctx 只有助理面,「用户问了什么」判不了。 */
   let userText = "";
-  /** 助理做的事。每项 `{name, input, at, err?, errText?}`,**只来自 tool_use 入参**——
-   *  例外只有两处结果标注:`err: true` = 该调用的 tool_result 带 `is_error:true`;`errText` = 该结果正文前 500 字
-   *  (只为让 P 判「同一调用里是不是 cd 那段失败」,不得拿来判别的;正文是工具输出、可被写进任何东西)。
-   *  (原第三处 `cwdReset` = 结果正文末行回置声明,只供 P 的跨调用 cwd 跟踪;2026-10-11 P 删跨调用跟踪,该字段随之删除。)
-   *  工具**输出**(tool_result)除此之外一律不进——那是别人说的话,不是他做的事。 */
+  /** 助理做的事。每项 `{name, input, at}`,**只来自 tool_use 入参**——工具**输出**(tool_result)一律不进,
+   *  那是别人说的话,不是他做的事。
+   *  (原有两处结果标注 `err` / `errText`(tool_result 的 `is_error` 与正文前 500 字)只供 P 从正文推断「同一调用里哪个 cd 失败」;
+   *  2026-10-11 P 删 cd 失败推断(同调用 cd 一律生效,理由见 RULE_P.commitOutsideRoot 头注),二者无消费者,随之删除。
+   *  更早的 `cwdReset`(回置声明)随 P 删跨调用跟踪删除。) */
   const actions = [];
-  // codex 257-p-agg-r1「没问到」②:P 的 cwd 跟踪把**失败的** `cd` 也当成移动成功。工具结果 `is_error:true` 的调用,
-  //   其动作带 `err: true`。消费者:RULE_P.commitOutsideRoot。
-  // 红队 ad3e4f93 BP-1:`is_error` 只说明**某一段**失败(`cd X && git diff | grep foo` 里 grep 无匹配退 1、尾部 push 失败、超时、打断),
-  //   不说明 cd 失败(语料 182 份:报错调用含 cd 段 149 次,cd 真失败 5 次)⇒ 另带 `errText`(结果正文前 500 字;
-  //   content 是串或 [{type:"text",text}] 数组,两种都取),P 只在正文有 cd 失败特征时才把 cd 记未知。
-  const errIds = new Map();
-  const resultText = (c) => (typeof c === "string" ? c
-    : Array.isArray(c) ? c.map((x) => (typeof x === "string" ? x : x && x.type === "text" && typeof x.text === "string" ? x.text : "")).join("\n") : "");
-  for (const e of Array.isArray(entries) ? entries : []) {
-    const uc = e?.type === "user" && Array.isArray(e.message?.content) ? e.message.content : [];
-    for (const b of uc) {
-      if (b?.type !== "tool_result" || typeof b.tool_use_id !== "string") continue;
-      if (b.is_error === true) errIds.set(b.tool_use_id, resultText(b.content).slice(0, 500));
-    }
-  }
   /** **本用户轮的时间线**(按转录顺序):`{k:"ask", v}` 用户亲口的话(开口行 / 排队消息)、`{k:"say", v}` 助理说的话、
    *  `{k:"write", v}` Write/Edit 面的写目标、`{k:"bash", v, d}` Bash/PowerShell 命令(`d` 方言 "bash"/"ps",a811daae BP-6)。被拦链上窗口前的那段(见下方补收)接在前头。
    *  立它的理由(红队 a2155edb BP-1/4/5):ND 的出路要「晚于最近一次**名词提问**」才算——旧实现窗口内的写入不分先后、
@@ -242,7 +227,7 @@ export function buildCtx(entries, extra = {}) {
     for (const b of c) {
       if (b?.type === "text") { text += (b.text || "") + "\n"; turnLog.push({ k: "say", v: b.text || "" }); }
       else if (b?.type === "tool_use") {
-        actions.push({ name: b.name, input: b.input || {}, at, ...(errIds.has(b.id) ? { err: true, errText: errIds.get(b.id) } : {}) });
+        actions.push({ name: b.name, input: b.input || {}, at });
         logAction(b.name, b.input);
       }
     }
@@ -566,6 +551,12 @@ export function buildCtx(entries, extra = {}) {
      *  再判「是不是 worktree / 暂存树下的闸副本」——否则在 worktree 里开的会话,自己的闸文件路径里就带 `.claude/worktrees/`,
      *  会被当成别人的副本(红队 a27628dd 口径的反面)。未注入 ⇒ null(按整条路径判)。 */
     hookCheckout,
+    /** 目录此刻在不在磁盘上(P 的 `commitOutsideRoot` 用它判「那次 cd / `-C` 失败」,codex 257-p-shrink-r1 断言 3)。
+     *  hook 只在实时路径注入(离线回放拿到的是「现在」的磁盘)。返回 true / false / null(取不到,非「不存在」);
+     *  只有 `false` 被当「不存在」。未注入 ⇒ null(规则按「cd 一律生效」)。 */
+    dirExists: typeof extra.dirExists === "function" ? (p) => {
+      try { const r = extra.dirExists(p); return r === true || r === false ? r : null; } catch { return null; }
+    } : null,
     /** P 的跨批持久计数(2026-08-22 用户亲签「改吧」)。三态与 batchGoal 同构:
      *  `undefined`=通道没接(夹具/旧路径 ⇒ 规则退回窗口式计账);
      *  `null`=接了、账不存在(首跑 ⇒ 计 0,宽限期);对象={carriers:自上轮三通道后累计承重提交数}。
@@ -690,23 +681,28 @@ export function selfTest() {
   chk("a07e98e9 BP-2:-C 取值按序交出(含 ~)", JSON.stringify(gitArgs("git -C ~/notes -C sub commit -am x").cdirs), JSON.stringify(["~/notes", "sub"]));
   chk("a07e98e9 BP-2:--git-dir= / --work-tree 两形交出", JSON.stringify((({ gitDir, workTree }) => [gitDir, workTree])(gitArgs("git --git-dir=../x/.git --work-tree ../x commit"))), JSON.stringify(["../x/.git", "../x"]));
   chk("a07e98e9 BP-2:GIT_DIR= 前缀交出", JSON.stringify(gitArgs("GIT_DIR=../x/.git GIT_WORK_TREE=../x git commit -am y").env), JSON.stringify({ GIT_DIR: "../x/.git", GIT_WORK_TREE: "../x" }));
-  // ad3e4f93 BP-1:报错动作带 err + errText(结果正文前 500 字;串与 text 块数组两形都取);未报错的不带
+  // 2026-10-11:P 删 cd 失败推断,`err` / `errText` 字段与其四条自测删除(此前 `cwdReset` 随删跨调用跟踪删除);
+  //   只留模块不变量「工具结果正文(报错与否)不进动作、动作只有 name / input / at 三键」
   {
     const ea = (content, isErr = true) => buildCtx([A([{ type: "tool_use", id: "t1", name: "Bash", input: { command: "cd E:/x && ls" } }]),
       { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", ...(isErr ? { is_error: true } : {}), content }] } }]).actions[0];
-    chk("ad3e4f93:报错结果为串 ⇒ err + errText", JSON.stringify([ea("Exit code 1").err, ea("Exit code 1").errText]), JSON.stringify([true, "Exit code 1"]));
-    chk("ad3e4f93:报错结果为 text 块数组 ⇒ errText 拼出正文", ea([{ type: "text", text: "bash: cd: E:/x: No such file or directory" }]).errText, "bash: cd: E:/x: No such file or directory");
-    chk("ad3e4f93:errText 截前 500 字", ea("x".repeat(900)).errText.length, 500);
-    chk("ad3e4f93:未报错 ⇒ 不带 err / errText", JSON.stringify(Object.keys(ea("ok", false)).filter((k) => /^err/.test(k))), "[]");
-    // 2026-10-11:P 删跨调用跟踪,`cwdReset`(回置声明)字段与其五条自测一并删除;只留「非报错结果正文不进动作」这条模块不变量
-    chk("非报错结果正文(含末行回置声明)不进动作", JSON.stringify(ea("SECRET\nShell cwd was reset to \\repo", false)).includes("SECRET")
-      || JSON.stringify(ea("SECRET\nShell cwd was reset to \\repo", false)).includes("reset"), false);
+    for (const isErr of [false, true]) {
+      const s = JSON.stringify(ea("SECRET\nShell cwd was reset to \\repo", isErr));
+      chk(`结果正文不进动作(${isErr ? "报错" : "非报错"})`, s.includes("SECRET") || s.includes("reset"), false);
+      chk(`动作只带 name / input / at(${isErr ? "报错" : "非报错"})`, JSON.stringify(Object.keys(ea("x", isErr)).sort()), JSON.stringify(["at", "input", "name"]));
+    }
   }
   // ad3e4f93 附二:headFacts.base 只收全长 sha(短 sha ⇒ null ⇒ tally 不去重)
   chk("ad3e4f93:headFacts base 短 sha ⇒ null", buildCtx([A([txt("x")])], { headFacts: () => ({ base: "abc1234", commits: [] }) }).headFacts().base, null);
   chk("ad3e4f93:headFacts base 全长 ⇒ 透传", buildCtx([A([txt("x")])], { headFacts: () => ({ base: "b".repeat(40), commits: [] }) }).headFacts().base, "b".repeat(40));
   // headFacts 通道三态与形状校验
   const hf = (v) => buildCtx([A([txt("x")])], v === undefined ? {} : { headFacts: () => v }).headFacts;
+  // dirExists 通道:未接 ⇒ null;非布尔 / 抛错 ⇒ null(只有 false 算「不存在」)
+  const de = (fn) => buildCtx([A([txt("x")])], fn === undefined ? {} : { dirExists: fn }).dirExists;
+  chk("dirExists 未接 ⇒ null", de(undefined), null);
+  chk("dirExists 透传 false", de(() => false)("E:/x"), false);
+  chk("dirExists 非布尔 ⇒ null", de(() => "no")("E:/x"), null);
+  chk("dirExists 抛错 ⇒ null", de(() => { throw new Error("EACCES"); })("E:/x"), null);
   chk("headFacts 未接 ⇒ undefined", hf(undefined), undefined);
   chk("headFacts 取不到 ⇒ null", hf(null)(), null);
   chk("headFacts 形状不对 ⇒ null", hf({ commits: [{ files: [3] }] })(), null);
