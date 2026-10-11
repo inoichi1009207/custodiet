@@ -165,10 +165,10 @@ export function buildCtx(entries, extra = {}) {
    *  条目下,但那是工具输出不是用户的字,不进;<system-reminder> 是系统注入,剥掉。
    *  2026-08-31 加(用户亲签名词日记闸项):此前 ctx 只有助理面,「用户问了什么」判不了。 */
   let userText = "";
-  /** 助理做的事。每项 `{name, input, at, err?, errText?, cwdReset?}`,**只来自 tool_use 入参**——
+  /** 助理做的事。每项 `{name, input, at, err?, errText?}`,**只来自 tool_use 入参**——
    *  例外只有两处结果标注:`err: true` = 该调用的 tool_result 带 `is_error:true`;`errText` = 该结果正文前 500 字
-   *  (只为让 P 判「是不是 cd 那段失败」,不得拿来判别的;正文是工具输出、可被写进任何东西);
-   *  `cwdReset` = 结果正文末行「Shell cwd was reset to <路径>」的路径(只为 P 的 cwd 追踪在调用边界回置,a084a536 BP-6)。
+   *  (只为让 P 判「同一调用里是不是 cd 那段失败」,不得拿来判别的;正文是工具输出、可被写进任何东西)。
+   *  (原第三处 `cwdReset` = 结果正文末行回置声明,只供 P 的跨调用 cwd 跟踪;2026-10-11 P 删跨调用跟踪,该字段随之删除。)
    *  工具**输出**(tool_result)除此之外一律不进——那是别人说的话,不是他做的事。 */
   const actions = [];
   // codex 257-p-agg-r1「没问到」②:P 的 cwd 跟踪把**失败的** `cd` 也当成移动成功。工具结果 `is_error:true` 的调用,
@@ -179,21 +179,11 @@ export function buildCtx(entries, extra = {}) {
   const errIds = new Map();
   const resultText = (c) => (typeof c === "string" ? c
     : Array.isArray(c) ? c.map((x) => (typeof x === "string" ? x : x && x.type === "text" && typeof x.text === "string" ? x.text : "")).join("\n") : "");
-  // 复核红队 a084a536 BP-6:Claude Code 的 Bash 工具 cd 到项目外后,调用结束把 shell cwd 拉回项目根,
-  //   结果正文**末行**写「Shell cwd was reset to <路径>」(语料 182 份 822 次,全 Bash、全在末行、全非报错)。
-  //   P 的 cwd 追踪要据此在调用边界回置 ⇒ 对**所有** tool_result(含非报错)只抽这一行的路径,交 `cwdReset`。
-  //   只认末行(去尾部空白后的最后一行整行匹配):正文中段出现同样字样(如 cat 了一份含这句的日志)不算;
-  //   正文其余部分一律不进 ctx(本模块不变量:tool_result 正文不进证据窗)。
-  const resetIds = new Map();
-  const RESET = /(?:^|\n)Shell cwd was reset to ([^\r\n]+?)\s*$/;
   for (const e of Array.isArray(entries) ? entries : []) {
     const uc = e?.type === "user" && Array.isArray(e.message?.content) ? e.message.content : [];
     for (const b of uc) {
       if (b?.type !== "tool_result" || typeof b.tool_use_id !== "string") continue;
-      const t = resultText(b.content);
-      if (b.is_error === true) errIds.set(b.tool_use_id, t.slice(0, 500));
-      const rm = RESET.exec(t.slice(-2000));
-      if (rm && rm[1].trim()) resetIds.set(b.tool_use_id, rm[1].trim());
+      if (b.is_error === true) errIds.set(b.tool_use_id, resultText(b.content).slice(0, 500));
     }
   }
   /** **本用户轮的时间线**(按转录顺序):`{k:"ask", v}` 用户亲口的话(开口行 / 排队消息)、`{k:"say", v}` 助理说的话、
@@ -252,8 +242,7 @@ export function buildCtx(entries, extra = {}) {
     for (const b of c) {
       if (b?.type === "text") { text += (b.text || "") + "\n"; turnLog.push({ k: "say", v: b.text || "" }); }
       else if (b?.type === "tool_use") {
-        actions.push({ name: b.name, input: b.input || {}, at, ...(errIds.has(b.id) ? { err: true, errText: errIds.get(b.id) } : {}),
-          ...(resetIds.has(b.id) ? { cwdReset: resetIds.get(b.id) } : {}) });
+        actions.push({ name: b.name, input: b.input || {}, at, ...(errIds.has(b.id) ? { err: true, errText: errIds.get(b.id) } : {}) });
         logAction(b.name, b.input);
       }
     }
@@ -709,13 +698,9 @@ export function selfTest() {
     chk("ad3e4f93:报错结果为 text 块数组 ⇒ errText 拼出正文", ea([{ type: "text", text: "bash: cd: E:/x: No such file or directory" }]).errText, "bash: cd: E:/x: No such file or directory");
     chk("ad3e4f93:errText 截前 500 字", ea("x".repeat(900)).errText.length, 500);
     chk("ad3e4f93:未报错 ⇒ 不带 err / errText", JSON.stringify(Object.keys(ea("ok", false)).filter((k) => /^err/.test(k))), "[]");
-    // a084a536 BP-6:回置声明(末行)⇒ cwdReset;报错 / 非报错、串 / text 块数组都取;中段出现不算;没有 ⇒ 不带该键
-    chk("a084a536 BP-6:非报错结果末行回置声明 ⇒ cwdReset", ea("a.txt\nShell cwd was reset to \\repo", false).cwdReset, "\\repo");
-    chk("a084a536 BP-6:text 块数组 + 尾随换行 ⇒ cwdReset", ea([{ type: "text", text: "x\nShell cwd was reset to \\repo\n" }], false).cwdReset, "\\repo");
-    chk("a084a536 BP-6:报错结果也取", ea("Exit code 1\nShell cwd was reset to \\repo").cwdReset, "\\repo");
-    chk("a084a536 BP-6:声明在正文中段(不是末行)⇒ 不取", ea("Shell cwd was reset to E:\\x\nmore output", false).cwdReset, undefined);
-    chk("a084a536 BP-6:没声明 ⇒ 不带 cwdReset", "cwdReset" in ea("ok", false), false);
-    chk("a084a536 BP-6:正文其余部分不进动作", JSON.stringify(ea("SECRET\nShell cwd was reset to \\repo", false)).includes("SECRET"), false);
+    // 2026-10-11:P 删跨调用跟踪,`cwdReset`(回置声明)字段与其五条自测一并删除;只留「非报错结果正文不进动作」这条模块不变量
+    chk("非报错结果正文(含末行回置声明)不进动作", JSON.stringify(ea("SECRET\nShell cwd was reset to \\repo", false)).includes("SECRET")
+      || JSON.stringify(ea("SECRET\nShell cwd was reset to \\repo", false)).includes("reset"), false);
   }
   // ad3e4f93 附二:headFacts.base 只收全长 sha(短 sha ⇒ null ⇒ tally 不去重)
   chk("ad3e4f93:headFacts base 短 sha ⇒ null", buildCtx([A([txt("x")])], { headFacts: () => ({ base: "abc1234", commits: [] }) }).headFacts().base, null);

@@ -376,11 +376,10 @@ const mkEntries = (c) => {
 // `failed: true`(codex 257-p-agg-r1「没问到」②):该项里的 Bash/PowerShell 调用全部失败——给 tool_use 编 id,
 //   并在其后补一条 `tool_result is_error:true`。没它,「失败的 cd 不算移出本仓」在规则层零证人。
 //   红队 ad3e4f93 BP-1:`failed` 可带结果正文——`true` ⇒ 正文 "Exit code 1"(非 cd 失败 ⇒ cd 照常生效);
-//   `failed: "<正文>"` ⇒ 用该正文(带 cd 失败特征时 P 才把 cd 记未知)。
-// `result: "<正文>"`(复核红队 a084a536 BP-6):该项里的 Bash/PowerShell 调用**成功**,结果正文为该串——给 tool_use 编 id,
-//   补一条 `tool_result is_error:false`。用途:写出 CC 的回置声明(末行「Shell cwd was reset to <路径>」)。
-//   与 `failed` 互斥(同一项两键都给 ⇒ 装载期报错)。没它,「有回置声明 ⇒ 回到声明路径」在规则层零证人。
-const PRIOR_ASSISTANT_KEYS = ["text", "write", "skill", "bash", "ps", "agent", "web", "read", "grep", "commit", "mcp", "at", "failed", "result"];
+//   `failed: "<正文>"` ⇒ 用该正文(带 cd 失败特征时 P 才把该调用的 cd 按原地)。
+// (原有 `result: "<正文>"` 键 = 成功结果正文,只为写出 CC 的回置声明供 P 的跨调用 cwd 跟踪;2026-10-11 P 删跨调用跟踪、
+//   gate-ctx 删 `cwdReset`,该键无消费者,一并删除——再写会被键名校验拦下。)
+const PRIOR_ASSISTANT_KEYS = ["text", "write", "skill", "bash", "ps", "agent", "web", "read", "grep", "commit", "mcp", "at", "failed"];
 // a2155edb(第十三次同族,见 FIXTURE_KEYS 注):非 assistant 的注入面,一项内按固定先后展开——
 //   interrupt(用户打断行)→ user(用户亲口行)→ queued(排队消息附件)→ assistant 条目 → stop(这一轮的 Stop)。
 //   `stop` 取值:"blocked"(同 toolUseID 的 hook_blocking_error 附件 + 汇总行,汇总文案按 lanes v2 不含「阻断」)/
@@ -394,8 +393,6 @@ const mkPriorEntries = (x) => {
     if (!PRIOR_KEYS.has(k)) throw new Error(`prior 夹具键不认识:「${k}」—— 拼错的键会被静默丢弃并伪装成规则缺陷。合法键:${[...PRIOR_KEYS].join(", ")}`);
   }
   if ("stop" in x && !["blocked", "blocked-fb", "released"].includes(x.stop)) throw new Error(`prior 夹具 stop 取值不认识:${JSON.stringify(x.stop)}(blocked / blocked-fb / released)`);
-  if ("result" in x && "failed" in x) throw new Error("prior 夹具 result 与 failed 互斥(一个是成功结果正文,一个是报错结果正文)");
-  if ("result" in x && typeof x.result !== "string") throw new Error(`prior 夹具 result 须为串:${JSON.stringify(x.result)}`);
   const out = [];
   if (x.interrupt) out.push({ type: "user", message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user]" }] } });
   if ("user" in x) out.push({ type: "user", origin: { kind: "human" }, message: { role: "user", content: String(x.user) } });
@@ -405,14 +402,12 @@ const mkPriorEntries = (x) => {
   if (hasAsst) {
     const asst = mkPriorAssistant(x);
     out.push(asst);
-    if (x.failed || typeof x.result === "string") {
+    if (x.failed) {
       const res = [];
       for (const b of asst.message.content) {
         if (b.type !== "tool_use" || !/^(Bash|PowerShell)$/.test(b.name)) continue;
-        b.id = `fx-${x.failed ? "fail" : "res"}-${++_stopSeq}`;
-        res.push(x.failed
-          ? { type: "tool_result", tool_use_id: b.id, is_error: true, content: typeof x.failed === "string" ? x.failed : "Exit code 1" }
-          : { type: "tool_result", tool_use_id: b.id, is_error: false, content: x.result });
+        b.id = `fx-fail-${++_stopSeq}`;
+        res.push({ type: "tool_result", tool_use_id: b.id, is_error: true, content: typeof x.failed === "string" ? x.failed : "Exit code 1" });
       }
       if (res.length) out.push({ type: "user", message: { role: "user", content: res } });
     }
