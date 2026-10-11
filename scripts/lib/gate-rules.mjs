@@ -4048,8 +4048,15 @@ const RULE_P = {
      *      现在不再重置」);是否有「cd 到项目外即回置」,文档未记载。
      *      ⇒ `bashCallEnd`:调用结束时模型判在根内(含根内子目录)⇒ 照常跨调用保持,**不采信**回置声明
      *      (复核红队 a56d53db BP-2:CC 只在 cwd 落到项目外时写这行,根内调用的输出末行恰似声明多半是命令自己打印的转录内容);
+     *      例外:本调用有 cdOf 认不出的 cd 类外壳 ⇒ 「根内」本身不可信,有声明照样采信(复核红队 a9de6a18 BP-2);
      *      在根外 / 任一种未知:有回置声明(gate-ctx 的 `cwdReset`)⇒ 下一次起点 = 声明路径,无声明 ⇒ 回本仓根。
-     *    · PowerShell:语料 0 次回置声明,行为文档未记载 ⇒ 维持跨调用保持(PS 跨调用 cwd 语义未证,见下 CEILING)。
+     *    · PowerShell:语料 0 次回置声明 ⇒ 维持跨调用保持。旁证:本机 ~/.claude/cache/changelog.md 第 4856 行(2.1.149)
+     *      「Fixed a PowerShell permission bypass: built-in `cd` functions (`cd..`, `cd\`, `cd~`, `X:`) changed the working directory
+     *      undetected, letting a later command read outside the workspace」——PS 内建 cd 函数会改工作目录、CC 据此跟踪
+     *      (修的是「没被检测到」),支持「PS 的 cd 对其后命令持续有效」;「later command」是否指下一次工具调用、
+     *      PS 是否有「cd 到项目外即回置」,文档未记载(见下 CEILING)。
+     *      PS 那份的两种未知另有调用边界处置(复核红队 a9de6a18):cd 失败 ⇒ 位置不变(`cdFailLoc`,不记 UNK_FAIL);
+     *      UNK_PARSE 只在产生它的那次调用内算根外,调用结束改记本仓根(`psCallEnd`,详下)。
      *    · Bash 与 PowerShell **分开记** cwd 状态(loc / prev / pushd 栈 / 盘符上次所在各一份;env 本来就只活在一次调用里),
      *      Bash 调用边界的回置只作用于 Bash 那一份(复核红队 a56d53db BP-1:原共用一份,Bash 回置把 PS 留下的他仓 cwd 一并抹掉 ⇒ 漏放)。
      *      依据:两个工具是两个 shell 进程,一个里的 cd 不改另一个的 cwd——这是更贴进程模型的选择,不是实测
@@ -4057,7 +4064,10 @@ const RULE_P = {
      *      Bash 回置后 PS 本仓提交失败会被诚实误拦)。分账键 = `cwdShell`。
      *  去向有两种「未知」(红队 a07e98e9 BP-2,不得混用):
      *    · `UNK_FAIL`:该 cd 所在调用的工具结果报错**且正文带 cd 失败特征**(codex 257-p-agg-r1「没问到」② + 红队 ad3e4f93 BP-1)
-     *      ⇒ 生没生效判不出 ⇒ **不算证据**(视为本仓);
+     *      ⇒ 生没生效判不出 ⇒ **不算证据**(视为本仓)。**只记在 Bash 那份**;PowerShell 的 cd 失败 ⇒ 位置不变
+     *      (复核红队 a9de6a18 BP-1:Set-Location 失败本就不改当前位置;分账后 PS 的 UNK_FAIL 没有调用边界洗掉,
+     *      原记法沿用到窗口结束、其后相对 `Set-Location ../x` 跟着解成未知 ⇒ 漏放)。同一 PS 调用里多个 cd、
+     *      正文只说有一个失败 ⇒ 判不出哪一个,全部按未生效(原地)处理——见 CEILING;
      *    · `UNK_PARSE`:去向解不出(变量 / 命令替换 / `~user` / popd 栈空 / `cd -` 无前值 / 相对路径接在根外或解不出的位置后 /
      *      bash 下同盘的裸盘符)⇒ 按 0aa11fd 之前语义**算可能在别处**(0aa11fd~ba5c9c2 视为本仓 ⇒ `git -C ~/notes` 等一律漏放)。
      *  提交段的去向 = 当时 cwd 再叠 `git -C`(按序,含 `~`)、`--work-tree` / `--git-dir` / `GIT_WORK_TREE=` / `GIT_DIR=`
@@ -4077,11 +4087,22 @@ const RULE_P = {
      *  (358 次是 cd 进会话 scratchpad,CC 不写声明),其后下一次调用不自带 cd、用仓相对路径的 56 次成功(唯一一次报错形是 ssh 远端命令的输出,非本地 cwd)
      *  ⇒ 无声明时也回到了根(静默回置)。--add-dir 附加工作目录未在语料里出现,是否回置未证 ⇒ 若不回置,同向漏放。
      *  回置声明取自工具输出末行,命令自己 echo 一行同样字样即可伪造(代价模型:故意伪造不计);只在调用结束于根外 / 未知时采信
-     *  (a56d53db BP-2)⇒ 模型把实际在根外的 cwd 误判成根内(符号链接 / junction 等)时,真声明会被忽略、照常保持该位置;
+     *  (a56d53db BP-2),或本调用有 cdOf 认不出的 cd 类外壳时(复核红队 a9de6a18 BP-2:`if …; then cd X; fi` / `do cd …`,
+     *  `opaqueCd`;引号外整词 cd / pushd / popd / chdir / Set-Location / sl / Push-Location / Pop-Location)
+     *  ⇒ 模型把实际在根外的 cwd 误判成根内而**无**认不出的 cd 外壳(符号链接 / junction 等)时,真声明会被忽略、照常保持该位置;
+     *  认不出的外壳没执行(`if false`)而输出末行恰似声明 ⇒ 被采信(偏放,与「恰似声明」同一族,概率更低);
      *  Bash 上 UNK_FAIL 的跨调用作用已被回置吸收 ⇒ `CD_FAIL` 在 Bash 上只在同一调用内承重。
      *  PowerShell 跨调用 cwd 语义未证(0 次声明)⇒ 维持保持;若实为回置 ⇒ PS 形 cd 他仓后本仓提交失败会被诚实误拦;
-     *  `cd "$(git rev-parse --show-toplevel)"` 后本仓提交失败 ⇒
+     *  `cd "$(git rev-parse --show-toplevel)"` 后**同一调用内**本仓提交失败 ⇒
      *  UNK_PARSE ⇒ 计别处(诚实误拦,与漏放同价);环境变量只在同一调用内跟踪(工具每次调用新开 shell);
+     *  PS 那份 UNK_PARSE 的跨调用取舍(复核红队 a9de6a18 BP-4):产生它的那次调用内照旧算根外(`Set-Location $x; git commit`
+     *  仍计别处);调用结束(loc / prev / Push-Location 栈里的)UNK_PARSE 一律改记本仓根 R——「未知、不算证据」,
+     *  与分账前中间 Bash 调用边界把它洗回根的效果一致(原跨调用无限期算根外 ⇒ `Set-Location (git rev-parse --show-toplevel)` /
+     *  `Set-Location $root` / 栈空 `Pop-Location` 之后任一次 PS 本仓提交失败都被计成别处承重提交)。
+     *  **漏放面**:PS 变量 / 命令替换 cd 到他仓,下一次 PS 调用不带 cd 直接提交、或相对 `Set-Location sub` 后提交 ⇒ 判本仓
+     *  (分账前同样漏:中间任一 Bash 调用把它洗回根;不插 Bash 时旧版算别处,这一小块是本取舍新让出的);
+     *  PS 同一调用多个 cd、正文只说有一个失败 ⇒ 全部按原地 ⇒ 成功的那个出仓 cd 被抹(漏放)/ 成功的那个回仓 cd 被抹(误拦)两向都有;
+     *  PS 内建 `cd..` / `cd\` / `cd~`(无空格的函数形,changelog 第 4856 行)cdOf 不认 ⇒ 当非 cd 段(漏放,未修,登记);
      *  BP-3(walk 的 cd 识别仍是 bash 专用、与本函数两套 cd 模型)未动。
      *  失败判据只看结果正文(`errText`)的 cd 失败特征(`CD_FAIL`),其余失败(管道尾 grep 退 1 / push 失败 / 超时 / 打断)不抹 cd
      *  (红队 ad3e4f93 BP-1);特征词宽(`No such file or directory` 也可能出自同一调用里别的命令)⇒ 那种调用里的 cd 记 UNK_FAIL、
@@ -4140,6 +4161,7 @@ const RULE_P = {
         ({ loc, prev, stack, lastOn } = S);
         const frames = [];                           // 子 shell 层:进入前的 {loc, prev, stack, env}
         let env = {};                                // 本调用内设过的 GIT_DIR / GIT_WORK_TREE(原始串,提交时按当时 cwd 解)
+        let opaque = false;                          // 复核红队 a9de6a18 BP-2:本调用有 cdOf 认不出的 cd 类外壳(`then cd …` 等)
         const enter = (n) => { for (let k = 0; k < n; k++) frames.push({ loc, prev, stack: [...stack], env: { ...env } }); };
         const leave = (n) => { for (let k = 0; k < n && frames.length; k++) { const f = frames.pop(); loc = f.loc; prev = f.prev; stack = f.stack; env = f.env; } };
         for (const seg of segs) {
@@ -4147,13 +4169,16 @@ const RULE_P = {
           if (!ps) enter(sc.open);
           const body = sc.body;
           const cd = body ? H.cdOf(body, ps) : null;
+          if (body && H.opaqueCd(body, ps, cd)) opaque = true;
           if (cd) {
             const was = loc;
             // codex 257-p-agg-r1「没问到」②:cd 失败 ⇒ 去向记未知(UNK_FAIL),不当作移出本仓的证据
             //   (原先失败的 cd 也当成功,本仓提交失败因而被计成别处承重提交)。
             // 红队 ad3e4f93 BP-1:「cd 失败」只认结果正文的 cd 失败特征(`CD_FAIL`),不认 `is_error` 本身——
             //   `cd X && git diff | grep foo` 的 grep 无匹配、尾部 push 失败、超时、打断都报错,cd 却已生效。
-            if (a.err && H.CD_FAIL.test(String(a.errText || ""))) { loc = UNK_FAIL; prev = was; }
+            // 复核红队 a9de6a18 BP-1:PowerShell 的 cd 失败 ⇒ 位置不变(`cdFailLoc`;分账后 PS 的 UNK_FAIL 没有调用边界洗掉,
+            //   原记 UNK_FAIL 会一直沿用、其后相对 `Set-Location ../x` 解成未知 ⇒ 漏放);Bash 照旧记 UNK_FAIL(调用边界回置吸收)。
+            if (a.err && H.CD_FAIL.test(String(a.errText || ""))) { if (!ps) prev = was; loc = H.cdFailLoc(ps, was, UNK_FAIL); }
             else if (cd.pop) { loc = stack.length ? stack.pop() : UNK_PARSE; prev = was; }
             else if (!cd.stay) {                     // PowerShell 无参:原地
               if (cd.back) loc = prev === null ? UNK_PARSE : prev;
@@ -4185,8 +4210,11 @@ const RULE_P = {
         }
         leave(frames.length);                        // 调用结束:未闭合的子 shell 层一律弹回(子 shell 不跨调用)
         if (!ps) {                                   // a084a536 BP-6:Bash 调用边界回置(PowerShell 跨调用语义未证,不动)
-          const nx = H.bashCallEnd(a, isPath(loc) && !H.outside(loc, R) ? loc : null, R);
+          const nx = H.bashCallEnd(a, isPath(loc) && !H.outside(loc, R) ? loc : null, R, opaque);
           if (nx !== null) { loc = note(nx); prev = null; }
+        } else {                                     // 复核红队 a9de6a18 BP-4:PS 的 UNK_PARSE 只在产生它的调用内算根外
+          const st = (l) => H.psCallEnd(l, UNK_PARSE, R);
+          loc = st(loc); prev = prev === null ? null : st(prev); stack = stack.map(st);
         }
         Object.assign(S, { loc, prev, stack, lastOn });   // 只存回本 shell 那一份(a56d53db BP-1)
       }
@@ -4194,21 +4222,37 @@ const RULE_P = {
     },
     /** a56d53db BP-1:cwd 状态分账键。Bash 与 PowerShell 是两个 shell 进程 ⇒ 各记一份(依据与未证项见 commitOutsideRoot 头注)。 */
     cwdShell(ps) { return ps ? "ps" : "bash"; },
+    /** 复核红队 a9de6a18 BP-1:带 cd 失败特征的调用里,cd 段之后的位置。PowerShell 的 Set-Location 失败不改当前位置 ⇒ 原地(`was`);
+     *  Bash 记 `unk`(UNK_FAIL:生没生效判不出、不算证据;跨调用由 Bash 调用边界回置吸收)。 */
+    cdFailLoc(ps, was, unk) { return ps ? was : unk; },
+    /** 复核红队 a9de6a18 BP-4:一次 PowerShell 调用结束时 PS 那份状态里的 UNK_PARSE(`unk`)⇒ 本仓根 R
+     *  (「未知、不算证据」;与分账前中间 Bash 调用边界把它洗回根的效果一致)。其余原样。取舍与漏放面见 commitOutsideRoot 头注。 */
+    psCallEnd(l, unk, R) { return l === unk ? R : l; },
+    /** 复核红队 a9de6a18 BP-2:这一段 cdOf 认不出(`cd` = null),引号外却有 cd 类词作整词出现(`then cd E:/x` / `do cd …` / `if … cd`)
+     *  ⇒ 本调用的 cwd 模型不可信,调用结束在根内也照样采信回置声明(见 `bashCallEnd`)。 */
+    opaqueCd(body, ps, cd) {
+      if (cd) return false;
+      let m = String(body || "");
+      try { m = stripQuoted(m, ps); } catch { /* 掩码失败 ⇒ 按原串 */ }
+      return /(?:^|[^\w-])(?:cd|pushd|popd|chdir|set-location|sl|push-location|pop-location)(?![\w-])/i.test(m);
+    },
     /** a084a536 BP-6:一次 Bash 调用结束后下一次调用的起点。`inRoot` = 调用结束时 cwd(在本仓根内才给,否则 null)。
      *  返回 null = 不动(照常跨调用保持),否则 = 新起点。
      *  ① 调用结束时在根内(含子目录)⇒ 照常保持,**不看**回置声明(a56d53db BP-2:CC 只在 cwd 落到项目外时写声明;
      *     根内调用输出的末行恰似声明 = 命令自己打印的内容,如 `tail -1` / `jq` 打出转录);
+     *     例外(复核红队 a9de6a18 BP-2):`opaque` = 本调用有 cdOf 认不出的 cd 类外壳(`if …; then cd X; fi` / `for … do cd …`)
+     *     ⇒ 「根内」本身不可信 ⇒ 有声明照样采信;无声明仍照常保持(不按 ② 回根)。
      *  ② 在根外 / 任一种未知(OUT / UNK_PARSE / UNK_FAIL):结果正文末行「Shell cwd was reset to <路径>」(gate-ctx 的 `cwdReset`)
      *     ⇒ 起点 = 该路径(绝对形才认);无声明 ⇒ 起点回本仓根。 */
-    bashCallEnd(a, inRoot, R) {
+    bashCallEnd(a, inRoot, R, opaque) {
       const H = RULE_P._p;
-      if (inRoot !== null) return null;
+      if (inRoot !== null && !opaque) return null;
       const r = typeof (a && a.cwdReset) === "string" ? a.cwdReset.trim().replace(/^(["'])([\s\S]*)\1$/, "$2") : "";
       if (r) {
         const p = r.replace(/\\/g, "/").replace(/^\/([a-z])(\/|$)/i, "$1:/");
         if (/^([A-Za-z]:)?\//.test(p)) return H.resolve(null, p);
       }
-      return R;
+      return inRoot !== null ? null : R;
     },
     /** 本轮(不含窗口)的命令语法承重证据:参数面承重提交 / 本轮 Write·Edit 承重件 / 本轮 Bash 写目标(cd 解析后)落承重件。 */
     ownSyntaxCarrier(ctx) {
@@ -4634,10 +4678,14 @@ const RULE_P = {
     { name: "落在别处的 cwd 追踪不并窗口(上一次调用的 cd 看不见)", apply: swapP({ commitOutsideRoot: (orig) => (ctx, root) =>
       orig(Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx, { window: () => null }), root) }) },
     { name: "Bash 调用边界不回置(根外 cwd 跨调用保持,a084a536 BP-6)", apply: swapP({ bashCallEnd: () => () => null }) },
-    { name: "回置声明不认(只走无声明默认,a084a536 BP-6 对照)", apply: swapP({ bashCallEnd: (orig) => (a, l, R) => orig({ ...a, cwdReset: undefined }, l, R) }) },
-    { name: "无声明一律回根(根内子目录也不跨调用保持,a084a536 BP-6)", apply: swapP({ bashCallEnd: (orig) => (a, l, R) => orig(a, null, R) }) },
-    { name: "根内也采信回置声明(输出末行恰似声明即回置,a56d53db BP-2)", apply: swapP({ bashCallEnd: (orig) => (a, l, R) => orig(a, a && a.cwdReset ? null : l, R) }) },
+    { name: "回置声明不认(只走无声明默认,a084a536 BP-6 对照)", apply: swapP({ bashCallEnd: (orig) => (a, l, R, o) => orig({ ...a, cwdReset: undefined }, l, R, o) }) },
+    { name: "无声明一律回根(根内子目录也不跨调用保持,a084a536 BP-6)", apply: swapP({ bashCallEnd: (orig) => (a, l, R, o) => orig(a, null, R, o) }) },
+    { name: "根内也采信回置声明(输出末行恰似声明即回置,a56d53db BP-2)", apply: swapP({ bashCallEnd: (orig) => (a, l, R, o) => orig(a, a && a.cwdReset ? null : l, R, o) }) },
     { name: "Bash 回置也作用于 PS(两种 shell 共用一份 cwd,a56d53db BP-1)", apply: swapP({ cwdShell: () => () => "bash" }) },
+    { name: "PS 的 cd 失败仍记未知(UNK_FAIL 跨调用沿用,复核红队 a9de6a18 BP-1)", apply: swapP({ cdFailLoc: () => (ps, was, unk) => unk }) },
+    { name: "PS 的 UNK_PARSE 跨调用持续算根外(复核红队 a9de6a18 BP-4)", apply: swapP({ psCallEnd: () => (l) => l }) },
+    { name: "认不出的 cd 外壳不算(根内一律不采信声明,复核红队 a9de6a18 BP-2)", apply: swapP({ opaqueCd: () => () => false }) },
+    { name: "cd 类词不论 cdOf 认没认出都算外壳(复核红队 a9de6a18 BP-2 对照)", apply: swapP({ opaqueCd: (orig) => (b, ps) => orig(b, ps, null) }) },
     { name: "段首 ( / { 不剥(cdOf 认不出子 shell 与大括号组里的 cd,a07e98e9 BP-1)", apply: swapP({ scope: () => (seg) => ({ body: String(seg || "").trim(), open: 0, close: 0 }) }) },
     { name: "子 shell 不开层(子 shell 里的 cd 当持久,a07e98e9 BP-1 反)", apply: swapP({ scope: (orig) => (seg, ps) => ({ ...orig(seg, ps), open: 0, close: 0 }) }) },
     { name: "任何报错都抹 cd(不看结果正文的 cd 失败特征,ad3e4f93 BP-1)", apply: swapP({ CD_FAIL: () => /[\s\S]?/ }) },
@@ -4972,6 +5020,22 @@ const RULE_P = {
         text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
         prior: [{ text: "切", ps: "Set-Location E:/elsewhere" }],
         bash: ["git status"], ps: ["git add AGENTS.md; git commit -am x"], headFacts: { root: "/repo", commits: [] } },
+      // 复核红队 a9de6a18 BP-1(620e556 引入的漏放):PS 切仓失败原记 UNK_FAIL,分账后没有 Bash 调用边界洗掉 ⇒ 沿用到窗口结束,
+      //   其后相对 Set-Location 解成未知、不算证据。现 PS 的 cd 失败 ⇒ 位置不变(仍在根)⇒ `../elsewhere` 解出根外
+      { name: "复核 620e556 BP-1:PS 切仓失败、插一次 Bash、PS 相对切他仓提交 ⇒ 别处",
+        text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "切", ps: "Set-Location /repo/nope", failed: "Set-Location : Cannot find path '\\repo\\nope' because it does not exist." }, { text: "看", bash: "ls" }],
+        ps: ["Set-Location ../elsewhere; git add AGENTS.md; git commit -m x"], headFacts: { root: "/repo", commits: [] } },
+      // 复核红队 a9de6a18 BP-2(620e556 引入的漏放):调用结束模型判在根内子目录,但本调用有 cdOf 认不出的 cd 外壳(`then cd …`)
+      //   ⇒ 「根内」不可信,真回置声明不得弃 ⇒ 下一次起点 = 声明路径(本仓根),`cd ../elsewhere` 解出根外
+      { name: "复核 620e556 BP-2:根内子目录 + cdOf 认不出的出项目 cd、真回置声明被弃 ⇒ 下一次相对他仓提交算别处",
+        text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "进子目录", bash: "cd docs" }, { text: "看", bash: "if true; then cd E:/elsewhere; fi; ls", result: "a.txt\nShell cwd was reset to \\repo" }],
+        bash: ["cd ../elsewhere && git add AGENTS.md && git commit -m x"], headFacts: { root: "/repo", commits: [] } },
+      // BP-4 的「同调用内照旧」一侧:PS 变量形 Set-Location 与提交在**同一次**调用 ⇒ UNK_PARSE 照旧算根外(钉住 psCallEnd 只在调用结束生效)
+      { name: "复核 620e556 BP-4 对照:同一次 PS 调用内 Set-Location 到变量后提交 ⇒ 按旧语义算别处",
+        text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        bash: ["sed -i s/a/b/ AGENTS.md"], ps: ["Set-Location $notes; git add -A; git commit -m x"], headFacts: { root: "/repo", commits: [] } },
       // 红队 a9af71da BP-1:范围超 CAP(60)时 hook 给聚合项(原返回 null ⇒ 恒回退语法面,merge 合回的闸改动看不见)
       { name: "a9af71da BP-1:聚合项(61 笔,净差带闸改动)、merge 合回、无红队 ⇒ 欠",
         text: "合回。", pLedger: { carriers: 0 },
@@ -5241,6 +5305,16 @@ const RULE_P = {
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
         prior: [{ text: "看", bash: "cd docs && tail -1 notes.txt", result: "Shell cwd was reset to \\repo" }],
         bash: ["cd .. && git commit -m law"], headFacts: { root: "/repo", commits: [] } },
+      // 复核红队 a9de6a18 BP-4(620e556 引入的诚实误拦):PS 那份的 UNK_PARSE 跨调用无限期持续且算根外
+      //   ⇒ 之后 PS 本仓提交失败被计成别处。现只在产生它的调用内算根外,调用结束改记本仓根(未知、不算证据)
+      { name: "复核 620e556 BP-4:PS 变量形去仓根、插 Bash、本轮 PS 本仓提交失败 ⇒ 不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        prior: [{ text: "去仓根", ps: "Set-Location (git rev-parse --show-toplevel)" }, { text: "看", bash: "git status" }],
+        ps: ["git commit -m law"], headFacts: { root: "/repo", commits: [] } },
+      { name: "复核 620e556 BP-4 变体:PS 栈空 Pop-Location、插 Bash、本轮 PS 本仓提交失败 ⇒ 不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        prior: [{ text: "回", ps: "Pop-Location" }, { text: "看", bash: "git status" }],
+        ps: ["git commit -m law"], headFacts: { root: "/repo", commits: [] } },
       // BP-1 边界:pLedger=0、4 笔法典提交 ⇒ 仍在宽限内(与 10 笔那条 pos 配对,钉住「按提交数计」而不是「一律越限」)
       { name: "a2a9f58b BP-1 边界:pLedger=0、git add -A 带进 4 笔法典提交 ⇒ 宽限内放行",
         text: "收工。", pLedger: { carriers: 0 }, bash: ["git add -A && git commit -m x"],
