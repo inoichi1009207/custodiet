@@ -284,9 +284,7 @@ console.log("正反例:");
 //   **注入通道**(官方 background_tasks[] 载荷 / 收尾时点三查①结果),不进 entries。
 //   第十六次:`ps`(2026-10-11 红队 a811daae BP-6)——走 **PowerShell 工具**的命令(顶层与 `prior` 项同写法)。
 //     写目标解析按工具名选方言;平铺夹具只发 Bash ⇒「同一串、不同工具、不同结论」写不出来。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "hookCheckout", "missingDirs", "at", "then"]);
-//   第十七次:`missingDirs`(2026-10-11 codex 257-p-shrink-r1 断言 3)——P 的目录存在性事实,注入通道:列出的路径「此刻不存在」,
-//     其余一律「存在」;不写该键 ⇒ 通道没接(ctx.dirExists=null,规则按「cd 一律生效」)。没它,「cd 他仓失败 && git commit」写不出来。
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "hookCheckout", "at", "then"]);
 //   第十五次:`then`(2026-10-10 红队 a2155edb BP-1;与十三、十四次同日由另一 worktree 并行加,合并时重编号)——**本窗口内**主 assistant 条目之后再接的条目(写法同 `prior` 项),
 //   ND 的「出路要晚于最近一次名词提问」要写出 [问1, 写日记, 排队问2, 说] 这种窗口内时序;平铺夹具只有「一条用户行 + 一条
 //   assistant」,时序根本写不出来——与上面各次同族:夹具支持面不足会让规则「测不出来」。
@@ -442,8 +440,6 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...("diffFacts" in c ? { diffTier: () => c.diffFacts } : {}),
   ...("headFacts" in c ? { headFacts: () => c.headFacts } : {}),
   ...("hookCheckout" in c ? { hookCheckout: c.hookCheckout } : {}),
-  ...("missingDirs" in c ? { dirExists: ((norm) => { const gone = new Set(c.missingDirs.map(norm)); return (p) => !gone.has(norm(p)); })(
-    (p) => String(p).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()) } : {}),
   // `pLedger` = P 的跨批持久账注入(2026-08-22 亲签)。与 batchGoal 同族:注入通道非动作。
   ...("pLedger" in c ? { pLedger: c.pLedger } : {}),
   // `prior` = [{text, write?, …}, …] ⇒ 拼成 assistant entries 交给 priorEntries。

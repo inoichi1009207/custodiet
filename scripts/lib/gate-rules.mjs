@@ -3812,8 +3812,7 @@ const RULE_P = {
     //     理由与让出面见 commitOutsideRoot 头注):该调用内提交前 cwd 已在本仓根外,或提交段带 `git -C <根外>` / git-dir / work-tree 根外;
     //     没有 ⇒ 视为本仓提交失败(未暂存 / pre-commit 失败 / 权限被拒),不计。
     //     同调用内去向解不出(UNK_PARSE:变量、命令替换、`~user` 等)⇒ 按 0aa11fd 之前语义算别处;
-    //     「cd 本身失败」**不读结果正文**,只认磁盘事实:Stop 时 cd 目标目录不存在(且本轮没有删 / 移目录的动作)⇒ 那个 cd 原地
-    //     (codex 257-p-shrink-r1 断言 3、红队 a8d5f844 BP-1;详 commitOutsideRoot 头注)。
+    //     同调用内的 cd **一律按生效**(不读结果正文、不看磁盘;cd 真失败 ⇒ 让出面,详 commitOutsideRoot 头注)。
     //   计数(a2a9f58b BP-1):宽限账与 detect 同取 `tally`——git 事实在 ⇒ 范围内带承重改动、且账上没记过 sha 的提交数;
     //     取不到 ⇒ 命令语法。原来计数仍是命令语法:`git add -A` / `commit -am` / merge 合回计 0 ⇒ 宽限账永不涨。
 
@@ -4051,26 +4050,20 @@ const RULE_P = {
      *      `--git-dir=../x/.git --work-tree=.` 只看 work-tree 会漏);
      *    · 同一调用内去向解不出(UNK_PARSE:变量 / 命令替换 / `~user` / popd 栈空 / `cd -` 无前值 / 相对路径接在根外或解不出的位置后 /
      *      bash 下同盘的裸盘符)之后的提交段 ⇒ 按 0aa11fd 之前语义**算可能在别处**(0aa11fd~ba5c9c2 视为本仓 ⇒ `git -C ~/notes` 等一律漏放)。
-     *  **cd 失败不读工具结果正文,只认磁盘事实**(`ctx.dirExists`,hook 实时路径注入;夹具 `missingDirs`):
-     *    Stop 时 cd 目标(或提交段 `-C` 落点)**不存在** ⇒ 那次 cd 失败、原地不动(`-C` 落点不存在 ⇒ 那次 git 失败、该提交段不算)。
-     *    `&&` / `;` / PS 续跑三种接法同一结论:`&&` 链提交没跑,`;` 与 PS 续跑在原地跑——都不是「提交进了他仓」。
-     *    事实「此刻不存在」只在**本轮没有删 / 移目录的动作**时才当「当时不存在」用(`movesDirs`:rm / rmdir / mv / git worktree remove|move|prune /
-     *    git clean / Remove-Item / Move-Item / Rename-Item 等,段首、外壳内、`-c` / `-Command` / `//c` / `-e` 载荷里,或 rmSync / rimraf /
-     *    rmtree / `::Delete(` 等 API 名,在本轮任一调用出现 ⇒ 整轮不用存在性,退回「cd 一律生效」)。
-     *    通道没接(离线回放 / 旧夹具)或取不到(权限等,非「不存在」)⇒ 同样按生效。
-     *    只在以下都成立时才问存在性(本批复核红队 BP-1~7):目标在**根外**(根内子目录消失时提交仍落本仓,`&&` 短路与相对 `-C ..`
-     *    建模不全,问了反而误拦);目标串分词干净(无反斜杠转义空格、残留引号、PS 反引号);目标是绝对路径,或本调用内已有绝对 cd
-     *    锚定过(相对目标依赖调用起点,起点按根算未必真);hook 侧祖先链上没有 `.git`(他仓特性分支子目录被 `git switch` 删掉 ⇒
-     *    「不知道」,`liveDirExists`)。判过一次 cd 失败后,同调用内 popd 遇空栈 / `cd -` 无前值按原地(BP-6)。
-     *    原「cd 一律生效」时 `cd <不存在的他仓> && git commit` 单个 cd 失败就误拦(codex 257-p-shrink-r1 断言 3、红队 a8d5f844 BP-1;
-     *    头注原写「`&&` 链无需特判」是错的:提交没跑,判据仍把命令文本里的提交当成提交动作)。
-     *    让出面:目录在本轮被**认不出的方式**删掉(脚本 / 子进程里删)⇒ 当时在、此刻不在 ⇒ 按失败 ⇒ 他仓提交判本仓(漏放,登记)。
-     *    此前删「结果正文推断」的理由:从结果正文推断「哪个 cd 失败」本批连修三轮——10ccd42 报错调用一律按原地、b7b3bb1 Bash 记未知、
+     *  **同一调用内的 cd 一律按生效,不读工具结果正文**(2026-10-11 派出方裁定,删 `cdFailedFor` / `CD_FAIL` 与 gate-ctx 的
+     *    `err` / `errText`)。**`&&` 链同样按生效**:`cd <打错的根外路径> && git commit` 里提交没跑,闸仍把命令文本里的提交当提交
+     *    ⇒ 计别处(诚实误拦;原头注称「`&&` 链无需特判」是错的,红队 a8d5f844 BP-1、codex 257-p-shrink-r1 断言 3)。
+     *    曾在批 257–258 改为「Stop 时看目录在不在磁盘上」收回这条误拦(f995088 → be1d2fb,四轮复核共二十余条新形态),
+     *    最后 codex 258-p-turnsafe-r1 证:「此刻不在」证明不了「当时 cd 失败」(他仓 post-commit 钩子提交后挪仓 ⇒ 漏放)。
+     *    用户 2026-10-11 签 A:删机制、回到一律按生效,这条误拦登记为让出面(代价:P 账上多计 1 笔,最多提前一轮武装三通道)。
+     *    删推断的理由:从结果正文推断「哪个 cd 失败」本批连修三轮——10ccd42 报错调用一律按原地、b7b3bb1 Bash 记未知、
      *    4abce92 按「失败行点名的目标」逐个判——每轮复核红队都打出新形态(a90f6b3f / aada7471 及其后各轮):PS 报错恒带当前位置
      *    绝对路径(撞任一 cd 目标)、长路径折行、正文 500 字截断、同名目录撞行、`~` 被展开后点名的不是原串、切盘报错不带盘符、
      *    exit 0 时 cd 失败根本不报错(`;` 链尾段成功)……文字推断是无底洞;语料 182 份里报错调用含 cd 段 149 次,cd 真失败只 5 次。
-     *  原「cd 一律生效」让出的「切他仓真失败 ⇒ 误拦」改由磁盘事实收回;「进根内子目录真失败 + `-C ../x` ⇒ 漏放」因根内不问存在性
-     *    仍是登记面(neg「根内目标不用存在性」钉着);目标在、cd 仍失败(权限)⇒ 仍按生效;本轮有删移动作 ⇒ 整轮退回旧判(登记)。
+     *  让出的面(cd 真失败、却按生效算;两者都要求**同一调用里** cd 失败与相对路径提交并存,语料近 0):
+     *    · cd 目标在根外且真失败、同调用内其后本仓提交(也失败)⇒ 计别处(诚实误拦;pos「已知残余:…切他仓真失败」钉着);
+     *    · `cd <打错的根外路径> && git commit`(提交没跑)⇒ 计别处(诚实误拦,用户 10-11 签 A;pos「已知残余:cd 打错的他仓 && 提交」钉着);
+     *    · cd 进根内子目录且真失败、其后相对 `git -C ../x` ⇒ 从那个不存在的子目录解、落回根内 ⇒ 漏放(neg「已知残余:…」钉着)。
      *  **为什么不做跨调用跟踪**(2026-10-11 派出方裁定,删掉 Bash 调用边界回置 / 回置声明采信 / PS·Bash 分账 / 未知跨调用 /
      *    认不出的 cd 外壳 / PS cd 失败原地 / pushd 栈跨调用整套):本批为它连修五轮(0aa11fd、afdd279、52779ec、620e556、f7306ec),
      *    每轮复核红队都在跨调用边界上找出新形态,而这些形态在语料里全是 0 次(派出方自统计,本机 182 份主转录:PS 1346 次调用、
@@ -4085,7 +4078,7 @@ const RULE_P = {
      *  兜底:git 事实层(本仓 `基点..HEAD` 范围,`facts` / `tally`)不依赖 cwd 跟踪,仍独立兜住**本仓**提交;本函数只在
      *    「本轮有提交命令、本仓范围里却没有本轮提交」时判那笔提交是不是落在别处(`commitsElsewhere`)。
      *  CEILING:`cd "$(git rev-parse --show-toplevel)"` 后同一调用内本仓提交失败 ⇒ UNK_PARSE ⇒ 计别处(诚实误拦,与漏放同价);
-     *  cd 失败只认磁盘事实(见上);
+     *  cd 失败一律不认(上段让出面);
      *  PS 内建 `cd..` / `cd\` / `cd~`(无空格的函数形,changelog 第 4856 行)与 `if …; then cd X; fi` / `do cd …` 等 cdOf 认不出的
      *  cd 外壳 ⇒ 当非 cd 段(漏放,登记);walk 的 cd 识别仍是 bash 专用、与本函数两套 cd 模型(BP-3)未动。 */
     commitOutsideRoot(ctx, root) {
@@ -4119,17 +4112,7 @@ const RULE_P = {
         return H.resolve(base, u);
       };
       const isOut = (l) => !isPath(l) || H.outside(l, R);
-      const acts = Array.isArray(ctx.actions) ? ctx.actions : [];
-      const gone = H.goneFn(ctx, acts);
-      // 复核红队(本批)BP-7:只对**根外**目标用存在性——根内子目录消失(打错、切分支删掉)时提交仍落本仓,
-      //   而 `&&` 短路与相对 `-C ..` 建模不全,用了反而误拦;根内目标一律按生效(原「进根内子目录真失败 + -C ../x」漏放回到登记面)。
-      const isGone = (l) => isPath(l) && H.outside(l, R) && gone(l);
-      const unq = (raw) => String(raw ?? "").replace(/^(["'])([\s\S]*)\1$/, "$2");
-      // BP-3:目标串解得不干净(反斜杠转义空格、残留引号、PS 反引号、反斜杠结尾)⇒ 解出的路径本身可疑,不拿去问存在性
-      const clean = (raw) => !/[\\`]$|["'`]|\\ /.test(unq(raw));
-      // BP-4:相对目标依赖调用起点(每次调用按根算,真实起点可能是上一次调用留下的子目录)⇒ 本调用内没有绝对 cd 锚定过就不问存在性
-      const absRaw = (raw) => { const u = unq(raw); return abs(u) || /^~/.test(u) || /^[A-Za-z]:/.test(u); };
-      for (const a of acts) {
+      for (const a of Array.isArray(ctx.actions) ? ctx.actions : []) {
         const name = String((a && a.name) || "");
         if (!/^(Bash|PowerShell)$/.test(name) || typeof (a.input && a.input.command) !== "string") continue;
         const ps = name === "PowerShell";
@@ -4138,7 +4121,6 @@ const RULE_P = {
         st = H.callStart(st, R);
         // 同一调用内的 cd 一律按生效(不读结果正文判 cd 失败,理由与让出面见本函数头注)
         let { loc, prev, stack } = st;
-        let anchored = false, failed = false;        // 本调用内:绝对 cd 生效过 / 判过一次 cd 失败(BP-4 / BP-6)
         const frames = [];                           // 子 shell 层:进入前的 {loc, prev, stack, env}
         let env = {};                                // 本调用内设过的 GIT_DIR / GIT_WORK_TREE(原始串,提交时按当时 cwd 解)
         const enter = (n) => { for (let k = 0; k < n; k++) frames.push({ loc, prev, stack: [...stack], env: { ...env } }); };
@@ -4150,22 +4132,14 @@ const RULE_P = {
           const cd = body ? H.cdOf(body, ps) : null;
           if (cd) {
             const was = loc;
-            // BP-6:本调用判过 cd 失败(失败的 pushd 不压栈)⇒ popd 遇空栈 / `cd -` 无前值按原地(真实 shell 报错不动),不记未知
-            if (cd.pop) { loc = stack.length ? stack.pop() : (failed ? was : UNK); prev = was; }
+            if (cd.pop) { loc = stack.length ? stack.pop() : UNK; prev = was; }
             else if (!cd.stay) {                     // PowerShell 无参:原地
-              let to;
-              if (cd.back) to = prev === null ? (failed ? was : UNK) : prev;
-              else if (cd.dyn) to = UNK;
-              else if ("home" in cd) to = home ? H.resolve(home, cd.home || ".") : OUT;
-              else to = dest(loc, cd.to, ps);
-              const ask = "to" in cd && clean(cd.to) && (anchored || absRaw(cd.to));
-              if (ask && isGone(to)) failed = true;  // 目标此刻不在 ⇒ 那次 cd 失败:原地,不压栈、不改 prev
-              else {
-                loc = to;
-                if ("home" in cd || ("to" in cd && absRaw(cd.to))) anchored = true;
-                if (/^(pushd|push-location)\b/i.test(body)) stack.push(was);
-                prev = was;
-              }
+              if (cd.back) loc = prev === null ? UNK : prev;
+              else if (cd.dyn) loc = UNK;
+              else if ("home" in cd) loc = home ? H.resolve(home, cd.home || ".") : OUT;
+              else loc = dest(loc, cd.to, ps);
+              if (/^(pushd|push-location)\b/i.test(body)) stack.push(was);
+              prev = was;
             }
             const d = driveOf(loc);
             if (d) st.lastOn.set(d, loc);
@@ -4175,12 +4149,7 @@ const RULE_P = {
             if (em) env[em[1].toUpperCase()] = em[2].trim();
             const um = ps ? /^remove-item\s+(?:-path\s+)?env:(GIT_DIR|GIT_WORK_TREE)\s*$/i.exec(body) : /^unset\s+(GIT_DIR|GIT_WORK_TREE)\s*$/.exec(body);
             if (um) delete env[um[1].toUpperCase()];
-            if (isCommitSeg(body)) {
-              const g = gitArgs(body), tg = H.commitTargets(g, env, loc, (b, x) => dest(b, x, ps));
-              const cds = (g && g.cdirs) || [];
-              const ask = cds.length > 0 && cds.every(clean) && (anchored || cds.some(absRaw));
-              if (!(ask && isGone(tg[0])) && tg.some(isOut)) return true;   // tg[0] = -C 叠出的落点;它不在 ⇒ 那次 git 失败
-            }
+            if (isCommitSeg(body) && H.commitTargets(gitArgs(body), env, loc, (b, x) => dest(b, x, ps)).some(isOut)) return true;
           }
           if (!ps) leave(sc.close);
         }
@@ -4196,40 +4165,6 @@ const RULE_P = {
       const d = (/^([A-Za-z]):/.exec(R)?.[1] || "").toLowerCase();
       if (d) s.lastOn.set(d, R);
       return s;
-    },
-    /** `commitOutsideRoot` 的「那次 cd / -C 失败」判据:返回 `(路径) ⇒ 此刻确知不存在`。通道没接,或本轮任一调用有删 / 移目录
-     *  的段(`movesDirs`;此刻不在 ≠ 当时不在)⇒ 恒 false(退回「cd 一律生效」)。只有 `dirExists` 明确给 false 才算不存在。 */
-    goneFn(ctx, acts) {
-      const H = RULE_P._p;
-      if (typeof ctx.dirExists !== "function" || acts.some((a) => H.movesDirs(a))) return () => false;
-      return (l) => ctx.dirExists(l) === false;
-    },
-    /** 这次调用有没有删 / 移目录的段(`commitOutsideRoot` 的 `vanish`:有 ⇒ 磁盘「此刻不存在」不当「当时不存在」用)。
-     *  宁宽勿窄——多认只是退回「cd 一律生效」(原判,偏严),少认才漏:全文剥引号后命令位置(含 if / { } 外壳内)是删移命令,
-     *  嵌套 shell 载荷(-c / -Command / //c / -e)里有删移命令,出现删目录 API 名,段首(剥 sudo / env / xargs 等外壳)是删移命令,
-     *  段内 `-exec rm` / `-delete`,或 git 子命令 worktree(remove|move|prune) / clean / mv / rm;解析失败 ⇒ 算删过。
-     *  认不出的:脚本内部删(`node x.mjs`)——登记让出面。 */
-    movesDirs(a) {
-      const name = String((a && a.name) || "");
-      if (!/^(Bash|PowerShell)$/.test(name) || typeof (a.input && a.input.command) !== "string") return false;
-      const ps = name === "PowerShell", H = RULE_P._p;
-      let segs;
-      try { segs = segments(ps ? a.input.command : H.stripHeredoc(a.input.command), ps); } catch { return true; }
-      const VERB = /^(?:rm|rmdir|rd|mv|unlink|del|erase|ri|mi|ren|rni|remove-item|move-item|rename-item)(?:\.exe)?(?:\s|$)/i;
-      // 全文兜底(PS `if (…) { ri x }`、`& { Remove-Item … }` 等外壳段首认不出):剥掉引号内容后,命令位置(行首或 ; | & ( { 之后)出现删移动词即算
-      const bare = a.input.command.replace(/"(?:\\.|`.|[^"\\`])*"|'[^']*'/g, "\"\"");
-      if (/(?:^|[;|&({\n]|\b(?:then|do|else)\s)\s*(?:rm|rmdir|rd|mv|unlink|del|erase|ri|mi|ren|rni|remove-item|move-item|rename-item)(?:\.exe)?(?=\s|$|[;|&)}])/im.test(bare)) return true;
-      // 复核红队 BP-2:嵌套 shell 的载荷(`bash -c "rm …"`、`powershell -Command "Remove-Item …"`、`cmd //c rd …`、`node -e "…"`)
-      //   与删目录 API(rmSync / rimraf / rmtree / [IO.Directory]::Delete)——看原文(不剥引号);多认只会退回偏严的旧语义
-      const raw = a.input.command;
-      if (/\b(?:rmSync|rmdirSync|rimraf|rmtree|removedirs)\b|::Delete\s*\(|Directory\.Delete\b/i.test(raw)) return true;
-      if (/(?:^|\s)(?:-c|-Command|-e|--eval|\/\/?c)\s+[\s\S]*?(?:^|[\s;|&({"'])(?:rm|rmdir|rd|mv|move|unlink|del|erase|ri|mi|remove-item|move-item|rename-item)(?=\s|$|["';|&)}])/im.test(raw)) return true;
-      return segs.some((seg) => {
-        const b = H.scope(seg, ps).body.replace(/^(?:(?:sudo|command|builtin|nohup|time|env(?:\s+-\S+)*(?:\s+\w+=\S*)*|xargs(?:\s+-\S+)*)\s+)+/i, "");
-        if (VERB.test(b) || /\s-exec(?:dir)?\s+(?:rm|mv)\b|\s-delete\b/.test(b)) return true;
-        const g = gitArgs(b);
-        return !!g && (/^(?:clean|mv|rm)$/.test(g.sub) || (g.sub === "worktree" && /^(?:remove|move|prune)$/.test(String(g.args[0] || ""))));
-      });
     },
     /** 提交段的全部去向候选:当时 cwd 依次叠 `git -C`,再加 `--work-tree` / `--git-dir`(段内参数优先,否则本调用设过的
      *  `GIT_WORK_TREE` / `GIT_DIR`,段首前缀并入 `g.env`)按叠完的目录解。`res(base, raw)` = 去向解析。任一在根外 ⇒ 别处。 */
@@ -4672,10 +4607,6 @@ const RULE_P = {
     //   改钉新语义「同调用 cd 一律生效」的反面:cd 认得出、却一律当失败原地不动
     //   (证人两向:pos「cd 他仓 && git commit」诸条转放行;neg「a90f6b3f BP-1 / aada7471 BP-2」cd docs 后 ../.git 从根解到根外转拦)
     { name: "cd 当失败(一律原地)", apply: swapP({ cdOf: (orig) => (body, ps) => (orig(body, ps) ? { stay: true } : null) }) },
-    // codex 257-p-shrink-r1 断言 3:磁盘事实判 cd / -C 失败(证人 = neg「cd <不存在的他仓> && git commit」诸条、pos「进根内不存在的子目录」)
-    { name: "目录存在性不看(cd / -C 失败一律不认)", apply: swapP({ goneFn: () => () => () => false }) },
-    { name: "存在性不分是否本轮删过(删移动作不认;证人 = pos「rm -rf / worktree remove 该目录」)", apply: swapP({ movesDirs: () => () => false }) },
-    { name: "删移动作一律算有(存在性永不用;证人 = neg「提交说明含 rm 字样」)", apply: swapP({ movesDirs: () => () => true }) },
     { name: "聚合项按 1 笔计(不按范围提交数 count,a9af71da BP-1)", apply: swapP({ facts: (orig) => (ctx) => {
       const f = orig(ctx);
       return f ? { ...f, commits: f.commits.map((c) => ({ ...c, aggregated: false })) } : f;
@@ -4999,48 +4930,19 @@ const RULE_P = {
       // 2026-10-11 删 cd 失败推断(commitOutsideRoot 头注):原此处三条正例——「aada7471 BP-1(Bash cd 真失败点名目标、其后 -C ../elsewhere)」
       //   「cd 失败按原地(PS 同形)」「D149⑱ BP-2(链尾 cat 报 No such file)」——钉的是结果正文推断:前两条按新语义翻成漏放,
       //   改判为 neg「已知残余:…进子目录真失败…」(只留 Bash 一条);D149⑱ BP-2 只钉「未点名不抹 cd」的细节,去掉 failed 后与上一条重复,删。
-      // 回退面(目录存在性通道没接 ⇒ cd 一律生效):原「已知残余」——Set-Location 他仓真失败、PS 续跑本仓 `git commit` 也失败
-      //   ⇒ 计别处。接上通道后由磁盘事实收回(neg「codex shrink-r1 断言 3」诸条);本条钉「通道没接时不臆断失败」。
-      { name: "存在性通道没接:同一 PS 调用 Set-Location 他仓、其后本仓提交失败 ⇒ cd 按生效,计别处(回退面)",
+      // 已知残余(删 cd 失败推断让出的诚实误拦,原为反例「codex agg-r1 ②:同一 PS 调用内切仓失败、其后本仓提交失败 ⇒ 不计别处」,改判期望):
+      //   Set-Location 他仓真失败、PS 续跑本仓 `git commit` 也失败 ⇒ cd 按生效 ⇒ 提交计别处。修掉它要重新从结果正文推断 cd 失败
+      //   (见 commitOutsideRoot 头注:三轮各被打出新形态);本条转绿 = 有人又加回了 cd 失败推断,须复核。
+      //   (Bash 同形「cd 他仓 ; git commit」原为反例「ad3e4f93 BP-1 反」,同一让出面,只留本条,删。)
+      // 已知残余(用户 2026-10-11 签 A):`cd <打错的根外路径> && git commit` 提交没跑、仍计别处。磁盘判据(f995088~be1d2fb)已撤:
+      //   「此刻不在」证不了「当时失败」(codex 258-p-turnsafe-r1)。本条转绿 = 有人又加回了 cd 失败判据,须复核其漏放面。
+      { name: "已知残余:cd 打错的他仓 && 提交(提交没跑)⇒ cd 按生效,计别处(诚实误拦,用户签 A)",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        then: [{ text: "提交", bash: "cd E:/__p_audit_missing_257__ && git commit -m law" }],
+        headFacts: { root: "/repo", commits: [] } },
+      { name: "已知残余:同一 PS 调用内 Set-Location 他仓真失败、其后本仓提交失败 ⇒ cd 按生效,计别处(诚实误拦)",
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
         then: [{ text: "切了再提交", ps: "Set-Location E:/elsewhere; git commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      // codex 257-p-shrink-r1 断言 3:cd 他仓、目录此刻在 ⇒ cd 生效 ⇒ 别处(存在性通道接上时的正向面,`missingDirs` 不含它)
-      { name: "codex shrink-r1 断言 3 对照:cd 他仓 && 提交、他仓目录在 ⇒ 别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/nope"],
-        then: [{ text: "提交", bash: "cd E:/elsewhere && git commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      // 本轮有删目录动作 ⇒ 此刻不在 ≠ 当时不在 ⇒ 不用存在性(临时仓提交后删掉的形态)
-      { name: "codex shrink-r1 断言 3 反面:cd 他仓提交后同轮 rm -rf 该目录 ⇒ 不用存在性,cd 按生效,别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/tmp/scratch"],
-        then: [{ text: "提交", bash: "cd E:/tmp/scratch && git commit -m law && cd E:/tmp && rm -rf scratch" }],
-        headFacts: { root: "/repo", commits: [] } },
-      { name: "codex shrink-r1 断言 3 反面:另一次调用 git worktree remove 该目录 ⇒ 不用存在性,别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/wt"],
-        then: [{ text: "提交", bash: "cd E:/wt && git commit -m law" }, { text: "清", bash: "git worktree remove E:/wt" }],
-        headFacts: { root: "/repo", commits: [] } },
-      { name: "codex shrink-r1 断言 3 反面:PS 外壳里删目录(if (…) { ri x -r })⇒ 全文兜底认作删移,不用存在性,别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/wt"],
-        then: [{ text: "提交", ps: "Set-Location E:/wt; git commit -m law" }, { text: "清", ps: "if ($done) { ri E:/wt -r }" }],
-        headFacts: { root: "/repo", commits: [] } },
-      // 复核红队(本批)BP-3:路径带转义空格 `E:/my\ repo` ⇒ 分词得 `E:/my\`(不干净)⇒ 不问存在性 ⇒ cd 按生效 ⇒ 别处
-      { name: "复核 BP-3:cd E:/my\\ repo && 提交(分词不干净)⇒ 不问存在性,cd 按生效,别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/my"],
-        then: [{ text: "提交", bash: "cd E:/my\\ repo && git add -A && git commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      // BP-4:相对目标、本调用无绝对 cd 锚定 ⇒ 起点不可信(上一次调用可能留在子目录)⇒ 不问存在性 ⇒ 别处
-      { name: "复核 BP-4:深仓根下 cd ../../other && 提交(无绝对锚定)⇒ 不问存在性,别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "E:/work/test", write: "E:/work/test/AGENTS.md", missingDirs: ["E:/other"],
-        then: [{ text: "提交", bash: "cd ../../other && git commit -m law" }],
-        headFacts: { root: "E:/work/test", commits: [] } },
-      // BP-2:嵌套 shell 载荷与删目录 API 也算删移 ⇒ 不用存在性
-      { name: "复核 BP-2:同轮 bash -c \"rm -rf 临时仓\" ⇒ 认作删移,不用存在性,别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/tmp/clone"],
-        then: [{ text: "提交", bash: "cd E:/tmp/clone && git add -A && git commit -m law" }, { text: "清", bash: "bash -c \"rm -rf E:/tmp/clone\"" }],
-        headFacts: { root: "/repo", commits: [] } },
-      { name: "复核 BP-2:同轮 npx rimraf 临时仓 ⇒ 认作删移,别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/tmp/clone"],
-        then: [{ text: "提交", bash: "cd E:/tmp/clone && git commit -m law" }, { text: "清", bash: "npx rimraf E:/tmp/clone" }],
         headFacts: { root: "/repo", commits: [] } },
       // 已知残余(2026-10-11 删跨调用跟踪让出的诚实误拦,原为反例「a084a536 BP-6:上一次 Bash cd 进根内子目录、本次 cd .. 回根后提交失败」,
       //   改判期望):真实 Bash 对根内 cd 跨调用保持 ⇒ 第二次调用的 `cd ..` 回到根;本实现每次调用起点 = 根 ⇒ `..` 解出根外 ⇒ 计别处。
@@ -5256,56 +5158,13 @@ const RULE_P = {
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
         then: [{ text: "提交", ps: "Set-Location docs; git --git-dir=../.git --work-tree=.. commit -m law" }],
         headFacts: { root: "/repo", commits: [] } },
-      // 回退面(存在性通道没接 ⇒ cd 一律生效):原「已知残余」——cd 进根内不存在的子目录、其后 `-C ../elsewhere` ⇒ 从 /repo/nope 解
-      //   ⇒ 根内 ⇒ 不计别处(漏放)。接上通道后由磁盘事实收回(pos「codex shrink-r1:同调用 cd 进根内不存在的子目录…」)。
-      { name: "存在性通道没接:同调用 cd 进根内子目录(实际失败)、其后 git -C ../elsewhere 提交 ⇒ cd 按生效,-C 解回根内,不计别处(回退面)",
+      // 已知残余(删 cd 失败推断让出的漏放,原为正例「aada7471 BP-1:Bash cd 真失败(报错点名目标)、其后 git -C ../elsewhere 提交 ⇒ 别处」,
+      //   改判期望):cd 进根内不存在的子目录真失败、真实 cwd 仍是根 ⇒ `-C ../elsewhere` 实指根外;本实现 cd 一律生效 ⇒ 从
+      //   /repo/nope 解 ⇒ /repo/elsewhere 根内 ⇒ 不计别处(漏放)。修掉它要重新从结果正文推断 cd 失败(见 commitOutsideRoot 头注);
+      //   本条转红 = 有人又加回了 cd 失败推断(或改成 cd 一律原地),须复核。(PS 同形原「cd 失败按原地」正例,同一让出面,删。)
+      { name: "已知残余:同调用 cd 进根内子目录真失败、其后 git -C ../elsewhere 提交 ⇒ cd 按生效,-C 解回根内,不计别处(漏放)",
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
         then: [{ text: "提交", bash: "cd /repo/nope; git -C ../elsewhere add AGENTS.md; git -C ../elsewhere commit -m x" }],
-        headFacts: { root: "/repo", commits: [] } },
-      // codex 257-p-shrink-r1 断言 3 / 红队 a8d5f844 BP-1:cd 进不存在的他仓目录 ⇒ cd 失败 ⇒ `&&` 链提交没跑 / `;` 与 PS 续跑在本仓跑
-      //   ——都不是「提交进了他仓」⇒ 不计别处(原「cd 一律生效」三种接法全误拦)
-      { name: "codex shrink-r1 断言 3:cd <不存在的他仓> && git commit ⇒ cd 失败,提交没跑,不计别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/__p_audit_missing_257__"],
-        then: [{ text: "提交", bash: "cd E:/__p_audit_missing_257__ && git commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      { name: "codex shrink-r1 断言 3:cd <不存在的他仓> ; 本仓 git commit 失败 ⇒ cd 原地,不计别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/elsewhere"],
-        then: [{ text: "提交", bash: "cd E:/elsewhere; git commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      { name: "codex shrink-r1 断言 3:PS Set-Location <不存在的他仓>; 本仓提交失败 ⇒ 原地,不计别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/elsewhere"],
-        then: [{ text: "切了再提交", ps: "Set-Location E:/elsewhere; git commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      { name: "codex shrink-r1 断言 3 同族:git -C <不存在的他仓> commit ⇒ git 失败,不计别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/elsewhere"],
-        then: [{ text: "提交", bash: "git -C E:/elsewhere commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      // 复核红队(本批)BP-7 / 原「已知残余」漏放:根内目标不用存在性(提交仍落本仓;`&&` 短路与相对 -C 建模不全)
-      { name: "复核 BP-7:cd <根内打错的子目录> && git -C .. commit ⇒ 根内目标按生效,-C .. 回根,不计别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["/repo/typo"],
-        then: [{ text: "提交", bash: "cd /repo/typo && git -C .. commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      { name: "根内目标不用存在性:cd 进根内不存在的子目录、其后 git -C ../elsewhere ⇒ 按生效,解回根内,不计别处(登记漏放)",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["/repo/nope"],
-        then: [{ text: "提交", bash: "cd /repo/nope; git -C ../elsewhere add AGENTS.md; git -C ../elsewhere commit -m x" }],
-        headFacts: { root: "/repo", commits: [] } },
-      // BP-6:失败的 pushd 不压栈 ⇒ 其后 popd 遇空栈按原地(不记未知)
-      { name: "复核 BP-6:pushd <打错的他仓>; popd; 本仓提交失败 ⇒ popd 原地,不计别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/typo"],
-        then: [{ text: "提交", bash: "pushd E:/typo; ls; popd; git commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      { name: "复核 BP-6:PS Push-Location <打错的他仓>; Pop-Location; 本仓提交失败 ⇒ 原地,不计别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/typo"],
-        then: [{ text: "提交", ps: "Push-Location E:/typo; ls; Pop-Location; git commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      { name: "复核 BP-6 同族:cd <打错的他仓>; cd -; 本仓提交失败 ⇒ 原地,不计别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/typo"],
-        then: [{ text: "提交", bash: "cd E:/typo; cd -; git commit -m law" }],
-        headFacts: { root: "/repo", commits: [] } },
-      // 删移动作识别宁宽:提交说明里的「rm」不算删(gitArgs 剥了 -m 载荷,子命令是 commit)⇒ 存在性照用
-      { name: "codex shrink-r1 断言 3:提交说明含 rm / worktree remove 字样 ⇒ 不算删移动作,存在性照用,不计别处",
-        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", missingDirs: ["E:/elsewhere"],
-        then: [{ text: "提交", bash: "cd E:/elsewhere && git commit -m \"rm stale; git worktree remove docs\"" }],
         headFacts: { root: "/repo", commits: [] } },
       // 2026-10-11 新增(删跨调用跟踪的接受侧,Bash / PS 各一):上一次调用 cd 他仓、本次调用本仓 `git commit` 失败 ⇒ 每次调用起点回根,不计别处
       //   (两条都在本轮,是「每次调用起点不回根」变异的证人;PS 一条正是让出面——PS 跨调用若保持 cwd、且那笔真提交进了他仓,这里会漏)

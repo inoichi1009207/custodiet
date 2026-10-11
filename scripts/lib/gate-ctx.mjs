@@ -551,12 +551,6 @@ export function buildCtx(entries, extra = {}) {
      *  再判「是不是 worktree / 暂存树下的闸副本」——否则在 worktree 里开的会话,自己的闸文件路径里就带 `.claude/worktrees/`,
      *  会被当成别人的副本(红队 a27628dd 口径的反面)。未注入 ⇒ null(按整条路径判)。 */
     hookCheckout,
-    /** 目录此刻在不在磁盘上(P 的 `commitOutsideRoot` 用它判「那次 cd / `-C` 失败」,codex 257-p-shrink-r1 断言 3)。
-     *  hook 只在实时路径注入(离线回放拿到的是「现在」的磁盘)。返回 true / false / null(取不到,非「不存在」);
-     *  只有 `false` 被当「不存在」。未注入 ⇒ null(规则按「cd 一律生效」)。 */
-    dirExists: typeof extra.dirExists === "function" ? (p) => {
-      try { const r = extra.dirExists(p); return r === true || r === false ? r : null; } catch { return null; }
-    } : null,
     /** P 的跨批持久计数(2026-08-22 用户亲签「改吧」)。三态与 batchGoal 同构:
      *  `undefined`=通道没接(夹具/旧路径 ⇒ 规则退回窗口式计账);
      *  `null`=接了、账不存在(首跑 ⇒ 计 0,宽限期);对象={carriers:自上轮三通道后累计承重提交数}。
@@ -697,12 +691,6 @@ export function selfTest() {
   chk("ad3e4f93:headFacts base 全长 ⇒ 透传", buildCtx([A([txt("x")])], { headFacts: () => ({ base: "b".repeat(40), commits: [] }) }).headFacts().base, "b".repeat(40));
   // headFacts 通道三态与形状校验
   const hf = (v) => buildCtx([A([txt("x")])], v === undefined ? {} : { headFacts: () => v }).headFacts;
-  // dirExists 通道:未接 ⇒ null;非布尔 / 抛错 ⇒ null(只有 false 算「不存在」)
-  const de = (fn) => buildCtx([A([txt("x")])], fn === undefined ? {} : { dirExists: fn }).dirExists;
-  chk("dirExists 未接 ⇒ null", de(undefined), null);
-  chk("dirExists 透传 false", de(() => false)("E:/x"), false);
-  chk("dirExists 非布尔 ⇒ null", de(() => "no")("E:/x"), null);
-  chk("dirExists 抛错 ⇒ null", de(() => { throw new Error("EACCES"); })("E:/x"), null);
   chk("headFacts 未接 ⇒ undefined", hf(undefined), undefined);
   chk("headFacts 取不到 ⇒ null", hf(null)(), null);
   chk("headFacts 形状不对 ⇒ null", hf({ commits: [{ files: [3] }] })(), null);

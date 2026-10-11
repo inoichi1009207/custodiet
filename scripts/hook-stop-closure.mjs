@@ -191,29 +191,6 @@ function gitNameStatus(git, range) {
  *      `{sha:HEAD, at, files:范围净差, aggregated:true, count}`,见函数内注。
  *  取不到(基点不合法、git 失败/超时)⇒ null ⇒ P 回退命令语法判据(fail-closed,不静默放行),
  *  且 hook 不推进基点(BP-2)。git 可注入(自测)。pathspecs = 闸引擎 pathspec(由 P 提供,与 ENGINE_REL 同一口径)。 */
-/** P 的目录存在性事实(gate-ctx `dirExists`):是目录 ⇒ true;不存在 / 不是目录 ⇒ false;其余错误(权限等)⇒ null。
- *  Windows 上不带盘符的绝对路径(Git Bash 的 `/tmp`、`/usr` 等挂载点)此处解不对 ⇒ null(不知道),不当「不存在」;
- *  非 Windows 上带盘符形(规则的 resolve 把 `/w/repo` 改写成 `w:/repo`,复核红队 BP-5)⇒ null。
- *  **不存在、但某个祖先目录带 `.git`(目录或文件)⇒ null**(复核红队 BP-1):他仓特性分支上的子目录在同轮 `git switch` /
- *  `checkout` / `stash` / `reset` 后被 git 删掉,「此刻不在」不等于「当时不在」;只有祖先链上没有任何 git 工作树时才答「不存在」。 */
-export function liveDirExists(p, platform = process.platform, stat = fs.statSync) {
-  const s = String(p || "").replace(/\\/g, "/");
-  if (!s) return null;
-  if (platform === "win32" ? !/^[A-Za-z]:\//.test(s) : /^[A-Za-z]:/.test(s)) return null;
-  const kind = (q) => { try { return stat(q).isDirectory() ? "dir" : "file"; } catch (e) { return e && (e.code === "ENOENT" || e.code === "ENOTDIR") ? "none" : null; } };
-  const k = kind(s);
-  if (k === null) return null;
-  if (k === "dir") return true;
-  const lead = /^([A-Za-z]:)?\//.exec(s)?.[0] ?? "";
-  const parts = s.slice(lead.length).split("/").filter(Boolean);
-  for (let i = parts.length - 1; i >= 0; i--) {
-    const anc = lead + parts.slice(0, i).join("/");
-    const g = kind(`${anc.replace(/\/$/, "")}/.git`);
-    if (g === null || g === "dir" || g === "file") return null;
-  }
-  return false;
-}
-
 export function readHeadFacts(base, git = _gitHere, pathspecs = []) {
   if (typeof base !== "string" || !/^[0-9a-f]{7,64}$/i.test(base)) return null;
   const HEX = /^[0-9a-f]{40,64}$/i;
@@ -2614,8 +2591,6 @@ export function run(transcriptPath, ctx = {}) {
             const batchBase = () => batchBaseOfGoal(ctx.batchGoal !== undefined ? ctx.batchGoal : readBatchGoal());
             return readHeadFacts(pHeadBase(ctx.sessionId, _allEntriesCache, undefined, undefined, batchBase), undefined, pp ? pp.ENGINE_PATHSPECS : []);
           } : undefined),
-        // P 的「cd / -C 目标此刻在不在」(codex 257-p-shrink-r1 断言 3):同样只在实时路径接(离线回放看到的是「现在」的磁盘)。
-        dirExists: ctx.dirExists !== undefined ? ctx.dirExists : (ctx.live ? liveDirExists : undefined),
         // ⚠️ **跨轮窗口必须真的传进来**(2026-08-20 实撞)。
         //   `ctx.window()` 从落地起就没被生产路径喂过 `priorEntries` ⇒ **恒为 null**,
         //   于是 I 项那条「取证窗口放宽到批窗口」的修法是**死代码**,我改完当轮它照样拦我。
@@ -4371,23 +4346,6 @@ function selfTest() {
         pHeadBase("selftest-no-such-session", s0, g2, late, () => batchBaseOfGoal({ cleared: true, baseCommit: "abc1234" })), null);
       hp("HEAD 基点:无会话 id ⇒ null", pHeadBase(undefined, [{ timestamp: "2026-10-10T08:00:00Z" }], g2, early), null);
       hp("HEAD 基点:会话 id 带路径字符 ⇒ null(不拼进文件名)", pHeadBase("../x", [{ timestamp: "2026-10-10T08:00:00Z" }], g2, early), null);
-      // P 的目录存在性(codex 257-p-shrink-r1 断言 3):ENOENT/ENOTDIR ⇒ false;权限等 ⇒ null;win32 无盘符 ⇒ null(Git Bash 挂载点解不对)
-      const stD = (r) => () => { if (r instanceof Error) throw r; return { isDirectory: () => r }; };
-      const erD = (code) => Object.assign(new Error(code), { code });
-      hp("目录存在性:是目录 ⇒ true", liveDirExists("E:/x", "win32", stD(true)), true);
-      hp("目录存在性:是文件 ⇒ false", liveDirExists("E:/x", "win32", (q) => { if (/\.git$/.test(q)) throw erD("ENOENT"); return { isDirectory: () => false }; }), false);
-      hp("目录存在性:ENOENT ⇒ false", liveDirExists("E:/x", "win32", stD(erD("ENOENT"))), false);
-      // 复核红队 BP-1:祖先带 .git(目录或 worktree 的 .git 文件)⇒ null;BP-5:非 win32 的伪盘符 ⇒ null
-      // 键按原写法给、运行时转小写(公开树洗表把 `E:/` 换成 `E:/`,小写键不跟着换 ⇒ 键与路径必须同一写法)
-      const fsD = (tree) => { const t = new Map(Object.entries(tree).map(([k, v]) => [k.toLowerCase(), v]));
-        return (q) => { const k = t.get(q.toLowerCase()); if (!k) throw erD("ENOENT"); return { isDirectory: () => k === "dir" }; }; };
-      hp("目录存在性 BP-1:他仓特性分支子目录已删、他仓根有 .git ⇒ null", liveDirExists("E:/elsewhere/feat", "win32", fsD({ "E:/elsewhere": "dir", "E:/elsewhere/.git": "dir" })), null);
-      hp("目录存在性 BP-1:祖先 .git 是文件(worktree)⇒ null", liveDirExists("E:/wt/a/b", "win32", fsD({ "E:/wt": "dir", "E:/wt/.git": "file" })), null);
-      hp("目录存在性 BP-1:祖先链无 .git ⇒ false", liveDirExists("E:/typo/x", "win32", fsD({})), false);
-      hp("目录存在性 BP-5:linux 下 w:/repo ⇒ null(不 stat)", liveDirExists("w:/repo", "linux", () => { throw erD("ENOENT"); }), null);
-      hp("目录存在性:EACCES ⇒ null(不当不存在)", liveDirExists("E:/x", "win32", stD(erD("EACCES"))), null);
-      hp("目录存在性:win32 下 /tmp/x ⇒ null(不 stat)", liveDirExists("/tmp/x", "win32", () => { throw erD("ENOENT"); }), null);
-      hp("目录存在性:linux 下 /tmp/x ⇒ 照 stat", liveDirExists("/tmp/x", "linux", stD(erD("ENOENT"))), false);
       // ── P 的收尾结算(settleP:hook 计账与基点推进;a2a9f58b BP-1 / BP-2 / BP-6)──
       {
         const P_ = RULES.find((r) => r.id === "P")._p;
