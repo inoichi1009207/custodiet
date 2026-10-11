@@ -11,7 +11,9 @@ Just want to install it? Jump to [Hand it to your agent](#hand-it-to-your-agent)
 
 ## Why
 
-Coding agents produce **false success**: they assert completion the environment doesn't support. On AppWorld self-assessing coding-agent trajectories with explicit status claims, **75.8%** of failures are false successes; LLM judges max out at **AUROC 0.65 (tau2-bench) / 0.54 (AppWorld)** while lightweight deterministic detectors reach **0.83–0.95 at ~3,300× lower latency** ([arXiv 2606.09863](https://arxiv.org/abs/2606.09863)). The paper's conclusion: *"production monitoring should use lightweight, domain-calibrated detectors **as triage signals** rather than relying on LLM judges as the primary monitor for false success."*
+Coding agents produce **false success**: they assert completion the environment doesn't support. A 2026 single-author workshop paper ([arXiv 2606.09863](https://arxiv.org/abs/2606.09863), ICML 2026 FAGEN workshop) quantifies it on two structured benchmarks: among AppWorld self-assessing coding-agent trajectories with explicit status claims, **75.8%** of failures (1,425 / 1,879) are false successes — a subset of the benchmark, as the paper itself notes. LLM judges do poorly: no configuration of 5 judges × 5 prompt strategies exceeds **AUROC 0.65** on tau2-bench (customer-service dialogues), and 3 judges reach only 0.54 on AppWorld; supervised lightweight **TF-IDF classifiers** reach 0.83 (tau2-bench) / 0.95 (AppWorld) on task-disjoint splits at ~3,300× lower latency. The abstract closes: *"These results suggest that production monitoring should use lightweight, domain-calibrated detectors as triage signals rather than relying on LLM judges as the primary monitor for false success."*
+
+Those numbers measure the paper's own statistical classifiers, **not this repo**. custodiet is a different kind of method — deterministic predicates over tool-call records, with no training data, never evaluated on the paper's benchmarks. The paper supports a direction (lightweight, domain-specific detection beats LLM judges as the primary signal), not this repo's specific method; it also states that its detector is a triage signal rather than an autonomous gate, and that open-ended code generation remains an open question.
 
 Upstream, the fabrication problem was reported and the issue **closed as not planned** ([anthropics/claude-code#2969](https://github.com/anthropics/claude-code/issues/2969)).
 
@@ -27,8 +29,18 @@ Upstream, the fabrication problem was reported and the issue **closed as not pla
 | Approach | Enforcement | Fails when |
 |---|---|---|
 | CLAUDE.md instructions | none — the model may ignore them | always, eventually |
-| LLM reviews LLM | another model's opinion | judge AUROC ≤ 0.65 on this task family |
+| LLM reviews LLM | another model's opinion | as the primary monitor: the paper above measured judge AUROC ≤ 0.65 (tau2-bench) and 0.54 (AppWorld); the open-ended coding tasks this repo faces are unmeasured |
 | **This repo** | **deterministic predicates over tool-call records** | only where a rule's stated ceiling says so |
+
+The author's own repo runs both: deterministic gates as the primary check, plus a prompt-type LLM judge for supplementary triage — it catches the kind of problem a keyword predicate cannot read semantically (e.g. treating a self-reported number as a verified fact). custodiet's installer ships only the deterministic gates, not that judge.
+
+## Evaluation status (read this first)
+
+- **Recall is unknown**: false positives are measured (see FAQ); misses are not, and the report always prints `RECALL=UNKNOWN`.
+- **Narrow deployment**: all usage data comes from one author on one main repo; there is no third-party deployment data.
+- **Text rules match Chinese only**: rules that read wording (causal claims, noun questions, scope-dodging, etc.) match Chinese phrasing, and the verdict messages are in Chinese.
+- **War-story numbers are author-attested**: each carries its date, denominator and how to reproduce it in the same paragraph; there is no third-party audit.
+- **The cited paper's numbers do not measure this repo**: see "Why".
 
 The 26 engine rules read a **structured context** built only from `assistant` text blocks and `tool_use` **inputs** — tool *outputs* never enter their evidence window, so *reading a file that mentions `git commit` cannot count as having committed* (that exact exploit is a regression test). The two not-yet-migrated built-in rules (A delegation-closure, R past-tense## What it watches at each stage (selection of the 28 rules: 26 engine + 2 built-in; `gate:accept` output is authoritative — hand counts drift)
 
@@ -69,7 +81,7 @@ Full tour and build order: [`docs/playbook.md`](docs/playbook.md) (the construct
 
 As of our survey we have **not observed** this combination elsewhere (*not observed*, not *doesn't exist*):
 
-- **Mutation-tested rules**: a rule cannot ship without ≥2 mutations of its own predicate that its fixtures demonstrably kill (`gate-migrate-check.mjs`). Before this harness existed we measured 40/97 mutants surviving under an all-green suite.
+- **Mutation-tested rules**: a rule cannot ship without ≥2 mutations of its own predicate that its fixtures demonstrably kill (`gate-migrate-check.mjs`). Before this harness existed (measured on 2026-08-19) we saw 40 of 97 mutants survive an all-green suite — the author's same-day record (see the comment in `scripts/gate-migrate-check.mjs`), with no re-run script.
 - **Load-time invariants**: blocking rules must cite a human-signed law anchor, must carry positive *and* negative fixtures, and are checked inside the production hook, not only in CI.
 - **False-positive & miss ledgers**: every alert lands in a denominator ledger; claimed false positives are filed with reasons; the report always prints `RECALL=UNKNOWN` because an absence of complaints is not an absence of misses.
 - **Debt with expiry**: every known limitation is a ledger row with a batch-count expiry; expiry reactivates the debt via `batch-goal --arm`. The mechanism ships; our own debt table stays in the source project.
@@ -97,9 +109,9 @@ As of our survey we have **not observed** this combination elsewhere (*not obser
 
 ## FAQ
 
-**False positives?** Filed in a ledger with reasons and measured against an automatic alert denominator (9.7% claimed rate at last count); several rules were narrowed through exactly that loop.
+**False positives?** Filed in a ledger with reasons and measured against an automatic alert denominator. The author's reading on 2026-10-11: 205 false positives / 2223 rule alerts (1512 turns) = 9.2%; all 205 were claimed by the executing agent itself, with no third-party countersign. Re-run: `node scripts/hook-stop-closure.mjs --fp-report` (the ledger data lives on the author's machine and is not published). Recall cannot be measured, so the report always prints `RECALL=UNKNOWN`. Several rules were narrowed through exactly that loop.
 
-**Overhead?** Zero dependencies. Measured on a 21k-entry transcript: 330–600 ms per Stop, of which ~40 ms is transcript reading (timing is stamped into the heartbeat ledger).
+**Overhead?** Zero dependencies. On the author's machine, 590 Stops from 2026-08-25 to 10-10: median 582 ms, p90 1575 ms, rising with transcript size — median 243 ms under 20 MB, 1037 ms at 20 MB and above (largest transcript ~117 MB). Source: the `dur=` field of CLEAN lines in the heartbeat ledger `.claude/.gate-heartbeat.log` (author-attested, no re-run script; reading the log reproduces it).
 
 **Infinite loops?** The hook checks `stop_hook_active`, and the engine records its own consecutive-block streak with a pressure valve (`STOP_CLOSURE_BLOCK_CAP`) that demotes to warnings rather than deadlocking — and the demotion is logged as a demotion, never as a pass.
 
@@ -107,7 +119,7 @@ As of our survey we have **not observed** this combination elsewhere (*not obser
 
 **Why is everything in Chinese?** This is a reference implementation extracted from the project that built it, comments and verdict messages included. The architecture (structured ctx / rules / registry / acceptance harness) is language-neutral; an English message pack is a welcome first contribution.
 
-**Are the war-story numbers audited?** They are the author's own ledgers (git log, alert ledger, debt table). The playbook marks them as author-attested. Read them the way you'd read any postmortem.
+**Are the war-story numbers audited?** Not by a third party. They come from the author's own ledgers (git log, alert ledger, debt table); each number carries its date, denominator and how to reproduce it in the same paragraph — a repo command where one exists, "author-attested" where not. The playbook marks them the same way. Read them the way you'd read any postmortem.
 
 ## Hand it to your agent
 
