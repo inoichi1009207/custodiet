@@ -299,13 +299,6 @@ export function buildCtx(entries, extra = {}) {
     .map((a) => String(a.input.file_path || "").replace(/\\/g, "/"))
     .filter(Boolean);
 
-  /** 起过的子代理类型,如 `grill:security`。**从 Agent 工具入参取**,
-   *  而不是在文本里找字符串——否则一个提到 `grill:security` 的文件就能满足 P 的通道。 */
-  const agents = actions
-    .filter((a) => a.name === "Agent" || a.name === "Task")
-    .map((a) => String(a.input.subagent_type || a.input.agentType || ""))
-    .filter(Boolean);
-
   /** 调用过的 skill / 内建工具名,用于判「跑没跑某条通道」。 */
   const toolNames = actions.map((a) => a.name);
   const skills = actions.filter((a) => a.name === "Skill").map((a) => String(a.input.skill || ""));
@@ -410,7 +403,7 @@ export function buildCtx(entries, extra = {}) {
    *  扫工具结果,于是结果里仅仅「提到」codex / grep / git commit / 承重路径,
    *  就能分别制造假豁免、假回读、假触发)。
    *  故:窗口也走 buildCtx,同样只留 assistant 文本块与 tool_use 入参。
-   *  规则拿到的是 `ctx.window.commits` / `ctx.window.agents` 这类**已结构化**的东西,
+   *  规则拿到的是 `ctx.window.commits` / `ctx.window.actions` 这类**已结构化**的东西,
    *  拿不到裸文本里的工具输出。
    *
    *  懒构造:绝大多数规则不需要窗口,不该为它们付解析成本(全语料回放 6604 片)。
@@ -512,6 +505,12 @@ export function buildCtx(entries, extra = {}) {
     return {
       batch: typeof g.batch === "string" ? g.batch : null,
       armedAt: typeof g.armedAt === "string" ? g.armedAt : null,
+      /** 批 258:结清态下「本批从何时起」(hook 从台账补回最早一次武装的时刻;W 按它切交付物)。不冒充 armedAt。 */
+      clearedArmedAt: typeof g.clearedArmedAt === "string" ? g.clearedArmedAt : null,
+      /** 批 258:同轮「关旧批 → 开新批」时被关那批的最早武装时刻(W 切交付物取较早者)。 */
+      priorClosedArmedAt: typeof g.priorClosedArmedAt === "string" ? g.priorClosedArmedAt : null,
+      /** 批 258:本轮开始时正开着的那一批的起点(hook 从台账算;W 切交付物取较早者)。 */
+      turnBatchStart: typeof g.turnBatchStart === "string" ? g.turnBatchStart : null,
       cleared: g.cleared === true,
       /** batch-goal 拒清留痕(判据未过 / 判据被改):有它且未结清 ⇒ 本批的 `--clear` 没成,ranClear 不得为真。 */
       clearRefusedAt: typeof g.clearRefusedAt === "string" ? g.clearRefusedAt : null,
@@ -541,11 +540,12 @@ export function buildCtx(entries, extra = {}) {
 
   // ⚠️ `ranAgent` 与 `trackedKnown` 已删(2026-08-25,批 101/D10):
   //   `--ctx-consumers` 扫描(coverage-check.mjs)+ 全仓 grep 复核=零消费。
-  //   「有没有起过 agent」的活消费面是 `agents`(经 `c.agents.length`/scopeActions);
   //   tracked 的 fail-closed 语义在 `isNew` 内部自持,不需要外露旗标。
   //   INV-5 的仪器即该扫描;字段再断线由它报,不靠注释宣称。
+  // ⚠️ `agents` 已删(批 258):最后一个消费者 T 的「独立复核」支删去后零消费(--ctx-consumers 当场报出)。
+  //   「起没起过某类子代理」的规则面一律直接读 `actions`(P 的 CH、W 的 reviewedOne 本来就这样读),入参取类型,不读文本。
   return {
-    text, userText, actions, bashCmds, bashDialects, commits, writes, reads, agents, toolNames, skills, written, isNew,
+    text, userText, actions, bashCmds, bashDialects, commits, writes, reads, toolNames, skills, written, isNew,
     window, batchGoal, turnLog,
     /** hook 所在 checkout 的根(批 255 已注入、此前只在 isNew 内部用)。P 的语法回退面用它把绝对路径化成仓相对形,
      *  再判「是不是 worktree / 暂存树下的闸副本」——否则在 worktree 里开的会话,自己的闸文件路径里就带 `.claude/worktrees/`,
@@ -712,11 +712,11 @@ export function selfTest() {
     buildCtx([A([use("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md" })])])
       .ranBash(/codex-run\.mjs/), true);
 
-  // S2-c:文本里提到 grill:security ⇒ 不算跑过该通道(消费面=agents,ranAgent 谓词已删,D10)
-  chk("正文提到 grill:security ⇒ agents 为空",
-    buildCtx([A([txt("建议跑 grill:security 审一遍")])]).agents.length, 0);
-  chk("真起 grill agent ⇒ agents 记到",
-    buildCtx([A([use("Agent", { subagent_type: "grill:security" })])]).agents.length, 1);
+  // S2-c:文本里提到 grill:security ⇒ 不进动作面(`agents` 字段批 258 删,规则面直接读 actions)
+  chk("正文提到 grill:security ⇒ 动作面无 Agent",
+    buildCtx([A([txt("建议跑 grill:security 审一遍")])]).actions.filter((a) => a.name === "Agent").length, 0);
+  chk("真起 grill agent ⇒ 动作面有 Agent 且入参带类型",
+    buildCtx([A([use("Agent", { subagent_type: "grill:security" })])]).actions.find((a) => a.name === "Agent")?.input.subagent_type, "grill:security");
 
   // 工具输出不得进 text(否则被读文件的内容会成为「他说的话」)
   chk("tool_result 不进 ctx.text",
@@ -860,10 +860,11 @@ export function selfTest() {
       ] } },
     ];
     const w2 = buildCtx([A([txt("本轮")])], { priorEntries: mixed }).window();
-    chk("窗口**保留**真事实:入参里的 agent 还在(过滤成全空必须转红)", w2.agents.length, 1);
+    const wAgents = w2.actions.filter((a) => a.name === "Agent" || a.name === "Task").map((a) => String(a.input.subagent_type || a.input.agentType || ""));
+    chk("窗口**保留**真事实:入参里的 agent 还在(过滤成全空必须转红)", wAgents.length, 1);
     chk("窗口**保留**真事实:assistant 说的话还在", w2.text.includes("上一轮我起了个 agent"), true);
     chk("窗口**不含** tool_result:文件里提到 git commit 不算提交过", w2.commits.length, 0);
-    chk("窗口**不含** tool_result:提到 grill:security 不额外算一个 agent", w2.agents.includes("grill:security"), false);
+    chk("窗口**不含** tool_result:提到 grill:security 不额外算一个 agent", wAgents.includes("grill:security"), false);
     chk("窗口**不含** tool_result:裸文本不进 text", w2.text.includes("git commit"), false);
 
     // 窗口只有一层,不递归(否则回放全语料时会指数展开)

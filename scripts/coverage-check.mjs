@@ -188,7 +188,7 @@ export function ctxConsumers(opts = {}) {
   //   必须仍在扫描面上 grep 得到,引用点被删/改名 ⇒ 例外失效、该字段自动回红——
   //   与 EXPECTED_DIVERGENCE「登记项须可验」同一形制,防例外表沦为第二张手写白名单。
   const ALIAS_CONSUMERS = {
-    agents: /\bc\.agents\.length\b/,       // gate-rules reviewed():窗口∪本轮的 agent 面
+    // (agents 条目批 258 删:T 的 reviewed() 删去后字段本身已从 ctx 撤掉)
     commits: /\bwin\.commits\b/,           // gate-rules batchDrifting():窗口式消费
   };
   const dead = [];
@@ -269,6 +269,22 @@ function selfTest() {
   }
 
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+
+  // 批 258(D149⑲):Stryker 配置的 mutate 行号区间须与 gate-ctx.mjs 里 buildCtx 的真实起止一致——
+  //   区间写死在 JSON 里,源文件一改就漂(10-11 实测 50-418 vs 真实 160–638,变异打到了 selfTest 外的别处)。
+  //   这里读两份配置与源文件当场比对;漂了就红,不靠「改了 gate-ctx 先重核行号」这句注释。
+  {
+    const src = fs.readFileSync("scripts/lib/gate-ctx.mjs", "utf8").split(/\r?\n/);
+    const s = src.findIndex((l) => /^export function buildCtx\(/.test(l));
+    const e = s < 0 ? -1 : src.findIndex((l, i) => i > s && /^}\s*$/.test(l));
+    const want = s >= 0 && e > s ? `scripts/lib/gate-ctx.mjs:${s + 1}-${e + 1}` : null;
+    for (const f of ["scripts/mutation/gate-ctx.stryker.json", "scripts/mutation/gate-ctx-fullsuite.stryker.json"]) {
+      if (!fs.existsSync(f)) continue;   // 没有该配置的仓(如公开树不带 scripts/mutation/)不比对
+      let got = null;
+      try { got = (JSON.parse(fs.readFileSync(f, "utf8")).mutate || [])[0] ?? null; } catch { got = null; }
+      chk(`Stryker 区间与 buildCtx 起止一致:${f}`, got, want);
+    }
+  }
 
   let pass = 0;
   for (const [ok, n, extra] of t) { console.log(`  ${ok ? "PASS" : "FAIL"}  ${n}${ok ? "" : "  ← " + extra}`); if (ok) pass++; }

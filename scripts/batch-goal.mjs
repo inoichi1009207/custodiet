@@ -823,6 +823,15 @@ function selfTest() {
     w("docs/adr/0009-a.md", "# 0009\n- 决定编号:301-D1\n另见 301-D2(待写)\n"); commit("adr");
     const r = cli("--clear"); return [r.status, /缺:301-D2(?![0-9、])/.test(r.stderr), /reason=adr-missing/.test(r.stderr)];
   }), [2, true, true]);
+  // 批 258(codex 258-cond2-r1 断言 3):同号未结清的原样重放保留 armedAt;结清后重开取新时刻
+  t("集成 258:同号原样重放不刷新 armedAt,--force 换号刷新", sandbox(({ cli, st }) => {
+    cli("--arm", "303", "--cond", "甲"); const a1 = st().armedAt;
+    const t0 = Date.now(); while (Date.now() - t0 < 15) { /* 让时钟走过一毫秒级 */ }
+    cli("--arm", "303", "--cond", "甲"); const a2 = st().armedAt;
+    const t1 = Date.now(); while (Date.now() - t1 < 15) { /* 同上 */ }
+    cli("--arm", "304", "--cond", "乙", "--force"); const a3 = st().armedAt;
+    return [typeof a1 === "string" && a1 === a2, a3 !== a1];
+  }), [true, true]);
   t("集成 BP-2:同号结清后重开 ⇒ 编号接着 D2、旧日记行与旧 ADR 不抵、补新的才结清", sandbox(({ tmp, cli, w, commit, st }) => {
     cli("--arm", "302", "--cond", "甲"); cli("--decision", "第一次"); cli("--outcome", "成果一");
     w("docs/adr/0009-a.md", "# 0009\n- 决定编号:302-D1\n"); fs.appendFileSync(path.join(tmp, "docs/product-diary.md"), "| d | 批 302:成果一 | y | e |\n"); commit("first");
@@ -981,6 +990,9 @@ if (argv.includes("--clear")) {
     //   留下批号,闸就能要求「台账末行的批号 == 状态文件的批号」——写失败时对不上。
     atomicWrite({ cleared: true, batch: prev?.batch ?? null });
     console.log("已结清批级完成条件(留结清标记,下次 --arm 覆盖;条件已存入 .batch-goal.jsonl)");
+    // 批 258 条件 4:收尾自动出一张报警量 × 误报率表(按规则),待修行下一批 --arm 会再列一次
+    const rep = fpReport();
+    if (rep) console.log("\n── 收尾误报率表 ──\n" + rep.trim());
   } catch (e) {
     // ⚠️ 失败必须走 stderr + 非零退出。原实现打 stdout 且 exit 0,
     //   调用方检查 $? 会以为清账成功,而陈旧条件还留在盘上(grill:error-handling 报出)。
@@ -1074,7 +1086,10 @@ if (argv.includes("--arm")) {
   //   台账 .jsonl 里有时间,但让读者去 join 两份文件是把简单的事做复杂了。
   // r2:同批逐字重放不得抹掉拒清痕迹(否则「拒清 → 原样重 arm → 正文写达成」就绕过了 K);换批或 --force 才清
   const carry = (cur && !cur.cleared && cur.batch === batch && cur.clearRefusedAt && !argv.includes("--force")) ? { clearRefusedAt: cur.clearRefusedAt, clearRefusedReason: cur.clearRefusedReason } : {};
-  try { atomicWrite({ batch, conditions: conds, checks, shell: "bash", armedAt: new Date().toISOString(), baseCommit, ...kept, ...carry }, seenVersion); }
+  // 批 258(codex 258-cond2-r1 断言 3):同号未结清的重放保留原 armedAt——它是「本批从何时起」,W 按它切交付物、
+  //   P 按它切凭证池;重放刷新它会把本批更早的写入切到批外(本批未审的交付物被放行)。换批或结清后重开才取新时刻。
+  const armedAt = sameOpen && typeof cur.armedAt === "string" && cur.armedAt ? cur.armedAt : new Date().toISOString();
+  try { atomicWrite({ batch, conditions: conds, checks, shell: "bash", armedAt, baseCommit, ...kept, ...carry }, seenVersion); }
   catch (e) { console.error(e.message); process.exit(2); }
   console.log(`已武装批 ${batch} 的 ${conds.length} 条完成条件${checks.length ? `(其中 ${checks.length} 条带可执行判据,--clear 时经 bash 跑)` : ""};收尾时须逐条写「条件N:达成/未达成/不适用」`);
   for (const c of checks) console.log(`  条件${c.i + 1} ⇐ $ ${c.cmd}${c.expect !== undefined ? `  期待含「${c.expect}」` : ""}${c.expectRe !== undefined ? `  期待匹配 /${c.expectRe}/` : ""}`);
@@ -1121,7 +1136,32 @@ if (argv.includes("--arm")) {
       console.log(`  到期语义:自动回 active——本批要么办掉,要么在收尾对照里写明为什么还不办。`);
     }
   } catch { console.log("⚠ 债表读不到,到期检查跳过(fail-open,仅提示层)"); }
+  // ── 误报率待修腿(批 258 条件 4)──
+  //   误报率 ≥15% 且报警 ≥20 的规则在开工时刻列出,与上面的到期债同一结构点:不靠人记得去翻报表。
+  //   报表由 hook-stop-closure `--fp-report --hot` 算(唯一实现);跑不出来 ⇒ 只提示,不拦开工。
+  const hotRep = fpReport(["--hot"]);
+  // 报表自己的完整性告警(台账断链 / 坏行)原样转出——开批只留「待修」行会把它们滤掉(codex 258-cond34-r1 附节)
+  for (const l of hotRep.split("\n")) if (/^(🔴|⚠)/.test(l)) console.log(l);
+  const hot = hotRep.split("\n").filter((l) => l.startsWith("待修 "));
+  if (hot.length) {
+    console.log(`⚠ **误报率待修的规则 ${hot.length} 条**(误报率 ≥15% 且报警 ≥20;本批要么修判据,要么在收尾对照里写明为什么不修):`);
+    for (const l of hot) console.log("  " + l.replace(/^待修 /, "").replace(/\s*← 下一批待修\s*$/, ""));
+  }
   process.exit(0);
+}
+
+/** 跑 hook-stop-closure `--fp-report [extra…]`,返回 stdout;跑不出 ⇒ 空串,**并说出来**(提示层 fail-open,但不静默——
+ *  codex 258-cond34-r1 断言 4:原实现非零退出 / 超时 / 异常一律无声,待修腿与收尾表看起来像「没有待修」)。 */
+function fpReport(extra = []) {
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "hook-stop-closure.mjs");
+  if (!fs.existsSync(script)) return "";   // 本仓没有收尾闸脚本:无从出表,不算故障
+  try {
+    const r = spawnSync(process.execPath, ["--no-warnings", script, "--fp-report", ...extra], { encoding: "utf8", timeout: 60000 });
+    if (r.status === 0) return String(r.stdout || "");
+    const why = r.error ? String(r.error.message || r.error) : `退出码 ${r.status}${r.signal ? `(${r.signal})` : ""}`;
+    console.log(`⚠ 误报率表跑不出来(${why}):${String(r.stderr || "").split("\n")[0].slice(0, 160)}——待修与收尾表本次缺,不拦`);
+    return "";
+  } catch (e) { console.log(`⚠ 误报率表跑不出来(${String(e && e.message || e).slice(0, 160)})——待修与收尾表本次缺,不拦`); return ""; }
 }
 
 if (argv.includes("--dry-check")) {

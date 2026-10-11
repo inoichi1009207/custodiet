@@ -130,6 +130,10 @@ function readBatchGoal() {
         // 只补 `closedConditions`,**不冒充 `conditions`**:
         // 「当前武装着这些条件」与「刚关掉的那批曾有这些条件」是两件事,混了 K 会误响。
         g = { ...g, batch: last.batch ?? null, closedConditions: last.conditions };
+        // 批 258(codex 258-cond2-r1 发现 1):结清态没有 armedAt ⇒ W 按批切交付物的判据退回整窗口,上一批的交付物又算回来。
+        //   补回这一批**最早一次**武装的时刻,放独立键 `clearedArmedAt`(不冒充 armedAt:P / K 等按 armedAt 判「武装中」的读者不受影响)。
+        const first = clearedArmedAtOf(lines, last.batch);
+        if (first) g = { ...g, clearedArmedAt: first };
       }
     } catch { /* 台账读不到 ⇒ 维持现状,fail-closed 那侧 */ }
   }
@@ -191,6 +195,22 @@ function gitNameStatus(git, range) {
  *      `{sha:HEAD, at, files:范围净差, aggregated:true, count}`,见函数内注。
  *  取不到(基点不合法、git 失败/超时)⇒ null ⇒ P 回退命令语法判据(fail-closed,不静默放行),
  *  且 hook 不推进基点(BP-2)。git 可注入(自测)。pathspecs = 闸引擎 pathspec(由 P 提供,与 ENGINE_REL 同一口径)。 */
+/** 批 258 条件 4:按规则的报警量 × 误报率表(纯函数,自测直接调)。误报 = 自签 + 用户加签 − 撤回(按规则 id 扣,不低于 0);
+ *  待修 = 误报率 ≥ 15% 且报警 ≥ 20。按报警量降序。台账行形状:alerts `{ids:[…]}`;ledger `{kind, id}`。 */
+export function fpTable(alerts, ledger, { minAlerts = 20, minRate = 0.15 } = {}) {
+  const per = {}, fp = {};
+  for (const a of alerts || []) for (const id of (a && a.ids) || []) per[id] = (per[id] || 0) + 1;
+  for (const x of ledger || []) {
+    if (!x || !x.id) continue;
+    if (x.kind === "claimed_fp" || x.kind === "confirmed_fp") fp[x.id] = (fp[x.id] || 0) + 1;
+    else if (x.kind === "retraction") fp[x.id] = (fp[x.id] || 0) - 1;
+  }
+  return Object.keys(per).map((id) => {
+    const f = Math.max(0, fp[id] || 0), rate = per[id] ? f / per[id] : 0;
+    return { id, alerts: per[id], fp: f, rate, hot: per[id] >= minAlerts && rate >= minRate };
+  }).sort((a, b) => b.alerts - a.alerts || a.id.localeCompare(b.id));
+}
+
 export function readHeadFacts(base, git = _gitHere, pathspecs = []) {
   if (typeof base !== "string" || !/^[0-9a-f]{7,64}$/i.test(base)) return null;
   const HEX = /^[0-9a-f]{40,64}$/i;
@@ -386,6 +406,36 @@ export function readDiffFacts(base, git = (args) => execFileSync("git", args, { 
  *  批 253b(红队 BP-14):旧实现只看「最后 arm 行的前一行」,同轮 clear 253 → arm 254 → `--arm 254 --force`
  *    重开时前一行是 arm 254 ⇒ 补不出 ⇒ K 阻断误报「取不到」。
  *  残余:最后 arm 与当前批号对不上(盘上状态与台账不同步)⇒ 不补,照旧报取不到。 */
+/** 结清态的「本批从何时起」(批 258,W 的 `clearedArmedAt`):台账从末尾的 clear 行往前走,收集同批号的 arm 行,
+ *  遇到更早的 clear 行或别批的 arm 行即停,取最早那条 arm 的 `at`。取不到 ⇒ null(W 退回整窗口,偏严)。 */
+export function clearedArmedAtOf(rows, batch) {
+  if (!Array.isArray(rows) || !rows.length || batch == null) return null;
+  let first = null;
+  for (let i = rows.length - 2; i >= 0; i--) {     // 末行是本次 clear
+    let r; try { r = JSON.parse(rows[i]); } catch { break; }
+    if (!r || r.action === "clear") break;
+    if (r.action === "arm") { if (r.batch !== batch) break; if (typeof r.at === "string") first = r.at; }
+  }
+  return first;
+}
+/** 批 258(codex 258-cond2-r2):「本轮开始那一刻正开着的那一批」从何时起——W 按它切交付物(取较早者)。
+ *  台账从头顺读到本轮开始时刻:arm 时若无开着的批则记起点(同号重放不刷新),clear 即关;本轮开始时有开着的批 ⇒ 它的起点;
+ *  没有 ⇒ 本轮内第一次 arm 的时刻;都没有 ⇒ null。覆盖「同号关账后重开」「同轮连关两批」(此前的单步回溯只看最后一段)。
+ *  turnStartMs 取不到(本轮条目无时间戳)⇒ null(W 退回其余起点 / 整窗口,偏严)。 */
+export function turnBatchStartOf(rows, turnStartMs) {
+  if (!Array.isArray(rows) || !Number.isFinite(turnStartMs)) return null;
+  let openSince = null, firstInTurn = null;
+  for (const line of rows) {
+    let r; try { r = JSON.parse(line); } catch { continue; }
+    const at = Date.parse(String((r && r.at) || ""));
+    if (!Number.isFinite(at)) continue;
+    if (at < turnStartMs) {
+      if (r.action === "arm" && openSince === null) openSince = r.at;
+      else if (r.action === "clear") openSince = null;
+    } else if (r.action === "arm" && firstInTurn === null) firstInTurn = r.at;
+  }
+  return openSince || firstInTurn;
+}
 function priorClosedFromJournal(rows, g) {
   const cur = g?.batch ?? null;
   const parse = (s) => { try { return JSON.parse(s); } catch { return undefined; } };
@@ -400,9 +450,10 @@ function priorClosedFromJournal(rows, g) {
     const r = parse(rows[j]);
     if (r === undefined) return g;
     if (r?.action === "clear") {
-      return Array.isArray(r.conditions) && (r.batch ?? null) !== cur
-        ? { ...g, priorClosedBatch: r.batch ?? null, priorClosedConditions: r.conditions }
-        : g;
+      if (!(Array.isArray(r.conditions) && (r.batch ?? null) !== cur)) return g;
+      // 批 258(复核红队 BP-1):同轮「关旧批 → 开新批」时,W 要按**被关那批**的起点切交付物——补回它最早一次武装的时刻
+      const priorArmedAt = clearedArmedAtOf(rows.slice(0, j + 1), r.batch ?? null);
+      return { ...g, priorClosedBatch: r.batch ?? null, priorClosedConditions: r.conditions, ...(priorArmedAt ? { priorClosedArmedAt: priorArmedAt } : {}) };
     }
     if (r?.action && (r.batch ?? null) === cur) continue;
     return g;
@@ -2572,7 +2623,17 @@ export function run(transcriptPath, ctx = {}) {
         //   规则自读的代价已实测过:同一条用例在「当前批 arm 过」与「没 arm」下结果不同,
         //   自测从 34/34 掉到 13/34,而代码一行没改。
         //   自测隔离(STOP_CLOSURE_SELFTEST)靠的也是这个:注入 undefined 即可,不必改判据。
-        batchGoal: ctx.batchGoal !== undefined ? ctx.batchGoal : readBatchGoal(),
+        // 批 258:实时路径给批状态补 `turnBatchStart`(本轮开始时正开着的那一批的起点;W 按它切交付物)
+        batchGoal: ctx.batchGoal !== undefined ? ctx.batchGoal : (() => {
+          const g = readBatchGoal();
+          if (!g || typeof g !== "object") return g;
+          try {
+            const ts = (Array.isArray(turn) ? turn : []).map((e) => Date.parse(String((e && e.timestamp) || ""))).filter(Number.isFinite);
+            const rows = fs.readFileSync(".claude/.batch-goal.jsonl", "utf8").trim().split("\n");
+            const tbs = ts.length ? turnBatchStartOf(rows, Math.min(...ts)) : null;
+            return tbs ? { ...g, turnBatchStart: tbs } : g;
+          } catch { return g; }
+        })(),
         // P 的跨批持久计账(2026-08-22 亲签「改吧」):同 batchGoal 的注入纪律——
         //   hook 读一次、规则纯函数;账文件在 gitignore 面;夹具经 ctx.pLedger 精确控制。
         pLedger: ctx.pLedger !== undefined ? ctx.pLedger : readPLedger(),
@@ -4334,6 +4395,36 @@ function selfTest() {
       hp("HEAD 基点 a9af71da:无会话 id ⇒ 批基点也不用", pHeadBase(undefined, s0, g2, late, () => "abc1234"), null);
       // 红队 a07e98e9 BP-5:退路批基点必须是**未结清**的批——已结清 ⇒ null(不拿已关批的基点把整批算到新会话头上)
       hp("批基点 a07e98e9 BP-5:批状态已结清 ⇒ null", batchBaseOfGoal({ cleared: true, batch: "257", baseCommit: "abc1234" }), null);
+      // 批 258(codex 258-cond2-r1 发现 1):结清态补回本批最早武装时刻,遇到更早的 clear / 别批 arm 即停
+      const jr = (o) => JSON.stringify(o);
+      hp("结清态武装时刻:取同批最早 arm(跨重放与决定行)",
+        clearedArmedAtOf([jr({ action: "clear", batch: "257", at: "T0" }), jr({ action: "arm", batch: "258", at: "T1" }), jr({ action: "decision", batch: "258", at: "T2" }),
+          jr({ action: "arm", batch: "258", at: "T3" }), jr({ action: "clear", batch: "258", at: "T4" })], "258"), "T1");
+      hp("结清态武装时刻:前面是别批的 arm ⇒ 停在那里", clearedArmedAtOf([jr({ action: "arm", batch: "257", at: "T0" }), jr({ action: "clear", batch: "258", at: "T4" })], "258"), null);
+      // 批 258 条件 4:误报率表——撤回按规则扣、待修门槛 ≥20 次且 ≥15%
+      {
+        const al = [...Array(20)].map(() => ({ ids: ["S"] })).concat([...Array(10)].map(() => ({ ids: ["K"] })));
+        const lg = [{ kind: "claimed_fp", id: "S" }, { kind: "claimed_fp", id: "S" }, { kind: "claimed_fp", id: "S" },
+          { kind: "confirmed_fp", id: "K" }, { kind: "claimed_fp", id: "K" }, { kind: "claimed_fp", id: "K" }, { kind: "retraction", id: "S" }];
+        const tb = fpTable(al, lg), s = tb.find((r) => r.id === "S"), k = tb.find((r) => r.id === "K");
+        hp("误报率表:撤回按规则扣(S 3 笔 − 1 撤回 = 2)", s.fp, 2);
+        hp("误报率表:S 20 次报警、10% ⇒ 不进待修", s.hot, false);
+        hp("误报率表:K 30% 但报警只有 10 次 ⇒ 不进待修", k.hot, false);
+        hp("误报率表:报警 20 次、误报 3 笔(15%)⇒ 进待修", fpTable(al, lg.filter((x) => x.kind !== "retraction")).find((r) => r.id === "S").hot, true);
+        hp("误报率表:撤回多于误报 ⇒ 不低于 0", fpTable([{ ids: ["V"] }], [{ kind: "retraction", id: "V" }])[0].fp, 0);
+        hp("误报率表:按报警量降序", tb.map((r) => r.id).join(","), "S,K");
+      }
+      // codex 258-cond2-r2:本轮开始时开着的那批的起点
+      const T = (h, m, s = 0) => `2026-10-10T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}Z`, ms = (x) => Date.parse(x);
+      const reopen = [jr({ action: "arm", batch: "258", at: T(8, 0) }), jr({ action: "clear", batch: "258", at: T(10, 0) }), jr({ action: "arm", batch: "258", at: T(10, 0, 5) })];
+      hp("本轮批起点:同号关账后重开 ⇒ 取本轮开始时开着的那批的起点", turnBatchStartOf(reopen, ms(T(9, 59))), T(8, 0));
+      const twoClears = [jr({ action: "arm", batch: "258", at: T(8, 0) }), jr({ action: "clear", batch: "258", at: T(10, 0) }),
+        jr({ action: "arm", batch: "259", at: T(10, 0, 5) }), jr({ action: "clear", batch: "259", at: T(10, 0, 9) })];
+      hp("本轮批起点:同轮连关两批 ⇒ 第一批的起点", turnBatchStartOf(twoClears, ms(T(9, 59))), T(8, 0));
+      hp("本轮批起点:同号原样重放不刷新", turnBatchStartOf([jr({ action: "arm", batch: "258", at: T(8, 0) }), jr({ action: "arm", batch: "258", at: T(9, 0) })], ms(T(9, 30))), T(8, 0));
+      hp("本轮批起点:本轮开始时无开着的批 ⇒ 本轮第一次 arm", turnBatchStartOf([jr({ action: "clear", batch: "257", at: T(7, 0) }), jr({ action: "arm", batch: "258", at: T(10, 0) })], ms(T(9, 59))), T(10, 0));
+      hp("本轮批起点:取不到本轮开始时刻 ⇒ null", turnBatchStartOf(reopen, NaN), null);
+      hp("结清态武装时刻:读不懂的行 ⇒ 停", clearedArmedAtOf(["garbage", jr({ action: "arm", batch: "258", at: "T1" }), jr({ action: "clear", batch: "258" })], "258"), "T1");
       hp("批基点 a07e98e9 BP-5:批状态未结清 ⇒ 用 baseCommit", batchBaseOfGoal({ batch: "257", conditions: ["甲"], baseCommit: "abc1234" }), "abc1234");
       hp("批基点 a07e98e9 BP-5:无批状态 ⇒ null", batchBaseOfGoal(null), null);
       hp("批基点 a07e98e9 BP-5:台账最后一条 arm 之后有 clear ⇒ null",
@@ -4752,7 +4843,7 @@ if (argv.includes("--self-test")) process.exit(selfTest());
 //     用户可选的加签通道,不再是生效条件;
 //   · `miss_review` = 抽查未命中回合的记录({sampled,found}),发现漏报即撤涉事规则「已验收」身份;
 //   · `--fp-report` 永远打印 RECALL=UNKNOWN:本台账量不了漏报率,「没看到漏报」≠「没有漏报」。
-if (["--fp", "--fp-confirm", "--fp-miss", "--fp-report"].includes(argv[0])) {
+if (["--fp", "--fp-confirm", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
   const LEDGER = ".claude/.gate-fp-ledger.jsonl";
   // D1/批 102:走 ledger-chain(接线点二)。CLI 语境写失败=任务失败,loud 退出不静默。
   const put = (o) => {
@@ -4774,6 +4865,14 @@ if (["--fp", "--fp-confirm", "--fp-miss", "--fp-report"].includes(argv[0])) {
     ckId(id);
     put({ kind: "claimed_fp", id, why: reason, by: "assistant" });
     console.log(`已记 误报:${id}(自签有效,2026-08-22 用户亲裁;--fp-confirm 是可选加签,非生效条件)`);
+  } else if (argv[0] === "--fp-retract") {
+    // 批 258 条件 4:撤回一笔自己记错的误报(那次其实拦对了)。台账只追加,撤回是新的一行,报表按规则扣。
+    const [, id, ...why] = argv;
+    const reason = why.join(" ").trim();
+    if (!id || !reason) { console.error('用法: --fp-retract <规则id> <为什么那次其实拦对了>(理由不得为空白)'); process.exit(2); }
+    ckId(id);
+    put({ kind: "retraction", id, why: reason, by: "assistant" });
+    console.log(`已记 撤回:${id}`);
   } else if (argv[0] === "--fp-confirm") {
     // 用户可选加签通道(非生效条件)。天花板照旧:进程判不出敲键盘的是谁,靠纪律不靠机制。
     const [, id, ...why] = argv;
@@ -4826,10 +4925,21 @@ if (["--fp", "--fp-confirm", "--fp-miss", "--fp-report"].includes(argv[0])) {
     const found = reviews.reduce((n, r) => n + (r.found || 0), 0);
     console.log(`报警分母: ${nAlert} 规则次 / ${alerts.length} 轮` +
       (nAlert ? `(${Object.entries(per).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join(" ")})` : ""));
-    console.log(`误报: ${claimed + confirmed}(自签 ${claimed} + 用户加签 ${confirmed})` +
-      (nAlert ? `  (误报/报警 = ${((claimed + confirmed) / nAlert * 100).toFixed(1)}%)` : ""));
+    const retracted = led.filter((x) => x.kind === "retraction").length;
+    // 总数与 fpTable 同一算法(codex 258-cond34-r1 断言 3):按规则 id 扣撤回、各自不低于 0 再求和;
+    //   含报警台账里没出现过的规则(否则「误报只在 T、报警只有 S」时表合计 0、总数 1)
+    const perFp = {};
+    for (const x of led) if (x && x.id) perFp[x.id] = (perFp[x.id] || 0) + (x.kind === "retraction" ? -1 : (x.kind === "claimed_fp" || x.kind === "confirmed_fp") ? 1 : 0);
+    const net = Object.values(perFp).reduce((n, v) => n + Math.max(0, v), 0);
+    console.log(`误报: ${net}(自签 ${claimed} + 用户加签 ${confirmed} − 撤回 ${retracted})` +
+      (nAlert ? `  (误报/报警 = ${(net / nAlert * 100).toFixed(1)}%)` : ""));
     console.log(`未命中抽查: 已审 ${sampled},发现漏报 ${found}${found > 0 ? " ← 涉事规则不得再称「已验收」" : ""}`);
     console.log(`RECALL=UNKNOWN —— 本台账量不了漏报率;「没看到漏报」≠「没有漏报」`);
+    // 批 258 条件 4:按规则的报警量 × 误报率表;误报率 ≥15% 且报警 ≥20 ⇒ 下一批待修(`--hot` 只印待修行,供 batch-goal 开批时列出)
+    const tbl = fpTable(alerts, led);
+    const hotOnly = argv.includes("--hot");
+    if (!hotOnly) console.log("\n规则  报警  误报  误报率  待修");
+    for (const r of tbl) if (!hotOnly || r.hot) console.log(`${hotOnly ? "待修 " : ""}${r.id.padEnd(4)}  ${String(r.alerts).padStart(4)}  ${String(r.fp).padStart(4)}  ${(r.rate * 100).toFixed(1).padStart(5)}%  ${r.hot ? "← 下一批待修" : ""}`);
   }
   process.exit(0);
 }
