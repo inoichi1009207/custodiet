@@ -43,9 +43,18 @@
 //   `properClose` 与 `ranClear` 已迁(本批)。
 
 /** 把命令串里被引号包住的内容替换成空格,**正确处理反斜杠转义**。
- *  返回的串里只剩「参数面」——用它做匹配,文本面的内容不会冒充成参数。 */
-export function stripQuoted(cmd) {
+ *  返回的串里只剩「参数面」——用它做匹配,文本面的内容不会冒充成参数。
+ *  `ps` = PowerShell 方言(红队 a811daae BP-6):反斜杠是普通字符、转义符是反引号,
+ *  `@"…"@` / `@'…'@` here-string 整段算引号内。**掩码与分词必须同一方言**——bashWriteTargets 曾用 POSIX 掩码
+ *  配 PowerShell 分词,`Set-Location "\repo\"; Add-Content …` 的 `\"` 被掩码当转义 ⇒ 引号不闭合、后段被吞。 */
+export function stripQuoted(cmd, ps = false) {
+  return quoteScan(cmd, ps).masked;
+}
+/** 同 `stripQuoted`,另报扫完时引号是否仍开着(`open`)——给「方言自判」用:同一串在一种方言下闭合、
+ *  另一种下不闭合,多半是方言选错了。 */
+export function quoteScan(cmd, ps = false) {
   const s = String(cmd || "");
+  if (ps) return quoteScanPs(s);
   let out = "";
   let quote = null;          // null / '"' / "'"
   for (let i = 0; i < s.length; i++) {
@@ -68,22 +77,53 @@ export function stripQuoted(cmd) {
     if (c === '"' || c === "'") { quote = c; out += " "; continue; }
     out += c;
   }
-  return out;
+  return { masked: out, open: quote !== null };
+}
+/** PowerShell 口径:反引号转义(单引号内不转义;单引号内 `''`、双引号内 `""` 按「闭合再开」自然处理,掩码同长);
+ *  here-string 开头 `@"`/`@'` 后须紧跟换行,收尾 `"@`/`'@` 须在行首。 */
+function quoteScanPs(s) {
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (!quote && c === "@" && (s[i + 1] === '"' || s[i + 1] === "'") && /^\r?\n/.test(s.slice(i + 2, i + 4))) {
+      const close = s.indexOf("\n" + s[i + 1] + "@", i + 2);
+      const end = close < 0 ? s.length : close + 3;
+      out += " ".repeat(end - i);
+      if (close < 0) return { masked: out, open: true };
+      i = end - 1;
+      continue;
+    }
+    if (c === "`" && i + 1 < s.length && quote !== "'") {
+      if (quote) { out += "  "; i++; }
+      else out += c + s[++i];
+      continue;
+    }
+    if (quote) {
+      if (c === quote) { quote = null; out += " "; }
+      else out += " ";
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; out += " "; continue; }
+    out += c;
+  }
+  return { masked: out, open: quote !== null };
 }
 
 /** 按 shell 的**语句分隔符**切段(`&&` / `||` / `;` / `|` / 换行),
  *  且**只在引号外**切——引号里的 `;` 不是分隔符。
  *  L 项那个「一条 `ls` 横跨整条序列化命令」的假阳,根因就是没有这一步。 */
-export function segments(cmd) {
+export function segments(cmd, ps = false) {
   const raw = String(cmd || "");
-  const masked = stripQuoted(raw);          // 与 raw 等长,可用同一组下标
+  const masked = stripQuoted(raw, ps);      // 与 raw 等长,可用同一组下标;方言与掩码同一套(BP-6)
+  const esc = ps ? "`" : "\\";
   const cuts = [];
   for (let i = 0; i < masked.length; i++) {
     // ⚠️ **转义的分隔符不是分隔符**(2026-08-20 codex 发现,「你没问到的」那节)。
     //   `echo a\;b` 原本被切成两段,而本文件自己的注释写着「引号外的 `\;` 有意义」
     //   ——注释说一套、代码做另一套,又一次。`stripQuoted` 在引号外**保留**了 `\x`,
     //   所以这里必须自己跳过被转义的那个字符。
-    if (masked[i] === "\\") { i++; continue; }
+    if (masked[i] === esc) { i++; continue; }
     const two = masked.slice(i, i + 2);
     if (two === "&&" || two === "||") { cuts.push([i, i + 2]); i++; continue; }
     const c = masked[i];
@@ -136,6 +176,15 @@ if (process.argv[1] && process.argv[1].endsWith("gate-cmd.mjs") && process.argv.
   chk("转义分隔符不切段", segments(ESC), [ESC]);
   chk("未转义照切(对照组,证明上一条不是恒不切)", segments("echo a;b"), ["echo a", "b"]);
   chk("空串给空数组", segments(""), []);
+
+  // 红队 a811daae BP-6:PowerShell 方言——反斜杠不是转义,反引号才是;here-string 整段算引号内
+  const PSX = 'Set-Location "\\repo\\"; Add-Content docs\\noun-diary.md "| winget | pm |"';
+  chk("BP-6 PS:\\\" 不是转义,分号照切", segments(PSX, true), ['Set-Location "\\repo\\"', 'Add-Content docs\\noun-diary.md "| winget | pm |"']);
+  chk("BP-6 对照:POSIX 口径下同串引号不闭合(这正是旧误拦的机理)", quoteScan(PSX).open, true);
+  chk("BP-6 PS 口径闭合", quoteScan(PSX, true).open, false);
+  chk("BP-6 PS:反引号转义的引号不闭合字符串", quoteScan('Write-Output "a`"b"; x', true).open, false);
+  chk("BP-6 PS:here-string 内的引号与分号不切", segments('$s = @"\na "; b\n"@; Out-File x', true), ['$s = @"\na "; b\n"@', "Out-File x"]);
+  chk("BP-6 PS 掩码等长(here-string)", stripQuoted('@"\nq"\n"@ x', true).length, '@"\nq"\n"@ x'.length);
 
   console.log(`gate-cmd 自测 ${pass}/${total}`);
   process.exit(pass === total ? 0 : 1);

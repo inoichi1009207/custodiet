@@ -1,4 +1,4 @@
-import { CARRIER_SURFACE, isDeliverable, CONTENT_WRITE_RE, normPath, isCarrierPath } from "./gate-carriers.mjs";
+import { CARRIER_SURFACE, isDeliverable, CONTENT_WRITE_RE, normPath, isCarrierPath, NON_CARRIER_AREA } from "./gate-carriers.mjs";
 import { classifyDiffTier, coversWrites } from "./gate-difftier.mjs";
 // gate-rules.mjs —— 声明式规则集(迁移中)
 //
@@ -11,7 +11,7 @@ import { classifyDiffTier, coversWrites } from "./gate-difftier.mjs";
 //   于是「读到一个含 `git commit` 的文档就判已提交」这种旧行为**在新架构里写不出来**。
 //   这不是迁移失误,正是重写的目的——见 gate-ctx.mjs 头注与 grill:security 的实测。
 
-import { quoteUntrusted } from "./gate-ctx.mjs";
+import { quoteUntrusted, gitArgs, isCommitSeg } from "./gate-ctx.mjs";
 import fs from "node:fs";
 
 /** 那个件在本仓在不在?**消息里凡是让人去跑某个脚本的,都要先问这一句。**
@@ -762,7 +762,7 @@ function touched(ctx, pathRe, onlyNew) {
     if (onlyNew && !ctx.isNew(p)) continue;
     out.push(p.split("/").slice(-2).join("/"));
   }
-  for (const cmd of ctx.bashCmds) {
+  for (const [ci, cmd] of ctx.bashCmds.entries()) {
     const c = cmd.replace(/\\/g, "/");
     if (!bashWrites(c, pathRe)) continue;
     // ⚠️ **用解析出的写目标,不用 `c.match(pathRe)[0]`**(2026-08-20)。
@@ -772,7 +772,15 @@ function touched(ctx, pathRe, onlyNew) {
     //   ⚠️ 这个 bug 我**一小时前刚在旧实现里修过**(`hook-stop-closure.mjs` 的 I 项),
     //   当时只改了那一处,新引擎这份副本原封不动 —— 与「载体清单其实有三份」是同一天、
     //   同一族的第二次:**修一个实现,不等于修好那件事**。全语料上它表现为 `I` 的 6 条残留分歧。
-    const targets = bashWriteTargets(c, pathRe);
+    // 红队 a811daae BP-6:目标解析喂**原串**并带方言——反斜杠先换成 `/` 会把 bash 的 `\"` 转义拆成 `/"`(引号失衡、目标错位),
+    //   而 PowerShell 的 `E:\x\` 本来就由方言口径按普通字符处理;`bashWriteTargets` 输出侧自己把 `\` 归一成 `/`。
+    //   预筛 `bashWrites` 仍吃归一串(它的口径归 D148,不在这里改)。
+    // BP-5 取舍:预筛判有写、这里解不出目标 ⇒ **仍按新建兜底**(fail-closed 不改)。改成「不判新建」会放过解不出的真新建
+    //   (变量拼路径、`dd of=`、`install` 等,头注列着);误拦面靠把诚实形态解出来收窄(BP-4:then/do/{/!、包装器带值选项)。
+    //   原串解不出时再按归一串解一次(旧口径):Git Bash 里不加引号的 `.claude\agents\x.md` 按 bash 语义反斜杠被吃掉,
+    //   原串解出的是 `.claudeagentsx.md`(不是载体);退回归一串至少不比旧行为多出「未解出目标」兜底。
+    let targets = bashWriteTargets(cmd, pathRe, { dialect: ctx.bashDialects?.[ci] });
+    if (!targets.length) targets = bashWriteTargets(c, pathRe, { dialect: ctx.bashDialects?.[ci] });
     if (!targets.length) { out.push("bash-write(未解出目标)"); continue; }
     for (const t of targets) {
       // ⚠️ D100(2026-09-06):Bash 面的目标**也要过 `isCarrierPath`**——与上面 Write/Edit
@@ -954,6 +962,21 @@ RULE_I.cases.neg.push({
   name: "by design:暂存树内直接新写不在 I 的辖区(D86 天花板,有记录的取舍)",
   text: "在暂存树里起草了一个新脚本。", tracked: ["scripts/x.mjs"],
   bash: "cat > clipboard/oss/public-repo/scripts/lib/brand-new.mjs <<'EOF'\nexport {};\nEOF",
+}, {
+  // 红队 a811daae BP-5(误拦,与 BP-4 同根):预筛 `bashWrites` 判有写、b7ef430 的 `bashWriteTargets` 把 `then` 当命令名给 [] ⇒
+  //   兜底「bash-write(未解出目标)」判新建。BP-4 修好后取到既有的 foo.md ⇒ 不算新建。(兜底本身保持 fail-closed,见 touched 注。)
+  name: "a811daae BP-5:if…then cp 覆盖既有 agent 不算新建",
+  text: "从暂存区覆盖了既有 agent。", tracked: [".claude/agents/foo.md"],
+  bash: "if [ -f clipboard/a.md ]; then cp clipboard/a.md .claude/agents/foo.md; fi",
+});
+// ⚠️ BP-3(`cp … .claude/agents/new.md 2>/dev/null`)在 I 面**写不成正例**:预筛 `bashWrites` 的 cp 支同样取「最后一个词」
+//   = `2>/dev/null` ⇒ 判无写 ⇒ 根本不调 `bashWriteTargets`。预筛归 D148(与五份旧 heredoc 剥法统一),本批只修
+//   `bashWriteTargets` 侧(P/K0/ND/L 直接消费它,已修);零件用例钉在 hook-stop-closure 自测「BP-3:」各条。
+RULE_I.cases.pos.push({
+  // BP-4 漏放形:包装器带值选项后的 cp 造新件
+  name: "a811daae BP-4:sudo -u bob cp 新 agent ⇒ 仍算新建",
+  text: "拷了个新 agent。", tracked: ["scripts/x.mjs"],
+  bash: "sudo -u bob cp clipboard/a.md .claude/agents/new.md",
 });
 
 /** J:立/改法未交代触发层。 */
@@ -2513,8 +2536,8 @@ const k0Bookkeeping = (ctx) => {
   //   「catch 吞掉真错」比缺功能贵:它把「坏了」伪装成「没命中」。
   //   故此处 catch 只兜**单条命令**的解析失败,不整体吞;且失败 ⇒ 不豁免(fail-closed)。
   const fromBash = [];
-  for (const cmd of (ctx.bashCmds || [])) {
-    try { for (const t of bashWriteTargets(cmd, ANY_PATH_RE)) { const p = norm(t); if (!RULE_I._i.isMemoryNote(p)) fromBash.push(p); } }
+  for (const [ci, cmd] of (ctx.bashCmds || []).entries()) {
+    try { for (const t of bashWriteTargets(cmd, ANY_PATH_RE, { dialect: ctx.bashDialects?.[ci] })) { const p = norm(t); if (!RULE_I._i.isMemoryNote(p)) fromBash.push(p); } }
     catch { return false; }   // 解析不了就不豁免,而不是当成「没写」
   }
   const all = [...fromTools, ...fromBash];
@@ -3706,6 +3729,8 @@ const RULE_U = {
 //     · 联网那条:只认工具名 `WebSearch|WebFetch`。
 //
 // ── 承重面判据 ─────────────────────────────────────────────────────────────
+// ⚠️ 2026-10-10(红队 a27628dd)起以 **git 事实**为主(`ctx.headFacts`,见 `_p` 里「触发面」那段头注);
+//   本段描述的命令语法证据降为**回退面**(git 事实取不到时)与「别的 checkout」补充面。
 // 旧式 `/git\s+commit/.test(toolRawText(turn)) && CARRIER_SURFACE.test(toolRawText(turn))`
 //   扫的是**含工具输出**的裸文本 ⇒ 读到一份提到 `git commit` 与某承重路径的文档就触发。
 // 新式两条证据,任一成立:
@@ -3730,6 +3755,14 @@ const RULE_U = {
 // CEILING(引擎侧,搬迁时才看清):`kind:"action"` 豁免拿到的 ctx 被剥掉了 `text`,
 //   但 `window()` 是同一个闭包,**window 那一层的 text 没有被剥**。本条的豁免因此
 //   刻意只碰 `.actions`,一个字的文本面都不读——这条纪律靠注释与用例守着,不靠引擎。
+/** P 的变异工具:临时把 `_p` 里的若干零件换成 `patch[k](原件)` 的返回值,跑原 detect,跑完还原。
+ *  拧的是**判据内部**的零件(codex 060:不许换成恒真/恒假的外壳)。 */
+const swapP = (patch) => (r) => ({ ...r, detect: (ctx) => {
+  const H = RULE_P._p, save = {};
+  for (const k of Object.keys(patch)) { save[k] = H[k]; H[k] = patch[k](save[k]); }
+  try { return r.detect(ctx); } finally { Object.assign(H, save); }
+} });
+
 const RULE_P = {
   id: "P",
   blocking: true,          // 用户常设授权:「新增阻断项一律授权自动化」
@@ -3752,84 +3785,516 @@ const RULE_P = {
     /** 切段 + 只留参数面。引号里的东西一律不算参数(gate-cmd 的唯一实现)。 */
     segs(cmd) { return segments(cmd).map(stripQuoted); },
 
-    /** 这条命令是不是**一次承重面提交**:有真 commit 段 + 有带承重路径的 git 段。
-     *  ⚠️ 2026-08-22 改(codex 全量分类逼出的真回归):原式整段走 stripQuoted ⇒
-     *  `git add -A "scripts/x.mjs"` 的**引号路径被剥瞎**,真承重提交判成不是(86 条
-     *  「旧有新无」分歧里 43 条 didCommit=true 的主嫌)。
-     *  修法分两半,**方向相反**,不许合并:
-     *    · `-m/-F` 的 message 载荷**先剥掉**——提交信息里提到路径=提及不是暂存,
-     *      这是已写明并接受的 CEILING(见上方头注),必须保住;
-     *    · 其余只去引号**字符**——引号路径的 add/commit 是真暂存,必须认。 */
-    isCarrierCommitCmd(cmd) {
-      const H = RULE_P._p, raw = segments(cmd);
-      const committed = raw.some((s) => H.GIT.test(s) && /\bcommit\b/.test(s) && !/--dry-run/.test(s));
-      if (!committed) return false;
-      return raw.some((s) => {
-        const noMsg = s.replace(/(?:-m|--message|-F|--file)(?:\s+|=)(?:"[^"]*"|'[^']*'|\S+)/g, " ");
-        const u = H.unquote(noMsg);
-        return H.GIT.test(u) && /\b(add|stage|commit)\b/.test(u) && CARRIER_SURFACE.test(u);   // stage=add 的官方别名(红队 186 BP-7)
-      });
+    // ══ 触发面(红队 a27628dd 轮重写:git 事实为主,命令语法为回退与补充)════════════════════
+    //   动机:「本轮有没有承重提交 / 带没带进闸引擎改动」原来**从命令语法逐个补洞**——merge/cherry-pick 合回、
+    //   bashWriteTargets 不认的写法(scratchpad 脚本、node -e 变量路径、perl -pi、git apply、checkout br -- f)、
+    //   `cd docs/laws && sed -i … collab.md`、提交信息含 --dry-run、写入滑出 400 条窗口——红队一次给出七族,
+    //   3f5aa7b 已是第 N 次补洞。这一族靠枚举收不完。
+    //   现以 **git 事实**为准:hook 记下本会话上次 P 结清时的 HEAD(`.claude/.p-head/<会话>.json`,读写在 hook 侧),
+    //   Stop 时取 `基点..HEAD` 首父链上被带进的提交及各自对第一父的改动文件(merge 同理)⇒ `ctx.headFacts()`,
+    //   再按 CARRIER_SURFACE / ENGINE_REL / NON_CARRIER_AREA 归类。改文件用什么写法、在哪一轮写、谁写的(子代理/worktree),
+    //   一概不问——问的是「本仓 HEAD 上落了什么」。
+    //   失效条件(任一 ⇒ 事实为 null ⇒ 回退下面的命令语法判据,fail-closed,不静默放行):
+    //     无会话 id、基点文件缺且 reflog 查不到会话开始时的 HEAD(含 reflog 被截断、起点晚于会话开始,a2a9f58b BP-2)、
+    //     git 失败/超时。
+    //   基点之后首父链提交 > 60 条(readHeadFacts 的 CAP)**不再是失效条件**(红队 a9af71da BP-1:原返回 null ⇒ 基点永不推进 ⇒
+    //     本会话此后恒回退语法面,merge 合回的闸改动看不见):hook 把整段当一笔聚合提交(`aggregated:true`、`count`、改动=范围净差),
+    //     计账按 `count`(`tally`),P 结清即推进基点。基点文件缺且 reflog 取不到时,退用当前批的 baseCommit(须是 HEAD 祖先)。
+    //   取不到时 hook **不推进基点**(a2a9f58b BP-2):否则回退面沉默的那一轮会把之前欠的范围吃掉。
+    //   已知天花板:同一 checkout 里**别的会话**的提交也会算进本会话范围(宪法要求并行写各开 worktree,故按违规处理);
+    //   基点不是 HEAD 祖先(amend/reset/换分支)时取 merge-base..HEAD 的首父链提交,各自改动只留「基点与 HEAD 之间真有差」的路径
+    //   (a2a9f58b BP-9:reset 撤掉的承重改动不再算成本次改动;只改信息的 amend ⇒ 无改动);红队切点至少取基点自身那条链上
+    //   最后一次闸改动的时刻(BP-3:不因 merge-base 更早而放宽)。
+    //   命令语法判据只在三处还活着:① git 事实取不到时的回退;② git 事实看不见的**别的 checkout** 的提交(他仓宪法照样算);
+    //   ③ 本轮有提交命令、而本仓范围里没有本轮的提交 ⇒ 提交落在别处(先 `cd` 到他仓、后续用相对路径,a2a9f58b BP-4;
+    //     Bash 调用结束根外 cwd 被回置,跨调用只认 PowerShell 与根内子目录,a084a536 BP-6),
+    //     此时按**本轮**的命令语法判(只看本轮,不看窗口:窗口里早已提交过的承重写入不得被一次空提交重新翻出来)。
+    //     「落在别处」须有正向证据(红队 a9af71da BP-5):提交执行时 cwd 在本仓根外,或提交段带 `git -C <根外>`;
+    //     没有 ⇒ 视为本仓提交失败(未暂存 / pre-commit 失败 / 权限被拒),不计。
+    //     去向解不出(UNK_PARSE:变量、`~user`、`--git-dir` 等之外解不出的形)⇒ 按 0aa11fd 之前语义算别处;
+    //     只有「cd 本身失败」(结果正文带 cd 失败特征)才不算证据(红队 a07e98e9 BP-1/BP-2、ad3e4f93 BP-1;详 commitOutsideRoot 头注)。
+    //   计数(a2a9f58b BP-1):宽限账与 detect 同取 `tally`——git 事实在 ⇒ 范围内带承重改动、且账上没记过 sha 的提交数;
+    //     取不到 ⇒ 命令语法。原来计数仍是命令语法:`git add -A` / `commit -am` / merge 合回计 0 ⇒ 宽限账永不涨。
+
+    /** 本仓闸引擎(仓相对路径,锚定)。git 事实只用它;外发暂存树(clipboard/,gitignore)与 worktree 本就不在 diff 里。 */
+    ENGINE_REL: /^scripts\/(?:hook-stop-closure|hook-guard)\.mjs$|^scripts\/lib\/gate-[\w-]+\.mjs$/i,
+    /** 与 ENGINE_REL 同一口径的 git pathspec(hook 取「上一次带闸改动的提交」时用;改一处必改另一处,自测钉着)。 */
+    ENGINE_PATHSPECS: ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", ":(glob)scripts/lib/gate-*.mjs"],
+    /** 聚合项(readHeadFacts 范围超 CAP=60)缺 `count` 时的计数下限 = CAP+1(范围至少这么多笔)。 */
+    AGG_MIN: 61,
+    /** 语法回退面的闸引擎路径:锚定文件名结尾,裸名只在路径**开头**认(`cd scripts/lib` 之后的相对形)。
+     *  派出方裁定(a27628dd):`clipboard/oss/public-repo/**` 与 `.claude/worktrees/**` 下的闸副本不算本仓闸引擎。 */
+    ENGINE_PATH_RE: /(?:^|\/)scripts\/(?:hook-stop-closure|hook-guard)\.mjs$|(?:^|\/)scripts\/lib\/gate-[\w-]+\.mjs$|^(?:hook-stop-closure|hook-guard|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs$/i,
+    WORKTREE_AREA: /(^|\/)\.claude\/worktrees\//i,
+    /** root = hook 所在 checkout 根(ctx.hookCheckout):落在它下面的绝对路径先化成仓相对形再判区域——
+     *  在 worktree 里开的会话,自己的闸文件路径本就含 `.claude/worktrees/`,不得当成别人的副本。 */
+    isEnginePath(p, root) {
+      const H = RULE_P._p;
+      let s = H.resolve(null, p);
+      if (root) {
+        const r = H.resolve(null, root).replace(/\/+$/, "");
+        if (r && s.toLowerCase().startsWith(r.toLowerCase() + "/")) s = s.slice(r.length + 1);
+      }
+      if (!s || NON_CARRIER_AREA.test(s) || H.WORKTREE_AREA.test(s)) return false;
+      return H.ENGINE_PATH_RE.test(s);
+    },
+    isCarrierOrEngine(p, root) { return isCarrierPath(CARRIER_SURFACE, p) || RULE_P._p.isEnginePath(p, root); },
+
+    /** git 事实;null = 取不到或没接(⇒ 回退语法判据)。 */
+    facts(ctx) {
+      if (!ctx || typeof ctx.headFacts !== "function") return null;
+      try { return ctx.headFacts() || null; } catch { return null; }
+    },
+    touches(c, pred) { return (c.files || []).some((f) => pred(normPath(f.path)) || (!!f.oldPath && pred(normPath(f.oldPath)))); },
+    gitCarrierCommits(f) {
+      const H = RULE_P._p;
+      return f.commits.filter((c) => H.touches(c, (p) => isCarrierPath(CARRIER_SURFACE, p) || H.ENGINE_REL.test(p)));
+    },
+    gitEngineCommits(f) { const H = RULE_P._p; return f.commits.filter((c) => H.touches(c, (p) => H.ENGINE_REL.test(p))); },
+
+    // ── 命令语法零件(回退与补充;唯一实现)──────────────────────────────────────
+    stripHeredoc(cmd) { return String(cmd || "").replace(/<<-?\s*(['"]?)(\w+)\1[\s\S]*?^\s*\2\s*$/gm, " "); },
+    /** 路径归一:分隔符、/d/ 形、`.` 与 `..` 段。 */
+    resolve(cwd, p) {
+      const fix = (s) => String(s || "").replace(/\\/g, "/").replace(/^\/([a-z])(\/|$)/i, "$1:/");
+      const t = fix(p);
+      const abs = /^([A-Za-z]:)?\//.test(t) || t.startsWith("~");
+      const full = abs || !cwd ? t : `${fix(cwd)}/${t}`;
+      const lead = /^([A-Za-z]:)?\//.exec(full)?.[0] ?? "";
+      const parts = [];
+      for (const seg of full.slice(lead.length).split("/")) {
+        if (!seg || seg === ".") continue;
+        if (seg === ".." && parts.length && parts[parts.length - 1] !== "..") { parts.pop(); continue; }
+        parts.push(seg);
+      }
+      return lead + parts.join("/");
+    },
+    /** 按段走一遍(heredoc 正文先剥掉,不当命令),跟踪 `cd`/`pushd`:交出 [{seg, cwd}]。cwd=null=沿用会话当前目录。
+     *  红队 a27628dd BP-3:`cd docs/laws && sed -i … collab.md` 原来取到裸名 `collab.md` ⇒ 不算承重。 */
+    //   红队 aaf414b6 BP-1:P 的各调用点**按工具名传方言**(`d` = "ps" / "bash";取自 `bashDialects` 或动作 name)——
+    //   不传时 bashWriteTargets 靠 cmdDialect 自判,PowerShell 里的别名 / 裸重定向 + 不加引号的反斜杠路径没有「动词-名词」cmdlet
+    //   ⇒ 判成 bash ⇒ 反斜杠被当转义吃掉(`cp clipboard\x.md docs\laws\collab.md` ⇒ `docslawscollab.md`)。d 缺 ⇒ 照旧自判。
+    dOf(a) { return String((a && a.name) || "") === "PowerShell" ? "ps" : "bash"; },
+    walk(cmd, d) {
+      const H = RULE_P._p, out = [];
+      const ps = d === "ps";
+      let cwd = null;
+      for (const seg of segments(ps ? String(cmd || "") : H.stripHeredoc(cmd), ps)) {
+        const m = /^(?:cd|pushd)\s+(?:-[LP]\s+)?(["']?)([^"'\s;&|]+)\1\s*$/.exec(seg);
+        if (m) { cwd = H.resolve(cwd, m[2]); continue; }
+        out.push({ seg, cwd });
+      }
+      return out;
+    },
+    /** cd 解析后的 Bash 写目标(写目标识别仍是 `bashWriteTargets` 唯一实现),过谓词。 */
+    writeTargets(cmd, pred, d) {
+      const H = RULE_P._p, out = [];
+      for (const { seg, cwd } of H.walk(cmd, d)) {
+        let ts = [];
+        try { ts = bashWriteTargets(seg, /[\s\S]/, { dialect: d }); } catch { ts = []; }
+        for (const t of ts) { const r = H.resolve(cwd, t); if (pred(r)) out.push(r); }
+      }
+      return out;
+    },
+    /** `git add|stage|commit` 段的路径参数(子命令位判定与载荷剥离走 gate-ctx `gitArgs` 唯一实现;cd 与 -C 解析后)。
+     *  红队 a27628dd BP-6:原式「git 段任意位置出现 add/commit」⇒ `git log -S commit -- 闸文件` 也算。 */
+    gitPathArgs(cmd, d) {
+      const H = RULE_P._p, out = [];
+      for (const { seg, cwd } of H.walk(cmd, d)) {
+        const g = gitArgs(seg);
+        if (!g || !/^(add|stage|commit)$/.test(g.sub)) continue;
+        const base = g.cdir ? H.resolve(cwd, g.cdir) : cwd;
+        for (const a of g.args) if (a && !a.startsWith("-")) out.push(H.resolve(base, a));
+      }
+      return out;
+    },
+    /** 这条命令里有没有一次提交(gate-ctx `isCommitSeg` 唯一实现:子命令位 + 先剥载荷再判 --dry-run;红队 a27628dd BP-4)。 */
+    hasCommit(cmd, d) { return (d === "ps" ? segments(String(cmd || ""), true) : segments(RULE_P._p.stripHeredoc(cmd))).some((s) => isCommitSeg(s)); },
+
+    /** 这条命令是不是**一次承重面提交**:有真 commit 段 + add/stage/commit 段的路径参数里有承重件。
+     *  `-m/-F` 载荷不算路径(提交信息里提到路径=提及不是暂存,头注 CEILING);引号路径照认(2026-08-22 真回归)。 */
+    isCarrierCommitCmd(cmd, d) {
+      const H = RULE_P._p;
+      if (!H.hasCommit(cmd, d)) return false;
+      return H.gitPathArgs(cmd, d).some((p) => H.isCarrierOrEngine(p));
     },
     carrierCommitCount(c) {
       if (!c || !Array.isArray(c.bashCmds)) return 0;
-      return c.bashCmds.filter((cmd) => RULE_P._p.isCarrierCommitCmd(cmd)).length;
+      return c.bashCmds.filter((cmd, i) => RULE_P._p.isCarrierCommitCmd(cmd, c.bashDialects?.[i])).length;
+    },
+    /** 本轮(withWin 时 ∪ 窗口)的 [命令, 方言] 对:bashCmds 与 bashDialects 等长同序,拼接时同步拼(aaf414b6 BP-1)。 */
+    cmdPairs(ctx, withWin) {
+      const w = withWin ? RULE_P._p.win(ctx) : null;
+      const pairs = (c) => (c && Array.isArray(c.bashCmds) ? c.bashCmds.map((cmd, i) => [cmd, c.bashDialects?.[i]]) : []);
+      return [...pairs(ctx), ...pairs(w)];
     },
 
-    /** 触发面 = 本轮真提交过 且(本轮写过承重件 或 提交命令的参数面上有承重路径)。 */
-    // ⚠️ 2026-08-27(D92):证据①从「**本轮**写入」放宽到「**窗口 ∪ 本轮**」。
-    //   实撞(用户让我复审另一条会话时逐条数出来的):那会话 120 轮里,
-    //   **同时有承重写入和提交的轮 = 0**,提交命令参数里带承重路径的 = 0
-    //   ⇒ P 在 258 次闸触发里**一次没响**。而它并非在偷懒:
-    //   它的节奏是「干几轮活 → 最后 `cd /other && git add -A && git commit`」——
-    //   `git add -A` 的参数面**没有路径**,写入又在几轮之前 ⇒ **两条证据都结构性为空**。
-    //   这不是罕见形态,是最自然的提交节奏;⇒ 承重面的三通道要求对它**从未生效过**。
-    //   `scopeActions` 早就取「窗口 ∪ 本轮」,只有 `triggered` 还卡在本轮——口径不一致。
-    //   **动手前先量**(PAT.causal 头注定的规矩):放宽后 proj-a 0→1、本会话 41→41,
-    //   代价可忽略;方向是**收紧**(补漏放),窄例外④「新增/收紧机器闸」明确适用。
-    //   ⚠️ 但 P 是**阻断且无逃生口**的规则,所以只放宽**触发**、不动通道判据,
-    //   且宽限计账(每 5 次承重提交欠一轮)原样保留——它就是防这条变吵的那个阀。
-    /** 本批提交是否触及**闸引擎文件**(D11 收紧的适用面):提交命令参数面或窗口内写面命中即算。
-     *  只看这三样——它们是判据本体;夹具/文档/agent 定义改动不在此列(那些仍走 grill 口径)。 */
-    //   红队 182 BP-8:`cd scripts/lib && git add gate-rules.mjs` 的相对形躲过全前缀 ⇒ 裸文件名也认(库文件按名枚举,
-    //   与 gate-carriers 的机件专名同一思路;顶层 `scripts/gate-*.mjs` 与 session-triage 刻意不在——法条口径)。
-    //   红队 3112024 轮 BP-2:裸名名单漏了 gate-difftier(P 分档的唯一实现)——补上。
-    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard)\.mjs|scripts\/lib\/gate-[\w-]+\.mjs|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs\b/i,
+    /** 本次 Stop 新增的承重提交数(a2a9f58b BP-1;**hook 计账与 detect 的唯一取值**)。返回 `{ n, shas }`:
+     *  · 未触发 ⇒ 0;
+     *  · git 事实在 ⇒ 范围内带承重 / 闸引擎改动、且 `pLedger.shas` 里没有的提交数(P 欠着时基点不推进 ⇒ 同一批提交下次还在,
+     *    按 sha 去重,一笔只计一次),加上别处补充面(他仓 / 提交落在别处)的笔数;`shas` = 本次新计的提交,hook 落账;
+     *  · 取不到 ⇒ 命令语法(参数面承重提交数,触发了至少计 1——写在前几轮、本轮 `git add -A` 的形态参数面是 0)。
+     *  失效条件:git 事实为 null 的那几轮按语法计,之后事实恢复时同一批提交会按 sha 再计一次(只会多计,方向偏严)。 */
+    tally(ctx) {
+      const H = RULE_P._p;
+      if (!ctx || !H.triggered(ctx)) return { n: 0, shas: [] };
+      const f = H.facts(ctx);
+      if (!f) return { n: Math.max(H.carrierCommitCount(ctx), 1), shas: [] };
+      const seen = new Set(((ctx.pLedger && ctx.pLedger.shas) || []).map((s) => String(s).toLowerCase()));
+      // 去重键(codex 257-p-agg-r1 断言 2 证伪「HEAD sha 去重」):聚合项代表「基点..HEAD」整段,只按 HEAD sha 去重时,
+      //   基点回退再前进到同一 HEAD,范围变大却被整项吞掉(61 笔历史实测最后一步计 0)。改按范围 `agg:<基点>..<HEAD>` 去重;
+      //   取不到基点 ⇒ 不去重(重计,偏严)。普通提交仍按自身 sha。
+      const key = (c) => (c.aggregated ? (f.base && c.sha ? `agg:${f.base}..${c.sha}`.toLowerCase() : null) : (c.sha ? String(c.sha).toLowerCase() : null));
+      const fresh = H.gitCarrierCommits(f).filter((c) => { const k = key(c); return !(k && seen.has(k)); });
+      const away = H.elsewhereHit(ctx, f) ? (H.commitsElsewhere(ctx, f) ? Math.max(H.carrierCommitCount(ctx), 1) : 1) : 0;
+      // 红队 a9af71da BP-1:聚合项(范围超 CAP,整段当一笔)带承重改动 ⇒ 按范围提交数 `count` 计(其中几笔带承重改动取不到,
+      //   按全数计);count 缺 ⇒ 61——是下界不是上界(实际 75 笔取不到总数时计 61),仍远超宽限门槛 5,方向上照拦。
+      //   去重按范围键(见上):同一段范围不重计;范围变了(HEAD 前移或基点变)⇒ 整段再计一次(偏严)。
+      const weight = (c) => (c.aggregated ? (Number.isInteger(c.count) && c.count > 0 ? c.count : H.AGG_MIN) : 1);
+      return { n: fresh.reduce((s, c) => s + weight(c), 0) + away, shas: fresh.map(key).filter((s) => typeof s === "string" && s) };
+    },
+
+    /** a2a9f58b BP-4:本轮有提交命令,而本仓范围里**没有本轮的提交** ⇒ 这些提交落在别处(同一调用内
+     *  `cd E:/elsewhere && … && git commit`,或 PowerShell 上一次调用 Set-Location 他仓;Bash 跨调用回置见 commitOutsideRoot 头注)。
+     *  「本轮的提交」= 提交时刻不早于本轮第一条提交命令的那一秒;时刻缺(夹具 / 本轮动作无时间戳)⇒ 范围里任一提交都算本轮的。
+     *  红队 a9af71da BP-5(误拦):原把「本仓范围里没有本轮提交」直接判成落在别处 ⇒ 本仓 `git commit` 因未暂存 / pre-commit 失败 /
+     *  权限被拒没落盘时也计 1 笔别处。现须**正向证据**(`commitOutsideRoot`):本轮某次提交执行时 cwd 在本仓根外
+     *  (窗口 ∪ 本轮按序追踪 cd 类动作),或提交段自带 `git -C <根外>`。没有 ⇒ 视为本仓提交失败,不计别处。 */
+    commitsElsewhere(ctx, f) {
+      const H = RULE_P._p;
+      const own = (Array.isArray(ctx.actions) ? ctx.actions : []).filter((a) => /^(Bash|PowerShell)$/.test(String((a && a.name) || ""))
+        && H.hasCommit(String((a.input && a.input.command) || ""), H.dOf(a)));
+      if (!own.length) return false;
+      const ats = own.map((a) => a.at).filter(Number.isFinite);
+      const start = ats.length ? Math.floor(Math.min(...ats) / 1000) * 1000 : null;
+      if (f.commits.some((c) => start === null || !Number.isFinite(c.at) || c.at >= start)) return false;
+      return H.commitOutsideRoot(ctx, f.root || ctx.hookCheckout || null);
+    },
+    /** cd 类段的去向(只给 `commitOutsideRoot` 的 cwd 追踪用)。bash `cd`/`pushd`/`chdir`,PowerShell `Set-Location`/`sl`/`Push-Location`
+     *  (`-Path`/`-LiteralPath` 取值,其余 `-x` 选项跳过)。返回 null(不是 cd 段)/ {to:路径} / {home:剩余段} / {back:true}(`cd -`)/
+     *  {pop:true}(popd / Pop-Location)/ {dyn:true}(变量、命令替换等解不出的目标)/ {stay:true}(PowerShell 无参)。 */
+    //   红队 a07e98e9 BP-2:PowerShell 冒号形 `-Path:E:\x` / `-LiteralPath:X`(原当未知选项跳过 ⇒ 无参 ⇒ stay)、
+    //   `-Path: X`(冒号后空格)照取值;PowerShell 段恰为盘符 `E:` ⇒ 切盘,交 {to:"E:"}(盘符相对,解析在 commitOutsideRoot)。
+    //   段首子 shell / 大括号组的 `(` / `{` 由调用方剥(commitOutsideRoot 的 `scope`),本函数只看剥后的正文。
+    cdOf(seg, ps) {
+      const s = String(seg || "").trim();
+      if (ps && /^[A-Za-z]:$/.test(s)) return { to: s };
+      if (/^(?:popd|pop-location)(?:\s+-\S+(?:\s+\S+)?)*\s*$/i.test(s)) return { pop: true };
+      const m = /^(cd|pushd|chdir|set-location|sl|push-location)(?:\s+([\s\S]*))?$/i.exec(s);
+      if (!m) return null;
+      const toks = String(m[2] || "").match(/"[^"]*"|'[^']*'|\S+/g) || [];
+      let target = null;
+      for (let i = 0; i < toks.length; i++) {
+        const t = toks[i];
+        const cm = /^-(?:path|literalpath):([\s\S]*)$/i.exec(t);
+        if (cm) { target = cm[1] !== "" ? cm[1] : (toks[i + 1] ?? null); break; }
+        if (/^-(?:path|literalpath|stackname)$/i.test(t)) { if (/^-(?:path|literalpath)$/i.test(t)) { target = toks[i + 1] ?? null; break; } i++; continue; }
+        if (t === "-") { target = "-"; break; }
+        if (t === "--") { target = toks[i + 1] ?? null; break; }
+        if (/^-/.test(t)) continue;
+        target = t; break;
+      }
+      if (target === null) return ps ? { stay: true } : { home: "" };
+      if (target === "-") return { back: true };
+      const u = target.replace(/^(["'])([\s\S]*)\1$/, "$2");
+      if (/[$`%(]/.test(u)) return { dyn: true };
+      const hm = /^~(?:[\\/](.*))?$/.exec(u);
+      if (hm) return { home: hm[1] || "" };
+      if (/^~/.test(u)) return { dyn: true };                    // ~user 形
+      return { to: u };
+    },
+    /** 段的作用域外壳(a07e98e9 BP-1):剥段首 `(` / `{ ` 与段尾 `)` / ` }`(只认引号外),交出
+     *  `{ body, open, close }`——`open` = 段首子 shell 开符数,`close` = 本段净收掉的层数(段尾 `)` 减去段内未配对的 `(`,
+     *  如 `echo $(pwd))` 只收 1 层)。段内净开(`echo $(cd /x` 切段后)⇒ `open` 另加该数(命令替换也是子 shell)。
+     *  大括号组 `{ …; }` 不开层(bash 语义:组内 cd 持久)。 */
+    scope(seg, ps) {
+      const raw = String(seg || "");
+      let m = raw;
+      try { m = stripQuoted(raw, ps); } catch { m = raw; }
+      // 手扫(不用带嵌套量词的尾锚正则:长空白串上会退化成平方回溯)
+      //   空白按 **raw** 判(掩码把引号内容抹成空格:按掩码判会把段尾的 `'\repo'` 当空白剥掉),
+      //   括号按**掩码**判(只认引号外的;掩码与 raw 等长同下标)。
+      const sp = (c) => c === " " || c === "\t" || c === "\r" || c === "\n";
+      if (m.length !== raw.length) m = raw;
+      let a = 0, lopen = 0;
+      for (;;) {
+        while (a < raw.length && sp(raw[a])) a++;
+        if (m[a] === "(") { lopen++; a++; continue; }
+        if (m[a] === "{" && (a + 1 >= raw.length || sp(raw[a + 1]))) { a++; continue; }
+        break;
+      }
+      let b = raw.length, tclose = 0;
+      for (;;) {
+        while (b > a && sp(raw[b - 1])) b--;
+        if (b > a && m[b - 1] === ")") { tclose++; b--; continue; }
+        if (b > a && m[b - 1] === "}" && (b - 1 === a || sp(raw[b - 2]))) { b--; continue; }
+        break;
+      }
+      const body = raw.slice(a, b).trim();
+      const inner = m.slice(a, b);
+      let bal = 0;
+      for (const c of inner) { if (c === "(") bal++; else if (c === ")") bal--; }
+      const open = lopen + Math.max(0, bal - tclose);
+      const close = Math.max(0, tclose - Math.max(0, bal)) + Math.max(0, -bal);
+      return { body, open, close };
+    },
+    /** 本轮某次提交执行时是否在本仓根外(BP-5 的正向证据)。窗口 ∪ 本轮的 Bash/PowerShell 动作**按序**走一遍,跟踪 cwd。起点 = 本仓根。
+     *  跨调用语义(复核红队 a084a536 BP-6 改正;原头注「跨调用保持,与 Bash 工具语义一致」与实情相反):
+     *    · Bash:交互会话里 cd 到项目外,调用结束 CC 把 shell cwd 拉回项目根,结果正文末行写「Shell cwd was reset to <路径>」
+     *      (本机语料 182 份 822 次,全 Bash、目标全为 \repo;本机 ~/.claude/cache/changelog.md 第 8531 行
+     *      CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR「freeze working directory for bash commands」、第 2408 行
+     *      「non-interactive sessions (-p / SDK / cloud) … a cd now persists across turns」)。
+     *      ⇒ `bashCallEnd`:有回置声明(gate-ctx 的 `cwdReset`)⇒ 下一次起点 = 声明路径;无声明 ⇒ 调用结束时在根外 /
+     *      任一种未知 ⇒ 回本仓根,根内子目录照常跨调用保持。
+     *    · PowerShell:语料 0 次回置声明,行为文档未记载 ⇒ 维持跨调用保持(PS 跨调用 cwd 语义未证,见下 CEILING)。
+     *    · Bash 与 PowerShell 共用一个 cwd 模型(是否真共用未证,D149⑧ 已登记的现状,未动)。
+     *  去向有两种「未知」(红队 a07e98e9 BP-2,不得混用):
+     *    · `UNK_FAIL`:该 cd 所在调用的工具结果报错**且正文带 cd 失败特征**(codex 257-p-agg-r1「没问到」② + 红队 ad3e4f93 BP-1)
+     *      ⇒ 生没生效判不出 ⇒ **不算证据**(视为本仓);
+     *    · `UNK_PARSE`:去向解不出(变量 / 命令替换 / `~user` / popd 栈空 / `cd -` 无前值 / 相对路径接在根外或解不出的位置后 /
+     *      bash 下同盘的裸盘符)⇒ 按 0aa11fd 之前语义**算可能在别处**(0aa11fd~ba5c9c2 视为本仓 ⇒ `git -C ~/notes` 等一律漏放)。
+     *  提交段的去向 = 当时 cwd 再叠 `git -C`(按序,含 `~`)、`--work-tree` / `--git-dir` / `GIT_WORK_TREE=` / `GIT_DIR=`
+     *  (前缀,或同一调用内 `export` / 裸赋值 / `$env:`)——**任一**落在根外即算别处(提交进的是 git-dir 那个仓:
+     *  `--git-dir=../x/.git --work-tree=.` 只看 work-tree 会漏),任一 UNK_PARSE 亦算。
+     *  子 shell `( … )` / 命令替换 `$( … )` 里的 cd 只作用到该层结束(`scope` 给层数;调用结束未闭合的层一律弹回);
+     *  大括号组 `{ …; }` 的 cd 持久(bash 语义)。PowerShell 的 `( … )` 不是作用域 ⇒ 只剥符号、不开层。
+     *  PowerShell 裸盘符 `E:` / 盘符相对 `E:sub`:回到该盘上次所在(本次追踪里见过的),没见过的他盘 ⇒ 根外。
+     *  `cd ~` 类:本仓根在 Users|home/<名> 下 ⇒ 按该家目录解,否则视为根外。
+     *  CEILING(登记):窗口(400 条)之前的 cd 看不见;
+     *  **无声明默认「根外/未知即回根」的失效条件**:非交互会话(`-p` / Agent SDK / 云端)里 cd 跨轮保持(changelog 第 2408 行),
+     *  回置不发生、也就没有声明 ⇒ 本默认在那里方向反转成**漏放**(上一次调用 cd 他仓、本次相对路径提交他仓 ⇒ 判本仓);
+     *  选此默认的依据(本机 182 份语料,交互会话):根外 Bash 调用结束有声明 819 次(声明即回置的直证);无声明 430 次
+     *  (358 次是 cd 进会话 scratchpad,CC 不写声明),其后下一次调用不自带 cd、用仓相对路径的 56 次成功(唯一一次报错形是 ssh 远端命令的输出,非本地 cwd)
+     *  ⇒ 无声明时也回到了根(静默回置)。--add-dir 附加工作目录未在语料里出现,是否回置未证 ⇒ 若不回置,同向漏放。
+     *  回置声明取自工具输出末行,命令自己 echo 一行同样字样即可伪造(代价模型:故意伪造不计);
+     *  Bash 上 UNK_FAIL 的跨调用作用已被回置吸收 ⇒ `CD_FAIL` 在 Bash 上只在同一调用内承重。
+     *  PowerShell 跨调用 cwd 语义未证(0 次声明)⇒ 维持保持;若实为回置 ⇒ PS 形 cd 他仓后本仓提交失败会被诚实误拦;
+     *  `cd "$(git rev-parse --show-toplevel)"` 后本仓提交失败 ⇒
+     *  UNK_PARSE ⇒ 计别处(诚实误拦,与漏放同价);环境变量只在同一调用内跟踪(工具每次调用新开 shell);
+     *  BP-3(walk 的 cd 识别仍是 bash 专用、与本函数两套 cd 模型)未动。
+     *  失败判据只看结果正文(`errText`)的 cd 失败特征(`CD_FAIL`),其余失败(管道尾 grep 退 1 / push 失败 / 超时 / 打断)不抹 cd
+     *  (红队 ad3e4f93 BP-1);特征词宽(`No such file or directory` 也可能出自同一调用里别的命令)⇒ 那种调用里的 cd 记 UNK_FAIL、
+     *  不算证据(偏放);正文缺(老转录 / 结果被截)⇒ 视为非 cd 失败、cd 照常生效(偏严)。 */
+    CD_FAIL: /No such file or directory|Not a directory|Cannot find path|找不到路径|does not exist|(?:^|[\s:])(?:cd|pushd|popd|chdir): |(?:Set|Push|Pop)-Location\s*:/im,
+    commitOutsideRoot(ctx, root) {
+      const H = RULE_P._p;
+      if (!root) return false;
+      const R = H.resolve(null, root).replace(/\/+$/, "");
+      if (!/^([A-Za-z]:)?\//.test(R)) return false;
+      const home = /^((?:[A-Za-z]:)?\/(?:users|home)\/[^/]+)(?:\/|$)/i.exec(R)?.[1] ?? null;
+      const OUT = "\0out", UNK_FAIL = "\0unk-fail", UNK_PARSE = "\0unk-parse";
+      const isPath = (l) => l !== OUT && l !== UNK_FAIL && l !== UNK_PARSE;
+      const fix = (p) => String(p).replace(/\\/g, "/").replace(/^\/([a-z])(\/|$)/i, "$1:/");
+      const abs = (p) => /^([A-Za-z]:)?\//.test(fix(p));
+      const driveOf = (l) => (isPath(l) ? (/^([A-Za-z]):/.exec(l)?.[1] || "").toLowerCase() : "");
+      const lastOn = new Map();                      // 盘 ⇒ 该盘上次所在(PowerShell 裸盘符切回用)
+      const note = (l) => { const d = driveOf(l); if (d) lastOn.set(d, l); return l; };
+      note(R);
+      /** 一个去向串解成 loc(cd 目标、-C、work-tree、git-dir 共用)。 */
+      const dest = (base, raw, ps) => {
+        const u = String(raw ?? "").replace(/^(["'])([\s\S]*)\1$/, "$2");
+        if (!u || /[$`%(]/.test(u)) return UNK_PARSE;
+        const hm = /^~(?:[\\/](.*))?$/.exec(u);
+        if (hm) return home ? H.resolve(home, hm[1] || ".") : OUT;
+        if (/^~/.test(u)) return UNK_PARSE;          // ~user 形
+        const dm = /^([A-Za-z]):(?![\\/])([\s\S]*)$/.exec(u);
+        if (dm) {                                    // 盘符相对:`E:` / `E:sub`
+          const d = dm[1].toLowerCase(), rd = driveOf(R), cur = lastOn.get(d);
+          if (!ps || cur === undefined) return d === rd ? UNK_PARSE : OUT;   // bash 下同盘裸盘符语义不定
+          return dm[2] ? H.resolve(cur, dm[2]) : cur;
+        }
+        if (abs(u)) return H.resolve(null, u);
+        if (base === OUT) return UNK_PARSE;
+        if (!isPath(base)) return base;              // 未知之后的相对路径:沿用那种未知
+        return H.resolve(base, u);
+      };
+      const isOut = (l) => l === OUT || l === UNK_PARSE || (isPath(l) && H.outside(l, R));
+      const w = H.win(ctx);
+      const seq = [...((w && Array.isArray(w.actions)) ? w.actions : []).map((a) => [a, false]),
+        ...(Array.isArray(ctx.actions) ? ctx.actions : []).map((a) => [a, true])];
+      let loc = R, prev = null;
+      let stack = [];
+      for (const [a, own] of seq) {
+        const name = String((a && a.name) || "");
+        if (!/^(Bash|PowerShell)$/.test(name) || typeof (a.input && a.input.command) !== "string") continue;
+        const ps = name === "PowerShell";
+        let segs = [];
+        try { segs = segments(ps ? a.input.command : H.stripHeredoc(a.input.command), ps); } catch { continue; }
+        const frames = [];                           // 子 shell 层:进入前的 {loc, prev, stack, env}
+        let env = {};                                // 本调用内设过的 GIT_DIR / GIT_WORK_TREE(原始串,提交时按当时 cwd 解)
+        const enter = (n) => { for (let k = 0; k < n; k++) frames.push({ loc, prev, stack: [...stack], env: { ...env } }); };
+        const leave = (n) => { for (let k = 0; k < n && frames.length; k++) { const f = frames.pop(); loc = f.loc; prev = f.prev; stack = f.stack; env = f.env; } };
+        for (const seg of segs) {
+          const sc = H.scope(seg, ps);
+          if (!ps) enter(sc.open);
+          const body = sc.body;
+          const cd = body ? H.cdOf(body, ps) : null;
+          if (cd) {
+            const was = loc;
+            // codex 257-p-agg-r1「没问到」②:cd 失败 ⇒ 去向记未知(UNK_FAIL),不当作移出本仓的证据
+            //   (原先失败的 cd 也当成功,本仓提交失败因而被计成别处承重提交)。
+            // 红队 ad3e4f93 BP-1:「cd 失败」只认结果正文的 cd 失败特征(`CD_FAIL`),不认 `is_error` 本身——
+            //   `cd X && git diff | grep foo` 的 grep 无匹配、尾部 push 失败、超时、打断都报错,cd 却已生效。
+            if (a.err && H.CD_FAIL.test(String(a.errText || ""))) { loc = UNK_FAIL; prev = was; }
+            else if (cd.pop) { loc = stack.length ? stack.pop() : UNK_PARSE; prev = was; }
+            else if (!cd.stay) {                     // PowerShell 无参:原地
+              if (cd.back) loc = prev === null ? UNK_PARSE : prev;
+              else if (cd.dyn) loc = UNK_PARSE;
+              else if ("home" in cd) loc = home ? H.resolve(home, cd.home || ".") : OUT;
+              else loc = dest(loc, cd.to, ps);
+              if (/^(pushd|push-location)\b/i.test(body)) stack.push(was);
+              prev = was;
+            }
+            note(loc);
+          } else if (body) {
+            const em = ps ? /^\$env:(GIT_DIR|GIT_WORK_TREE)\s*=\s*([\s\S]+)$/i.exec(body)
+              : /^(?:export\s+)?(GIT_DIR|GIT_WORK_TREE)=(\S*)$/.exec(body);
+            if (em) env[em[1].toUpperCase()] = em[2].trim();
+            const um = ps ? /^remove-item\s+(?:-path\s+)?env:(GIT_DIR|GIT_WORK_TREE)\s*$/i.exec(body) : /^unset\s+(GIT_DIR|GIT_WORK_TREE)\s*$/.exec(body);
+            if (um) delete env[um[1].toUpperCase()];
+            if (own && isCommitSeg(body)) {
+              const g = gitArgs(body);
+              let dir = loc;
+              for (const c of (g && g.cdirs) || []) dir = dest(dir, c, ps);
+              const e = { ...env, ...((g && g.env) || {}) };
+              const wt = (g && g.workTree) ?? e.GIT_WORK_TREE ?? null, gd = (g && g.gitDir) ?? e.GIT_DIR ?? null;
+              const cands = [dir, ...[wt, gd].filter((x) => typeof x === "string").map((x) => dest(dir, x, ps))];
+              // 本调用里失败的 cd 之后 dir 是 UNK_FAIL ⇒ 不算证据;根外 / UNK_PARSE 才算
+              if (cands.some(isOut)) return true;
+            }
+          }
+          if (!ps) leave(sc.close);
+        }
+        leave(frames.length);                        // 调用结束:未闭合的子 shell 层一律弹回(子 shell 不跨调用)
+        if (!ps) {                                   // a084a536 BP-6:Bash 调用边界回置(PowerShell 跨调用语义未证,不动)
+          const nx = H.bashCallEnd(a, isPath(loc) && !H.outside(loc, R) ? loc : null, R);
+          if (nx !== null) { loc = note(nx); prev = null; }
+        }
+      }
+      return false;
+    },
+    /** a084a536 BP-6:一次 Bash 调用结束后下一次调用的起点。`inRoot` = 调用结束时 cwd(在本仓根内才给,否则 null)。
+     *  返回 null = 不动(照常跨调用保持),否则 = 新起点。
+     *  ① 正向证据优先:结果正文末行「Shell cwd was reset to <路径>」(gate-ctx 的 `cwdReset`)⇒ 起点 = 该路径(绝对形才认);
+     *  ② 无声明:调用结束时在根外 / 任一种未知(OUT / UNK_PARSE / UNK_FAIL)⇒ 起点回本仓根;根内(含子目录)照常保持。 */
+    bashCallEnd(a, inRoot, R) {
+      const H = RULE_P._p;
+      const r = typeof (a && a.cwdReset) === "string" ? a.cwdReset.trim().replace(/^(["'])([\s\S]*)\1$/, "$2") : "";
+      if (r) {
+        const p = r.replace(/\\/g, "/").replace(/^\/([a-z])(\/|$)/i, "$1:/");
+        if (/^([A-Za-z]:)?\//.test(p)) return H.resolve(null, p);
+      }
+      return inRoot === null ? R : null;
+    },
+    /** 本轮(不含窗口)的命令语法承重证据:参数面承重提交 / 本轮 Write·Edit 承重件 / 本轮 Bash 写目标(cd 解析后)落承重件。 */
+    ownSyntaxCarrier(ctx) {
+      const H = RULE_P._p, isC = (p) => H.isCarrierOrEngine(p, ctx.hookCheckout || null);
+      if (H.carrierCommitCount(ctx) > 0) return true;
+      if ((ctx.writes || []).some(isC)) return true;
+      return H.cmdPairs(ctx, false).some(([cmd, d]) => { try { return H.writeTargets(cmd, isC, d).length > 0; } catch { return false; } });
+    },
+    /** git 事实在时的补充面是否命中(他仓绝对路径 / 提交落在别处)。只在本轮真提交过时看。 */
+    elsewhereHit(ctx, f) {
+      const H = RULE_P._p;
+      if (!(typeof ctx.didCommit === "function" && ctx.didCommit())) return false;
+      if (H.elsewhereCarrier(ctx, f.root)) return true;
+      return H.commitsElsewhere(ctx, f) && H.ownSyntaxCarrier(ctx);
+    },
+
+    /** 红队 agent 且入参绑定闸文件/规则 id/diff(D11 + 红队 182 BP-9)。 */
+    isBoundHunter(a) {
+      if (!a || !/^(Agent|Task)$/.test(String(a.name || ""))) return false;
+      const t = String((a.input && (a.input.subagent_type || a.input.agentType)) || "");
+      return /^_gate-bypass-hunter$/.test(t) && RULE_P._p.hunterBound(a);
+    },
     /** 红队 182 BP-9:起一次空 prompt 的 `_gate-bypass-hunter` 也满足收紧 ⇒ 与 W 的 reviewedOne 同法,
      *  入参须提及闸引擎文件名 / 规则 id / diff 文件——只证发起,不证采纳(与另两通道同一 CEILING)。 */
     hunterBound(a) {
       const p = JSON.stringify((a && a.input) || {});
       return /hook-stop-closure|hook-guard|gate-[\w-]+\.mjs|\.diff\b|规则 ?id|rule ids?|\bRULE_[A-Z0-9]+\b|批 ?\d{3}/i.test(p);
     },
+    /** 旧整串正则(hook-start-gate 按名引用它判「本批碰没碰闸引擎」,口径与本条同源;P 自己改用上面三件)。 */
+    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard)\.mjs|scripts\/lib\/gate-[\w-]+\.mjs|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs\b/i,
+
+    /** 本批提交是否**带进了闸引擎改动**(D11 收紧的适用面)。
+     *  · git 事实在 ⇒ **只认** `基点..HEAD` 上被带进的提交里有没有本仓闸引擎文件(派出方 a27628dd 口径①:
+     *    不认 400 窗口里任意一次闸写入——那是 BP-7 / 量化 a00051d 14/26 误拦的成因之一)。
+     *  · 取不到 ⇒ 回退语法判据:窗口 ∪ 本轮里**最后一次绑定红队之后**的闸写入 / 暂存(BP-7:红队之前的改动已被它覆盖)。
+     *  结果按 ctx 缓存(独立视角通道的谓词对每个动作都调它)。 */
+    _engMemo: new WeakMap(),
     gateEngineTouched(ctx) {
       const H = RULE_P._p;
-      const w = H.win(ctx);
-      const seen = [...(ctx.writes || []), ...((w && w.writes) || [])].map((p) => String(p).replace(/\\/g, "/"));
-      if (seen.some((p) => H.GATE_ENGINE.test(p))) return true;
-      const cmds = [...(ctx.bashCmds || []), ...((w && w.bashCmds) || [])];
-      // codex 182 Q3:`ctx.writes` 不含 Bash 写目标 ⇒ `node -e writeFileSync('scripts/lib/gate-rules.mjs')` 后
-      //   `git add -A` 提交,收紧看不见。Bash 面写目标与 I 项同一实现(`bashWriteTargets`),不另抄。
-      if (cmds.some((cmd) => { try { return bashWriteTargets(cmd, H.GATE_ENGINE).length > 0; } catch { return false; } })) return true;
-      return cmds.some((cmd) => segments(cmd).some((s) => {
-        const noMsg = s.replace(/(?:-m|--message|-F|--file)(?:\s+|=)(?:"[^"]*"|'[^']*'|\S+)/g, " ");
-        return H.GIT.test(noMsg) && /\b(add|commit)\b/.test(noMsg) && H.GATE_ENGINE.test(noMsg.replace(/\\/g, "/"));
-      }));
+      if (!ctx || typeof ctx !== "object") return false;
+      if (H._engMemo.has(ctx)) return H._engMemo.get(ctx);
+      const f = H.facts(ctx);
+      const v = f ? H.gitEngineCommits(f).length > 0 : H.engineBySyntax(ctx);
+      H._engMemo.set(ctx, v);
+      return v;
     },
+    engineBySyntax(ctx) {
+      const H = RULE_P._p, w = H.win(ctx), root = ctx.hookCheckout || null;
+      const acts = [...((w && Array.isArray(w.actions)) ? w.actions : []), ...(Array.isArray(ctx.actions) ? ctx.actions : [])];
+      let last = -1;
+      acts.forEach((a, i) => { if (H.isBoundHunter(a)) last = i; });
+      const eng = (p) => H.isEnginePath(p, root);
+      for (const a of acts.slice(last + 1)) {
+        const name = String((a && a.name) || ""), inp = (a && a.input) || {};
+        const fp = inp.file_path || inp.notebook_path;
+        if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(name) && typeof fp === "string" && eng(fp)) return true;
+        if (/^(Bash|PowerShell)$/.test(name) && typeof inp.command === "string") {
+          try {
+            if (H.writeTargets(inp.command, eng, H.dOf(a)).length) return true;
+            if (H.gitPathArgs(inp.command, H.dOf(a)).some(eng)) return true;
+          } catch { /* 解析失败不算证据(回退面;git 事实面不受影响) */ }
+        }
+      }
+      return false;
+    },
+
+    /** 绝对路径且不在本 checkout 下(他仓 / 别的 checkout)。worktree 在仓根之内 ⇒ 不算「外」(派出方裁定:不算本仓)。 */
+    outside(p, root) {
+      const H = RULE_P._p, n = H.resolve(null, p).toLowerCase();
+      if (!/^([a-z]:)?\//.test(n)) return false;
+      if (!root) return true;
+      const r = H.resolve(null, root).toLowerCase().replace(/\/+$/, "");
+      return !(n === r || n.startsWith(r + "/"));
+    },
+    /** git 事实在时的补充面:git 看不见的**别的 checkout** 的承重提交(他仓宪法照样算,D93′)。
+     *  只认绝对路径落在本仓根之外的承重写入 / 暂存;相对路径默认在本 checkout,由 git 事实负责。 */
+    elsewhereCarrier(ctx, root) {
+      const H = RULE_P._p, w = H.win(ctx);
+      const isOut = (p) => H.outside(p, root) && H.isCarrierOrEngine(p);
+      if ([...(ctx.writes || []), ...((w && w.writes) || [])].some(isOut)) return true;
+      return H.cmdPairs(ctx, true).some(([cmd, d]) => {
+        try { return H.writeTargets(cmd, isOut, d).length > 0 || (H.hasCommit(cmd, d) && H.gitPathArgs(cmd, d).some(isOut)); } catch { return false; }
+      });
+    },
+
+    /** 触发面。 */
+    // ⚠️ 2026-08-27(D92)回退面的证据①放宽到「窗口 ∪ 本轮」:「干几轮活 → 最后 `git add -A && git commit`」
+    //   这一最自然的节奏下两条证据都结构性为空(实撞 120 轮 0 次响)。git 事实面上这件事不再成立(看的是落了什么),
+    //   回退面照旧保留它。
     triggered(ctx) {
-      if (!ctx || typeof ctx.didCommit !== "function" || !ctx.didCommit()) return false;
-      if (RULE_P._p.carrierCommitCount(ctx) > 0) return true;
-      const w = RULE_P._p.win(ctx);
-      const seen = [...(ctx.writes || []), ...((w && w.writes) || [])];
-      if (seen.some((p) => isCarrierPath(CARRIER_SURFACE, p))) return true;   // D86:路径面剔除非载体区
-      // codex 185「你没问到」2(High):承重件经 **Bash** 改 + `git add -A` ⇒ writes 空、参数面无路径 ⇒ 原式不触发,
-      //   于是 gateEngineTouched 为真也走不到红队检查。Bash 写目标与 I/D11 同一实现。
-      const cmds = [...(ctx.bashCmds || []), ...((w && w.bashCmds) || [])];
-      if (cmds.some((cmd) => {
-        try { return bashWriteTargets(cmd, CARRIER_SURFACE).some((t) => isCarrierPath(CARRIER_SURFACE, t)); } catch { return false; }
-      })) return true;
-      // 红队 3112024 轮 BP-1:`cd scripts/lib && sed -i … gate-rules.mjs` 再 `git add -A` 提交——bashWriteTargets 不解析 cd,
-      //   取到裸名不算承重 ⇒ 不触发;而 gateEngineTouched 用裸名分支认得出它。两个判据对同一命令不得相反:
-      //   已提交且闸引擎被动过 ⇒ 触发。
-      return RULE_P._p.gateEngineTouched(ctx);
+      if (!ctx) return false;
+      const H = RULE_P._p, f = H.facts(ctx);
+      const committed = typeof ctx.didCommit === "function" && ctx.didCommit();
+      if (f) {
+        if (H.gitCarrierCommits(f).length) return true;
+        return H.elsewhereHit(ctx, f);
+      }
+      if (!committed) return false;
+      return H.triggeredBySyntax(ctx);
+    },
+    /** 回退面(git 事实取不到):本轮真提交过 且(参数面承重提交 / 窗口∪本轮承重写入 / cd 解析后的 Bash 承重写目标 / 闸引擎被动过)。 */
+    triggeredBySyntax(ctx) {
+      const H = RULE_P._p;
+      if (H.carrierCommitCount(ctx) > 0) return true;
+      const w = H.win(ctx);
+      if ([...(ctx.writes || []), ...((w && w.writes) || [])].some((p) => isCarrierPath(CARRIER_SURFACE, p))) return true;   // D86
+      // codex 185「你没问到」2:承重件经 Bash 改 + `git add -A` ⇒ writes 空、参数面无路径。Bash 写目标与 I/D11 同一实现。
+      if (H.cmdPairs(ctx, true).some(([cmd, d]) => { try { return H.writeTargets(cmd, (p) => isCarrierPath(CARRIER_SURFACE, p), d).length > 0; } catch { return false; } })) return true;
+      // 红队 3112024 轮 BP-1:两个判据对同一命令不得相反——已提交且闸引擎被动过 ⇒ 触发。
+      return H.gateEngineTouched(ctx);
     },
 
     win(c) { try { return c && typeof c.window === "function" ? c.window() : null; } catch { return null; } },
@@ -3924,18 +4389,91 @@ const RULE_P = {
         const name = String(a && a.name || ""), inp = (a && a.input) || {};
         if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(name) && typeof (inp.file_path || inp.notebook_path) === "string") writes.push(inp.file_path || inp.notebook_path);
         if (/^(Bash|PowerShell)$/.test(name) && typeof inp.command === "string") {
-          try { writes.push(...bashWriteTargets(inp.command, CARRIER_SURFACE)); } catch { return out; }
+          try { writes.push(...bashWriteTargets(inp.command, CARRIER_SURFACE, { dialect: H.dOf(a) })); } catch { return out; }
         }
       }
       if (w && Array.isArray(w.writes)) writes.push(...w.writes);
       return coversWrites(facts, writes, isC) ? out.filter((h) => !H.SOFT_CH.test(String(h.ch))) : out;
     },
 
+    hunterCh() { return RULE_P._p.CH.find((c) => /独立视角/.test(c.key)); },
+
+    /** 红队凭证池:闸引擎面上独立视角通道只认这里面的动作。
+     *  codex 185「你没问到」1(High):红队凭证得绑**本批**——上一批的红队调用不能抵本批。
+     *  ── git 事实在(红队 a27628dd / 量化 a00051d 之后,派出方口径②③)────────────────────────────
+     *    切点 = max(批武装时刻, **比本次范围更早的最后一次带闸引擎改动的提交**时刻),只在「本仓、按 git 事实带闸改动」
+     *    的提交处切——他仓提交、`--amend`、只改法典/ADR/src 的提交都不切(a00051d:26 次 D11 阻断里 14 次是这样切出来的误拦)。
+     *    宽松口径(派出方定):「红队 → 按回件修闸 → 提交」里的修闸提交在本次范围内,不切 ⇒ 这一轮红队抵账。
+     *    窗口动作须有有效时间戳且不晚于本轮最晚动作(同下面 191 ②③);本轮动作恒在池内。
+     *  ── 取不到 git 事实(回退,保持现状,fail-closed)──────────────────────────────────────────
+     *    主路径:动作带转录时间戳且 `batchGoal.armedAt` 在 ⇒ 切点 = max(武装时刻, 窗口最后一次**任意**提交);
+     *    再退:窗口里最后一次任意提交之后。「任何提交都切」的代价是「红队 → 记台账提交 → 关账」会被拦一次。
+     *    (191 两队红队:① 切点取 max 而非只取武装时刻;② 窗口动作**必须**有有效 at 才入池;③ 上界=本轮最晚动作;
+     *     ④ armedAt 按有限性判,epoch 不被真值兜底吞掉。红队 186:提交判定剥载荷后再看 --dry-run——现走 isCommitSeg。) */
+    armedAt(ctx) {
+      const parsedArm = Date.parse(String((ctx && ctx.batchGoal && ctx.batchGoal.armedAt) || ""));
+      return Number.isFinite(parsedArm) ? parsedArm : null;
+    },
+    /** 窗口里时刻 ≥ cutAt(且有有效时间戳、不晚于本轮最晚动作)的动作 ∪ 本轮动作。cutAt=null ⇒ 整窗 ∪ 本轮。 */
+    poolAfter(ctx, cutAt) {
+      const H = RULE_P._p, w = H.win(ctx);
+      const wa = (w && Array.isArray(w.actions)) ? w.actions : [];
+      const own = Array.isArray(ctx.actions) ? ctx.actions : [];
+      if (cutAt === null || cutAt === undefined) return [...wa, ...own];
+      const upper = own.map((a) => a.at).filter(Number.isFinite).sort((x, y) => y - x)[0] ?? null;
+      return [...wa.filter((a) => Number.isFinite(a.at) && a.at >= cutAt && (upper === null || a.at <= upper)), ...own];
+    },
+    hunterPool(ctx) {
+      const H = RULE_P._p, w = H.win(ctx);
+      const wa = (w && Array.isArray(w.actions)) ? w.actions : [];
+      const own = Array.isArray(ctx.actions) ? ctx.actions : [];
+      const armedAt = H.armedAt(ctx);
+      const after = (cutAt) => H.poolAfter(ctx, cutAt);
+      const f = H.facts(ctx);
+      if (f) {
+        const cuts = [armedAt, f.engineAnchorAt].filter((x) => Number.isFinite(x));
+        return cuts.length ? after(Math.max(...cuts)) : [...wa, ...own];
+      }
+      const isCommitAction = (a) => /^(Bash|PowerShell)$/.test(String(a.name || "")) && H.hasCommit(String((a.input && a.input.command) || ""), H.dOf(a));
+      if (armedAt !== null && wa.some((a) => Number.isFinite(a.at))) {
+        let lastCommitAt = null;
+        for (const a of wa) if (isCommitAction(a) && Number.isFinite(a.at)) lastCommitAt = a.at;
+        return after(lastCommitAt !== null ? Math.max(armedAt, lastCommitAt) : armedAt);
+      }
+      let cut = -1;
+      wa.forEach((a, i) => { if (isCommitAction(a)) cut = i; });
+      return [...wa.slice(cut + 1), ...own];
+    },
+    /** 某条通道的取值池:闸引擎面上的独立视角 = 红队凭证池,其余 = 窗口 ∪ 本轮。
+     *  hook 侧计账清零与 detect **同一张脸**(派出方 a27628dd 口径⑤:原来计账用整窗、判据用凭证池,注释说一致实际不是)。 */
+    channelPool(ctx, ch) {
+      const H = RULE_P._p;
+      return (ch === H.hunterCh() && H.gateEngineTouched(ctx)) ? H.hunterPool(ctx) : H.scopeActions(ctx);
+    },
+
+    // ── 合回分支的点名抵账(a2a9f58b BP-8)——2026-10-11 已撤 ──
+    //   codex 257-p-gitfacts-r2 断言 6 证伪:「红队 prompt 点名了分支名」可被只在背景里提到、明说不审的 prompt 满足 ⇒ 放过真欠账。
+    //   commitNames / namesAny / namedCover 三个函数随之删除(史料见 git 4c1b04b);BP-8 误拦退回残余 D149④,待非文本判据。
+    /** 闸引擎面的红队凭证是否已在(detect、计账清零同一取值):时刻切点池里有绑定红队(点名覆盖已撤,见上)。 */
+    hunterMet(ctx) {
+      const H = RULE_P._p, ch = H.hunterCh();
+      // 点名覆盖(namedCover)已撤:codex 257-p-gitfacts-r2 断言 6 实证——prompt 只在背景里列了分支名、且明说不在审查范围,
+      //   照样抵掉该分支带进的闸改动 ⇒ 它会放过真欠账,不是单纯收紧误拦,不属窄例外③;BP-8 误拦退回为残余(D149④)。
+      return H.hunterPool(ctx).some((a) => { try { return ch.test(a, ctx); } catch { return false; } });
+    },
+    /** 三条通道各自是否已有凭证(与 detect 同一取值池、同一谓词)。 */
+    channelsMet(ctx) {
+      const H = RULE_P._p;
+      return H.CH.map((ch) => (ch === H.hunterCh() && H.gateEngineTouched(ctx)) ? H.hunterMet(ctx)
+        : H.channelPool(ctx, ch).some((a) => { try { return ch.test(a, ctx); } catch { return false; } }));
+    },
+
     /** 每累计 K 次承重面提交,义务重新武装一次 ⇒ 各需 ceil(承重提交数 / K) 遍。
-     *  本轮至少算 1 次(触发时已确认本轮有承重提交,只是路径可能只落在 writes 上)。 */
+     *  本轮至少算 1 次(触发时已确认本轮有承重提交,只是路径可能只落在 writes 上)。
+     *  git 事实在 ⇒ 范围本身就跨轮,计数取 `tally`(不再加窗口的命令语法计数,否则同一笔算两次)。 */
     needRuns(ctx) {
       const H = RULE_P._p;
-      const n = H.carrierCommitCount(H.win(ctx)) + Math.max(H.carrierCommitCount(ctx), 1);
+      const n = H.facts(ctx) ? Math.max(H.tally(ctx).n, 1) : H.carrierCommitCount(H.win(ctx)) + Math.max(H.carrierCommitCount(ctx), 1);
       return { commits: n, need: Math.max(1, Math.ceil(n / H.rearm())) };
     },
   },
@@ -3956,65 +4494,24 @@ const RULE_P = {
     //   漏放贵于误拦:多跑一次红队≈10 分钟;漏一次=闸看起来在守而实际是装饰,且没人再撞。
     //   ⇒ 触及闸引擎的提交,红队**每批必跑**,不计入宽限;另两通道仍按宽限。
     const engine = H.gateEngineTouched(ctx);
-    const hunterCh = H.CH.find((c) => /独立视角/.test(c.key));
-    // codex 185「你没问到」1(High):红队凭证得绑**本批**——窗口里上一批的红队调用(它之后已有一次提交)
-    //   不能抵本批。凭证池=本轮动作 ∪ 窗口里**最后一次提交之后**的动作;窗口不分批,提交是最近的批边界近似。
-    const hunterPool = (() => {
-      const w = H.win(ctx);
-      const wa = (w && w.actions) || [];
-      // ── 批边界(红队 186 BP-1~8 之后重写)────────────────────────────────
-      //   首版用「提交」近似批边界,第二版给 docs-only 提交开例外——红队一次给出八种写法打穿例外
-      //   (分次 add、`-A` 与显式路径并列、`docs/.`、`cd` 相对形、反斜杠/绝对路径/glob、提交信息含 --dry-run、
-      //   `git stage`、子代理提交)。结论:提交不是批边界,**批号武装时刻才是**(本仓的批时钟=batch-goal)。
-      //   主路径:动作带转录时间戳(gate-ctx `at`),`batchGoal.armedAt` 在 ⇒ 凭证池=武装之后的动作。
-      //   回退(夹具/无时间戳/未武装):**任何**含 commit 的命令都切(fail-closed,不再给 docs-only 例外);
-      //   `git stage` 视同 add;`--dry-run` 在剥 message 之后判。代价:回退路径下「红队 → 记台账提交 → 关账」
-      //   会被拦一次——出路是关账前把红队放在最后一次提交之后,或让批武装(主路径)生效。
-      const commitCuts = (cmd) => segments(cmd).some((s) => {
-        if (!H.GIT.test(s) || !/\bcommit\b/.test(s)) return false;
-        const noMsg = s.replace(/(?:-m|--message|-F|--file)(?:\s+|=)(?:"[^"]*"|'[^']*'|\S+)/g, " ");
-        return !/--dry-run\b/.test(noMsg);
-      });
-      const isCommitAction = (a) => /^(Bash|PowerShell)$/.test(String(a.name || "")) && commitCuts(String((a.input && a.input.command) || ""));
-      // ── 191 两队红队重写(BP-1/2/4/7/8;上一版的四处毛病逐条对应)────────────────
-      //   ① 切点只取武装时刻,而法条(reporting.md 触发层)写的是「自上一次**承重面 commit** 以来」⇒
-      //      批开头跑一次红队后,后续闸改动可无限追加提交而不再复跑,达成它**不需要伪造、只需不重新 --arm**;
-      //      且 `--clear` 会抹掉 armedAt ⇒「不结清反而更松」。现取 max(武装时刻, 窗口最后一次切边界提交),
-      //      比两句中任一句都严,不与任一句冲突。代价是回退路径的老账重现:「红队 → 记台账提交 → 关账」会被拦一次,
-      //      出路照旧=关账前把红队放在最后一次提交之后。漏放贵于误拦,取这一边。
-      //   ② 量词不一致:开关是「**任一**动作有 at」,豁免是「**这一条**没 at」⇒ 一条带 at 的动作就能让所有
-      //      不带 at 的条目白拿凭证资格。两队红队各自实测到同一形态。现改为窗口动作**必须**有有效 at 才入池(fail-closed)。
-      //      误伤成本已量:两队合计读 93850 + 1991 条真实条目,缺时间戳 0 条 ⇒ 生产上这一支本就是空集。
-      //   ③ `a.at >= armedAt` 只有下界没有上界 ⇒ 未来时间戳恒在池内。现加上界=本轮最晚动作时刻(取不到则不设上界)。
-      //   ④ armedAt 用真值兜底 ⇒ epoch(Date.parse 得 0)被吞成 null、主路径整条关闭;改按有限性判(与 gate-ctx 同族修法)。
-      const parsedArm = Date.parse(String((ctx.batchGoal && ctx.batchGoal.armedAt) || ""));
-      const armedAt = Number.isFinite(parsedArm) ? parsedArm : null;
-      // 本轮动作恒在池内:它们就是「此刻正在做的事」,不参与批边界过滤(BP-7:原注释说本轮动作无 at,
-      //   而生产上本轮条目同样带 at,于是「先红队后武装」这类合规次序会被自己的时间戳踢出池)。
-      const own = ctx.actions || [];
-      if (armedAt && wa.some((a) => Number.isFinite(a.at))) {
-        let lastCommitAt = null;
-        for (const a of wa) if (isCommitAction(a) && Number.isFinite(a.at)) lastCommitAt = a.at;
-        const cutAt = lastCommitAt !== null ? Math.max(armedAt, lastCommitAt) : armedAt;
-        const upper = own.map((a) => a.at).filter(Number.isFinite).sort((x, y) => y - x)[0] ?? null;
-        return [...wa.filter((a) => Number.isFinite(a.at) && a.at >= cutAt && (upper === null || a.at <= upper)), ...own];
-      }
-      let cut = -1;
-      wa.forEach((a, i) => { if (isCommitAction(a)) cut = i; });
-      return [...wa.slice(cut + 1), ...own];
-    })();
-    const hunterMissing = engine && !hunterPool.some((a) => { try { return hunterCh.test(a, ctx); } catch { return false; } });
+    const hunterCh = H.hunterCh();
+    const hunterPool = engine ? H.hunterPool(ctx) : [];
+    // 红队凭证:时刻切点池(与计账清零同一取值 `hunterMet`;点名覆盖已撤,D149④)
+    const hunterMissing = engine && !H.hunterMet(ctx);
     const hunterHit = (commits) => ({ ch: hunterCh.key + "——闸引擎面每批必跑(D11 独立于宽限)", got: 0, need: 1, commits, every: H.rearm() });
     if (ctx.pLedger !== undefined) {
       const prior = ctx.pLedger ? ctx.pLedger.carriers : 0;
-      const mine = Math.max(H.carrierCommitCount(ctx), 1);
-      const effective = prior + mine;
+      // a2a9f58b BP-1:计数从 git 事实取(范围内带承重改动、未记过账的提交数),取不到再退回命令语法——与 hook 计账同一份 `tally`
+      const effective = prior + H.tally(ctx).n;
       if (effective < H.rearm()) return hunterMissing ? [hunterHit(effective)] : [];
       const acts = H.scopeActions(ctx);
       const out = [];
       for (const ch of H.CH) {
-        const pool = (engine && ch === hunterCh) ? hunterPool : acts;   // 红队凭证只认本批(见 hunterPool 注)
-        const chActs = pool.filter((a) => { try { return ch.test(a, ctx); } catch { return false; } });   // 带 ctx:D11 闸引擎面收紧
+        if (engine && ch === hunterCh) {   // 红队凭证只认本批(见 hunterPool 注)
+          if (hunterMissing) out.push({ ch: ch.key, got: 0, need: 1, commits: effective, every: H.rearm() });
+          continue;
+        }
+        const chActs = acts.filter((a) => { try { return ch.test(a, ctx); } catch { return false; } });   // 带 ctx:D11 闸引擎面收紧
         if (chActs.length >= 1) continue;
         out.push({ ch: ch.key, got: 0, need: 1, commits: effective, every: H.rearm() });
       }
@@ -4084,6 +4581,48 @@ const RULE_P = {
   // ⚠️ 变异必须动**判据内部**再跑原用例,不能换成恒真/恒假的壳(codex 060 判死过那种)。
   //   这四条各自复现一种「历史上真出现过或差点写成」的错法,证人已逐条核实。
   mutations: [
+    // ── 红队 a27628dd 轮的新分支各钉一条(swapP:临时换掉 _p 里的零件,跑完还原)────────────────────
+    { name: "git 事实不接(恒回退语法判据:merge/cherry-pick 合回看不见)", apply: swapP({ facts: () => () => null }) },
+    { name: "git 面切点退回「任意提交都切」(不看 engineAnchorAt)", apply: swapP({ hunterPool: (orig) => (ctx) => {
+      const H = RULE_P._p, save = H.facts;
+      H.facts = () => null;
+      try { return orig(ctx); } finally { H.facts = save; }
+    } }) },
+    { name: "回退面闸引擎证据取整窗(不按最后一次绑定红队切,回到 e23bdd8)", apply: swapP({ isBoundHunter: () => () => false }) },
+    { name: "闸副本不过 NON_CARRIER_AREA / worktree 剔除", apply: swapP({ isEnginePath: () => (p) => RULE_P._p.ENGINE_PATH_RE.test(normPath(p)) }) },
+    { name: "提交判定回到原始段测 --dry-run(提交信息含 --dry-run 即隐形)", apply: swapP({ hasCommit: () => (cmd) =>
+      segments(String(cmd)).some((s) => /^(\w+=\S+\s+)*git\b/.test(s) && /\bcommit\b/.test(s) && !/--dry-run/.test(s)) }) },
+    { name: "不按 hook checkout 化相对形(worktree 会话自己的闸文件被当成副本)", apply: swapP({ isEnginePath: (orig) => (p) => orig(p, null) }) },
+    { name: "git 面不认别的 checkout 的承重提交", apply: swapP({ elsewhereCarrier: () => () => false }) },
+    { name: "路径参数不限子命令位(git 段里任意位置的路径都算暂存)", apply: swapP({ gitPathArgs: () => (cmd) =>
+      segments(String(cmd)).filter((s) => /^(\w+=\S+\s+)*git\b/.test(s)).flatMap((s) => s.split(/\s+/).slice(2).filter((t) => t && !t.startsWith("-"))) }) },
+    { name: "cd 不解析(walk 丢掉 cwd)", apply: swapP({ walk: (orig) => (cmd, d) => orig(cmd, d).map((x) => ({ ...x, cwd: null })) }) },
+    // ── 红队 a2a9f58b 轮的新分支各钉一条 ────────────────────────────────────────────────────────────
+    { name: "计数退回命令语法(git add -A / merge 合回计 0,BP-1)", apply: swapP({ tally: () => (ctx) => {
+      const H = RULE_P._p;
+      return H.triggered(ctx) ? { n: Math.max(H.carrierCommitCount(ctx), 1), shas: [] } : { n: 0, shas: [] };
+    } }) },
+    { name: "计数不按 sha 去重(同一批提交每次 Stop 再计一遍)", apply: swapP({ tally: (orig) => (ctx) =>
+      orig(Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx, { pLedger: ctx.pLedger ? { ...ctx.pLedger, shas: [] } : ctx.pLedger })) }) },
+    { name: "提交落在别处不补语法(先 cd 他仓、后续相对路径,BP-4)", apply: swapP({ commitsElsewhere: () => () => false }) },
+    // ── 红队 a9af71da / aaf414b6 轮的新分支各钉一条 ──────────────────────────────────────────────────
+    { name: "落在别处不要正向证据(本仓提交未落盘也计别处,a9af71da BP-5)", apply: swapP({ commitOutsideRoot: () => () => true }) },
+    { name: "落在别处的 cwd 追踪不并窗口(上一次调用的 cd 看不见)", apply: swapP({ commitOutsideRoot: (orig) => (ctx, root) =>
+      orig(Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx, { window: () => null }), root) }) },
+    { name: "Bash 调用边界不回置(根外 cwd 跨调用保持,a084a536 BP-6)", apply: swapP({ bashCallEnd: () => () => null }) },
+    { name: "回置声明不认(只走无声明默认,a084a536 BP-6 对照)", apply: swapP({ bashCallEnd: (orig) => (a, l, R) => orig({ ...a, cwdReset: undefined }, l, R) }) },
+    { name: "无声明一律回根(根内子目录也不跨调用保持,a084a536 BP-6)", apply: swapP({ bashCallEnd: (orig) => (a, l, R) => orig(a, null, R) }) },
+    { name: "段首 ( / { 不剥(cdOf 认不出子 shell 与大括号组里的 cd,a07e98e9 BP-1)", apply: swapP({ scope: () => (seg) => ({ body: String(seg || "").trim(), open: 0, close: 0 }) }) },
+    { name: "子 shell 不开层(子 shell 里的 cd 当持久,a07e98e9 BP-1 反)", apply: swapP({ scope: (orig) => (seg, ps) => ({ ...orig(seg, ps), open: 0, close: 0 }) }) },
+    { name: "任何报错都抹 cd(不看结果正文的 cd 失败特征,ad3e4f93 BP-1)", apply: swapP({ CD_FAIL: () => /[\s\S]?/ }) },
+    { name: "结果正文不看(cd 失败也当生效,codex agg-r1 ② 反)", apply: swapP({ CD_FAIL: () => /(?!)/ }) },
+    { name: "聚合项按 1 笔计(不按范围提交数 count,a9af71da BP-1)", apply: swapP({ facts: (orig) => (ctx) => {
+      const f = orig(ctx);
+      return f ? { ...f, commits: f.commits.map((c) => ({ ...c, aggregated: false })) } : f;
+    } }) },
+    { name: "P 调用点不传方言(PowerShell 别名 + 反斜杠路径被自判成 bash,aaf414b6 BP-1)", apply: swapP({ dOf: () => () => undefined,
+      cmdPairs: (orig) => (ctx, w) => orig(ctx, w).map(([c]) => [c, undefined]) }) },
+    { name: "提交落在别处时取整窗语法(窗口里已提交过的承重写入被空提交翻出来)", apply: swapP({ ownSyntaxCarrier: () => (ctx) => RULE_P._p.triggeredBySyntax(ctx) }) },
     // 批 257 条件 3 分档两向各钉一条(证人 = 「改普通承重脚本」pos 与「只改测试文件」neg);写入覆盖另钉一条(证人 = 「别的 checkout」pos):
     { name: "分档不核写入覆盖(别的 checkout 的承重写入也免)", apply: (r) => ({ ...r, detect: (ctx) => {
       const H = RULE_P._p, save = H.tierFilter;
@@ -4121,7 +4660,7 @@ const RULE_P = {
       if (!H.triggered(ctx)) return [];
       if (ctx.pLedger !== undefined) {
         const prior = ctx.pLedger ? ctx.pLedger.carriers : 0;
-        if (prior + Math.max(H.carrierCommitCount(ctx), 1) < H.rearm()) return [];
+        if (prior + H.tally(ctx).n < H.rearm()) return [];
         const acts = H.scopeActions(ctx);
         const CH2 = [H.CH[0], { key: H.CH[1].key, test: (a) => /^(Agent|Task)$/.test(String(a.name || "")) }, H.CH[2]];
         return CH2.filter((ch) => !acts.some((a) => { try { return ch.test(a); } catch { return false; } }))
@@ -4134,7 +4673,7 @@ const RULE_P = {
       if (!H.triggered(ctx)) return [];
       if (ctx.pLedger !== undefined) {
         const prior = ctx.pLedger ? ctx.pLedger.carriers : 0;
-        if (prior + Math.max(H.carrierCommitCount(ctx), 1) < H.rearm()) return [];
+        if (prior + H.tally(ctx).n < H.rearm()) return [];
         const acts = H.scopeActions(ctx);
         const CH2 = [H.CH[0], H.CH[1], { key: H.CH[2].key, test: (a) => /^(WebSearch|WebFetch|Read|Grep)$/.test(String(a.name || "")) }];
         return CH2.filter((ch) => !acts.some((a) => { try { return ch.test(a); } catch { return false; } }))
@@ -4149,7 +4688,7 @@ const RULE_P = {
       const acts = Array.isArray(ctx.actions) ? ctx.actions : [];
       if (ctx.pLedger !== undefined) {
         const prior = ctx.pLedger ? ctx.pLedger.carriers : 0;
-        if (prior + Math.max(H.carrierCommitCount(ctx), 1) < H.rearm()) return [];
+        if (prior + H.tally(ctx).n < H.rearm()) return [];
         return H.CH.filter((ch) => !acts.some((a) => { try { return ch.test(a); } catch { return false; } }))
           .map((ch) => ({ ch: ch.key, got: 0, need: 1, commits: 0, every: H.rearm() }));
       }
@@ -4233,11 +4772,208 @@ const RULE_P = {
         write: "scripts/lib/gate-rules.mjs", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x",
         prior: [{ text: "上批红队", agent: { type: "_gate-bypass-hunter", prompt: "红队批 184 的 scripts/lib/gate-rules.mjs 改动" } },
                 { text: "提交", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m \"fix: drop --dry-run flag\"" }] },
-      { name: "回退路径 fail-closed:红队之后的 docs-only 提交也切(无批时间戳时不给例外)",
+      // 派出方 a27628dd 口径④:取不到 git 事实时 fail-closed 回退现状——红队之后**任何**提交都切。
+      //   (原同形 pos「回退路径 fail-closed:红队之后的 docs-only 提交也切」已按宽松口径翻成 neg 的 git 面版本;
+      //    这里留下的是同一输入、**不给 git 事实**的那一半。)
+      { name: "a27628dd 口径④:取不到 git 事实 ⇒ 回退现状,红队之后的 docs-only 提交也切",
         text: "本批收尾提交。", pLedger: { carriers: 0 },
         write: "scripts/lib/gate-rules.mjs", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x",
         prior: [{ text: "本批红队", agent: { type: "_gate-bypass-hunter", prompt: "红队本批 scripts/lib/gate-rules.mjs 的改动" } },
                 { text: "记台账", bash: "git add docs/gate-debts.md docs/product-diary.md && git commit -m x" }] },
+      // ══ 红队 a27628dd 的拦截侧(漏放族;git 事实面)══════════════════════════════════════════════
+      // BP-1:worktree 子代理改闸,父侧 merge --no-ff / cherry-pick 合回 ⇒ 不是 commit 命令,原判据不触发
+      { name: "a27628dd BP-1:merge --no-ff 带进闸引擎(SUB 形态)⇒ 欠红队",
+        text: "合回子代理。", pLedger: { carriers: 0 },
+        bash: ["git merge --no-ff worktree-agent-x -m merge"],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "a27628dd BP-1:cherry-pick 带进闸引擎 ⇒ 欠红队",
+        text: "摘过来。", pLedger: { carriers: 0 },
+        bash: ["git cherry-pick abc1234"],
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/hook-stop-closure.mjs"] }] } },
+      { name: "a27628dd BP-1:merge 带进闸引擎、合回前子代理在 worktree 里跑的红队父侧看不见 ⇒ 仍欠",
+        text: "子代理说它红队过了。", pLedger: { carriers: 0 },
+        bash: ["git merge --squash worktree-agent-x", "git commit -m squash"],
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-ctx.mjs", "docs/laws/reporting.md"] }] } },
+      // BP-2:bashWriteTargets 不认的写法改闸(scratchpad 脚本)+ `git add -A` ⇒ git 事实照样看得见
+      { name: "a27628dd BP-2:scratchpad 脚本改闸 + git add -A ⇒ 欠红队",
+        text: "用脚本批量改。", pLedger: { carriers: 0 },
+        bash: ["node C:/Users/x/AppData/Local/Temp/scratch/edit.mjs", "git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"] }] } },
+      // BP-3:`cd docs/laws && sed -i … collab.md` 再 `git add -A`(两个面都钉:回退面靠 cd 解析,git 面靠事实)
+      { name: "a27628dd BP-3(回退面):cd docs/laws 后 sed 改法典 + git add -A ⇒ 承重提交",
+        text: "第五笔。", pLedger: { carriers: 4 },
+        bash: ["cd docs/laws && sed -i s/a/b/ collab.md", "git add -A && git commit -m x"] },
+      { name: "a27628dd BP-3(git 面):同上,事实里有 docs/laws/collab.md",
+        text: "第五笔。", pLedger: { carriers: 4 },
+        bash: ["cd docs/laws && sed -i s/a/b/ collab.md", "git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: [{ files: ["docs/laws/collab.md"] }] } },
+      // 复核红队 aaf414b6(两条均 365fd54 引入,回退面):
+      //   BP-2:方言自判在未掩码原串上找 PS 标记 ⇒ 引号里的 `$env:` 把 bash 判成 ps ⇒ `\`+换行续行失效、续行后的宪法目标丢
+      { name: "aaf414b6 BP-2:bash 续行 + 引号里 $env: 改宪法", text: "第五笔。", pLedger: { carriers: 4 },
+        bash: ["sed -i 's/$env:A/$env:B/g' \\\n  AGENTS.md", "git add -A && git commit -m x"] },
+      //   BP-3:引号里的单个 `<` 被当裸重定向算子、连 `-Path` 一起剔 ⇒ `-Value` 吞掉 AGENTS.md
+      { name: "aaf414b6 BP-3:PS Set-Content -Value \"<\" -Path 宪法", text: "第五笔。", pLedger: { carriers: 4 },
+        ps: "Set-Content -Value \"<\" -Path AGENTS.md", bash: ["git add -A && git commit -m x"] },
+      // BP-4:提交信息里含 --dry-run ⇒ 原 isCarrierCommitCmd 在原始段上判,整笔不算承重提交 ⇒ 宽限多给一笔
+      { name: "a27628dd BP-4:提交信息含 --dry-run 的法典提交仍算承重提交",
+        text: "第五笔。", pLedger: { carriers: 4 },
+        bash: ["git add -A docs/laws/collab.md && git commit -m \"drop --dry-run flag\""] },
+      // BP-5:写入早已滑出 400 条窗口,本轮只 `git add -A && git commit` ⇒ git 事实照样看得见
+      { name: "a27628dd BP-5:写入滑出窗口 + 本轮只 git add -A ⇒ 欠红队",
+        text: "收工提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/hook-guard.mjs"] }] } },
+      // BP-6 的漏放半边:`git stage` 闸文件(原第三支只认 add|commit)
+      { name: "a27628dd BP-6:git stage 闸文件 + 提交 ⇒ 欠红队",
+        text: "提交。", pLedger: { carriers: 0 },
+        bash: ["git stage scripts/lib/gate-rules.mjs && git commit -m x"] },
+      // 口径的反面:**在 worktree 里开的会话**改自己的闸文件(路径含 `.claude/worktrees/`)⇒ 仍是闸引擎(回退面)
+      { name: "a27628dd 口径反面:worktree 里的会话改自己的闸文件 + git add -A ⇒ 欠红队",
+        text: "在自己的 worktree 里改闸。", pLedger: { carriers: 0 }, hookCheckout: "/repo/.claude/worktrees/w1",
+        write: "/repo/.claude/worktrees/w1/scripts/lib/gate-rules.mjs", bash: ["git add -A && git commit -m x"] },
+      // git 事实在、本仓无提交,但承重提交落在**别的 checkout**(他仓宪法照样算)⇒ 语法补充面接住
+      { name: "a27628dd 补充面:git 事实在,他仓承重提交照样触发",
+        text: "第五笔,在别的仓改宪法。", pLedger: { carriers: 4 }, write: "E:/elsewhere/AGENTS.md",
+        bash: ["cd E:/elsewhere && git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: [] } },
+      // 同上,但本轮另有一笔本仓业务提交(范围里有本轮的提交 ⇒ 「提交落在别处」那支不成立)⇒ 只靠绝对路径的他仓补充面接住
+      //   (a2a9f58b 轮加:BP-4 那支与本支在上一条里同时成立,单靠上一条钉不住本支)
+      { name: "a27628dd 补充面:本仓业务提交 + 同轮他仓绝对路径改宪法并提交 ⇒ 照样触发",
+        text: "第五笔,两边各提交一次。", pLedger: { carriers: 4 }, write: "E:/elsewhere/AGENTS.md",
+        bash: ["git add -A src/app/page.tsx && git commit -m x", "cd E:/elsewhere && git add -A && git commit -m y"],
+        headFacts: { root: "/repo", commits: [{ files: ["src/app/page.tsx"] }] } },
+      // git 面切点:比本次范围更早的最后一次带闸改动的提交晚于红队 ⇒ 红队不抵本次(单变量:与 a00051d BP-2 neg 只差 engineAnchorAt)
+      { name: "a27628dd git 面切点:上一次带闸改动的提交晚于红队 ⇒ 仍欠",
+        text: "再改一版判据,提交。", at: "2026-10-10T10:30:00Z", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-10-10T08:00:00Z", conditions: ["甲"] },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", at: "2026-10-10T10:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "他仓提交", at: "2026-10-10T10:10:00Z", bash: "cd /d/dotfiles-claude && git add -A && git commit -m x" },
+                { text: "改提交信息", at: "2026-10-10T10:20:00Z", bash: "git commit --amend --no-edit" }],
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-10T10:30:00Z" }], engineAnchorAt: "2026-10-10T10:15:00Z" } },
+      // ══ 红队 a2a9f58b 的拦截侧 ═══════════════════════════════════════════════════════════════════
+      // codex 257-p-agg-r1 断言 2:账上只记过 HEAD sha(范围更小的那一次),这次同一 HEAD 代表的范围变大 ⇒ 仍按聚合项计
+      //   (旧口径按 HEAD sha 整项去重 ⇒ 计 0、放行)
+      { name: "codex agg-r1 ②:聚合项范围变大、账上只有同一 HEAD sha ⇒ 仍计,三通道全欠",
+        text: "收工。", pLedger: { carriers: 0, shas: ["e".repeat(40)] }, bash: ["git add -A && git commit -m x"],
+        headFacts: { root: "/repo", base: "b".repeat(40), commits: [{ sha: "e".repeat(40), aggregated: true, count: 61, files: ["AGENTS.md"] }] } },
+      // BP-1:计数从 git 事实取。`git add -A` 的参数面没有路径 ⇒ 旧计数恒 0、宽限账永不涨;现在 10 笔法典提交在 pLedger=0 时
+      //   照样越过宽限上限 ⇒ 三通道全欠(原 BP-3 git 面正例预置 pLedger:4 遮住了这个洞)
+      { name: "a2a9f58b BP-1:pLedger=0、git add -A 带进 10 笔法典提交 ⇒ 越过宽限,三通道全欠",
+        text: "收工。", pLedger: { carriers: 0 }, bash: ["git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: Array.from({ length: 10 }, () => ({ files: ["docs/laws/collab.md"] })) } },
+      // BP-4:`cd E:/elsewhere` 后相对路径改宪法并提交 ⇒ 本仓范围里没有本轮的提交 ⇒ 按本轮语法判。
+      //   a084a536 BP-6 改形:原写「上一次 Bash 调用 cd、本次提交」——真实 Bash 调用结束根外 cwd 被回置,那是错的期望 ⇒ 改同一调用内
+      //   (PowerShell 跨调用形见下方 Set-Location -Path: / 裸盘符两条)
+      //   写入单独一次调用(根内相对路径)、cd 与提交同一调用:写入若也跟在 cd 后,walk 会解到他仓 ⇒ elsewhereCarrier 抢先命中,cd 追踪没被钉住
+      { name: "a2a9f58b BP-4:同一调用内先 cd 他仓再相对提交(承重写入在本轮)⇒ 提交落在别处,照样计承重提交",
+        text: "第五笔,在他仓改宪法。", pLedger: { carriers: 4 },
+        bash: ["sed -i s/a/b/ AGENTS.md", "cd E:/elsewhere && git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: [] } },
+      // 红队 a9af71da BP-5 修后的拦截侧:正向证据的另两种形态(相对 cd 解出根外 / 提交段自带 git -C 根外)仍算别处
+      //   a084a536 BP-6 改形:原为上一次 Bash 调用 cd(跨调用,真实语义下被回置)⇒ 改同一调用内
+      //   写入单独一次调用(根内相对路径)、cd 与提交同一调用:写入若也跟在 cd 后,walk 会解到他仓 ⇒ elsewhereCarrier 抢先命中,cd 追踪没被钉住
+      { name: "a9af71da BP-5:同一调用内 cd ../elsewhere(相对,解出在本仓根外)再相对提交 ⇒ 别处,照样计",
+        text: "第五笔,在隔壁仓改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        bash: ["sed -i s/a/b/ AGENTS.md", "cd ../elsewhere && git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: [] } },
+      { name: "a9af71da BP-5:提交段自带 git -C ../elsewhere(根外)⇒ 别处,照样计",
+        text: "第五笔,在隔壁仓改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        bash: ["sed -i s/a/b/ ../elsewhere/AGENTS.md", "git -C ../elsewhere commit -am x"],
+        headFacts: { root: "/repo", commits: [] } },
+      // 红队 a07e98e9 BP-1(0aa11fd 引入的漏放):段首 `(` / `{` 让 cdOf 认不出 cd ⇒ 提交段 cwd 仍判本仓根
+      { name: "a07e98e9 BP-1:子 shell 里 cd 他仓改宪法并提交 ⇒ 别处",
+        text: "第五笔,在隔壁仓改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        bash: ["(cd ../elsewhere && sed -i s/a/b/ AGENTS.md && git commit -am x)"],
+        headFacts: { root: "/repo", commits: [] } },
+      { name: "a07e98e9 BP-1:大括号组里 cd 他仓改宪法并提交 ⇒ 别处",
+        text: "第五笔,在隔壁仓改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        bash: ["{ cd E:/elsewhere && sed -i s/a/b/ AGENTS.md && git commit -am x; }"],
+        headFacts: { root: "/repo", commits: [] } },
+      // 红队 a07e98e9 BP-2(0aa11fd 引入的漏放):去向解不出 / 只认 -C 的绝对形 ⇒ 判在根内
+      { name: "a07e98e9 BP-2:git -C ~/notes(本仓根不在家目录下)改宪法并提交 ⇒ 别处",
+        text: "第五笔,在笔记仓改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        bash: ["sed -i s/a/b/ ~/notes/AGENTS.md", "git -C ~/notes commit -am x"],
+        headFacts: { root: "/repo", commits: [] } },
+      { name: "a07e98e9 BP-2:--git-dir + --work-tree 指他仓提交 ⇒ 别处",
+        text: "第五笔,在隔壁仓改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        bash: ["sed -i s/a/b/ ../x/AGENTS.md", "git --git-dir=../x/.git --work-tree=../x commit -am x"],
+        headFacts: { root: "/repo", commits: [] } },
+      { name: "a07e98e9 BP-2:GIT_DIR= / GIT_WORK_TREE= 前缀指他仓提交 ⇒ 别处",
+        text: "第五笔,在隔壁仓改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        bash: ["sed -i s/a/b/ ../x/AGENTS.md", "GIT_DIR=../x/.git GIT_WORK_TREE=../x git commit -am x"],
+        headFacts: { root: "/repo", commits: [] } },
+      { name: "a07e98e9 BP-2:PS Set-Location -Path:E:\\x(冒号形)后相对路径改宪法并提交 ⇒ 别处",
+        text: "第五笔,在隔壁仓改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "切到他仓", ps: "Set-Location -Path:E:\\x" }],
+        bash: ["sed -i s/a/b/ AGENTS.md && git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: [] } },
+      { name: "a07e98e9 BP-2:PS 裸盘符 E: 切盘后相对路径改宪法并提交 ⇒ 别处",
+        text: "第五笔,在 E 盘改宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "切盘", ps: "E:" }],
+        bash: ["sed -i s/a/b/ AGENTS.md && git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: [] } },
+      //   a084a536 BP-6 改形:原为上一次 Bash 调用 cd 变量(跨调用,真实语义下被回置)⇒ 改同一调用内
+      //   写入单独一次调用(根内相对路径)、cd 与提交同一调用:写入若也跟在 cd 后,walk 会解到他仓 ⇒ elsewhereCarrier 抢先命中,cd 追踪没被钉住
+      { name: "a07e98e9 BP-2:同一调用内 cd 到变量(去向解不出,UNK_PARSE)后相对提交 ⇒ 按旧语义算别处",
+        text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        bash: ["sed -i s/a/b/ AGENTS.md", "cd \"$NOTES_REPO\" && git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: [] } },
+      // 红队 ad3e4f93 BP-1(ba5c9c2 引入的漏放):is_error 只说明某一段失败,不说明 cd 失败(管道尾 grep 无匹配退 1)
+      //   a084a536 BP-6 改形:原为「失败调用里 cd、下一次 Bash 调用提交」(跨调用,真实语义下被回置)⇒ 改同一调用内:
+      //   cd 成功、提交成功、尾段 grep 无匹配退 1 ⇒ 整调用 is_error,正文无 cd 失败特征 ⇒ cd 照常生效
+      //   写入单独一次调用(根内相对路径)、cd 与提交同一调用:写入若也跟在 cd 后,walk 会解到他仓 ⇒ elsewhereCarrier 抢先命中,cd 追踪没被钉住
+      { name: "ad3e4f93 BP-1:同一调用内 cd 成功、提交后尾段 grep 失败(报错无 cd 失败特征)⇒ 仍算别处",
+        text: "第五笔,在他仓改宪法。", pLedger: { carriers: 4 }, bash: ["sed -i s/a/b/ AGENTS.md"],
+        then: [{ text: "提交并看一眼", bash: "cd E:/elsewhere && git add -A && git commit -m x && git log --oneline -1 | grep foo", failed: true }],
+        headFacts: { root: "/repo", commits: [] } },
+      // 复核红队 a084a536 BP-6 对照:Bash 结果末行回置声明指向的不是本仓根 ⇒ 下一次调用从声明路径起 ⇒ 相对路径提交在别处
+      { name: "a084a536 BP-6 对照:上一次 Bash 回置声明指向他仓 ⇒ 下一次相对路径改宪法并提交算别处",
+        text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "看一眼", bash: "ls", result: "a.txt\nShell cwd was reset to E:\\elsewhere" }],
+        bash: ["sed -i s/a/b/ AGENTS.md && git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: [] } },
+      // 红队 a9af71da BP-1:范围超 CAP(60)时 hook 给聚合项(原返回 null ⇒ 恒回退语法面,merge 合回的闸改动看不见)
+      { name: "a9af71da BP-1:聚合项(61 笔,净差带闸改动)、merge 合回、无红队 ⇒ 欠",
+        text: "合回。", pLedger: { carriers: 0 },
+        bash: ["git merge --no-ff worktree-agent-x -m m"],
+        headFacts: { root: "/repo", head: "9".repeat(40), commits: [{ sha: "9".repeat(40), aggregated: true, count: 61, files: ["scripts/lib/gate-rules.mjs", "src/app/page.tsx"] }] } },
+      { name: "a9af71da BP-1:聚合项(61 笔)净差只带法典、pLedger=0 ⇒ 按 61 笔计,越过宽限,三通道全欠",
+        text: "收工。", pLedger: { carriers: 0 }, bash: ["git add -A && git commit -m x"],
+        headFacts: { root: "/repo", head: "9".repeat(40), commits: [{ sha: "9".repeat(40), aggregated: true, count: 61, files: ["docs/laws/collab.md"] }] } },
+      // 红队 aaf414b6 BP-1:P 调 bashWriteTargets 不传方言 ⇒ PowerShell 别名 / 裸重定向 + 反斜杠路径被自判成 bash、反斜杠被吃
+      { name: "aaf414b6 BP-1:PS 别名反斜杠路径改法典(回退面)⇒ 承重写入",
+        text: "第五笔。", pLedger: { carriers: 4 }, ps: "cp clipboard\\x.md docs\\laws\\collab.md", bash: ["git add -A && git commit -m x"] },
+      { name: "aaf414b6 BP-1:PS 裸重定向写他仓宪法(git 面补充面)⇒ 照样触发",
+        text: "第五笔,两边各提交一次。", pLedger: { carriers: 4 }, ps: "\"| x |\" >> E:\\elsewhere\\AGENTS.md",
+        bash: ["git add -A src/app/page.tsx && git commit -m x", "cd E:/elsewhere && git add -A && git commit -m y"],
+        headFacts: { root: "/repo", commits: [{ files: ["src/app/page.tsx"] }] } },
+      // BP-8 已知残余(点名覆盖已撤,D149④):两个 worktree 并行改闸、各自红队,依次合回;第一次合回(10:30)晚于
+      //   B 的红队(10:00)⇒ 第二次合回仍按时刻切点、要求重跑红队。红队 a12212b9 问 2 论证这是**应拦**:B 的红队审的是
+      //   A 合回之前的状态,A+B 合起来的状态从没被红队过 ⇒ 补跑是未满足的要求,不是误拦(D149④ 已据此重新归类)。
+      { name: "a2a9f58b BP-8:并行 worktree 依次合回,B 的红队早于 A 的合回 ⇒ 合起来的状态仍欠红队(点名不抵账)",
+        text: "合回第二个 worktree。", at: "2026-10-10T11:00:00Z", pLedger: { carriers: 0 },
+        bash: ["git merge --no-ff worktree-agent-b -m m"],
+        prior: [{ text: "并行红队 B", at: "2026-10-10T10:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 worktree-agent-b 的 scripts/lib/gate-rules.mjs 改动" } }],
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-10T11:00:00Z" }], engineAnchorAt: "2026-10-10T10:30:00Z" } },
+      // codex 257-p-gitfacts-r2 断言 6 的反例:prompt 只在背景列表里提到 feature/b、明说不在审查范围 ⇒ 不得抵账(点名覆盖撤回的理由)
+      { name: "codex r2 ⑥:红队 prompt 背景里列了合回分支、明说不审它 ⇒ 仍欠",
+        text: "合回 feature/b。", at: "2026-10-10T11:00:00Z", pLedger: { carriers: 0 },
+        bash: ["git merge --no-ff feature/b -m m"],
+        prior: [{ text: "红队 K0", at: "2026-10-10T10:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队规则 K0 的判据。背景:在途分支 feature/a、feature/b(不在本次审查范围)" } }],
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-10T11:00:00Z", branches: ["feature/b"] }], engineAnchorAt: "2026-10-10T10:30:00Z" } },
+      // BP-8 的拦截半边:红队点名的分支不是这次合回的分支(整词比对:b2 ≠ b)⇒ 仍按时刻切点,欠红队
+      { name: "a2a9f58b BP-8 反:红队点名 worktree-agent-b2,合回的是 worktree-agent-b ⇒ 仍欠",
+        text: "合回第二个 worktree。", at: "2026-10-10T11:00:00Z", pLedger: { carriers: 0 },
+        bash: ["git merge --no-ff worktree-agent-b -m m"],
+        prior: [{ text: "并行红队 B2", at: "2026-10-10T10:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 worktree-agent-b2 的 scripts/lib/gate-rules.mjs 改动" } }],
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-10T11:00:00Z" }], engineAnchorAt: "2026-10-10T10:30:00Z" } },
+      // BP-8:git 事实给了分支名 ⇒ 以它为准(命令面写的分支不算)
+      { name: "a2a9f58b BP-8 反:git 事实说合回的是 worktree-agent-a,红队点名 b ⇒ 仍欠",
+        text: "合回。", at: "2026-10-10T11:00:00Z", pLedger: { carriers: 0 },
+        bash: ["git merge --no-ff worktree-agent-b -m m"],
+        prior: [{ text: "并行红队 B", at: "2026-10-10T10:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 worktree-agent-b 的 scripts/lib/gate-rules.mjs 改动" } }],
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-10T11:00:00Z", branches: ["worktree-agent-a"] }], engineAnchorAt: "2026-10-10T10:30:00Z" } },
       // codex 185「你没问到」1(High):上一批的红队调用(之后已有一次提交)不能抵本批
       { name: "codex-185 ①:旧批红队调用不抵本批 ⇒ 仍欠",
         text: "批 185 新改动。", pLedger: { carriers: 0 },
@@ -4375,6 +5111,203 @@ const RULE_P = {
         diffFacts: { root: "/repo", files: [{ path: "scripts/lib/ledger-chain.test.mjs", status: "M", readable: true }] } },
     ],
     neg: [
+      // ══ 红队 a9af71da 的接受侧 ═════════════════════════════════════════════════════════════════
+      // BP-5(误拦):本仓 `git commit` 没落盘(未暂存 / pre-commit 失败 / 权限被拒)⇒ 范围里无本轮提交,但没有任何离开本仓根的证据
+      //   ⇒ 不是「落在别处」(原三通道全命中;b7ef430 上放行)
+      { name: "a9af71da BP-5:本仓提交未落盘、无离开本仓根的证据 ⇒ 放行",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        bash: ["git commit -m law"], headFacts: { root: "/repo", commits: [] } },
+      { name: "a9af71da BP-5:cd 进本仓子目录后提交未落盘 ⇒ 仍在本仓,放行",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        prior: [{ text: "进子目录", bash: "cd docs/laws" }],
+        bash: ["git commit -m law"], headFacts: { root: "/repo", commits: [] } },
+      { name: "a9af71da BP-5:PS 切他仓后又 Set-Location 回本仓根,提交未落盘 ⇒ 放行",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        // a084a536 BP-6 改形:原第一步是 Bash `cd E:/elsewhere`(调用结束即被回置,「切回」那步成了空证人)⇒ 改 PowerShell 跨调用形
+        prior: [{ text: "去他仓看一眼", ps: "Set-Location E:/elsewhere" }, { text: "回来", ps: "Set-Location -Path '\\repo'" }],
+        bash: ["git commit -m law"], headFacts: { root: "/repo", commits: [] } },
+      // BP-5 修后「落在别处」那支须有 cd 证据才走到 `ownSyntaxCarrier`;原证人(下方「本次范围无提交、窗口里有已提交过的承重写入」)
+      //   不再走到它 ⇒ 补一条带 cd 的:窗口里早已提交过的法典写入,本轮在他仓做一笔非承重提交 ⇒ 只看本轮,不得翻出窗口里的写入
+      //   a084a536 BP-6 改形:原为上一次 Bash 调用 cd 他仓(真实语义下被回置 ⇒ 走不到 ownSyntaxCarrier,空证人)⇒ 改同一调用内
+      { name: "a9af71da BP-5:同一调用内 cd 他仓做非承重提交、窗口里有本仓早已提交过的法典写入 ⇒ 不触发(只看本轮语法)",
+        text: "在他仓提交业务改动。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "上批改法典", write: "docs/laws/collab.md" }],
+        bash: ["cd E:/elsewhere && git add -A && git commit -m x"], headFacts: { root: "/repo", commits: [] } },
+      // BP-1 接受侧:聚合项净差只带业务码 ⇒ 不触发(聚合不等于一律越限)
+      { name: "a9af71da BP-1:聚合项(61 笔)净差只有 src/ ⇒ 不触发",
+        text: "合回。", pLedger: { carriers: 0 },
+        bash: ["git merge --no-ff worktree-agent-x -m m"],
+        headFacts: { root: "/repo", head: "9".repeat(40), commits: [{ sha: "9".repeat(40), aggregated: true, count: 61, files: ["src/app/page.tsx"] }] } },
+      // ══ 红队 a2a9f58b 的接受侧 ═════════════════════════════════════════════════════════════════
+      //   (BP-8「点名覆盖」已撤,该夹具移到 pos 作已知残余的钉子,见 D149④)
+      // codex 257-p-agg-r1 断言 2 的接受侧:账上已记同一范围键 `agg:<基点>..<HEAD>` ⇒ 不重计、宽限内放行
+      { name: "codex agg-r1 ②反:账上已记同一聚合范围 ⇒ 不重计",
+        text: "收工。", pLedger: { carriers: 0, shas: [`agg:${"b".repeat(40)}..${"e".repeat(40)}`] }, bash: ["git add -A && git commit -m x"],
+        headFacts: { root: "/repo", base: "b".repeat(40), commits: [{ sha: "e".repeat(40), aggregated: true, count: 61, files: ["AGENTS.md"] }] } },
+      // codex 257-p-agg-r1「没问到」②:前轮 `Set-Location E:/elsewhere` 失败(is_error),本轮本仓 `git commit` 也失败 ⇒ 不是别处提交
+      { name: "codex agg-r1 ②:前轮切仓失败、本轮本仓提交失败 ⇒ 不计别处承重提交",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", bash: ["git commit -m law"],
+        prior: [{ text: "切", ps: "Set-Location E:/elsewhere", failed: "Set-Location : Cannot find path 'E:\\elsewhere' because it does not exist." }],
+        headFacts: { root: "/repo", commits: [] } },
+      // ad3e4f93 BP-1 接受侧(bash 形):cd 本身失败的正文 ⇒ cd 记未知、不算证据
+      //   a084a536 BP-6 后:这条跨调用形现由 Bash 调用边界回置兜住(cd 失败与否都回根),CD_FAIL 在 Bash 上只在同一调用内承重 ⇒ 下一条是同一调用形
+      { name: "ad3e4f93 BP-1 反:上一次 bash cd 失败(No such file)、本轮本仓提交失败 ⇒ 不计别处(跨调用形,现由回置兜住)",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", bash: ["git commit -m law"],
+        prior: [{ text: "切", bash: "cd E:/elsewhere && git status", failed: "/usr/bin/bash: line 1: cd: E:/elsewhere: No such file or directory" }],
+        headFacts: { root: "/repo", commits: [] } },
+      { name: "ad3e4f93 BP-1 反:同一调用内 bash cd 失败(No such file)、其后本仓提交失败 ⇒ 不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        then: [{ text: "切了再提交", bash: "cd E:/elsewhere ; git commit -m law", failed: "/usr/bin/bash: line 1: cd: E:/elsewhere: No such file or directory" }],
+        headFacts: { root: "/repo", commits: [] } },
+      // a07e98e9 BP-1 接受侧:子 shell 里的 cd 只作用到子 shell 结束 ⇒ 其后本仓提交失败不算别处
+      { name: "a07e98e9 BP-1 反:子 shell 里 cd 他仓、子 shell 后本仓提交失败 ⇒ 不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        bash: ["(cd E:/elsewhere && ls) ; git commit -m law"], headFacts: { root: "/repo", commits: [] } },
+      // 照实:这条是**空证人**——`$( … )` 里的 cd 根本认不出(段首是 echo,见 D149),不是「认出了、按子 shell 弹回」
+      { name: "a07e98e9 BP-1 反:命令替换里 cd 他仓(cd 在 $( ) 里认不出,见 D149)、其后本仓提交失败 ⇒ 不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        bash: ["echo $(cd E:/elsewhere && pwd) && git commit -m law"], headFacts: { root: "/repo", commits: [] } },
+      // a07e98e9 BP-2 接受侧:git -C ~ 解在本仓根内(本仓根在家目录下)⇒ 本仓提交失败,不计别处
+      { name: "a07e98e9 BP-2 反:git -C ~/repo(根就在家目录下)⇒ 仍是本仓,不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "C:/Users/me/repo", write: "C:/Users/me/repo/AGENTS.md",
+        bash: ["git -C ~/repo commit -m law"], headFacts: { root: "C:/Users/me/repo", commits: [] } },
+      { name: "a07e98e9 BP-2 反:PS 切到 E: 再切回本仓所在盘 后本仓提交失败 ⇒ 回到本仓,不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "C:/w/repo", write: "C:/w/repo/AGENTS.md",
+        prior: [{ text: "切盘", ps: "E:" }, { text: "切回", ps: "C:" }],
+        bash: ["git commit -m law"], headFacts: { root: "C:/w/repo", commits: [] } },
+      // ══ 复核红队 a084a536 BP-6(本批引入的诚实误拦)═══════════════════════════════════════════════
+      //   CC 的 Bash 工具 cd 到项目外后调用结束即把 cwd 拉回项目根(结果正文末行「Shell cwd was reset to \repo」,语料 822 次)
+      { name: "a084a536 BP-6:上一次 Bash cd 到变量路径(UNK_PARSE)、本轮本仓提交失败 ⇒ 调用边界回根,不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", bash: ["git commit -m law"],
+        prior: [{ text: "看一眼", bash: "cd \"$HOME/.claude/projects/example-project\" && ls | head" }],
+        headFacts: { root: "/repo", commits: [] } },
+      { name: "a084a536 BP-6:上一次 Bash cd ~ 下(OUT)、本轮本仓提交失败 ⇒ 调用边界回根,不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", bash: ["git commit -m law"],
+        prior: [{ text: "看一眼", bash: "cd ~/.claude/cache && grep -n x changelog.md" }],
+        headFacts: { root: "/repo", commits: [] } },
+      { name: "a084a536 BP-6:上一次 Bash cd 他仓、结果末行回置声明指向本仓根 ⇒ 回根,本仓提交失败不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", bash: ["git commit -m law"],
+        prior: [{ text: "看一眼", bash: "cd E:/elsewhere && ls", result: "a.txt\nShell cwd was reset to \\repo" }],
+        headFacts: { root: "/repo", commits: [] } },
+      // 根内子目录照常跨调用保持(钉「无声明一律回根」的过度回置):上一次 cd docs,本次 `cd ..` 回到根 ⇒ 本仓
+      { name: "a084a536 BP-6:上一次 Bash cd 进根内子目录、本次 cd .. 回根后提交失败 ⇒ 子目录跨调用保持,不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md", bash: ["cd .. && git commit -m law"],
+        prior: [{ text: "进子目录", bash: "cd docs" }],
+        headFacts: { root: "/repo", commits: [] } },
+      // BP-1 边界:pLedger=0、4 笔法典提交 ⇒ 仍在宽限内(与 10 笔那条 pos 配对,钉住「按提交数计」而不是「一律越限」)
+      { name: "a2a9f58b BP-1 边界:pLedger=0、git add -A 带进 4 笔法典提交 ⇒ 宽限内放行",
+        text: "收工。", pLedger: { carriers: 0 }, bash: ["git add -A && git commit -m x"],
+        headFacts: { root: "/repo", commits: Array.from({ length: 4 }, () => ({ files: ["docs/laws/collab.md"] })) } },
+      // BP-1 去重:P 欠着时基点不推进 ⇒ 已记过账的两笔下次还在范围里;账上有其 sha ⇒ 不再计(3 + 0 < 5)
+      { name: "a2a9f58b BP-1 去重:范围里两笔已记过账(sha 在账上)⇒ 不重复计,宽限内放行",
+        text: "上轮已计账的两笔,本轮没有新提交。", pLedger: { carriers: 3, shas: ["1".repeat(40), "2".repeat(40)] },
+        headFacts: { root: "/repo", commits: [{ sha: "1".repeat(40), files: ["docs/laws/collab.md"] }, { sha: "2".repeat(40), files: ["AGENTS.md"] }] } },
+      // ══ 红队 a27628dd / 量化 a00051d 的接受侧(误拦族)═════════════════════════════════════════
+      // BP-1 反:merge 带进的只有业务码 ⇒ 不触发(git 事实只认承重面)
+      { name: "a27628dd BP-1 反:merge 只带进 src/ ⇒ 不触发",
+        text: "合回子代理的业务改动。", pLedger: { carriers: 0 },
+        bash: ["git merge --no-ff worktree-agent-x -m merge"],
+        headFacts: { root: "/repo", commits: [{ files: ["src/app/page.tsx"] }] } },
+      // BP-1 反:merge 带进闸引擎,其后父侧跑过绑定的红队 ⇒ 放行
+      { name: "a27628dd BP-1 反:merge 带进闸引擎 + 合回后跑了绑定红队 ⇒ 放行",
+        text: "合回并红队。", pLedger: { carriers: 0 },
+        bash: ["git merge --no-ff worktree-agent-x -m merge"],
+        agent: { type: "_gate-bypass-hunter", prompt: "红队合回的 scripts/lib/gate-rules.mjs 改动" },
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"] }] } },
+      // BP-6 反(回退面):闸副本在外发暂存树 / cp 备份进 clipboard / git log -S / heredoc 提交信息 / grep "tee "
+      //   ——之后一笔无关提交不得被要求红队(派出方裁定:暂存树与 worktree 下的副本不算本仓闸引擎)
+      { name: "a27628dd BP-6 反:改外发暂存树里的闸副本 + 无关提交 ⇒ 不要求红队",
+        text: "同步公开仓。", pLedger: { carriers: 0 }, write: "/repo/clipboard/oss/public-repo/scripts/lib/gate-rules.mjs",
+        bash: ["git add -A src/app/page.tsx && git commit -m x"] },
+      { name: "a27628dd BP-6 反:cp 备份闸文件到 clipboard + 无关提交 ⇒ 不要求红队",
+        text: "先备份。", pLedger: { carriers: 0 },
+        bash: ["cp scripts/lib/gate-rules.mjs clipboard/bak/gate-rules.mjs", "git add -A src/app/page.tsx && git commit -m x"] },
+      { name: "a27628dd BP-6 反:cd 进暂存树改闸副本 + 无关提交 ⇒ 不要求红队",
+        text: "改副本。", pLedger: { carriers: 0 },
+        bash: ["cd clipboard/oss/public-repo/scripts/lib && sed -i s/a/b/ gate-rules.mjs", "git add -A src/app/page.tsx && git commit -m x"] },
+      { name: "a27628dd BP-6 反:改 worktree 里的闸副本 + 本仓无关提交 ⇒ 不要求红队",
+        text: "看一眼子代理的改动。", pLedger: { carriers: 0 }, write: "/repo/.claude/worktrees/w1/scripts/lib/gate-rules.mjs",
+        bash: ["git add -A src/app/page.tsx && git commit -m x"] },
+      { name: "a27628dd BP-6 反:git log -S commit -- 闸文件(只读)+ 无关提交 ⇒ 不要求红队",
+        text: "查历史。", pLedger: { carriers: 0 },
+        bash: ["git log -S commit -- scripts/lib/gate-rules.mjs", "git add -A src/app/page.tsx && git commit -m x"] },
+      { name: "a27628dd BP-6 反:heredoc 提交信息里提到 git add 闸文件 ⇒ 不要求红队",
+        text: "提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A src/app/page.tsx && git commit -F - <<'EOF'\nfix: 页面\ngit add scripts/lib/gate-rules.mjs 那一步留给下批\nEOF"] },
+      { name: "a27628dd BP-6 反:grep -c \"tee \" 闸文件(只读)+ 无关提交 ⇒ 不要求红队",
+        text: "数一下。", pLedger: { carriers: 0 },
+        bash: ["grep -c \"tee \" scripts/lib/gate-rules.mjs", "git add -A src/app/page.tsx && git commit -m x"] },
+      // BP-7 反(回退面):上一批改闸 → 提交 → 绑定红队 → 无关提交;本批再做一笔无关承重提交 ⇒ 不要求重跑红队
+      { name: "a27628dd BP-7 反(回退面):闸改动全在最后一次绑定红队之前 ⇒ 不要求重跑",
+        text: "改法典,提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A docs/laws/collab.md && git commit -m x"],
+        prior: [{ text: "改闸", write: "scripts/lib/gate-rules.mjs" },
+                { text: "提交闸", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x" },
+                { text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "记台账", bash: "git add docs/gate-debts.md && git commit -m x" }] },
+      { name: "a27628dd BP-7 反(git 面):本次范围只带进法典 ⇒ 窗口里旧的闸写入不算",
+        text: "改法典,提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A docs/laws/collab.md && git commit -m x"],
+        prior: [{ text: "改闸", write: "scripts/lib/gate-rules.mjs" },
+                { text: "提交闸", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x" }],
+        headFacts: { root: "/repo", commits: [{ files: ["docs/laws/collab.md"] }] } },
+      // git 面:范围空(已提交过的承重写入还在窗口里)+ 一笔空提交 ⇒ 不触发(承重面的 BP-7 同形)
+      { name: "a27628dd git 面:本次范围无提交、窗口里有已提交过的承重写入 ⇒ 不触发",
+        text: "再提交一次(无改动)。", pLedger: { carriers: 4 },
+        bash: ["git commit -m x"], prior: [{ text: "上批改法典", write: "docs/laws/collab.md" }],
+        headFacts: { root: "/repo", commits: [] } },
+      // 量化 a00051d BP-1:改闸 → 提交 → 绑定红队 → 只改文档的提交;本轮只提交宪法 ⇒ 放行(两个面各一条)
+      { name: "a00051d BP-1(git 面):红队之后只有宪法/文档提交 ⇒ 放行",
+        text: "提交宪法。", at: "2026-10-10T09:33:00Z", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-10-10T08:00:00Z", conditions: ["甲"] },
+        bash: ["git add AGENTS.md && git commit -m x"],
+        prior: [{ text: "改闸", at: "2026-10-10T09:28:00Z", write: "scripts/lib/gate-rules.mjs" },
+                { text: "提交闸", at: "2026-10-10T09:29:00Z", bash: "git add scripts/lib/gate-rules.mjs && git commit -m x" },
+                { text: "红队", at: "2026-10-10T09:29:20Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "提交文档", at: "2026-10-10T09:30:00Z", bash: "git add docs/e.md && git commit -m x" }],
+        headFacts: { root: "/repo", commits: [{ files: ["AGENTS.md"], at: "2026-10-10T09:33:00Z" }], engineAnchorAt: "2026-10-10T09:29:00Z" } },
+      { name: "a00051d BP-1(回退面):红队之后只有宪法/文档提交 ⇒ 放行",
+        text: "提交宪法。", at: "2026-10-10T09:33:00Z", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-10-10T08:00:00Z", conditions: ["甲"] },
+        bash: ["git add AGENTS.md && git commit -m x"],
+        prior: [{ text: "改闸", at: "2026-10-10T09:28:00Z", write: "scripts/lib/gate-rules.mjs" },
+                { text: "提交闸", at: "2026-10-10T09:29:00Z", bash: "git add scripts/lib/gate-rules.mjs && git commit -m x" },
+                { text: "红队", at: "2026-10-10T09:29:20Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "提交文档", at: "2026-10-10T09:30:00Z", bash: "git add docs/e.md && git commit -m x" }] },
+      // 量化 a00051d BP-2:他仓提交与 --amend 不切凭证池(git 面切点只在本仓带闸改动的提交)
+      { name: "a00051d BP-2(git 面):红队 → 他仓提交 → amend → 本仓闸修复提交 ⇒ 红队仍抵账",
+        text: "按回件修闸并提交。", at: "2026-10-10T10:30:00Z", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-10-10T08:00:00Z", conditions: ["甲"] },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", at: "2026-10-10T10:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "他仓提交", at: "2026-10-10T10:10:00Z", bash: "cd /d/dotfiles-claude && git add -A && git commit -m x" },
+                { text: "改提交信息", at: "2026-10-10T10:20:00Z", bash: "git commit --amend --no-edit" }],
+        headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-10T10:30:00Z" }], engineAnchorAt: "2026-10-10T09:00:00Z" } },
+      // 量化 a00051d BP-3:上一批改闸并红队,新批武装后只提交 src/ ⇒ 不触发(两个面)
+      { name: "a00051d BP-3(git 面):新批只提交 src/ ⇒ 不欠红队",
+        text: "新批业务改动。", at: "2026-10-10T10:30:00Z", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-10-10T10:00:00Z", conditions: ["甲"] },
+        bash: ["git add -A src/app/page.tsx && git commit -m x"],
+        prior: [{ text: "改闸", at: "2026-10-10T09:00:00Z", write: "scripts/lib/gate-rules.mjs" },
+                { text: "提交闸", at: "2026-10-10T09:01:00Z", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x" },
+                { text: "红队", at: "2026-10-10T09:02:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }],
+        headFacts: { root: "/repo", commits: [{ files: ["src/app/page.tsx"] }], engineAnchorAt: "2026-10-10T09:01:00Z" } },
+      { name: "a00051d BP-3(回退面):新批只提交 src/ ⇒ 不欠红队",
+        text: "新批业务改动。", at: "2026-10-10T10:30:00Z", pLedger: { carriers: 0 },
+        batchGoal: { armedAt: "2026-10-10T10:00:00Z", conditions: ["甲"] },
+        bash: ["git add -A src/app/page.tsx && git commit -m x"],
+        prior: [{ text: "改闸", at: "2026-10-10T09:00:00Z", write: "scripts/lib/gate-rules.mjs" },
+                { text: "提交闸", at: "2026-10-10T09:01:00Z", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x" },
+                { text: "红队", at: "2026-10-10T09:02:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }] },
+      // 量化 a00051d BP-4 / 派出方口径③:原 pos「回退路径 fail-closed:红队之后的 docs-only 提交也切」**翻成放行**——
+      //   与原 neg「codex-185 ① 边界」只差中间一笔文档提交、一拦一放,自相矛盾。宽松口径:红队之后按回件修闸再提交
+      //   算这一轮红队的处置。git 事实在 ⇒ 文档提交不切。(取不到 git 事实时的「任何提交都切」另有 pos 钉着。)
+      { name: "a00051d BP-4(原 pos 翻面):git 事实在 ⇒ 红队之后的 docs-only 提交不切,修闸提交抵账",
+        text: "本批收尾提交。", pLedger: { carriers: 0 },
+        write: "scripts/lib/gate-rules.mjs", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x",
+        prior: [{ text: "本批红队", agent: { type: "_gate-bypass-hunter", prompt: "红队本批 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "记台账", bash: "git add docs/gate-debts.md docs/product-diary.md && git commit -m x" }],
+        headFacts: { root: "/repo", commits: [{ files: ["docs/gate-debts.md", "docs/product-diary.md"] }, { files: ["scripts/lib/gate-rules.mjs"] }] } },
       // 批 257 条件 3 分档的接受侧证人:只改测试文件 ⇒ 轻档 ⇒ 只欠独立视角,grill 在场即放行。
       { name: "条件3:只改测试文件 ⇒ 轻档,免跨模型与联网",
         text: "第五笔,改测试。", pLedger: { carriers: 4 },
@@ -5486,6 +6419,20 @@ RULE_W.cases.neg.push({
   user: "这次不需要外审。",
   text: "收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
   write: "clipboard/oss/public-repo/README.md",
+}, {
+  // 红队 a2155edb BP-6(真实语料有连拦链):判官型拦截只留 feedback 行、无拦截附件,连拦两次;
+  //   回扫曾把它当「已放行」截断,轮开口的免审丢失 ⇒ 误拦。「被拦」改由 gate-ctx `isBlockedStop`(与 lastTurn 共用)判。
+  name: "a2155edb BP-6:feedback 行型拦截连拦两次,轮开口的免审仍认",
+  text: "收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+  write: "clipboard/oss/public-repo/README.md",
+  prior: [{ user: "这份 README 别外审了,直接关账。", text: "在写", stop: "blocked-fb" }, { text: "补了一处", stop: "blocked-fb" }],
+});
+RULE_W.cases.pos.push({
+  // 红队 a2155edb BP-3:回扫遇到打断行不停,会走到打断之前那一轮的开口、把旧免审带进来 ⇒ 打断行是轮边界
+  name: "a2155edb BP-3:打断行之前那一轮的「别外审」不带进打断之后",
+  text: "收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+  write: "clipboard/oss/public-repo/README.md",
+  prior: [{ user: "这份 README 别外审了,直接关账。", text: "在写" }, { interrupt: true, text: "接着写" }, { text: "补了一处", stop: "blocked" }],
 });
 RULE_W.cases.pos.push({
   // 红队 182 BP-4:否定-否定形态是**要求外审**
@@ -6146,7 +7093,11 @@ export const RULE_O = {
  *  天花板:① 句式白名单只认「是什么/是啥/什么意思」族,「为什么 X」类机制问抓不到
  *  (当日 PATH 一词就是靠判断补的,这类靠自觉);② 判不出问的词是否已在册
  *  (同名词二次出现按约定不重记——那是合法的不动日记,走声明出路);
- *  ③ 判不出追加的那一行质量够不够。 */
+ *  ③ 判不出追加的那一行质量够不够;④(红队 a2155edb BP-1 附带)**一条消息里问两个名词、只补一行**判不出——
+ *  出路按「晚于最近一次名词提问」切,同一条消息里的两问共用一个时点;要逮它得核行内容,归③,不在本判据里假装。
+ *  出路时序(a2155edb):动作与声明只认晚于本轮最近一次名词提问的(时间线 `ctx.turnLog`,含被拦链上窗口前那段);
+ *  失效条件:gate-ctx 不再给 `turnLog`(退回不切的旧口径,BP-1 复活)/ `bashWriteTargets` 改回手写正则(BP-2/7 复活)
+ *  ——两者各有变异证人(「不按最近一次提问切」「Bash 面提到日记即算」)。 */
 const RULE_ND = {
   id: "ND",
   blocking: true,   // 2026-08-31 用户亲签:「日记要不要加闸项——加了吧」
@@ -6158,21 +7109,42 @@ const RULE_ND = {
     { say: "就地声明 ⟪名词日记:不适用,因⟫ + 理由——合法理由如:不是名词问 / 同名词已在册(改原行补「再遇」)/ 纯闲聊",
       sample: { text: "名词日记:不适用,因这是对上文指代的追问,不是名词问。" } },
   ],
-  detect: (ctx) => {
+  // 第二参只给 mutations 注入变异开关(引擎只传 ctx,默认值即真判据)——变异与真判据共用这一份实现,
+  //   不再各抄一份旧判据(红队 a2155edb 附节二②:「不剥引文」变异抄的是旧版出路,新判据改了它还在测旧的)。
+  detect: (ctx, V = {}) => {
     if (!toolPresent("docs/noun-diary.md")) return [];
-    const ut = maskQuoted(String(ctx.userText || ""));
-    const m = ut.match(/(是什么|是啥|什么意思|啥意思|到底是啥|什么东西)/);
+    const Q = /(是什么|是啥|什么意思|啥意思|到底是啥|什么东西)/;
+    const mask = V.noMask ? (s) => String(s || "") : (s) => maskQuoted(String(s || ""));
+    const m = mask(ctx.userText).match(Q);
     if (!m) return [];
-    // 出路1(动作面):本轮真动过日记——Write/Edit 面或 Bash 面都认
-    // Bash 面只认**写**到日记(红队 7e1392f 轮 BP-5:`grep -n winget docs/noun-diary.md` 查一下没查到也算「动过」);
-    //   被拦链上之前跑的 Bash 同样认(BP-9)
-    const ND_BASH_WRITE = /(>>?|\btee\b(\s+-a)?|\bsed\s+-i\b[^|;&]*|\bAdd-Content\b|\bSet-Content\b|\bOut-File\b)[^|;&]*noun-diary\.md/i;
-    const touched = [...(ctx.writes || []), ...(ctx.turnPriorWrites || [])].some((w) => /docs\/noun-diary\.md$/.test(String(w).replace(/\\/g, "/"))) ||
-      [...(ctx.bashCmds || []), ...(ctx.turnPriorBash || [])].some((c) => ND_BASH_WRITE.test(c));
+    if (V.noEscapes) return [m[1]];
+    // 出路只认**晚于本轮最近一次名词提问**的动作与声明(红队 a2155edb BP-1:窗口内补了 winget 的日记、
+    //   后又排队问 scoop,旧实现拿那次写入替两问一起结账;7e1392f BP-3 只在窗口前回扫里切过,窗口内没切)。
+    //   时间线 `ctx.turnLog` 由 gate-ctx 按转录顺序给出(含被拦链上窗口前那段);「哪句算提问」在这里判、
+    //   与上面触发用**同一个**句式与剥引文——非提问的排队消息(「顺便把 K 补上」)不切(BP-5)。
+    //   没有时间线(旧调用方)⇒ 退回本轮全部动作与话(不切),与 a2155edb 之前窗口内的口径相同。
+    const log = Array.isArray(ctx.turnLog) ? ctx.turnLog : null;
+    let after;
+    if (log) {
+      let last = -1;
+      if (!V.noCut) for (let i = 0; i < log.length; i++) if (log[i].k === "ask" && Q.test(mask(log[i].v))) last = i;
+      after = log.slice(last + 1);
+    } else {
+      after = [...(ctx.writes || []).map((v) => ({ k: "write", v })), ...(ctx.bashCmds || []).map((v, i) => ({ k: "bash", v, d: ctx.bashDialects?.[i] })), { k: "say", v: ctx.text || "" }];
+    }
+    // 出路1(动作面):真写了日记——Write/Edit 面,或 Bash 面的**写目标**是日记。
+    //   Bash 面的写目标取自 `bashWriteTargets()`(唯一实现,引号感知;红队 a2155edb BP-2/BP-7:旧手写正则把
+    //   `=>`、`awk 'NF > 3'`、写别的文件的重定向、heredoc 正文当成写日记,又把 `sed -i '$a | … |'`、Add-Content、
+    //   node appendFileSync、python open(…,'a') 的真写入漏掉)。只读地 grep 一下日记不算(7e1392f BP-5)。
+    const DIARY = /(?:^|\/)docs\/noun-diary\.md$/i;
+    const touched = after.some((x) =>
+      (x.k === "write" && DIARY.test(String(x.v).replace(/\\/g, "/"))) ||
+      (x.k === "bash" && (V.bashMention ? /noun-diary\.md/i.test(x.v) : (() => { try { return bashWriteTargets(x.v, DIARY, { dialect: x.d }).length > 0; } catch { return false; } })())));
     if (touched) return [];
-    // 出路2(文本出路,按 INV-1 写进判据受正反例与变异约束):就地声明不适用+理由
-    const at = maskQuoted(String(ctx.text || ""));
-    if (/名词日记[:：][^\n]{0,80}(不适用|已在册|已记|已补|非名词|同名词)/.test(at)) return [];
+    // 出路2(文本出路,按 INV-1 写进判据受正反例与变异约束):就地声明不适用+理由。
+    //   被拦链上先前说过的声明同样认(a2155edb BP-4),同样只认提问之后说的。
+    const said = after.filter((x) => x.k === "say").map((x) => x.v).join("\n").slice(-200_000);
+    if (/名词日记[:：][^\n]{0,80}(不适用|已在册|已记|已补|非名词|同名词)/.test(mask(said))) return [];
     return [m[1]];
   },
   exempts: [],
@@ -6181,22 +7153,12 @@ const RULE_ND = {
     `${renderEscapes(RULE_ND.escapes)}\n` +
     `      天花板:句式白名单只认「是什么/是啥/什么意思」族;「为什么 X」类机制问抓不到,那半仍靠自觉。`,
   mutations: [
-    { name: "去掉两条出路(动了日记/声明了也照拦)", apply: (r) => ({ ...r, detect: (ctx) => {
-      if (!toolPresent("docs/noun-diary.md")) return [];
-      const m = maskQuoted(String(ctx.userText || "")).match(/(是什么|是啥|什么意思|啥意思|到底是啥|什么东西)/);
-      return m ? [m[1]] : [];
-    } }) },
-    { name: "不剥引文(用户引用一句含「是什么」的话也拦)", apply: (r) => ({ ...r, detect: (ctx) => {
-      if (!toolPresent("docs/noun-diary.md")) return [];
-      const m = String(ctx.userText || "").match(/(是什么|是啥|什么意思|啥意思|到底是啥|什么东西)/);
-      if (!m) return [];
-      const touched = [...(ctx.writes || []), ...(ctx.turnPriorWrites || [])].some((w) => /docs\/noun-diary\.md$/.test(String(w).replace(/\\/g, "/"))) ||
-        (ctx.bashCmds || []).some((c) => /noun-diary\.md/.test(c));
-      if (touched) return [];
-      const at = maskQuoted(String(ctx.text || ""));
-      if (/名词日记[:：][^\n]{0,80}(不适用|已在册|已记|已补|非名词|同名词)/.test(at)) return [];
-      return [m[1]];
-    } }) },
+    { name: "去掉两条出路(动了日记/声明了也照拦)", apply: (r) => ({ ...r, detect: (ctx) => RULE_ND.detect(ctx, { noEscapes: true }) }) },
+    { name: "不剥引文(用户引用一句含「是什么」的话也拦)", apply: (r) => ({ ...r, detect: (ctx) => RULE_ND.detect(ctx, { noMask: true }) }) },
+    // a2155edb 附节二②:「Bash 只认写入」的变异证人——退回「命令里提到日记就算动过」必须被 grep 正例逮住
+    { name: "Bash 面提到日记即算动过(不看写入目标)", apply: (r) => ({ ...r, detect: (ctx) => RULE_ND.detect(ctx, { bashMention: true }) }) },
+    // a2155edb BP-1:不按「最近一次名词提问」切 ⇒ 问 1 的日记替问 2 结账,必须被 `then` 正例逮住
+    { name: "不按最近一次提问切(旧写入替新问题结账)", apply: (r) => ({ ...r, detect: (ctx) => RULE_ND.detect(ctx, { noCut: true }) }) },
   ],
   cases: {
     pos: [
@@ -6205,6 +7167,25 @@ const RULE_ND = {
       { user: "SVC 是什么?", text: "SVC 是歌声音色转换。名词日记我回头再补。" },
       // 红队 7e1392f 轮 BP-5:只读地 grep 一下日记(没查到)不算动过 ⇒ 照拦
       { user: "winget 是什么?", text: "winget 是 Windows 包管理器。", bash: "grep -n winget docs/noun-diary.md" },
+      // 红队 a2155edb BP-1:**窗口内**先补了 winget 的日记、后又排队问 scoop ⇒ 旧写入不替新问题结账
+      { name: "a2155edb BP-1:窗口内 [问1, 写日记, 排队问2, 说] ⇒ 拦",
+        user: "winget 是什么?", text: "winget 是 Windows 包管理器,已补日记。", write: "/repo/docs/noun-diary.md",
+        then: [{ queued: "scoop 又是什么?" }, { text: "scoop 也是包管理器。" }] },
+      // 红队 a2155edb BP-2:命令里有 `>` 也提到日记,但都不是写日记
+      { name: "a2155edb BP-2:awk 引号里的 > 不是写", user: "winget 是什么?", text: "winget 是包管理器。", bash: "awk 'NF > 3' docs/noun-diary.md" },
+      { name: "a2155edb BP-2:--cond 引号里的 > 不是写", user: "winget 是什么?", text: "winget 是包管理器。",
+        bash: "node scripts/batch-goal.mjs --cond \"日志 >1MB 要压\" && grep winget docs/noun-diary.md" },
+      { name: "a2155edb BP-2:箭头函数不是重定向", user: "winget 是什么?", text: "winget 是包管理器。", bash: "node -e \"[1].map(r=>r)\" docs/noun-diary.md" },
+      { name: "a2155edb BP-2:重定向写的是别的文件", user: "winget 是什么?", text: "winget 是包管理器。", bash: "grep winget docs/noun-diary.md > clipboard/hits.txt" },
+      { name: "a2155edb BP-2:heredoc 正文提到日记路径", user: "winget 是什么?", text: "winget 是包管理器。",
+        bash: "cat <<'EOF' > clipboard/note.md\n回头补 docs/noun-diary.md\nEOF" },
+      // 红队 a811daae BP-6 对照:**同一串**走 Bash 工具 ⇒ 按 bash 口径 `\"` 是转义、引号吞到行尾,Git Bash 里这条也写不进日记 ⇒ 照拦
+      //   (证明方言跟工具名走,不是「两种口径取并集」)
+      { name: "a811daae BP-6 对照:同串走 Bash 工具 ⇒ 不算写日记", user: "winget 是什么?", text: "winget 是包管理器。",
+        bash: "Set-Location \"\\repo\\\"; Add-Content docs\\noun-diary.md \"| winget | pm |\"" },
+      // BP-4 对照:if 条件里的 grep 读日记不算写(跳保留字不能把条件命令当写)
+      { name: "a811daae BP-4 对照:if grep 日记; then … 不算写日记", user: "winget 是什么?", text: "winget 是包管理器。",
+        bash: "if grep -q winget docs/noun-diary.md; then echo ok; fi" },
     ],
     neg: [
       // 动作面出路:真追加了日记
@@ -6219,6 +7200,39 @@ const RULE_ND = {
       { user: "你上一条说「这是什么」那个判据有问题。", text: "收到,我去看那条判据。" },
       // 无名词问
       { user: "继续吧。", text: "好,接着跑。" },
+      // 红队 a2155edb BP-7:真写了日记、旧手写正则认不出的四种写法
+      { name: "a2155edb BP-7:sed -i 追加表格行", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
+        bash: "sed -i '$a | winget | Windows 包管理器 |' docs/noun-diary.md" },
+      // a811daae BP-6 起改走 PowerShell 工具(`ps`):Add-Content 是 PowerShell cmdlet,夹具原只能发 Bash;
+      //   方言跟工具名走后,Bash 工具里这条按 bash 口径 `docs\noun-diary.md` 的反斜杠被吃掉(Git Bash 里也确实写不进日记)。
+      { name: "a2155edb BP-7:Add-Content -Path 反斜杠路径", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
+        ps: "Add-Content -Path docs\\noun-diary.md -Value '| winget | Windows 包管理器 |'" },
+      { name: "a2155edb BP-7:node appendFileSync", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
+        bash: "node -e \"require('fs').appendFileSync('docs/noun-diary.md', '| winget | 包管理器 |\\n')\"" },
+      { name: "a2155edb BP-7:python open(…,'a')", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
+        bash: "python -c \"open('docs/noun-diary.md', 'a', encoding='utf-8').write('| winget | 包管理器 |\\n')\"" },
+      // 红队 a811daae BP-5(误拦):`then` 被当命令名 ⇒ 认不出写日记(f4b3a9e 前的旧 ND 正则认得,b7ef430 认不出)
+      { name: "a811daae BP-5:if ! grep …; then tee -a 日记 <<EOF", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
+        bash: "if ! grep -q winget docs/noun-diary.md; then tee -a docs/noun-diary.md <<'EOF'\n| winget | pm |\nEOF\nfi" },
+      // 红队 a811daae BP-6(误拦):PowerShell 工具里 `"\repo\"` 的 `\"` 不是转义;b7ef430 用 POSIX 掩码 ⇒ 引号不闭合、Add-Content 被吞
+      { name: "a811daae BP-6:PowerShell Set-Location \"\\repo\\\"; Add-Content 日记", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
+        ps: "Set-Location \"\\repo\\\"; Add-Content docs\\noun-diary.md \"| winget | pm |\"" },
+      // BP-6 Bash 侧反向同族:`\"` 在 bash 双引号里是转义,目标是日记(b7ef430 解成 `b/ docs/noun-diary.md`)
+      { name: "a811daae BP-6:Bash sed -i \"s/a/\\\" b/\" 日记", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
+        bash: "sed -i \"s/a/\\\" b/\" docs/noun-diary.md" },
+      // 复核红队 aaf414b6 BP-3(误拦,365fd54 引入):引号里的单个 `>` 被当裸重定向算子、连 `-Path` 一起剔 ⇒ `-Value` 吞掉真路径
+      { name: "aaf414b6 BP-3:PS Add-Content -Value 单个 > 再 -Path 日记", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
+        ps: "Add-Content -Value \">\" -Path docs/noun-diary.md" },
+      // 红队 a2155edb BP-5:被拦后排队的是**非提问**消息 ⇒ 不切掉之前的日记写入
+      { name: "a2155edb BP-5:非提问的排队消息不切先前的日记写入", text: "补了 K,收工。",
+        prior: [{ user: "winget 是什么?", text: "winget 是包管理器,已补日记。", write: "/repo/docs/noun-diary.md", stop: "blocked" },
+          { queued: "顺便把 K 也补上。" }] },
+      // 红队 a2155edb BP-4:被拦链上已就地声明过不适用 ⇒ 续跑时认
+      { name: "a2155edb BP-4:被拦链上的文本声明续跑时认", text: "补了 K,收工。",
+        prior: [{ user: "RVC 是什么?", text: "RVC 是检索式声音转换。名词日记:不适用,因同名词已在册。", stop: "blocked" }] },
+      // 同上,判官型拦截(只留 feedback 行,BP-6 形态)同样认作同一用户轮
+      { name: "a2155edb BP-4/6:feedback 行型拦截后续跑,先前的日记写入仍认", text: "收工。",
+        prior: [{ user: "winget 是什么?", text: "已补日记。", write: "/repo/docs/noun-diary.md", stop: "blocked-fb" }] },
     ],
   },
 };

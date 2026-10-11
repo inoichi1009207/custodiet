@@ -282,7 +282,19 @@ console.log("正反例:");
 //   「追加既有 memory 文件不算新建」这条反例根本写不出来。
 //   第十次:`bgTasks`(2026-09-06,D104(a) S 的动作面)与 `concurrentWriters`(D95 CW 项,2026-10-09 随 CW 裁撤移除)——两条都是
 //   **注入通道**(官方 background_tasks[] 载荷 / 收尾时点三查①结果),不进 entries。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "at"]);
+//   第十六次:`ps`(2026-10-11 红队 a811daae BP-6)——走 **PowerShell 工具**的命令(顶层与 `prior` 项同写法)。
+//     写目标解析按工具名选方言;平铺夹具只发 Bash ⇒「同一串、不同工具、不同结论」写不出来。
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "hookCheckout", "at", "then"]);
+//   第十五次:`then`(2026-10-10 红队 a2155edb BP-1;与十三、十四次同日由另一 worktree 并行加,合并时重编号)——**本窗口内**主 assistant 条目之后再接的条目(写法同 `prior` 项),
+//   ND 的「出路要晚于最近一次名词提问」要写出 [问1, 写日记, 排队问2, 说] 这种窗口内时序;平铺夹具只有「一条用户行 + 一条
+//   assistant」,时序根本写不出来——与上面各次同族:夹具支持面不足会让规则「测不出来」。
+//   同批给 `prior` 项补了注入面(见 PRIOR_KEYS):user / queued / stop / interrupt,
+//   BP-3~6(打断行、排队消息、被拦 Stop 的两种落盘形态)原来只能在 gate-ctx 自测里写,现在规则层也写得出。
+//   第十四次:`hookCheckout`(同日,同一批)——hook 所在 checkout 根。没它,「在 worktree 里开的会话改自己的闸文件」
+//     与「主树会话碰 worktree 里的闸副本」两种形态在夹具里分不开(路径都含 `.claude/worktrees/`)。
+//   第十三次:`headFacts`(2026-10-10 红队 a27628dd,P 的 HEAD 移动事实:「本轮提交带进了哪些文件」)——注入通道,不进 entries;
+//     夹具给 `{ root?, commits:[{files:[路径|{path,oldPath,status}], at?}], engineAnchorAt? }`,这里包成惰性函数交 ctx.headFacts。
+//     没它,「子代理在 worktree 改闸、父侧 merge 合回」「bashWriteTargets 不认的写法 + git add -A」这些形态在夹具里写不出来。
 //   第十二次:`diffFacts`(2026-10-10 批 257 条件 3,P 的 diff 分档事实)——注入通道,夹具给对象,这里包成惰性函数交 ctx.diffTier。
 //   第十一次:`debtFacts`(2026-09-12 批 202,DP 的部署欠账事实)——注入通道,不进 entries。
 //   第七次:`at`(ISO 时间 ⇒ 条目 `timestamp`)—— D107(191):P 的凭证池主路径按 `batchGoal.armedAt`
@@ -314,6 +326,10 @@ const mkEntries = (c) => {
   if (c.bash) for (const cmd of (Array.isArray(c.bash) ? c.bash : [c.bash])) {
     blocks.push({ type: "tool_use", name: "Bash", input: { command: cmd } });
   }
+  // `ps` = 走 PowerShell 工具的命令(红队 a811daae BP-6:写目标解析按工具名选方言,夹具要能写出「同串、不同工具」)。
+  if (c.ps) for (const cmd of (Array.isArray(c.ps) ? c.ps : [c.ps])) {
+    blocks.push({ type: "tool_use", name: "PowerShell", input: { command: cmd } });
+  }
   if (c.read) blocks.push({ type: "tool_use", name: "Read", input: { file_path: c.read } });
   if (c.grep) blocks.push({ type: "tool_use", name: "Grep", input: { pattern: "x", path: c.grep } });
   if (c.web) blocks.push({ type: "tool_use", name: "WebSearch", input: { query: String(c.web) } });
@@ -331,7 +347,10 @@ const mkEntries = (c) => {
     : [];
   // `at`:本轮条目的转录时间戳(D107)。不给则不写该字段——gate-ctx 解析不出 ⇒ `at` 为 null,
   //   与旧夹具行为一字不差(本轮动作恒在凭证池内),故加这条键不改任何既有用例的判定。
-  return [...pre, { type: "assistant", ...(c.at ? { timestamp: c.at } : {}), message: { content: blocks } }];
+  // `then`:主 assistant 条目之后、同一窗口内再接的条目(写法同 prior 项;a2155edb BP-1)。
+  if ("then" in c && !Array.isArray(c.then)) throw new Error(`夹具 then 须为数组:${JSON.stringify(c.then)}`);
+  const tail = Array.isArray(c.then) ? c.then.flatMap(mkPriorEntries) : [];
+  return [...pre, { type: "assistant", ...(c.at ? { timestamp: c.at } : {}), message: { content: blocks } }, ...tail];
 };
 // ⚠️ `tracked` 必须**从夹具注入**,不能让规则自己去 execFileSync git。
 //   注不进来 ⇒ ctx 侧 fail-closed 当「新建」——于是 I 的「改既有载体」这一支
@@ -354,11 +373,60 @@ const mkEntries = (c) => {
 //   **「夹具支持面不足会让规则『测不出来』,而它长得像规则写错了」**。
 //   第七次仍是照着这句话栽的,故这次连**键名校验**一起补上(下面 PRIOR_KEYS):
 //   静默丢弃拼错的键正是这一族的传播机制。
-const PRIOR_KEYS = new Set(["text", "write", "skill", "bash", "agent", "web", "read", "grep", "commit", "mcp", "at"]);
-const mkPriorEntry = (x) => {
+// `failed: true`(codex 257-p-agg-r1「没问到」②):该项里的 Bash/PowerShell 调用全部失败——给 tool_use 编 id,
+//   并在其后补一条 `tool_result is_error:true`。没它,「失败的 cd 不算移出本仓」在规则层零证人。
+//   红队 ad3e4f93 BP-1:`failed` 可带结果正文——`true` ⇒ 正文 "Exit code 1"(非 cd 失败 ⇒ cd 照常生效);
+//   `failed: "<正文>"` ⇒ 用该正文(带 cd 失败特征时 P 才把 cd 记未知)。
+// `result: "<正文>"`(复核红队 a084a536 BP-6):该项里的 Bash/PowerShell 调用**成功**,结果正文为该串——给 tool_use 编 id,
+//   补一条 `tool_result is_error:false`。用途:写出 CC 的回置声明(末行「Shell cwd was reset to <路径>」)。
+//   与 `failed` 互斥(同一项两键都给 ⇒ 装载期报错)。没它,「有回置声明 ⇒ 回到声明路径」在规则层零证人。
+const PRIOR_ASSISTANT_KEYS = ["text", "write", "skill", "bash", "ps", "agent", "web", "read", "grep", "commit", "mcp", "at", "failed", "result"];
+// a2155edb(第十三次同族,见 FIXTURE_KEYS 注):非 assistant 的注入面,一项内按固定先后展开——
+//   interrupt(用户打断行)→ user(用户亲口行)→ queued(排队消息附件)→ assistant 条目 → stop(这一轮的 Stop)。
+//   `stop` 取值:"blocked"(同 toolUseID 的 hook_blocking_error 附件 + 汇总行,汇总文案按 lanes v2 不含「阻断」)/
+//   "blocked-fb"(判官型:只有 Stop hook feedback 行 + 汇总行、无附件,a2155edb BP-6 的真实语料形态)/
+//   "released"(只有汇总行 = 已放行)。
+const PRIOR_EXTRA_KEYS = ["user", "queued", "stop", "interrupt"];
+const PRIOR_KEYS = new Set([...PRIOR_ASSISTANT_KEYS, ...PRIOR_EXTRA_KEYS]);
+let _stopSeq = 0;
+const mkPriorEntries = (x) => {
   for (const k of Object.keys(x)) {
     if (!PRIOR_KEYS.has(k)) throw new Error(`prior 夹具键不认识:「${k}」—— 拼错的键会被静默丢弃并伪装成规则缺陷。合法键:${[...PRIOR_KEYS].join(", ")}`);
   }
+  if ("stop" in x && !["blocked", "blocked-fb", "released"].includes(x.stop)) throw new Error(`prior 夹具 stop 取值不认识:${JSON.stringify(x.stop)}(blocked / blocked-fb / released)`);
+  if ("result" in x && "failed" in x) throw new Error("prior 夹具 result 与 failed 互斥(一个是成功结果正文,一个是报错结果正文)");
+  if ("result" in x && typeof x.result !== "string") throw new Error(`prior 夹具 result 须为串:${JSON.stringify(x.result)}`);
+  const out = [];
+  if (x.interrupt) out.push({ type: "user", message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user]" }] } });
+  if ("user" in x) out.push({ type: "user", origin: { kind: "human" }, message: { role: "user", content: String(x.user) } });
+  if ("queued" in x) out.push({ type: "attachment", attachment: { type: "queued_command", prompt: String(x.queued), origin: { kind: "human" } } });
+  // 只写了非 assistant 面的项不再凭空造一条空 assistant;一个键都没写的项照旧给空 assistant(旧夹具逐字不变)
+  const hasAsst = PRIOR_ASSISTANT_KEYS.some((k) => k in x) || !PRIOR_EXTRA_KEYS.some((k) => k in x);
+  if (hasAsst) {
+    const asst = mkPriorAssistant(x);
+    out.push(asst);
+    if (x.failed || typeof x.result === "string") {
+      const res = [];
+      for (const b of asst.message.content) {
+        if (b.type !== "tool_use" || !/^(Bash|PowerShell)$/.test(b.name)) continue;
+        b.id = `fx-${x.failed ? "fail" : "res"}-${++_stopSeq}`;
+        res.push(x.failed
+          ? { type: "tool_result", tool_use_id: b.id, is_error: true, content: typeof x.failed === "string" ? x.failed : "Exit code 1" }
+          : { type: "tool_result", tool_use_id: b.id, is_error: false, content: x.result });
+      }
+      if (res.length) out.push({ type: "user", message: { role: "user", content: res } });
+    }
+  }
+  if (x.stop) {
+    const id = `fx-stop-${++_stopSeq}`;
+    if (x.stop === "blocked") out.push({ type: "attachment", attachment: { type: "hook_blocking_error", hookEvent: "Stop", toolUseID: id, blockingError: "x" } });
+    if (x.stop === "blocked-fb") out.push({ type: "user", isMeta: true, message: { role: "user", content: "Stop hook feedback:\n[只查一件事:…]" } });
+    out.push({ type: "system", subtype: "stop_hook_summary", hookCount: 2, toolUseID: id,
+      hookErrors: x.stop === "released" ? [] : [x.stop === "blocked" ? "判官拦了一下(全文已附给模型;/lanes 看全文)" : "[只查一件事:…]"] });
+  }
+  return out;
+};
+const mkPriorAssistant = (x) => {
   if ("at" in x) {
     if (!Number.isFinite(Date.parse(String(x.at)))) throw new Error(`prior 夹具 at 解析不出时刻:${JSON.stringify(x.at)} —— 用 ISO 串`);
   }
@@ -369,6 +437,9 @@ const mkPriorEntry = (x) => {
   if (x.commit) b.push({ type: "tool_use", name: "Bash", input: { command: "git commit -m x" } });
   if (x.bash) for (const cmd of (Array.isArray(x.bash) ? x.bash : [x.bash])) {
     b.push({ type: "tool_use", name: "Bash", input: { command: cmd } });
+  }
+  if (x.ps) for (const cmd of (Array.isArray(x.ps) ? x.ps : [x.ps])) {
+    b.push({ type: "tool_use", name: "PowerShell", input: { command: cmd } });
   }
   if (x.agent) b.push({ type: "tool_use", name: "Agent",
     input: typeof x.agent === "object" ? { subagent_type: x.agent.type, prompt: x.agent.prompt } : { subagent_type: x.agent } });
@@ -385,11 +456,13 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...("bgTasks" in c ? { bgTasks: c.bgTasks } : {}),
   ...("debtFacts" in c ? { debtFacts: c.debtFacts } : {}),
   ...("diffFacts" in c ? { diffTier: () => c.diffFacts } : {}),
+  ...("headFacts" in c ? { headFacts: () => c.headFacts } : {}),
+  ...("hookCheckout" in c ? { hookCheckout: c.hookCheckout } : {}),
   // `pLedger` = P 的跨批持久账注入(2026-08-22 亲签)。与 batchGoal 同族:注入通道非动作。
   ...("pLedger" in c ? { pLedger: c.pLedger } : {}),
   // `prior` = [{text, write?, …}, …] ⇒ 拼成 assistant entries 交给 priorEntries。
   // 没写 `prior` 就**不传**(window() 保持 null),与生产上「取不到窗口」一致。
-  ...(Array.isArray(c.prior) ? { priorEntries: c.prior.map(mkPriorEntry) } : {}),
+  ...(Array.isArray(c.prior) ? { priorEntries: c.prior.flatMap(mkPriorEntries) } : {}),
 });
 // ── `--migrate-check <id>`:**单条规则**的迁移标准(秒级)────────────────────────
 // 立此模式的理由(2026-08-20,用户问「迁移和切换的具体标准是什么」):
@@ -526,9 +599,18 @@ for (const r of RULES) {
       else if ("debtFacts" in base) withFields.debtFacts = base.debtFacts;
       else delete withFields.debtFacts;
     }
-    const merged = isReplace
+    let merged = isReplace
       ? { ...withFields, text: replaceText }
       : { ...withFields, text: `${base.text || ""}${e.sample.text ? " " + e.sample.text : ""}` };
+    // `then`(a2155edb):正例带窗口内时序时,出路是「**现在**再做一件事」——接成时间线最末一项,
+    //   而不是塞回主 assistant 条目(那在排队问题之前,按 ND 的新判据本就不该算)。
+    //   prior 面认得的字段进末项,其余(注入通道)仍并在顶层。
+    if (!isReplace && Array.isArray(base.then)) {
+      const tailItem = {}, top = { ...base };
+      for (const [k, v] of Object.entries(rest)) { if (k !== "text" && PRIOR_KEYS.has(k)) tailItem[k] = v; else if (k !== "text") top[k] = v; }
+      if (e.sample.text) tailItem.text = e.sample.text;
+      merged = { ...top, then: [...base.then, tailItem] };
+    }
     const tag = `${r.id} 出路自证[正例${pi}]:${e.say.replace(/\*/g, "").slice(0, 24)}…`;
     // ── say ↔ sample 词面咬合(D81 的**部分**处置,批 117;先例=doctest)────────
     //   doctest 之所以不漂,是因为**说明里的例子就是被执行的那个东西**——说明与测试

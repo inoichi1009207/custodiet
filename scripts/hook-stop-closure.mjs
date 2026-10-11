@@ -158,6 +158,203 @@ function attachBatchLog(g, git = (args) => execFileSync("git", args, { encoding:
   } catch { return g; }
 }
 
+const _gitHere = (args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+
+/** `git diff --name-status -M -z <range>` 的解析(唯一实现;分档事实与 HEAD 移动事实共用)。 */
+function gitNameStatus(git, range) {
+  const parts = String(git(["-c", "core.quotepath=false", "diff", "--name-status", "-M", "-z", ...range, "--"]) || "").split("\0");
+  const files = [];
+  for (let k = 0; k < parts.length && parts[k];) {
+    const st = parts[k++];
+    const oldPath = /^[RC]/.test(st) ? parts[k++] : null;
+    const path = parts[k++];
+    if (!path) break;
+    files.push({ path, oldPath, status: st });
+  }
+  return files;
+}
+
+/** P 项的 **HEAD 移动事实**(红队 a27628dd:「本轮是否有承重提交 / 是否带进了闸引擎改动」改用 git 事实判)。
+ *  base = 本会话上次 P 结清时的 HEAD。返回 `{ base, head, root, commits:[{sha, at, files}], engineAnchorAt }`:
+ *    · base 是 HEAD 祖先 ⇒ `base..HEAD` 首父链上的每个提交,改动取**对第一父**(merge 同理:子代理在 worktree 改、
+ *      父侧 `merge --no-ff` / `--squash`+commit / cherry-pick 合回,都在这里现形);
+ *    · 不是祖先(amend / reset / 换分支)⇒ 取 merge-base..HEAD 首父链上的提交(红队 a2a9f58b BP-9:原取「base 与 HEAD 的
+ *      树差」当一笔 ⇒ `reset --hard HEAD~1` 再提交业务改动时,被撤掉的承重 / 闸文件被算成改动),各自改动**只留 base 与 HEAD 之间
+ *      真有差的路径**(只改提交信息的 amend ⇒ 无改动;amend 进新闸改动 ⇒ 正好是那几处);标 `rewritten`。
+ *    · 每个提交带 `parents` 与 `branches`(合回提交的分支名:第二父上的分支指针 ∪ 合回标题里的 `Merge branch 'X'`;
+ *      非合回提交为 [])——原供 P 的红队点名抵账(BP-8),该抵账已撤(D149④),现无消费者;
+ *      每个合回提交多一次 `git branch --points-at` 调用,留待 D149④ 的非文本判据决定去留(红队 a12212b9 附节二④)。
+ *    · engineAnchorAt = 范围起点**及更早**的最后一次带闸引擎改动的提交时刻(首父链,ms),P 的红队凭证切点。
+ *      非祖先时取「base 自身那条链」与 merge-base 两者较晚的一个(BP-3:原只取 merge-base,amend 进已红队提交时切点回退得更早
+ *      ⇒ 旧红队照样抵账;与祖先情形「切点 = base 上最后一次闸改动」对齐)。
+ *    · 范围首父链提交 > 60(CAP)⇒ 不再返回 null(红队 a9af71da BP-1):整段当一笔聚合提交
+ *      `{sha:HEAD, at, files:范围净差, aggregated:true, count}`,见函数内注。
+ *  取不到(基点不合法、git 失败/超时)⇒ null ⇒ P 回退命令语法判据(fail-closed,不静默放行),
+ *  且 hook 不推进基点(BP-2)。git 可注入(自测)。pathspecs = 闸引擎 pathspec(由 P 提供,与 ENGINE_REL 同一口径)。 */
+export function readHeadFacts(base, git = _gitHere, pathspecs = []) {
+  if (typeof base !== "string" || !/^[0-9a-f]{7,64}$/i.test(base)) return null;
+  const HEX = /^[0-9a-f]{40,64}$/i;
+  try {
+    const root = String(git(["rev-parse", "--show-toplevel"]) || "").trim();
+    const head = String(git(["rev-parse", "HEAD"]) || "").trim();
+    const full = String(git(["rev-parse", "--verify", `${base}^{commit}`]) || "").trim();
+    if (!root || !HEX.test(head) || !HEX.test(full)) return null;
+    const CAP = 60;
+    const commits = [];
+    let anchor = full;
+    let ancestor = true;
+    try { git(["merge-base", "--is-ancestor", full, head]); } catch { ancestor = false; }
+    if (!ancestor) {
+      anchor = String(git(["merge-base", full, head]) || "").trim();
+      if (!HEX.test(anchor)) return null;
+    }
+    if (anchor !== head) {
+      // 字段以 \x1f 分隔:sha、提交时刻、父提交(空格分隔)、标题
+      const lines = String(git(["rev-list", "--first-parent", `--max-count=${CAP + 1}`, "--format=%H%x1f%ct%x1f%P%x1f%s", "--no-commit-header", `${anchor}..${head}`]) || "")
+        .split("\n").map((s) => s.trim()).filter(Boolean);
+      // 非祖先:只留 base 与 HEAD 之间真有差的路径(BP-9)
+      let differ = null;
+      if (!ancestor) {
+        differ = new Set();
+        for (const x of gitNameStatus(git, [full, head])) { differ.add(x.path); if (x.oldPath) differ.add(x.oldPath); }
+      }
+      const keep = (files) => (differ ? files.filter((x) => differ.has(x.path) || (!!x.oldPath && differ.has(x.oldPath))) : files);
+      if (lines.length > CAP) {
+        // 红队 a9af71da BP-1:原来这里返回 null ⇒ hook 不推进基点 ⇒ 范围只增不减 ⇒ 本会话此后事实恒 null、P 永久退回语法面
+        //   (语法面看不见 merge 合回的闸改动;跑齐三通道也恢复不了)。现把整段范围当**一笔聚合提交**:改动取范围净差
+        //   (一次 diff,无上限),带范围内首父链提交数 `count`(取不到按 CAP+1 计,只会多计)与 `aggregated: true`;
+        //   sha / at 取 HEAD(首父链第一行)。P 侧按 `count` 计账(偏严)、按范围键 `agg:<基点>..<HEAD>` 去重(codex 257-p-agg-r1 断言 2:
+        //   只按 HEAD sha 去重会吞掉变大的范围;基点非全长 sha ⇒ 不去重);P 结清即推进基点 ⇒ 溢出可恢复。
+        //   CEILING:净差看不见「范围内改了又改回」的承重改动(净差为空 ⇒ 不计);合回分支名不取(点名覆盖已撤,无消费者)。
+        const [sha, ct] = lines[0].split("\x1f");
+        if (!HEX.test(sha || "") || sha.toLowerCase() !== head.toLowerCase()) return null;
+        let cnt = NaN;
+        try { cnt = Number(String(git(["rev-list", "--first-parent", "--count", `${anchor}..${head}`]) || "").trim()); } catch { /* 取不到 ⇒ 按 CAP+1 */ }
+        commits.push({ sha, at: /^\d+$/.test(ct || "") ? +ct * 1000 : null, files: keep(gitNameStatus(git, [anchor, head])), parents: [], branches: [],
+          aggregated: true, count: Number.isInteger(cnt) && cnt > CAP ? cnt : CAP + 1, ...(ancestor ? {} : { rewritten: true }) });
+      } else for (const ln of lines.reverse()) {
+        const [sha, ct, ps = "", subject = ""] = ln.split("\x1f");
+        if (!HEX.test(sha || "")) return null;
+        const parents = ps.split(/\s+/).filter((p) => HEX.test(p));
+        const files = keep(gitNameStatus(git, [`${sha}^1`, sha]));
+        const branches = [];
+        if (parents.length > 1) {
+          const m = /^Merge (?:remote-tracking )?branch '([^']+)'/.exec(subject);
+          if (m) branches.push(m[1]);
+          try {
+            for (const b of String(git(["branch", "--format=%(refname:short)", "--points-at", parents[1]]) || "").split("\n").map((s) => s.trim()).filter(Boolean)) {
+              if (!branches.includes(b)) branches.push(b);
+            }
+          } catch { /* 分支指针取不到 ⇒ 只用标题 */ }
+        }
+        commits.push({ sha, at: /^\d+$/.test(ct || "") ? +ct * 1000 : null, files, parents, branches, ...(ancestor ? {} : { rewritten: true }) });
+      }
+    }
+    let engineAnchorAt = null;
+    if (Array.isArray(pathspecs) && pathspecs.length) {
+      const at = (rev) => { const ct = String(git(["log", "--first-parent", "-1", "--format=%ct", rev, "--", ...pathspecs]) || "").trim(); return /^\d+$/.test(ct) ? +ct * 1000 : null; };
+      const xs = [at(full), ...(ancestor ? [] : [at(anchor)])].filter((x) => x !== null);
+      engineAnchorAt = xs.length ? Math.max(...xs) : null;
+    }
+    return { base: full, head, root, commits, engineAnchorAt };
+  } catch { return null; }
+}
+
+/** P 的 HEAD 基点(每会话一份:`.claude/.p-head/<会话 id>.json`,gitignore 面)。
+ *  按会话分文件:同一 checkout 上别的会话结清不得替本会话推进基点。
+ *  失效条件:无会话 id ⇒ 不读不写(P 回退语法判据)。 */
+const P_HEAD_DIR = ".claude/.p-head";
+const pHeadFile = (sid) => (typeof sid === "string" && /^[\w-]{1,128}$/.test(sid) ? `${P_HEAD_DIR}/${sid}.json` : null);
+function readPHead(sid) {
+  const p = pHeadFile(sid);
+  if (!p) return null;
+  try { const j = JSON.parse(fs.readFileSync(p, "utf8")); return typeof j.head === "string" && /^[0-9a-f]{40,64}$/i.test(j.head) ? j.head : null; }
+  catch { return null; }
+}
+/** 写基点。`head` = 读 git 事实那一刻的 HEAD(红队 a2a9f58b BP-6:原来在这里重新 `rev-parse HEAD`
+ *  ⇒ 读事实与写基点之间落的提交永远不被审);不给才现取。 */
+function writePHead(sid, head, git = _gitHere) {
+  const p = pHeadFile(sid);
+  if (!p) return;
+  if (typeof head !== "string" || !/^[0-9a-f]{40,64}$/i.test(head)) head = String(git(["rev-parse", "HEAD"]) || "").trim();
+  if (!/^[0-9a-f]{40,64}$/i.test(head)) return;
+  fs.mkdirSync(P_HEAD_DIR, { recursive: true });
+  const tmp = `${p}.${process.pid}.tmp`;
+  try { fs.writeFileSync(tmp, JSON.stringify({ head, at: new Date().toISOString() })); fs.renameSync(tmp, p); }
+  finally { try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* 残骸不阻断 */ } }
+  // 30 天未动的会话基点顺手清掉(会话早已结束;残留只占盘,不影响判据)
+  try {
+    const old = Date.now() - 30 * 86400e3;
+    for (const n of fs.readdirSync(P_HEAD_DIR)) { const q = `${P_HEAD_DIR}/${n}`; if (fs.statSync(q).mtimeMs < old) fs.unlinkSync(q); }
+  } catch { /* 清理失败不影响 */ }
+}
+/** 基点:有基点文件用它;没有(会话第一次 Stop)⇒ 取**会话开始时刻**的 HEAD(reflog `HEAD@{时刻}`)。
+ *  会话开始时刻 = 转录里第一条带时间戳的条目。取不到 ⇒ null(P 回退语法判据)。
+ *  红队 a2a9f58b BP-2 附带:`HEAD@{早于 reflog 起点}` 带 -q 时**静默返回最老一条记录**(不报错)⇒ reflog 被截断时,
+ *  会话开始到截断点之间的提交会落在基点之前、永不被审。现读 HEAD reflog 第一行:其时刻晚于会话开始、且不是建立记录
+ *  (旧 sha 非全零;全零 = checkout 自此才有 HEAD,最老记录就是起点,照用)⇒ 当作取不到。读 reflog 的函数可注入(自测)。 */
+const _reflogFirstLine = (git) => {
+  const p = String(git(["rev-parse", "--git-path", "logs/HEAD"]) || "").trim();
+  if (!p) return "";
+  const fd = fs.openSync(p, "r");
+  try { const buf = Buffer.alloc(4096); const n = fs.readSync(fd, buf, 0, 4096, 0); return buf.toString("utf8", 0, n).split("\n")[0] || ""; }
+  finally { fs.closeSync(fd); }
+};
+/** reflog 取不到基点时的退路(红队 a9af71da BP-1 附):**未结清**的当前批的 `baseCommit`。
+ *  红队 a07e98e9 BP-5(误拦):原从台账尾部倒找第一条 arm 行、不看其后的 clear 行 ⇒ 批已结清后的新会话拿已关批的基点
+ *  ⇒ 整批提交算到新会话头上(现场 66803b1..HEAD 首父链 61 笔 ⇒ 聚合计 61)。现两处都认结清:
+ *  · `batchBaseOfGoal(g)`:hook 已读的批状态(`ctx.batchGoal` / `readBatchGoal()`),`cleared` ⇒ null(生产调用点用它);
+ *  · `batchBaseFromRows(rows)`:台账行,最后一条 arm 之后若有 clear 行 ⇒ null(默认退路,状态读不到时的兜底)。
+ *  读不到 / 没有 / 坏 ⇒ null。 */
+export function batchBaseOfGoal(g) {
+  if (!g || typeof g !== "object" || g.cleared) return null;
+  return typeof g.baseCommit === "string" ? g.baseCommit : null;
+}
+export function batchBaseFromRows(rows) {
+  for (let i = (rows || []).length - 1; i >= 0; i--) {
+    let r; try { r = typeof rows[i] === "string" ? JSON.parse(rows[i]) : rows[i]; } catch { continue; }
+    if (r && r.action === "clear") return null;                 // 最后一次 arm 之后已结清 ⇒ 没有当前批
+    if (r && r.action === "arm") return typeof r.baseCommit === "string" ? r.baseCommit : null;
+  }
+  return null;
+}
+const _batchJournalBase = () => {
+  if (process.env.STOP_CLOSURE_SELFTEST === "1") return null;   // 自测隔离(同 readPLedger:测出来的东西不得取决于磁盘上碰巧有什么)
+  try { return batchBaseFromRows(fs.readFileSync(".claude/.batch-goal.jsonl", "utf8").trim().split("\n")); }
+  catch { return null; }                                          // 台账读不到 ⇒ 无退路
+};
+/** 退路 `batchBase`(可注入,自测):reflog 那支取不到(截断 / 读不懂 / 无时间戳 / HEAD@{} 解析不出)时,当前批的 `baseCommit`
+ *  是 HEAD 祖先 ⇒ 用它当基点;否则维持 null(P 回退语法判据)。
+ *  CEILING(登记残余):批基点晚于会话开始 ⇒ 会话开始到武装之间的提交不在 git 事实范围内(只剩语法面看);
+ *  早于会话开始 ⇒ 范围更大(只会多看,方向偏严;超 60 笔走聚合)。 */
+export function pHeadBase(sid, entries, git = _gitHere, reflogFirst = _reflogFirstLine, batchBase = _batchJournalBase) {
+  if (!pHeadFile(sid)) return null;
+  const b = readPHead(sid);
+  if (b) return b;
+  const fromReflog = () => {
+    try {
+      const first = (entries || []).find((e) => e && typeof e.timestamp === "string" && Number.isFinite(Date.parse(e.timestamp)));
+      if (!first) return null;
+      const t0 = Date.parse(first.timestamp);
+      const d = new Date(t0).toISOString().replace("T", " ").replace(/\.\d+Z$/, " +0000");
+      const v = String(git(["rev-parse", "--verify", "-q", `HEAD@{${d}}`]) || "").trim();
+      if (!/^[0-9a-f]{40,64}$/i.test(v)) return null;
+      const m = /^([0-9a-f]{40,64}) [0-9a-f]{40,64} .*? (\d+) [+-]\d{4}(\t|$)/i.exec(String(reflogFirst(git) || ""));
+      if (!m) return null;                                         // reflog 读不懂 ⇒ 不知道够不够早 ⇒ 取不到
+      if (+m[2] * 1000 > t0 && !/^0+$/.test(m[1])) return null;   // 起点晚于会话开始且不是建立记录 ⇒ 被截断
+      return v;
+    } catch { return null; }
+  };
+  const v = fromReflog();
+  if (v) return v;
+  try {
+    const bb = typeof batchBase === "function" ? batchBase() : null;
+    if (typeof bb !== "string" || !/^[0-9a-f]{7,64}$/i.test(bb)) return null;
+    git(["merge-base", "--is-ancestor", bb, "HEAD"]);           // 非祖先 ⇒ 抛 ⇒ null
+    return bb;
+  } catch { return null; }
+}
+
 /** P 项分档的 diff 事实(批 257 条件 3;判据在 `lib/gate-difftier.mjs`):批基点到 HEAD **并上**基点到工作树的改动文件
  *  (提交后又在工作树还原的,两边任一处出现都算,红队 c3 BP-7 同族),带状态、改名的旧路径、新内容读不读得到。
  *  只在 P 真欠跨模型/联网时由 ctx.diffTier 惰性调用;只用 `--name-status`,不取全文(红队 c3 BP-8:逐文件 git show 会撞 hook 超时)。
@@ -170,13 +367,8 @@ export function readDiffFacts(base, git = (args) => execFileSync("git", args, { 
     if (!root) return null;
     const files = [];
     for (const range of [[base, "HEAD"], [base]]) {
-      const parts = String(git(["-c", "core.quotepath=false", "diff", "--name-status", "-M", "-z", ...range, "--"]) || "").split("\0");
-      for (let k = 0; k < parts.length && parts[k];) {
-        const st = parts[k++];
-        const oldPath = /^[RC]/.test(st) ? parts[k++] : null;
-        const path = parts[k++];
-        if (!path) break;
-        files.push({ path, oldPath, status: st, readable: /^[AM]/.test(st) ? exists(`${root}/${path}`) : false, head: range.length === 2 });
+      for (const f of gitNameStatus(git, range)) {
+        files.push({ ...f, readable: /^[AM]/.test(f.status) ? exists(`${root}/${f.path}`) : false, head: range.length === 2 });
       }
     }
     if (files.length > 600) return null;
@@ -469,6 +661,7 @@ function perfLine() {
 //   hook feedback 天然是轮次边界——它之后的输出才是「对上次拦截的回应」。
 export function lastTurn(entries) {
   let start = 0;
+  const blockedIds = blockedStopIds(entries);
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
     // ⚠️ 边界③(2026-10-09 批 257 实撞,探针直证):Stop 拦截也会以 `type:"attachment"` +
@@ -478,10 +671,10 @@ export function lastTurn(entries) {
     //   本轮 116 条、含被拦旧句)。与②′同理 `i+1`:拦截之后才是「对拦截的回应」。
     //   只认**已结束**的那次 Stop(其后已有同 toolUseID 的汇总行)——进行中的这一次里别的 hook 先落的附件不得切窗(热修红队 BP-2)。
     //   起点取那条汇总行之后:汇总行里带着各 hook 的全文(含判官提示词),不得进证据窗(热修红队附节二 4)。
-    if (e.type === "attachment" && e.attachment?.type === "hook_blocking_error" && e.attachment?.hookEvent === "Stop") {
-      const j = entries.findIndex((x, k) => k > i && x?.type === "system" && x.hookCount !== undefined && x.toolUseID === e.attachment.toolUseID);
-      if (j > i) { start = j + 1; break; }
-    }
+    //   a2155edb BP-6:「这次 Stop 被拦没有」改由 gate-ctx 的 `isBlockedStop` 判(唯一实现,被拦后续跑的补收回扫同用它):
+    //   同 toolUseID 拦截附件、或汇总行前的 feedback 行(判官型 prompt hook 只留这一种)任一即算。倒着扫先遇到的是
+    //   汇总行(它在附件与 feedback 行之后),起点取它之后;没有汇总行的那次(进行中)不在这里切,与原③一致。
+    if (e.type === "system" && e.hookCount !== undefined && isBlockedStop(entries, i, blockedIds)) { start = i + 1; break; }
     if (e.type === "system" && e.hookCount !== undefined) {
       const s = JSON.stringify(e.hookErrors || []) + JSON.stringify(e.hookAdditionalContext || "");
       // ⚠️ `i + 1` 而不是 `i`:本闸自己的输出**不得进入自己的证据窗口**。
@@ -506,7 +699,7 @@ export function lastTurn(entries) {
     //   正是 S7 立 `i+1` 要断的那条洗白链)。同理 `i+1` 排除,反馈之后才是「对拦截的回应」。
     //   真实用户发言也可能是字符串形态 ⇒ 判据锚定 harness 固定前缀,不看正文关键词。
     // v7(codex v6 接缝 1):用户亲口打的话恰以这个前缀开头(贴报错来问)⇒ 是用户发言,走边界①,不当 hook 反馈切掉
-    if (typeof c === "string" && c.startsWith("Stop hook feedback:") && e.origin?.kind !== "human") { start = i + 1; break; }
+    if (isStopFeedbackLine(e)) { start = i + 1; break; }
     // 边界②″ 已撤(2026-10-09):lanes 转投 v1 的插件消息形态已退役;v2 以 isMeta 行附全文、引擎仍落 feedback 行与附件,由②′/③认。
     //   lanes 附给模型的闸全文(isMeta 且以 Stop hook feedback: 开头)由上一行②′按 `i+1` 当边界(窗口从它之后起),不当边界①。
     //   热修红队 BP-4/9(10-09):无 origin 的 isMeta 行(技能/命令展开的正文、系统提醒)与插件消息都不是新一轮的起点
@@ -635,7 +828,8 @@ function checkA(entries) {
 //   **规则不追溯**:生效时刻(`CODEX_A_SINCE`)之前发起的作业不入账。提示里的 poll 用这次发起用的那支 runner,能力按它判。
 // 残余(照实列):
 //   ①历史转录没有 BODY 块:旧 runner 发起、用 cat 等 shell 读法读 R 的会判待读(v5 接受的代价;出路一条 `--poll J` 或 Read R)。
-//   ②Read R 不证读全:读到第 10 行起的任意一段正文即算(10-10 收紧:只读到 9 行头部不算)。显式 `--out` 复用同一路径不占位,旧件可能被当成新件读。
+//   ②Read R 不证读全:读到正文(第二个 `---` 之后;第 1 行没读到时按第 9 行起)任意一段即算(10-10 收紧:只读到头部不算;
+//     a2155edb BP-8 更正行号——runner 头部 8 行、正文第 9 行起,原写第 10 行;空正文回件完整读过头部并读到文件尾即算)。显式 `--out` 复用同一路径不占位,旧件可能被当成新件读。
 //   ③R 读不到(超过 2MB、已移走)时 BODY 块只比 J 不比正文。
 //   ④别的会话发起、本会话只 poll 的作业不入账。
 //   ⑤hook 进程 os.tmpdir() 未直证;一个 CODEX_LOG 都没留下的作业,目录不一致时只能落「未知」。
@@ -656,8 +850,18 @@ const CODEX_SKEW_MS = 2000;                      // 下界容差:runner 的 star
 export const CODEX_A_SINCE = Date.parse("2026-10-10T06:33:44Z");
 // runner 的发起占位行(与 codex-run.mjs 的 PLACEHOLDER_RE 同一正则,自测核两边一致):Read 到它永不算读回
 export const CODEX_PLACEHOLDER_RE = /^\(codex-run 作业 \S+ 运行中,结果未产出——占位\)\s*$/;
-// runner 写的结果件头部固定 8 行 `---…---` 加 1 空行,正文从第 10 行起;Read 只读到头部不算读回(红队 7e1392f 轮 BP-4)
-export const CODEX_BODY_FIRST_LINE = 10;
+// runner 写的结果件头部是两个 `---` 之间共 8 行(含两条 `---`),**正文从第 9 行起**(codex-run.mjs `resultHeader`;
+//   红队 a2155edb BP-8:原写「8 行加 1 空行、正文第 10 行」与 runner 不符——runner 头部以 `---\n` 收尾、正文紧接其后,
+//   没有空行)。Read 只读到头部不算读回(红队 7e1392f 轮 BP-4)。判读回时优先按读到的第二个 `---` 定位,本常量只在
+//   第 1 行没读到时兜底;自测用 runner 的 `resultHeader` 拼夹具并核两边一致(照 PLACEHOLDER_RE 的对齐做法)。
+export const CODEX_BODY_FIRST_LINE = 9;
+/** 结果件去掉 runner 头部(第 1 行是 `---` 时剥到第二个 `---` 为止),余下即正文;不是该形态原样返回。 */
+export function codexStripHeader(s) {
+  const lines = String(s).split(/\r?\n/);
+  if (lines[0]?.trim() !== "---") return String(s);
+  const k = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
+  return k > 0 ? lines.slice(k + 1).join("\n") : String(s);
+}
 const CODEX_ARG_ERROR = /缺 --task|任务文件不存在|拒绝入参|未知参数|参数 \S+ 缺值/;
 
 /** tool_result 的正文(字符串或 text 块数组)。 */
@@ -668,25 +872,56 @@ function codexResultText(b) {
   return "";
 }
 
-/** 段内分词:认单/双引号;`ps` = PowerShell(反斜杠是普通字符)。不做变量展开。 */
+/** 段内分词:认单/双引号;`ps` = PowerShell(反斜杠是普通字符,反引号是转义符,`@"…"@` here-string 整段一个词的一部分)。
+ *  不做变量展开。转义与引号规则与 gate-cmd `quoteScan(…, ps)` 同一方言(红队 a811daae BP-6:掩码与分词须同一套)。 */
 export function codexWords(seg, ps = false) {
+  return codexWordsShaped(seg, ps).map((x) => x.w);
+}
+/** 同 `codexWords`,每个词另带 `shape`:与 `w` 等长,**引号内或转义而来**的字符换成 `\u0001`,裸字符原样。
+ *  给「算子只认引号外」的判断用(复核红队 aaf414b6 BP-3:`-Value ">" -Path 日记` 的 `">"` 分词后与裸 `>` 同形,
+ *  `dropRedirWords` 把它连同下一词 `-Path` 一起剔掉)。`w` 与 `codexWords` 逐字相同(唯一实现,`codexWords` 由此派生)。 */
+function codexWordsShaped(seg, ps = false) {
+  const QCH = "\u0001";
   const s = String(seg || "");
   const out = [];
-  let cur = "", has = false, q = null;
+  let cur = "", shape = "", has = false, q = null;
+  const lit = (x) => { cur += x; shape += QCH.repeat(x.length); };   // 引号内 / 转义:字面
+  const bare = (x) => { cur += x; shape += x; };                      // 引号外:裸字符
+  const flush = () => { if (has || cur) out.push({ w: cur, shape }); cur = ""; shape = ""; has = false; };
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
-    if (q === "'") { if (c === "'") q = null; else cur += c; continue; }
+    if (q === "'") { if (c === "'") q = null; else lit(c); continue; }
+    // bash `\`+换行 = 续行:引号外与双引号内都整对删除(不断词、不留字符)。原把换行当转义出的字面字符收进词里,
+    //   BP-2 的 `sed -i '…' \⏎  AGENTS.md` 因此多出一个 "\n" 目标(aaf414b6 BP-2 同批;单引号内不是转义,不动)。
+    if (!ps && q !== "'" && c === "\\" && (s[i + 1] === "\n" || (s[i + 1] === "\r" && s[i + 2] === "\n"))) {
+      i += s[i + 1] === "\r" ? 2 : 1; continue;
+    }
     if (q === '"') {
       if (c === '"') { q = null; continue; }
-      if (!ps && c === "\\" && i + 1 < s.length && /["\\$`]/.test(s[i + 1])) { cur += s[++i]; continue; }
-      cur += c; continue;
+      if (!ps && c === "\\" && i + 1 < s.length && /["\\$`]/.test(s[i + 1])) { lit(s[++i]); continue; }
+      if (ps && c === "`" && i + 1 < s.length) { lit(s[++i]); continue; }
+      lit(c); continue;
+    }
+    if (ps && c === "@" && (s[i + 1] === '"' || s[i + 1] === "'") && /^\r?\n/.test(s.slice(i + 2, i + 4))) {
+      const close = s.indexOf("\n" + s[i + 1] + "@", i + 2);
+      const end = close < 0 ? s.length : close + 3;
+      lit(s.slice(s[i + 2] === "\r" ? i + 4 : i + 3, close < 0 ? s.length : close)); has = true;
+      i = end - 1; continue;
+    }
+    if (ps && c === "`" && i + 1 < s.length) {
+      const n = s[++i];
+      if (n === "\r" || n === "\n") {                          // 行尾反引号 = 续行,等于空白
+        if (n === "\r" && s[i + 1] === "\n") i++;
+        flush(); continue;
+      }
+      lit(n); has = true; continue;
     }
     if (c === "'" || c === '"') { q = c; has = true; continue; }
-    if (/\s/.test(c)) { if (has || cur) out.push(cur); cur = ""; has = false; continue; }
-    if (!ps && c === "\\" && i + 1 < s.length) { cur += s[++i]; has = true; continue; }
-    cur += c; has = true;
+    if (/\s/.test(c)) { flush(); continue; }
+    if (!ps && c === "\\" && i + 1 < s.length) { lit(s[++i]); has = true; continue; }
+    bare(c); has = true;
   }
-  if (has || cur) out.push(cur);
+  flush();
   return out;
 }
 
@@ -713,7 +948,7 @@ export function codexUnwrapSubst(words, ps = false) {
 function codexCommandSegs(cmd, ps, depth = 0) {
   const out = [];
   const groups = [];
-  for (const seg of segments(cmd)) {
+  for (const seg of segments(cmd, ps)) {                 // 切段与分词同一方言(红队 a811daae BP-6 同族)
     const ws = codexUnwrapSubst(codexWords(seg, ps), ps);
     for (let a = 0, k = 0; k <= ws.length; k++) if (k === ws.length || ws[k] === "&") { if (k > a) groups.push(ws.slice(a, k)); a = k + 1; }
   }
@@ -908,16 +1143,38 @@ export function codexLedger(entries, env = {}) {
         // 读到的是 runner 的发起占位 ⇒ 永不算读回(v7,按内容判,不靠时间戳)
         const plain = text.split(/\r?\n/).map((l) => l.replace(/^\s*\d+[\t→]/, "")).join("\n").trim();
         // 一行带行号的内容都没有(越界 offset 只回一句提示)也不算读到(红队 d1cae02 轮 BP-6);
-        //   只读到 runner 写的 9 行头部(`---` 包着的版本/模型/沙箱…)也不算——正文从第 10 行起(红队 7e1392f 轮 BP-4:
-        //   Read limit:10 看一眼头部就被判读回)
+        //   只读到 runner 写的头部(`---` 包着的版本/模型/沙箱…)也不算(红队 7e1392f 轮 BP-4:Read limit 看一眼头部就被判读回)。
         const lineNos = [...text.matchAll(/^\s*(\d+)[\t→]/gm)].map((m) => Number(m[1]));
-        const reachesBody = lineNos.some((n) => n >= CODEX_BODY_FIRST_LINE);
-        reads.push({ seq: ev.seq, ts: ev.ts, p, ph: CODEX_PLACEHOLDER_RE.test(plain) || !lineNos.length, head: !reachesBody });
         // 分页 Read 同一文件:按行号拼接后取块(v6,codex v5 第 4 条:BODY 跨页时单页都不完整)。
         //   v7(codex v6 第 5 条):每段连续行号各自拼——前面有没读到的空档,不连累后面完整的块;不用 Math.min(...) 展开(红队附二-4)
+        //   (a2155edb:拼页先于下面判「读到正文没有」,正文起始行要用到本页)
         const pg = pages.get(p) || new Map();
         pages.set(p, pg);
         for (const l of text.split(/\r?\n/)) { const m = /^\s*(\d+)[\t→](.*)$/.exec(l); if (m) pg.set(Number(m[1]), m[2]); }
+        // 正文起始行(红队 a2155edb BP-8:原写死第 10 行,而 runner 实际头部是两个 `---` 之间共 8 行、正文从第 9 行起,
+        //   一行正文的回件完整 Read 后永远判「只读到头部」;自测 HEAD 多带一个空行所以没逮到):
+        //   **按第二个 `---` 定位**——已读到的页里第 1 行是 `---` 且其后某行也是 `---` ⇒ 正文从那行的下一行起;
+        //   第 1 行没读到(从中间开读)⇒ 退回 runner 头部常量推导的 `CODEX_BODY_FIRST_LINE`(自测核它与 runner 真实头部一致)。
+        let dashAt = null;
+        if (String(pg.get(1) ?? "").trim() === "---") {
+          for (const n of [...pg.keys()].sort((x, y) => x - y)) if (n > 1 && String(pg.get(n)).trim() === "---") { dashAt = n; break; }
+        }
+        const bodyFirst = dashAt != null ? dashAt + 1 : CODEX_BODY_FIRST_LINE;
+        const reachesBody = lineNos.some((n) => n >= bodyFirst);
+        // 空正文回件(只有头部):**完整读过即读回**(a2155edb BP-8 的派出方口径)。「完整」= 头部 1..收尾 `---` 每行都已读到、
+        //   本次读到了收尾那行、且本次读到了文件尾(近似:返回行数少于请求上限,没给上限按 Read 缺省 2000)、收尾之后只有空行。
+        //   ⚠️ 「行数少于上限 ⇒ 到了文件尾」这个前提**并不成立**(红队 a811daae 附节二④;本机 changelog 照实:
+        //   2.1.145「whole-file read exceeds the token limit ⇒ truncated first page with a "PARTIAL view" notice」——
+        //   超 token 限时返回的是截断的首页,行数可能远少于 2000;2.1.86「deduplicates unchanged re-reads」——
+        //   重复读未变文件不回正文,本函数看到的行可能是 0)。现在不出事,靠的是另两条同时成立:头部 1..收尾 `---`
+        //   全部读到、且**收尾之后读到的行全是空行**——截断首页在空正文回件上就是全文(回件短),在非空回件上
+        //   收尾后必有非空行而不满足 tailBlank。判据不改;回件若长到首页截断且截断点恰在空行段,此近似会失效。
+        //   判「正文确实为空」在下面结账处做:能读到 R 时以 R 的当前内容为准,读不到才信本次读的文件尾。
+        const lim = Number(inp.limit) > 0 ? Number(inp.limit) : 2000;
+        const fullHead = dashAt != null && lineNos.includes(dashAt) && [...Array(dashAt).keys()].every((k) => pg.has(k + 1));
+        const tailBlank = lineNos.filter((n) => n > (dashAt ?? Infinity)).every((n) => !String(pg.get(n) ?? "").trim());
+        const emptyBodyRead = fullHead && tailBlank && lineNos.length < lim;
+        reads.push({ seq: ev.seq, ts: ev.ts, p, ph: CODEX_PLACEHOLDER_RE.test(plain) || !lineNos.length, head: !reachesBody, emptyBodyRead });
         if (/^\s*\d+[\t→]CODEX_(BODY|FAIL)_BEGIN=/m.test(text)) pg.hasBegin = true;
         if (pg.hasBegin) {                                       // 没见过 BEGIN 的文件不拼(省得每次 Read 都重扫)
           const keys = [...pg.keys()].sort((x, y) => x - y);
@@ -1128,8 +1385,11 @@ export function codexLedger(entries, env = {}) {
       }
       const afterDone = (r) => (doneTs != null ? (r.ts != null && r.ts >= doneTs)
         : ledger && doneSeq != null ? r.seq > doneSeq : true);
+      // 空正文回件(a2155edb BP-8):完整读过头部且读到文件尾即算;R 读得到时以 R 当前正文是否为空为准
+      //   (R 有正文而本次只回了头部——例如 limit 恰好截在收尾 `---`——不算)。
+      const rBodyEmpty = typeof rBody === "string" ? !codexStripHeader(rBody).trim() : true;
       const readBack = mine("BODY").some((d) => typeof rBody !== "string" || codexNormBody(d.text) === codexNormBody(rBody)) ||
-        reads.some((r) => r.seq > job.launchSeq && job.R.has(r.p) && !r.ph && !r.head && afterDone(r));
+        reads.some((r) => r.seq > job.launchSeq && job.R.has(r.p) && !r.ph && (!r.head || (r.emptyBodyRead && rBodyEmpty)) && afterDone(r));
       status = readBack ? "read" : kind === "done" ? "pending-read" : kind === "running" ? "running" : "unknown";
     }
     const label = J || `codex 作业(tool_use …${job.id.slice(1)})`;
@@ -1383,11 +1643,221 @@ export function ranProbe(blob) {
  *  `node gen.mjs > ~/…/memory/x.md` 对 I 隐形)。允许盘符 / `~` / `$HOME` 前缀;
  *  `${VAR}`、含空格的引号路径仍解不出——那是**漏放侧**(bashWrites 直接 false,I 根本不跑),不是误报侧。 */
 const PATH_TOK = String.raw`(?:[A-Za-z]:|~|\$HOME|\$\{HOME\})?[\w./-]+`;
-const REDIRECT_TARGET_RE = new RegExp(String.raw`(?<![=\-])>>?\s*['"]?(${PATH_TOK})`, "g");
-export function bashWriteTargets(rawCmd, pathRe) {
-  // ⚠️ heredoc 界符要认**引号形式**(codex 2026-08-20:原式只认 `<<'X'` 与 `<<X`,
-  //   而 `cat <<"EOF"` 剥不掉 ⇒ **正文被当命令**,产生假写入)。
-  const noHeredoc = String(rawCmd).replace(/<<-?\s*(['"]?)(\w+)\1[\s\S]*?^\s*\2\s*$/gm, " ");
+/** 剥 heredoc 正文(数据不是命令),**保留界符所在行的其余部分**。
+ *  ⚠️ heredoc 界符要认**引号形式**(codex 2026-08-20:原式只认 `<<'X'` 与 `<<X`,
+ *   而 `cat <<"EOF"` 剥不掉 ⇒ **正文被当命令**,产生假写入)。
+ *  ⚠️ a2155edb(BP-7 同批):原式从界符**之后**一路吃到收尾行,把同一行的 `>> docs/noun-diary.md` 也吃掉了
+ *   ——`cat <<'EOF' >> 文件` 是追加的常见写法,真写入因此对本函数隐形。 */
+function stripHeredocBodies(cmd) {
+  return String(cmd).replace(/<<-?\s*(['"]?)(\w+)\1([^\n]*)\n[\s\S]*?^\s*\2\s*$/gm, (_m, _q, _w, rest) => " " + rest);
+}
+/** 一段命令(已按语句分隔符切过)里**引号外**的 `&`、`(`、`)`、反引号再切一刀:子 shell、命令替换、后台 `&`、
+ *  `2>&1` 都在这里断开。返回原文切片(引号内容原样保留,供取 JS/Python 写调用的入参)。 */
+function subParts(seg, ps = false) {
+  const masked = stripQuoted(seg, ps);
+  const esc = ps ? "`" : "\\";
+  const out = [];
+  let at = 0;
+  for (let i = 0; i < masked.length; i++) {
+    if (masked[i] === esc) { i++; continue; }
+    if ("&()`".includes(masked[i])) { out.push(seg.slice(at, i)); at = i + 1; }
+  }
+  out.push(seg.slice(at));
+  return out.map((s) => s.trim()).filter(Boolean);
+}
+/** 重定向目标:只认**引号外**的 `>` / `>>`(`awk 'NF > 3'`、`--cond "…>1MB"`、node -e 里的 `=>` 都在引号里,a2155edb BP-2);
+ *  目标 token 从原文取(可带引号)。`>&1` 这类 fd 复制、`/dev/*`、PowerShell 的 `$null` 不算写。 */
+function redirectTargets(part, ps = false) {
+  const masked = stripQuoted(part, ps);
+  const esc = ps ? "`" : "\\";
+  const out = [];
+  for (let i = 0; i < masked.length; i++) {
+    if (masked[i] === esc) { i++; continue; }
+    if (masked[i] !== ">") continue;
+    const prev = i > 0 ? masked[i - 1] : "";
+    if (prev === "=" || prev === "-") continue;                 // `=>` 箭头、`->`(2026-08-22 实撞,--fp 第 3 笔)
+    let j = i + 1;
+    if (masked[j] === ">") j++;
+    if (masked[j] === "|") j++;                                 // `>|` 强制覆盖
+    while (j < part.length && /\s/.test(part[j])) j++;
+    if (part[j] === "&") { i = j; continue; }                   // `>&2`
+    const tok = codexWords(part.slice(j), ps)[0] || "";
+    i = j;
+    if (!tok || /^(\/dev\/|\$null$|nul$)/i.test(tok)) continue;
+    out.push(tok);
+  }
+  return out;
+}
+/** 解释器内联脚本里的写文件调用(入参是字面量路径才取得到;变量、path.join 取不到——漏放侧,照实列在头注)。 */
+const API_WRITE_RES = [
+  // node:fs 同步 / 回调 / promises / 流
+  /\b(?:writeFileSync|appendFileSync|writeFile|appendFile|createWriteStream)\s*\(\s*(['"`])([^'"`]+)\1/g,
+  // python:open(路径, 'a'|'w'|'x'|'+') 与 Path(路径).write_text/.write_bytes/.open('a')
+  /\bopen\s*\(\s*[rRbBuU]?(['"])([^'"]+)\1\s*,\s*(?:mode\s*=\s*)?[rRbBuU]?['"][^'"]*[wax+][^'"]*['"]/g,
+  /\bPath\s*\(\s*[rR]?(['"])([^'"]+)\1\s*\)\s*\.\s*(?:write_text|write_bytes|open\s*\(\s*['"][^'"]*[wax+])/g,
+  // .NET:[IO.File]::WriteAllText / AppendAllText / AppendAllLines …
+  /\[(?:System\.)?IO\.File\]::(?:WriteAll\w*|AppendAll\w*)\s*\(\s*(['"])([^'"]+)\1/gi,
+];
+/** PowerShell 写文件 cmdlet:取 -Path / -LiteralPath / -FilePath 的值,没有就取第一个位置参数(这三个 cmdlet 的 0 号位都是路径)。 */
+const PS_WRITE_CMDLETS = /^(?:add-content|set-content|out-file|tee-object|ac)$/i;
+const PS_MOVE_CMDLETS = /^(?:copy-item|move-item|cpi|mi|copy|move)$/i;
+const PS_PATH_PARAMS = /^(?:path|literalpath|filepath|pspath|lp|destination)$/i;
+const PS_SWITCHES = /^(?:nonewline|force|append|noclobber|passthru|whatif|confirm|asbytestream|recurse|container)$/i;
+function psTargets(words, k, move) {
+  const named = [], pos = [];
+  for (let i = k + 1; i < words.length; i++) {
+    const w = words[i];
+    if (/^-[A-Za-z]/.test(w)) {
+      const [name, inline] = w.slice(1).split(/:(.*)/s);
+      if (PS_SWITCHES.test(name)) continue;
+      const val = inline !== undefined && inline !== "" ? inline : words[++i];
+      if (val === undefined) break;
+      if (PS_PATH_PARAMS.test(name) && (!move || /^destination$/i.test(name))) named.push(val);
+      continue;
+    }
+    pos.push(w);
+  }
+  if (named.length) return named;
+  return move ? (pos.length >= 2 ? [pos[1]] : []) : (pos.length ? [pos[0]] : []);
+}
+/** 命令名比较:`/usr/bin/sed`、`sed.exe` 都是 sed;**整词**比较(a2155edb:旧式 `(?:tee|cp|mv)\s+` 缺词界,
+ *  `committee x`、`scp a b`、`gcp …` 都被当成 tee/cp)。 */
+const cmdName = (w) => String(w || "").replace(/\\/g, "/").replace(/^.*\//, "").replace(/\.exe$/i, "").toLowerCase();
+/** 包装器 → 它**带值**的选项(红队 a811daae BP-4:原式只跳 `-` 开头的词,`nice -n 10 cp`、`sudo -u bob cp`、
+ *  `xargs -I {} cp` 的选项值被当成命令名 ⇒ 写命令整个看不见)。`s` = 带值短选项字母(可附着 `-ubob` 或取下一词;
+ *  簇 `-Eu bob` 里带值字母在簇尾才取下一词),`l` = 带值长选项(`--user bob`;`--user=bob` 自带值),`pos` = 选项之后
+ *  还要吞掉的位置参数个数(timeout 的时长)。表外选项一律当无值开关——**漏表的带值选项是漏放侧**(其值被当命令名)。 */
+const CMD_WRAPPERS = {
+  sudo: { s: "ugpCDrRtTU", l: /^--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)$/ },
+  doas: { s: "uC" },
+  env: { s: "uCS", l: /^--(?:unset|chdir|split-string)$/ },
+  xargs: { s: "IdEaLnPs", l: /^--(?:arg-file|delimiter|max-args|max-lines|max-procs|max-chars|process-slot-var)$/ },
+  nice: { s: "n", l: /^--adjustment$/ },
+  ionice: { s: "cnp", l: /^--(?:class|classdata|pid)$/ },
+  nohup: {}, command: {}, busybox: {}, builtin: {},
+  time: { s: "fo", l: /^--(?:format|output)$/ },
+  exec: { s: "a" },
+  stdbuf: { s: "ioe", l: /^--(?:input|output|error)$/ },
+  timeout: { s: "sk", l: /^--(?:signal|kill-after)$/, pos: 1 },
+};
+const wrapperOptTakesNext = (w, spec) => {
+  if (/^--/.test(w)) return !w.includes("=") && !!spec.l && spec.l.test(w);
+  for (let i = 1; i < w.length; i++) if ((spec.s || "").includes(w[i])) return i === w.length - 1;
+  return false;
+};
+/** 段首的 shell 保留字 / PowerShell 关键字:**其后**仍是命令位(BP-4:`then cp …`、`do …`、`{ cp …; }`、`! cp …`
+ *  原被当成命令名)。`SH_NO_CMD`:其后不是命令(`for x in …` 的变量名、`case x in`)——整段无命令。 */
+const SH_LEAD = /^(?:then|do|else|elif|if|while|until|!|\{|try|finally)$/;
+const SH_NO_CMD = /^(?:for|foreach|select|case|in|function|done|fi|esac|\}|;;)$/;
+/** 一个子段的词序列里哪些位置是**命令位**:返回 `[{k, end}]`,`end` = 该命令参数的右界(不含)——
+ *  find `-exec … \;`/`+` 的终止符、`{ … }` 的右括号都在这里截住(否则 `{ cp a b }` 的 `}` 被当成 cp 的目标)。见调用点注释。 */
+function cmdPositions(words) {
+  const out = [];
+  const start = (k, end) => {
+    for (;;) {
+      while (k < end && /^[A-Za-z_]\w*=/.test(words[k])) k++;                    // 前置 VAR=…
+      if (k >= end) return;
+      const n = cmdName(words[k]);
+      if (SH_LEAD.test(n)) {
+        if (n === "{") { const c = words.indexOf("}", k + 1); if (c > k && c < end) end = c; }
+        k++; continue;
+      }
+      if (SH_NO_CMD.test(n)) return;
+      if (n === "git") {
+        // git 子命令里只有 `mv` 在工作树里造出新路径(语料实撞:`git -C \repo mv a b`,旧式靠缺词界的 `mv\s+` 碰巧认到)
+        let j = k + 1;
+        while (j < end && /^-/.test(words[j])) { if (/^(?:-C|-c|--git-dir|--work-tree|--namespace)$/.test(words[j])) j++; j++; }
+        if (words[j] === "mv") out.push({ k: j, end });
+        return;
+      }
+      if (/^(?:echo|printf|write-host|write-output)$/.test(n)) return;
+      const spec = Object.hasOwn(CMD_WRAPPERS, n) ? CMD_WRAPPERS[n] : null;
+      if (!spec) { out.push({ k, end }); return; }
+      k++;
+      while (k < end && /^-./.test(words[k])) {                                   // 包装器自己的选项(带值的连值一起跳)
+        if (words[k] === "--") { k++; break; }
+        k += wrapperOptTakesNext(words[k], spec) ? 2 : 1;
+      }
+      for (let p = 0; p < (spec.pos || 0) && k < end; p++) k++;                   // timeout 的时长
+    }
+  };
+  start(0, words.length);
+  for (let k = 1; k < words.length; k++) {
+    if (/^-(?:exec|execdir|ok|okdir)$/.test(words[k])) {
+      let e = k + 1;
+      while (e < words.length && !/^(?:\\?;|\+)$/.test(words[e])) e++;           // find 的 -exec 以 `;`/`\;`/`+` 收尾
+      start(k + 1, e);
+    } else if (/^%?\{$/.test(words[k])) start(k + 1, words.length);
+  }
+  return out;
+}
+/** 剔除重定向词(红队 a811daae BP-3:`cp a .claude/agents/new.md 2>/dev/null` 的「最后一个位置参数」取成了
+ *  `2>/dev/null`;tee 把 `>`、`/dev/null` 当目标)。认 `>` `>>` `>|` `&>` `&>>` `<` `<<<` `>&` `<&`,前可带 fd 号或 `*`(PS);
+ *  算子自带目标(`2>/dev/null`、`2>&1`)只剔本词,裸算子(`>`、`2>`)连下一词一起剔。
+ *  重定向**目标**由 `redirectTargets` 另行(引号感知地)取,这里只管不让它冒充命令参数。
+ *  **算子只认引号外**(复核红队 aaf414b6 BP-3,365fd54 引入):原在分词后的纯词上判,引号信息已丢 ⇒
+ *  `Add-Content -Value ">" -Path docs/noun-diary.md` 里的 `">"` 被当裸算子、连 `-Path` 一起剔 ⇒ `-Value` 吞掉真路径
+ *  (ND 误拦;`Set-Content -Value "<" -Path AGENTS.md` 对 P 不可见)。现吃 `codexWordsShaped` 的词:在 `shape`
+ *  (引号内 / 转义字符已换成 \u0001)上判算子,`">x"`、`\>`、`` `> `` 都是参数;`>"x y"` 的算子在引号外,照剔。
+ *  失效条件:调用方改回喂纯词数组(无 `shape`)⇒ 按 `w` 判,退回旧行为(BP-3 复活),自测「BP-3b:」各条翻红。 */
+const REDIR_WORD = /^(?:\d+|&|\*)?(?:>>|>\||>&|<<<|<&|&>>|&>|>|<)(.*)$/s;
+function dropRedirWords(words) {
+  const out = [];
+  for (let i = 0; i < words.length; i++) {
+    const x = words[i];
+    const w = typeof x === "string" ? x : x.w;
+    const m = REDIR_WORD.exec(typeof x === "string" ? x : x.shape);
+    if (!m) { out.push(w); continue; }
+    if (m[1] === "") i++;                                                          // 裸算子:目标在下一词
+  }
+  return out;
+}
+/** sed:-i / --in-place 才是写;有 -e/-f 时全部非选项词都是文件,否则第一个非选项词是脚本、其余是文件。 */
+function sedTargets(words, k) {
+  let inPlace = false, hasScript = false, endOpts = false;
+  const rest = [];
+  for (let i = k + 1; i < words.length; i++) {
+    const w = words[i];
+    if (!endOpts && w === "--") { endOpts = true; continue; }
+    if (!endOpts && /^-/.test(w) && w.length > 1) {
+      if (/^-[A-Za-z]*i/.test(w) && !/^--/.test(w) || /^--in-place\b/.test(w)) inPlace = true;
+      if (w === "-e" || w === "-f" || w === "--expression" || w === "--file") { hasScript = true; i++; }
+      else if (/^--(expression|file)=/.test(w)) hasScript = true;
+      continue;
+    }
+    if (w !== "") rest.push(w);
+  }
+  if (!inPlace) return [];
+  return hasScript ? rest : rest.slice(1);
+}
+/** 方言自判(红队 a811daae BP-6):调用方知道工具名就传 `dialect`("bash" / "ps",或工具名 "Bash" / "PowerShell");
+ *  不知道(P 的调用点、窗口外旧调用方、夹具)⇒ 按命令自判:像 PowerShell(段首是动词-名词 cmdlet、或含 `$env:` / `*>` / `>$null`;heredoc 正文先剥掉再看)取 ps,
+ *  否则 bash;**所选方言下引号不闭合、另一方言下闭合 ⇒ 换方言**(同一串在一种方言里闭合、另一种不闭合,多半是方言选错)。
+ *  自判是近似:两种方言都闭合时只看 cmdlet 形,`powershell -Command "…"` 这类嵌套由 nestedScript 按内层再定。 */
+const PS_CMDLET_LEAD = /(?:^|[\n;|{(]\s*|&&\s*)(?:Get|Set|Add|Out|New|Remove|Copy|Move|Test|Select|Where|ForEach|Write|Invoke|Start|Stop|Import|Export|ConvertTo|ConvertFrom|Join|Split|Measure|Sort|Tee|Clear|Rename|Resolve|Push|Pop)-[A-Z][A-Za-z]+\b|\$env:|(?:^|\s)\*>|[\s>]\$null\b/;
+export function cmdDialect(cmd, hint) {
+  const h = String(hint || "").toLowerCase();
+  if (h === "ps" || h === "powershell" || h === "pwsh") return "ps";
+  if (h === "bash" || h === "sh") return "bash";
+  // 先剥 bash heredoc 正文再看形(语料对照实撞:`cat > x.ps1 <<'EOF'` 正文里的 `$env:`/`Get-…` 把整条 bash 命令判成 ps,
+  //   于是 heredoc 不剥、正文被当命令解析);PowerShell 没有 `<<`,对 ps 命令这一步是空操作。
+  const s = stripHeredocBodies(String(cmd || ""));
+  // 复核红队 aaf414b6 BP-2(365fd54 引入):PS 标记只认**引号外**的。原在未掩码原串上测 ⇒ `sed -i 's/$env:A/$env:B/g' \⏎ AGENTS.md`
+  //   引号里的 `$env:` 把 bash 命令判成 ps ⇒ `\`+换行续行失效、换行成分段 ⇒ 续行后的目标丢(P 漏放)。
+  //   掩码本身方言相关 ⇒ 两种口径各掩一次各测一次:一致 ⇒ 取之;不一致 ⇒ 取引号闭合的那种口径的结论;
+  //   两口径都闭合或都不闭合 ⇒ 取 bash 口径的结论(先按 bash 掩码找、ps 掩码复核)。之后照旧做「所选方言不闭合、另一方言闭合 ⇒ 换」。
+  //   失效条件:改回在原串上测 ⇒ 自测「BP-2b:」与 P pos「aaf414b6 BP-2」翻红。
+  const qb = quoteScan(s, false), qp = quoteScan(s, true);
+  const byB = PS_CMDLET_LEAD.test(qb.masked) ? "ps" : "bash";
+  const byP = PS_CMDLET_LEAD.test(qp.masked) ? "ps" : "bash";
+  const d = byB === byP ? byB : (qb.open && !qp.open ? byP : byB);
+  const [qd, qo] = d === "ps" ? [qp, qb] : [qb, qp];
+  return qd.open && !qo.open ? (d === "ps" ? "bash" : "ps") : d;
+}
+export function bashWriteTargets(rawCmd, pathRe, opts = {}) {
+  const ps = cmdDialect(rawCmd, typeof opts === "string" ? opts : opts && opts.dialect) === "ps";
+  // heredoc 是 POSIX 语法;PowerShell 没有 `<<`(here-string 由 quoteScan/codexWords 的 ps 口径整段吞)
+  const noHeredoc = ps ? String(rawCmd) : stripHeredocBodies(rawCmd);
   // ⚠️ **已知误报，试过一次修法、失败并退回，记在这里免得下次再试**（2026-08-20）。
   //   症状：M 报了一个**根本不存在**的 `f.md` —— 它来自我为了测正则而写的探针字符串
   //   `node -e "…cat > f.md <<EOF…"`。仓里 grep 全零。
@@ -1402,57 +1872,107 @@ export function bashWriteTargets(rawCmd, pathRe) {
   //     要靠**读懂 JS**，不是读懂 shell。shell 层分不开。
   //   → 现状保留：假写入目标会让 M 要求回读一个不存在的文件（吓人但 **fail-closed**）。
   //     宁可如此，不要为了安静而把真写入放过去。
-  const out = [];
-  for (const s of noHeredoc.split(/&&|\|\||;|\n/)) {
-    const seg = s.trim().replace(/\\/g, "/");
-    if (/^git\s+(add|commit|push|status|log|diff|show|stash|fetch|pull|branch|tag)\b/.test(seg)) continue;
-    for (const m of seg.matchAll(/(?:writeFileSync|appendFileSync)\s*\(\s*['"]([^'"]+)/g)) out.push(m[1]);
-    // ⚠️ `(?<![=\-])`:**箭头函数不是重定向**(2026-08-22 实撞,--fp 台账第 3 笔):
-    //   `node -e '….map(r=>r.ts)'` 的 `=>r.ts` 被当成 `> r.ts` ⇒ M 要求回读一个不存在的文件。
-    //   箭头在 node -e 内联脚本里是日常形态,不修则天天复发。`->`(如 clang 参数)一并排除;
-    //   合法的 `2>`/`&>`/`>>` 不受影响(前导是数字/&/空白,不在排除集里)。
-    // ⚠️ D100(2026-09-06):路径类原来是 `[\w./-]+`,**吃不下盘符与 `~`**——
-    //   `cat >> C:/Users/…/memory/x.md` 只取到 `C`,`>> ~/.claude/…` 一个字都取不到
-    //   ⇒ 目标解不出 ⇒ 调用点按「未解出目标」兜底成命中(fail-closed),既有文件的追加也被判新建。
-    //   路径类见 `PATH_TOK`(单源)。
-    for (const m of seg.matchAll(REDIRECT_TARGET_RE)) { if (!/^\/dev\//.test(m[1])) out.push(m[1]); }
-    // ⚠️ `--` 是**参数终止符**,取目标时要跳过它(codex 2026-08-20:
-    //   `sed -i 's/x/y/' -- 既有文件` 会把 `--` 取成目标 ⇒ 过滤后 targets 为空
-    //   ⇒ 调用点报「未解出目标」⇒ **阻断一次改既有文件的正常操作**)。
-    //   故这一支不再按位置数 token,改成:取该段里最后一个**像路径**的 token。
-    for (const m of seg.matchAll(/(?:^|[\s;&|(])sed\s+-i[^\s]*\s([^;&|\n]*)/g)) {
-      const toks = m[1].split(/\s+/)
-        .filter((x) => x && x !== "--" && !x.startsWith("-") && !/^['"]/.test(x));
-      const last = toks[toks.length - 1];
-      if (last) out.push(last.replace(/^["'`]|["'`]$/g, ""));
-    }
-    for (const m of seg.matchAll(/(?:tee|cp|mv)\s+([^;&|)\n]+)/g)) {
-      const toks = m[1].trim().split(/\s+/)
-        // ⚠️ `--` 是**参数终止符**不是目标(codex:`sed -i 's/x/y/' -- 既有文件` 会被取成 `--`,
-        //   过滤后 targets 为空 ⇒ 调用点报「未解出目标」⇒ **阻断一次改既有文件的正常操作**)。
-        .filter((x) => !x.startsWith("-"))
-        .map((x) => x.replace(/^["'`]|["'`]$/g, ""));
-      if (toks.length) out.push(toks[toks.length - 1]);
-    }
-  }
+  // ── a2155edb(BP-2 / BP-7)改为**引号感知**:先按 gate-cmd 的 `segments()`(引号外才切,含 `|`)切语句,
+  //   段内再按引号外的 `&` `(` `)` 反引号切成子段;重定向只认引号外的 `>`,命令按词(`codexWords`,PowerShell 口径:
+  //   反斜杠是普通字符)认、整词比命令名。由此修掉:`awk 'NF > 3'`、`--cond "…>1MB"`、`=>` 被当重定向;
+  //   `sed -i '$a | wg | … |' 文件` 的脚本里的 `|` 把真目标截掉;`committee`/`scp` 被当 tee/cp;
+  //   Add-Content / Set-Content / Out-File、python open(…,'a') 认不出;`cat <<'EOF' >> 文件` 同行重定向被 heredoc 剥掉。
+  //   顺带结清 D7「引号包分号——真目标丢失」(那条用例改钉新行为)。
+  // ⚠️ 仍不做的(漏放侧,照实):变量 / 命令替换拼出的路径、`path.join(...)` 入参、`cd docs; … >> noun-diary.md` 的相对目录、
+  //   `dd of=`、`install`、`New-Item -Value`;`cp -r a/ b/` 仍取到目录 `b/`。
+  // ── a811daae:BP-6 掩码/切段/分词按**同一方言**(bash:反斜杠转义;PowerShell:反引号转义、反斜杠是普通字符);
+  //   BP-4 命令位跳过 shell 保留字(then/do/else/{/! …)与包装器带值选项(`nice -n 10`、`sudo -u bob`、`xargs -I {}`);
+  //   BP-3 命令参数先剔重定向词(`2>/dev/null`、`>`+目标)再取「最后一个位置参数」。
+  const out = rawWriteTargets(noHeredoc, 0, ps);
   // ⚠️ 规格化 `./` 与 `..`(codex:`scripts/../scripts/x.mjs` 实际是既有文件,
   //   而 `isNew` 只做字符串裁剪、不消解 `..` ⇒ 误判新建)。
   const norm = (p) => {
     const parts = [];
-    for (const seg of p.replace(/^\.\//, "").split("/")) {
+    for (const seg of String(p).replace(/\\/g, "/").replace(/^\.\//, "").split("/")) {
       if (seg === "." || seg === "") continue;
       if (seg === ".." ) { parts.pop(); continue; }
       parts.push(seg);
     }
     return parts.join("/");
   };
-  // ⚠️【已登记未修】codex 另报三条,均属**分段器不理解引号**这一族,修它要引入小状态机:
+  // ⚠️【已登记未修】codex 另报三条:
   //   ① `node a.mjs | tee scripts/new.mjs` —— `bashWrites` 的 execForm 分支不识别 tee ⇒
   //      本函数根本不被调用(缺陷在 bashWrites 侧,不在这里);
   //   ② `cp -r a/ b/` 取到目录 `b/`,无从知道实际写的是 `b/a`;
-  //   ③ `cp a ".claude/agents/new agent.md"` —— 含空格的引号路径被按空白拆碎。
-  //   当前取舍:宁可漏这三类,不为它们引入一个会自己出 bug 的解析器。
-  return [...new Set(out.map(norm))].filter((p) => p && pathRe.test(p));
+  //   ③ (a2155edb 起已解:按词取认引号)`cp a ".claude/agents/new agent.md"` 曾被按空白拆碎。
+  // 含未展开变量的目标(`.claude/skills/x/$NAME.md`、`$env:X`)解不出真路径 ⇒ 不报(旧 PATH_TOK 在 `$` 处截断,
+  //   调用点再按「不闭合」丢掉;按词取之后整段都在,这里显式丢,口径不变)。`~`、`$HOME`、`${HOME}` 前缀照旧认。
+  const unresolved = (p) => /\$/.test(String(p).replace(/^(?:\$HOME|\$\{HOME\})(?=\/|$)/, ""));
+  return [...new Set(out.map(norm))].filter((p) => p && !unresolved(p) && pathRe.test(p));
+}
+/** 子 shell 的脚本参数:`bash -c '…'` / `sh -lc "…"` / `cmd /c "…"` / `powershell -Command "…"`。
+ *  语料对照实撞:`cmd /c "cd /d \repo && pnpm graph:check > clipboard\x.log"` 的重定向在引号里,引号感知后要递归进去才认得。 */
+function nestedScript(words, k) {
+  const n = cmdName(words[k]);
+  if (/^(?:bash|sh|zsh|dash)$/.test(n)) {
+    for (let i = k + 1; i < words.length; i++) {
+      if (/^-[A-Za-z]*c[A-Za-z]*$/.test(words[i]) && !/^--/.test(words[i])) return words[i + 1] ?? null;
+      if (!/^-/.test(words[i])) return null;                      // 跑脚本文件,不是 -c
+    }
+    return null;
+  }
+  if (n === "cmd") {
+    const i = words.findIndex((w, j) => j > k && /^\/[ck]$/i.test(w));
+    return i > 0 ? words.slice(i + 1).join(" ") : null;
+  }
+  if (n === "powershell" || n === "pwsh") {
+    const i = words.findIndex((w, j) => j > k && /^-(?:c|command)$/i.test(w));
+    return i > 0 ? words.slice(i + 1).join(" ") : null;
+  }
+  return null;
+}
+function rawWriteTargets(noHeredoc, depth, ps = false) {
+  const out = [];
+  for (const seg0 of segments(noHeredoc, ps)) {
+    for (const part of subParts(seg0, ps)) {
+      // 解释器内联脚本里的写调用:入参在引号里,扫原文(「提到」与「真写」shell 层分不开——见上方已知误报,保留 fail-closed)
+      for (const re of API_WRITE_RES) { re.lastIndex = 0; for (const m of part.matchAll(re)) out.push(m[2]); }
+      // 分词与掩码同一方言(BP-6);重定向词先剔掉,不让它冒充命令名或参数(BP-3)
+      const words = dropRedirWords(codexWordsShaped(part, ps));   // 带 shape:引号里的 `>`/`<` 不是算子(aaf414b6 BP-3)
+      // ⚠️ `(?<![=\-])` 的旧意(2026-08-22 实撞,--fp 第 3 笔):箭头函数不是重定向——现由 redirectTargets 的前一字符检查承接。
+      // ⚠️ D100(2026-09-06):盘符 / `~` 路径要整段取到——现由按词取承接(不再走 PATH_TOK 字符类)。
+      for (const t of redirectTargets(part, ps)) out.push(t);
+      // 只在**命令位**认写命令(`grep -n tee docs/noun-diary.md` 的 tee 是参数,不是命令):
+      //   段首(跳过前置 VAR=… 与 shell 保留字 then/do/else/{/! …)、包装器(sudo/env/xargs/nohup/time/nice/timeout/busybox…,
+      //   带值选项连值跳过)之后、find 的 -exec/-execdir 之后(到 `;`/`+` 为止)、PowerShell 脚本块 `{` / `%{` 之后。
+      //   git 子命令不写工作树文件(重定向照上面认)。
+      for (const { k, end } of cmdPositions(words)) {
+        const ws = words.slice(0, end);
+        const name = cmdName(ws[k]);
+        if (name === "sed") out.push(...sedTargets(ws, k));
+        else if (name === "tee") out.push(...ws.slice(k + 1).filter((x) => x && !x.startsWith("-")));   // `--` 不是目标(codex 2026-08-20)
+        else if (name === "cp" || name === "mv") {
+          // `-t DIR` / `--target-directory[=]DIR`:目标是 DIR(语料:`find … -exec mv -t packets/math {} +`,旧取到 `+`)。
+          //   与 `cp -r a/ b/` 同一天花板:取到的是目录,不知道落进去的文件名。
+          const ti = ws.findIndex((x, i) => i > k && /^(?:-t|--target-directory)(?:=|$)|^-t./.test(x));
+          if (ti > 0) {
+            const w = ws[ti];
+            const v = w === "-t" || w === "--target-directory" ? ws[ti + 1] : w.replace(/^(?:--target-directory=|-t)/, "");
+            if (v) out.push(v);
+            continue;
+          }
+          const toks = ws.slice(k + 1).filter((x) => x && !x.startsWith("-"));
+          if (toks.length >= 2) out.push(toks[toks.length - 1]);      // cp A B 写的是 B
+        }
+        else if (PS_WRITE_CMDLETS.test(name)) out.push(...psTargets(ws, k, false));
+        else if (PS_MOVE_CMDLETS.test(name)) out.push(...psTargets(ws, k, true));
+        else if (depth < 3) {
+          const inner = nestedScript(ws, k);
+          // 内层方言按外壳定:bash/sh -c ⇒ bash;powershell/pwsh -Command、cmd /c ⇒ ps 口径(反斜杠是普通字符)
+          if (inner) {
+            const innerPs = !/^(?:bash|sh|zsh|dash)$/.test(name);
+            out.push(...rawWriteTargets(innerPs ? inner : stripHeredocBodies(inner), depth + 1, innerPs));
+          }
+        }
+      }
+    }
+  }
+  return out;
 }
 
 export function bashWrites(rawCmd, pathRe) {
@@ -1593,8 +2113,34 @@ function readPLedger() {
   if (process.env.STOP_CLOSURE_SELFTEST === "1") return null;
   try {
     const j = JSON.parse(fs.readFileSync(".claude/.p-ledger.json", "utf8"));
-    return { carriers: Number.isFinite(+j.carriers) ? Math.max(0, Math.floor(+j.carriers)) : 0 };
+    return { carriers: Number.isFinite(+j.carriers) ? Math.max(0, Math.floor(+j.carriers)) : 0,
+      shas: Array.isArray(j.shas) ? j.shas : [] };
   } catch { return null; }
+}
+
+/** P 的收尾结算(唯一实现;live 路径落盘、自测直接喂):计账 + 基点推进。纯函数,不读写盘。
+ *  返回 `{ ledger, advance, head }`:
+ *    · ledger = 要写的账 `{carriers, shas}`,null = 不动账。三通道齐(动作面)⇒ 清零;否则累加 `tally(eCtx).n`
+ *      (红队 a2a9f58b BP-1:与 detect 同一份取值——git 事实在 ⇒ 范围内带承重改动、未记过 sha 的提交数;
+ *       原来这里是命令语法计数,`git add -A` / merge 合回计 0 ⇒ 宽限账永不涨)。`shas` 累积已计提交(封顶 400),去重用;
+ *    · advance = 推进基点:**只在 git 事实非 null 且 P 无命中**时(BP-2:事实取不到时回退面沉默 ≠ 结清,推进会让之前欠的蒸发);
+ *    · head = 推进到哪:git 事实读到的那个 HEAD(BP-6:不重新 rev-parse,读事实与写基点之间落的提交留给下一次审)。 */
+export function settleP(P, eCtx, eFindings) {
+  const prior = (eCtx.pLedger && eCtx.pLedger.carriers) || 0;
+  const priorShas = (eCtx.pLedger && Array.isArray(eCtx.pLedger.shas)) ? eCtx.pLedger.shas : [];
+  const t = P.tally(eCtx);
+  // ⚠️ **补账面必须与规则面同一张脸**(2026-08-22 用户追问「搜索结果打算干啥」逼出的反思
+  //   当场逮到:规则认「窗口∪本轮」,补账原来只认「单轮三通道齐」⇒ 通道分散跑时
+  //   账永不清零,爬满后窗口一滑走就全额讨税——教科书 reset 病长在自己刚写的代码里)。
+  //   天花板写明:窗口里的旧一轮通道在滑出前可能多次抵账(有界宽松,上限=400 条窗口),方向是少收税。
+  // codex 185「你没问到」3 / 派出方 a27628dd 口径⑤:计账与判据同一取值池、同一谓词(`channelsMet`;BP-8 的点名抵账已撤)。
+  const allThree = P.channelsMet(eCtx).every(Boolean);
+  const next = allThree ? 0 : prior + t.n;
+  const shas = [...new Set([...priorShas, ...t.shas])].slice(-400);
+  const ledger = (next !== prior || allThree || shas.length !== priorShas.length) ? { carriers: next, shas } : null;
+  const f = P.facts(eCtx);
+  const advance = !!f && !eFindings.some((x) => x && x.id === "P");
+  return { ledger, advance, head: f && typeof f.head === "string" ? f.head : null };
 }
 
 let _trackedCache;
@@ -1752,8 +2298,8 @@ import { RULES, ranClear as ranClearRule, maskQuoted, BG_RUNNING_STATUS } from "
 // `validateRules` 是 2026-08-20 才接进**生产路径**的 —— 此前它只在 `gate:accept` 里跑,
 // 于是 INV-1..4 对真跑的闸完全不生效(grill:recon 查出,`grep -c` = 0)。
 import { runRules, validateRules } from "./lib/gate-registry.mjs";
-import { buildCtx } from "./lib/gate-ctx.mjs";
-import { segments } from "./lib/gate-cmd.mjs";   // 批 257:A 项 codex 账的命令切段(引号外才切,唯一实现)
+import { buildCtx, isBlockedStop, blockedStopIds, isStopFeedbackLine } from "./lib/gate-ctx.mjs";
+import { segments, stripQuoted, quoteScan } from "./lib/gate-cmd.mjs";   // 批 257:A 项 codex 账的命令切段(引号外才切,唯一实现)
 // DP 的部署欠账事实源(2026-09-12 批 202)。**动态导入、缺件静默退场**:本文件随公开树 custodiet 分发,
 //   那边未必带 debt-facts.mjs;缺件时注入 undefined,DP 退回命令解析判法(与判活探针三件同一缺件纪律)。
 let readDebtFacts = () => undefined;
@@ -2036,6 +2582,15 @@ export function run(transcriptPath, ctx = {}) {
         // P 的 diff 分档事实(批 257 条件 3):惰性,只在实时路径接——离线回放拿到的是「现在」的工作树,套到历史轮上是错配。
         diffTier: ctx.diffTier !== undefined ? ctx.diffTier
           : (ctx.live ? () => { const g = ctx.batchGoal !== undefined ? ctx.batchGoal : readBatchGoal(); return readDiffFacts(g && g.baseCommit); } : undefined),
+        // P 的 HEAD 移动事实(红队 a27628dd):惰性,只在实时路径接(离线回放拿到的是「现在」的 HEAD,套到历史轮上是错配 ⇒
+        //   undefined ⇒ P 回退命令语法判据)。基点 = 本会话上次 P 结清时的 HEAD,没有就取会话开始时刻的 HEAD(reflog)。
+        headFacts: ctx.headFacts !== undefined ? ctx.headFacts
+          : (ctx.live ? () => {
+            const pp = RULES.find((r) => r.id === "P")?._p;
+            // 退路批基点取 hook 已有的批状态(带 cleared;a07e98e9 BP-5):已结清 ⇒ 无退路,不拿已关批的基点
+            const batchBase = () => batchBaseOfGoal(ctx.batchGoal !== undefined ? ctx.batchGoal : readBatchGoal());
+            return readHeadFacts(pHeadBase(ctx.sessionId, _allEntriesCache, undefined, undefined, batchBase), undefined, pp ? pp.ENGINE_PATHSPECS : []);
+          } : undefined),
         // ⚠️ **跨轮窗口必须真的传进来**(2026-08-20 实撞)。
         //   `ctx.window()` 从落地起就没被生产路径喂过 `priorEntries` ⇒ **恒为 null**,
         //   于是 I 项那条「取证窗口放宽到批窗口」的修法是**死代码**,我改完当轮它照样拦我。
@@ -2064,35 +2619,35 @@ export function run(transcriptPath, ctx = {}) {
             inv.slice(0, 6).map((x) => `      · ${x}`).join("\n") +
             `\n      这不是某一轮的问题,是**规则表自身坏了** —— 先修它,别继续跑。` });
       }
-      // P 计账落盘(只在生产形态 `live`;离线/自测/回放不落——分母纪律同 .gate-alerts):
-      //   三通道齐(动作面)⇒ 清零;否则累加本轮承重提交数。规则纯函数,账只在这儿动。
+      // P 的收尾结算(只在生产形态 `live`;离线/自测/回放不落——分母纪律同 .gate-alerts):计账 + 基点推进。
+      //   取值与判据唯一实现在 `settleP`(纯函数,自测直接喂);这里只落盘。
+      //   计账:三通道齐(动作面)⇒ 清零;否则累加 `tally`(git 事实在 ⇒ 范围内未记过账的承重提交数,红队 a2a9f58b BP-1)。
+      //   基点:**只在 git 事实非 null 且 P 无命中(结清)时**推进到读事实那一刻的 HEAD(BP-2 / BP-6)。
+      //   P 欠着(含 UNKNOWN)或事实取不到 ⇒ 基点不动 ⇒ 下一次 Stop 仍看得见这些提交,义务不会因换了一轮而蒸发。
+      let _settle = null;
       if (live) try {
         const _P = RULES.find((r) => r.id === "P")?._p;
-        if (_P) {
-          const prior = (eCtx.pLedger && eCtx.pLedger.carriers) || 0;
-          const mine = _P.carrierCommitCount(eCtx);
-          // ⚠️ **补账面必须与规则面同一张脸**(2026-08-22 用户追问「搜索结果打算干啥」逼出的反思
-          //   当场逮到:规则认「窗口∪本轮」,补账原来只认「单轮三通道齐」⇒ 通道分散跑时
-          //   账永不清零,爬满后窗口一滑走就全额讨税——教科书 reset 病长在自己刚写的代码里)。
-          //   天花板写明:窗口里的旧一轮通道在滑出前可能多次抵账(有界宽松,上限=400 条窗口),
-          //   方向是少收税;反向(原 bug)是无界多收。
-          const scope = _P.scopeActions(eCtx);
-          // codex 185「你没问到」3:这里原来 `ch.test(a)` 不带 ctx ⇒ 计账侧按通用口径认 grill 充分、判据侧却欠红队,
-          //   台账被清零而义务未兑现。计账与判据必须同一张脸:带 eCtx。
-          const allThree = _P.CH.every((ch) => scope.some((a) => { try { return ch.test(a, eCtx); } catch { return false; } }));
-          const next = allThree ? 0 : prior + mine;
-          if (next !== prior || allThree) {
-            // D52(批 104):裸 writeFileSync=截断后写,崩在中间读者见半文件;换 tmp+rename 原子写
-            //   (同 batch-goal atomicWrite 的形)。读-改-写竞态半条:并发 Stop 仅在双写会话违规时
-            //   存在,姿态见 104 威胁模型呈签件;此处只修「写不半截」这一确定收益。
-            const tmpP = `.claude/.p-ledger.json.${process.pid}.tmp`;
-            try {
-              fs.writeFileSync(tmpP, JSON.stringify({ carriers: next, at: new Date().toISOString() }));
-              fs.renameSync(tmpP, ".claude/.p-ledger.json");
-            } finally { try { if (fs.existsSync(tmpP)) fs.unlinkSync(tmpP); } catch { /* 残骸不阻断 */ } }
-          }
-        }
-      } catch { /* 账写不了不影响闸;规则侧下轮读到旧值只会更严 */ }
+        if (_P) _settle = settleP(_P, eCtx, eFindings);
+      } catch { /* 结算算不出 ⇒ 账与基点都不动(下轮读到旧值只会更严) */ }
+      // codex 257-p-gitfacts-r2 补:账写失败而基点照推 ⇒ 已越过的提交下轮不再在范围里、也没进账 ⇒ 少计(漏放)。
+      //   故账要写而没写成 ⇒ 基点不推进(下轮仍看得见这些提交,tally 按 sha 去重,不会重计)。
+      let _ledgerOk = true;
+      if (live && _settle && _settle.ledger) try {
+        _ledgerOk = false;
+        // D52(批 104):裸 writeFileSync=截断后写,崩在中间读者见半文件;换 tmp+rename 原子写
+        //   (同 batch-goal atomicWrite 的形)。读-改-写竞态半条:并发 Stop 仅在双写会话违规时
+        //   存在,姿态见 104 威胁模型呈签件;此处只修「写不半截」这一确定收益。
+        const tmpP = `.claude/.p-ledger.json.${process.pid}.tmp`;
+        try {
+          fs.writeFileSync(tmpP, JSON.stringify({ ..._settle.ledger, at: new Date().toISOString() }));
+          fs.renameSync(tmpP, ".claude/.p-ledger.json");
+          _ledgerOk = true;
+        } finally { try { if (fs.existsSync(tmpP)) fs.unlinkSync(tmpP); } catch { /* 残骸不阻断 */ } }
+      } catch { /* 账写不了不影响闸;_ledgerOk=false ⇒ 下面不推进基点 */ }
+      //   基点写不了 ⇒ 下次仍用旧基点(只会多看提交,方向 fail-closed)。
+      if (live && _settle && _settle.advance && _ledgerOk) try {
+        writePHead(ctx.sessionId, _settle.head);
+      } catch { /* 基点写不了不影响闸 */ }
       // ── D50 绊线(批 098):本轮写过 gate-playbook.md 或 docs/**.md ⇒ 顺带跑文档引用漂移核 ──
       //   「靠人记得」当日被 T 项判死(登记不算处置),升级为写触发:写与查同轮必然相遇。
       //   只在 live 生产形态跑(audit/dry-run 重放离线语料会反复空触发);绊线自身失败不拦、
@@ -2640,8 +3195,13 @@ function selfTest() {
     const RF = R.replace(/\\/g, "/");
     const R2 = "\\repo\\clipboard\\codex\\t-r2.md";
     const LOGP = (J) => `C:\\Users\\x\\AppData\\Local\\Temp\\codex-run-jobs\\${J}.log`;
-    const HEAD = ["---", "codex 版本: codex-cli 0.153.4", "模型: (codex 默认)", "sandbox: read-only(缺省,写被 OS 拒)",
-      "network: on", "repo_brief: (none)", "复看: codex resume abc", "---", ""];
+    // 结果件头部**用 runner 的真实格式拼**(红队 a2155edb BP-8:原夹具多带一个空行,正文落在第 10 行,与写死的
+    //   CODEX_BODY_FIRST_LINE=10 恰好吻合,于是 runner 真实的「正文第 9 行起」从没被测到)。runner 在场就取它的
+    //   `resultHeader`(照 PLACEHOLDER_RE 两边对齐的做法);公开树缺 runner 时退回逐字抄写的同形 8 行。
+    const HEAD = (_codexRunForSelfTest && typeof _codexRunForSelfTest.resultHeader === "function")
+      ? _codexRunForSelfTest.resultHeader({ codexVersion: "codex-cli 0.153.4", sandbox: "read-only" }, "abc").replace(/\n$/, "").split("\n")
+      : ["---", "codex 版本: codex-cli 0.153.4", "模型: (codex 默认)", "sandbox: read-only(缺省,写被 OS 拒)",
+        "network: on(codex 自带通道;2026-08-09 实测 read-only 下四客户端全 200)", "repo_brief: (none)", "复看: codex resume abc", "---"];
     const BODY = ["## 结论", "甲方说得对,乙方的第二条不成立。", "全文报告写在 clipboard/review-A.md。"];
     const FILE = [...HEAD, ...BODY].join("\n");
     const numbered = (lines, from = 1) => lines.map((l, i) => `${from + i}\t${l}`).join("\n");
@@ -2802,10 +3362,37 @@ function selfTest() {
       cx("终审 BP-8:台账已清、只剩旧 running 观测,完整 Read R ⇒ 已读回", st([...launchBg(), ...runPoll, ...jm("J1"), ...readR()], stEnv(null)), "read");
       cx("终审 BP-8 对照:台账仍说 running ⇒ 运行中(读到的是占位/旧件不算)", st([...launchBg(), ...runPoll, ...readR()], stEnv({ state: "running", startedAt: new Date(now).toISOString(), timeoutMs: 900000 })), "running");
       // 红队 d1cae02 轮 BP-6:Read 只回一句提示(越界 offset),一行文件内容都没有 ⇒ 不算读回
-      // 红队 7e1392f 轮 BP-4:Read limit 只读到头部(前 9 行)⇒ 不算读回;读到第 10 行起的正文才算
-      cx("7e1392f BP-4:只读到结果件头部 ⇒ 不算读回", st([...launchDone(), ...call("Read", { file_path: R, limit: 9 }, numbered(HEAD))], stEnv(null)), "pending-read");
-      cx("7e1392f BP-4 对照:分页读到正文 ⇒ 已读回", st([...launchDone(), ...call("Read", { file_path: R, limit: 9 }, numbered(HEAD)),
-        ...call("Read", { file_path: R, offset: 10 }, numbered(BODY, 10))], stEnv(null)), "read");
+      // 红队 7e1392f 轮 BP-4:Read limit 只读到头部 ⇒ 不算读回;读到正文(第二个 `---` 之后,runner 格式即第 9 行起)才算
+      //   (a2155edb BP-8:头部是 8 行;夹具改用 runner 真实格式后,「只读头部」= limit 8)
+      const HN = HEAD.length;
+      cx("7e1392f BP-4:只读到结果件头部 ⇒ 不算读回", st([...launchDone(), ...call("Read", { file_path: R, limit: HN }, numbered(HEAD))], stEnv(null)), "pending-read");
+      cx("7e1392f BP-4 对照:分页读到正文 ⇒ 已读回", st([...launchDone(), ...call("Read", { file_path: R, limit: HN }, numbered(HEAD)),
+        ...call("Read", { file_path: R, offset: HN + 1 }, numbered(BODY, HN + 1))], stEnv(null)), "read");
+      // ── 红队 a2155edb BP-8 ──
+      if (_codexRunForSelfTest && typeof _codexRunForSelfTest.resultHeader === "function") {
+        cx("a2155edb BP-8:闸的正文起始行与 runner 真实头部一致", _codexRunForSelfTest.resultHeader({ codexVersion: "x" }, "t").split("\n").length, CODEX_BODY_FIRST_LINE);
+      }
+      cx("a2155edb BP-8:正文起始行 = 头部行数 + 1(夹具即 runner 格式)", HN + 1, CODEX_BODY_FIRST_LINE);
+      const ONE = [...HEAD, "无发现"];
+      cx("a2155edb BP-8:一行正文的回件完整 Read ⇒ 已读回", st([...launchDone(), ...readR(R, 1, ONE)], { ...stEnv(null), resultBody: () => ONE.join("\n") }), "read");
+      cx("a2155edb BP-8:一行正文、从第 9 行起读(第 1 行没读到,走常量兜底)⇒ 已读回",
+        st([...launchDone(), ...call("Read", { file_path: R, offset: HN + 1 }, numbered(["无发现"], HN + 1))], { ...stEnv(null), resultBody: () => ONE.join("\n") }), "read");
+      // 头部行数变了(runner 加了一行)也按第二个 `---` 定位,不靠常量
+      const H10 = [...HEAD.slice(0, -1), "extra: 新加的一行", "---"];
+      cx("a2155edb BP-8:头部多一行也按第二个 --- 定位(只读头部仍不算)",
+        st([...launchDone(), ...call("Read", { file_path: R, limit: H10.length }, numbered(H10))], { ...stEnv(null), resultBody: () => [...H10, "无发现"].join("\n") }), "pending-read");
+      cx("a2155edb BP-8 对照:头部多一行、读到其后的正文 ⇒ 已读回",
+        st([...launchDone(), ...readR(R, 1, [...H10, "无发现"])], { ...stEnv(null), resultBody: () => [...H10, "无发现"].join("\n") }), "read");
+      // 空正文回件(只有头部):完整读过即读回(派出方口径)
+      const HEADONLY = HEAD.join("\n") + "\n";
+      cx("零件:codexStripHeader 剥到第二个 ---", codexStripHeader([...HEAD, "正文甲", "---", "正文乙"].join("\n")), "正文甲\n---\n正文乙");
+      cx("零件:codexStripHeader 空正文 ⇒ 空白", codexStripHeader(HEADONLY).trim(), "");
+      cx("零件:codexStripHeader 非头部形态原样", codexStripHeader("无头部\n正文"), "无头部\n正文");
+      cx("a2155edb BP-8:空正文回件、完整 Read(到文件尾)⇒ 已读回", st([...launchDone(), ...readR(R, 1, HEAD)], { ...stEnv(null), resultBody: () => HEADONLY }), "read");
+      cx("a2155edb BP-8:空正文回件、R 读不到时信本次读到的文件尾 ⇒ 已读回", st([...launchDone(), ...readR(R, 1, HEAD)], { ...stEnv(null), resultBody: () => null }), "read");
+      cx("a2155edb BP-8 反向:空正文回件只读了头部前半 ⇒ 待读", st([...launchDone(), ...call("Read", { file_path: R, limit: 4 }, numbered(HEAD.slice(0, 4)))], { ...stEnv(null), resultBody: () => HEADONLY }), "pending-read");
+      cx("a2155edb BP-8 反向:R 有正文而 Read 恰停在收尾 --- ⇒ 待读(不按「空正文」放行)", st([...launchDone(), ...call("Read", { file_path: R, limit: HN }, numbered(HEAD))], { ...stEnv(null), resultBody: () => FILE }), "pending-read");
+      cx("a2155edb BP-8 反向:R 有正文、没给 limit 却只回了头部(读不到 R 时才信文件尾)⇒ 待读", st([...launchDone(), ...readR(R, 1, HEAD)], stEnv(null)), "pending-read");
       cx("d1cae02 BP-6:Read 没返回任何文件行 ⇒ 不算读回", st([...launchDone(),
         ...call("Read", { file_path: R, offset: 999 }, "<system-reminder>Warning: the file exists but is shorter than the provided offset (999).</system-reminder>")], stEnv(null)), "pending-read");
       // 红队 v6 BP-4:规则不追溯——生效时刻之前发起的作业不入账
@@ -3624,6 +4211,9 @@ function selfTest() {
       const sum = (id) => ({ type: "system", subtype: "stop_hook_summary", hookCount: 1, hookErrors: [], toolUseID: id });
       hp("lastTurn:已结束的 Stop 从汇总行之后起算", lastTurn([H("做"), A2("甲"), att("s1"), sum("s1"), A2("乙")]).length, 1);
       hp("lastTurn:进行中的附件(无汇总行)不切窗", lastTurn([H("做"), A2("甲"), att("s1"), A2("乙")]).length, 4);
+      // a2155edb BP-6:判官型拦截只留 feedback 行(无附件),与补收回扫同用 isBlockedStop ⇒ 起点在汇总行之后(汇总行带判官全文,不进证据窗)
+      const jfb = { type: "user", isMeta: true, message: { content: "Stop hook feedback:\n[只查一件事:…]" } };
+      hp("lastTurn:feedback 行型拦截从汇总行之后起算(BP-6)", lastTurn([H("做"), A2("甲"), jfb, { ...sum("j1"), hookErrors: ["[只查一件事:…]"] }, A2("乙")]).length, 1);
       const L = (o) => JSON.stringify(o);
       const blk = (id) => [L(att(id)), L({ ...sum(id), hookErrors: ["收尾闸阻断 1 项:x"] })];
       const q = L({ type: "attachment", attachment: { type: "queued_command", prompt: "改做 X", origin: { kind: "human" } } });
@@ -3645,6 +4235,178 @@ function selfTest() {
       hp("diff 事实:带仓根、A/M 记新内容读不读得到", f && `${f.root}|${f.files[2].readable}|${f.files[6].readable}`, "/repo|true|false");
       hp("diff 事实:基点不合法 ⇒ null(不分档)", readDiffFacts("HEAD~1; rm", git), null);
       hp("diff 事实:git 失败 ⇒ null", readDiffFacts("66803b1b2b", () => { throw new Error("x"); }), null);
+    }
+    // ── 红队 a27628dd:P 的 HEAD 移动事实(git 注入)──
+    {
+      const A = "a".repeat(40), B = "b".repeat(40), C = "c".repeat(40), M = "d".repeat(40), X = "e".repeat(40);
+      const RS = "\x1f";
+      // 默认:祖先情形,首父链 C(法典)→ M(合回 worktree-agent-x,第二父 X,对第一父带进闸改动)
+      const defRev = `${M}${RS}1760000100${RS}${C} ${X}${RS}Merge branch 'worktree-agent-x'——合回\n${C}${RS}1760000000${RS}${A}${RS}改法典\n`;
+      const mk = ({ ancestor = true, revlist = defRev, count = "", mb = B, diff = {}, log = {}, pointsAt = "worktree-agent-x\nother\n" } = {}) => {
+        const seen = [];
+        const git = (a) => {
+          seen.push(a.join(" "));
+          if (a[0] === "rev-parse" && a[1] === "--show-toplevel") return "/repo\n";
+          if (a[0] === "rev-parse" && a[1] === "HEAD") return M + "\n";
+          if (a[0] === "rev-parse" && a[1] === "--verify") return A + "\n";
+          if (a[0] === "merge-base" && a[1] === "--is-ancestor") { if (!ancestor) throw new Error("1"); return ""; }
+          if (a[0] === "merge-base") return mb + "\n";
+          if (a[0] === "rev-list") return a.includes("--count") ? count : revlist;
+          if (a[0] === "branch") return pointsAt;
+          if (a[2] === "diff") {
+            const r = a.slice(6, -1).join("..");
+            if (r in diff) return diff[r];
+            return r === `${C}^1..${C}` ? "M\0docs/laws/collab.md\0"
+              : r === `${M}^1..${M}` ? "M\0scripts/lib/gate-rules.mjs\0" : "";     // merge:对第一父的改动
+          }
+          if (a[0] === "log") return (log[a[4]] ?? "1759999000") + "\n";
+          return "";
+        };
+        return { git, seen };
+      };
+      const specs = ["scripts/hook-stop-closure.mjs"];
+      const { git, seen } = mk();
+      const f = readHeadFacts("aaaaaaa", git, specs);
+      hp("HEAD 事实:首父链提交按时间正序、merge 取对第一父的改动",
+        f && f.commits.map((c) => `${c.sha[0]}@${c.at}:${c.files.map((x) => x.path).join(",")}`).join(" "),
+        "c@1760000000000:docs/laws/collab.md d@1760000100000:scripts/lib/gate-rules.mjs");
+      hp("HEAD 事实:合回提交带分支名(标题 ∪ 第二父的分支指针)与父提交,普通提交分支名为空(a2a9f58b BP-8)",
+        f && f.commits.map((c) => `${c.parents.length}:${c.branches.join("+")}`).join(" "), "1: 2:worktree-agent-x+other");
+      hp("HEAD 事实:分支指针查的是第二父", seen.includes(`branch --format=%(refname:short) --points-at ${X}`), true);
+      hp("HEAD 事实:head 透传(BP-6 写基点用它)", f && f.head, M);
+      hp("HEAD 事实:engineAnchorAt 取范围起点的闸引擎提交时刻(带 pathspec)", f && f.engineAnchorAt, 1759999000000);
+      hp("HEAD 事实:engineAnchorAt 的 git log 从基点起、带 pathspec", seen.some((s) => s === `log --first-parent -1 --format=%ct ${A} -- scripts/hook-stop-closure.mjs`), true);
+      // ── 非祖先(a2a9f58b BP-9 / BP-3)── merge-base = B;HEAD 上只有 M 一笔新提交
+      const nonAnc = (o) => mk({ ancestor: false, revlist: `${M}${RS}1760000200${RS}${B}${RS}x\n`, ...o });
+      // BP-9:基点 A 带闸改动,reset --hard 回 B 再提交业务 ⇒ 树差 A..M 里有被撤掉的闸文件,但 M 自己只改了 src
+      const rst = readHeadFacts("aaaaaaa", nonAnc({ diff: { [`${M}^1..${M}`]: "M\0src/a.ts\0", [`${A}..${M}`]: "M\0scripts/lib/gate-rules.mjs\0M\0src/a.ts\0" } }).git, specs);
+      hp("HEAD 事实 BP-9:reset 后提交业务 ⇒ 只算 merge-base..HEAD 的改动(撤掉的闸文件不算)",
+        rst && rst.commits.map((c) => `${c.rewritten}:${c.files.map((x) => x.path).join(",")}`).join(" "), "true:src/a.ts");
+      // amend 只改提交信息:M 对其父的改动 = 原闸改动,但 A..M 树差为空 ⇒ 无改动
+      const msgOnly = readHeadFacts("aaaaaaa", nonAnc({ diff: { [`${M}^1..${M}`]: "M\0scripts/lib/gate-rules.mjs\0", [`${A}..${M}`]: "" } }).git, specs);
+      hp("HEAD 事实:只改信息的 amend ⇒ 提交在、改动为空", msgOnly && msgOnly.commits.map((c) => c.files.length).join(","), "0");
+      // BP-3:amend 进新闸改动 ⇒ 改动正好是新那处;切点取 base(A)链上最后一次闸改动与 merge-base 两者较晚
+      const am = nonAnc({ diff: { [`${M}^1..${M}`]: "M\0scripts/lib/gate-rules.mjs\0M\0docs/a.md\0", [`${A}..${M}`]: "M\0scripts/lib/gate-rules.mjs\0" },
+        log: { [A]: "1760000050", [B]: "1759999000" } });
+      const amf = readHeadFacts("aaaaaaa", am.git, specs);
+      hp("HEAD 事实 BP-3:amend 进新闸改动 ⇒ 只留与基点真有差的路径", amf && amf.commits.map((c) => c.files.map((x) => x.path).join(",")).join(" "), "scripts/lib/gate-rules.mjs");
+      hp("HEAD 事实 BP-3:非祖先时切点取 base 自身链上的闸改动时刻(不因 merge-base 更早而放宽)", amf && amf.engineAnchorAt, 1760000050000);
+      hp("HEAD 事实:基点非祖先、无新提交(reset 回退)⇒ 无提交", readHeadFacts("aaaaaaa", mk({ ancestor: false, mb: M }).git, specs)?.commits.length, 0);
+      // 红队 a9af71da BP-1:范围超 60 ⇒ 原返回 null(基点永不推进、P 永久退回语法面);现整段当一笔聚合提交
+      const big = (first) => Array.from({ length: 61 }, (_, i) => `${i === 0 ? first : String(i % 10).repeat(40)}${RS}1760000300${RS}${RS}x\n`).join("");
+      const aggDiff = { [`${A}..${M}`]: "M\0scripts/lib/gate-rules.mjs\0M\0src/a.ts\0" };
+      const agg = readHeadFacts("aaaaaaa", mk({ revlist: big(M), count: "75\n", diff: aggDiff }).git, specs);
+      hp("HEAD 事实 a9af71da BP-1:范围超 60 ⇒ 不再 null,整段当一笔聚合提交(sha=HEAD、count、at=HEAD、改动=范围净差)",
+        agg && agg.commits.map((c) => `${c.sha[0]}:${c.aggregated}:${c.count}:${c.at}:${c.files.map((x) => x.path).join(",")}`).join(" "),
+        "d:true:75:1760000300000:scripts/lib/gate-rules.mjs,src/a.ts");
+      hp("HEAD 事实 a9af71da BP-1:聚合时 engineAnchorAt 照旧算", agg && agg.engineAnchorAt, 1759999000000);
+      hp("HEAD 事实 a9af71da BP-1:count 取不到 ⇒ 按 61(只会多计)",
+        readHeadFacts("aaaaaaa", mk({ revlist: big(M), count: "garbage", diff: aggDiff }).git, specs)?.commits[0].count, 61);
+      hp("HEAD 事实 a9af71da BP-1:首父链第一行不是 HEAD(读的过程中 HEAD 动了)⇒ null",
+        readHeadFacts("aaaaaaa", mk({ revlist: big("0".repeat(40)), count: "75" }).git, specs), null);
+      hp("HEAD 事实 a9af71da BP-1:非祖先聚合 ⇒ 净差只留与基点真有差的路径",
+        readHeadFacts("aaaaaaa", mk({ ancestor: false, revlist: big(M), count: "70", diff: { [`${B}..${M}`]: "M\0scripts/lib/gate-rules.mjs\0M\0src/a.ts\0", [`${A}..${M}`]: "M\0src/a.ts\0" } }).git, specs)
+          ?.commits.map((c) => `${c.rewritten}:${c.files.map((x) => x.path).join(",")}`).join(" "), "true:src/a.ts");
+      hp("HEAD 事实:基点不合法 ⇒ null", readHeadFacts("HEAD; rm", git, specs), null);
+      hp("HEAD 事实:git 失败 ⇒ null", readHeadFacts("aaaaaaa", () => { throw new Error("x"); }, specs), null);
+      hp("HEAD 事实:不给 pathspec ⇒ engineAnchorAt 为 null(不拿基点自身时刻冒充)", readHeadFacts("aaaaaaa", mk().git, [])?.engineAnchorAt, null);
+      // 基点:无基点文件 ⇒ 取会话开始时刻的 HEAD(reflog);reflog 起点晚于会话开始且非建立记录 ⇒ 取不到(a2a9f58b BP-2)
+      const rl = [];
+      const g2 = (a) => { rl.push(a.join(" ")); return B + "\n"; };
+      const rfl = (old, ts) => () => `${old} ${B} Some One <a@b.c> ${ts} +0800\tcommit: x`;
+      const early = rfl("1".repeat(40), 1700000000), late = rfl("1".repeat(40), 1800000000), born = rfl("0".repeat(40), 1800000000);
+      hp("HEAD 基点:无基点文件 ⇒ reflog 取会话开始时的 HEAD", pHeadBase("selftest-no-such-session", [{ type: "x" }, { timestamp: "2026-10-10T08:00:00.123Z" }], g2, early), B);
+      hp("HEAD 基点:reflog 查询用会话开始时刻", rl[0], "rev-parse --verify -q HEAD@{2026-10-10 08:00:00 +0000}");
+      hp("HEAD 基点 BP-2:reflog 被截断(起点晚于会话开始)⇒ null(-q 会静默给最老记录)",
+        pHeadBase("selftest-no-such-session", [{ timestamp: "2026-10-10T08:00:00Z" }], g2, late), null);
+      hp("HEAD 基点:reflog 起点是建立记录(旧 sha 全零)⇒ 最老记录就是起点,照用",
+        pHeadBase("selftest-no-such-session", [{ timestamp: "2026-10-10T08:00:00Z" }], g2, born), B);
+      hp("HEAD 基点:reflog 读不懂 ⇒ null", pHeadBase("selftest-no-such-session", [{ timestamp: "2026-10-10T08:00:00Z" }], g2, () => "garbage"), null);
+      // 红队 a9af71da BP-1 附:reflog 那支取不到 ⇒ 退用当前批的 baseCommit(须是 HEAD 祖先),否则维持 null
+      const s0 = [{ timestamp: "2026-10-10T08:00:00Z" }];
+      hp("HEAD 基点 a9af71da:reflog 被截断、当前批基点是 HEAD 祖先 ⇒ 用批基点", pHeadBase("selftest-no-such-session", s0, g2, late, () => "abc1234"), "abc1234");
+      hp("HEAD 基点 a9af71da:reflog 读不懂、批基点在 ⇒ 用批基点", pHeadBase("selftest-no-such-session", s0, g2, () => "garbage", () => "abc1234"), "abc1234");
+      hp("HEAD 基点 a9af71da:批基点不是 HEAD 祖先 ⇒ null",
+        pHeadBase("selftest-no-such-session", s0, (a) => { if (a[0] === "merge-base") throw new Error("1"); return B + "\n"; }, late, () => "abc1234"), null);
+      hp("HEAD 基点 a9af71da:批基点不是 sha 形 ⇒ null(不进命令行)",
+        pHeadBase("selftest-no-such-session", s0, () => { throw new Error("不该调"); }, late, () => "--output=x"), null);
+      hp("HEAD 基点 a9af71da:reflog 取得到 ⇒ 不看批基点", pHeadBase("selftest-no-such-session", s0, g2, early, () => "abc1234"), B);
+      hp("HEAD 基点 a9af71da:无会话 id ⇒ 批基点也不用", pHeadBase(undefined, s0, g2, late, () => "abc1234"), null);
+      // 红队 a07e98e9 BP-5:退路批基点必须是**未结清**的批——已结清 ⇒ null(不拿已关批的基点把整批算到新会话头上)
+      hp("批基点 a07e98e9 BP-5:批状态已结清 ⇒ null", batchBaseOfGoal({ cleared: true, batch: "257", baseCommit: "abc1234" }), null);
+      hp("批基点 a07e98e9 BP-5:批状态未结清 ⇒ 用 baseCommit", batchBaseOfGoal({ batch: "257", conditions: ["甲"], baseCommit: "abc1234" }), "abc1234");
+      hp("批基点 a07e98e9 BP-5:无批状态 ⇒ null", batchBaseOfGoal(null), null);
+      hp("批基点 a07e98e9 BP-5:台账最后一条 arm 之后有 clear ⇒ null",
+        batchBaseFromRows([JSON.stringify({ action: "arm", batch: "257", baseCommit: "66803b1" }), JSON.stringify({ action: "decision", batch: "257" }), JSON.stringify({ action: "clear", batch: "257" })]), null);
+      hp("批基点 a07e98e9 BP-5:台账 clear 之后又 arm ⇒ 用新批 baseCommit",
+        batchBaseFromRows([JSON.stringify({ action: "arm", batch: "257", baseCommit: "66803b1" }), JSON.stringify({ action: "clear", batch: "257" }), JSON.stringify({ action: "arm", batch: "258", baseCommit: "abc1234" })]), "abc1234");
+      hp("批基点 a07e98e9 BP-5:台账未结清 ⇒ 用 arm 的 baseCommit",
+        batchBaseFromRows([JSON.stringify({ action: "arm", batch: "257", baseCommit: "66803b1" }), "坏行"]), "66803b1");
+      hp("HEAD 基点 a07e98e9 BP-5:reflog 截断 + 批已结清 ⇒ null(端到端)",
+        pHeadBase("selftest-no-such-session", s0, g2, late, () => batchBaseOfGoal({ cleared: true, baseCommit: "abc1234" })), null);
+      hp("HEAD 基点:无会话 id ⇒ null", pHeadBase(undefined, [{ timestamp: "2026-10-10T08:00:00Z" }], g2, early), null);
+      hp("HEAD 基点:会话 id 带路径字符 ⇒ null(不拼进文件名)", pHeadBase("../x", [{ timestamp: "2026-10-10T08:00:00Z" }], g2, early), null);
+      // ── P 的收尾结算(settleP:hook 计账与基点推进;a2a9f58b BP-1 / BP-2 / BP-6)──
+      {
+        const P_ = RULES.find((r) => r.id === "P")._p;
+        const S1 = "1".repeat(40), S2 = "2".repeat(40), S3 = "3".repeat(40), HD = "9".repeat(40);
+        const sc = ({ ledger = { carriers: 0 }, facts, cmd = "git add -A && git commit -m x", extra = [] } = {}) => buildCtx(
+          [{ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: cmd } }, ...extra] } }],
+          { pLedger: ledger, ...(facts === undefined ? {} : { headFacts: () => facts }) });
+        const law3 = { root: "/repo", head: HD, commits: [S1, S2, S3].map((sha) => ({ sha, files: ["docs/laws/collab.md"] })) };
+        const s1 = settleP(P_, sc({ facts: law3 }), []);
+        hp("settleP BP-1:git add -A 带进 3 笔法典提交 ⇒ 账 +3(原命令语法计 0)、记下 sha", JSON.stringify(s1.ledger), JSON.stringify({ carriers: 3, shas: [S1, S2, S3] }));
+        hp("settleP BP-6:推进到读事实那一刻的 HEAD", `${s1.advance}:${s1.head}`, `true:${HD}`);
+        const s2 = settleP(P_, sc({ ledger: { carriers: 3, shas: [S1, S2, S3] }, facts: law3 }), [{ id: "P" }]);
+        hp("settleP 去重:同一批提交再出现(P 欠着、基点没动)⇒ 账不动", s2.ledger, null);
+        hp("settleP:P 有命中 ⇒ 不推进基点", s2.advance, false);
+        const s3 = settleP(P_, sc({ facts: null }), []);
+        hp("settleP BP-2:git 事实取不到、P 无命中 ⇒ 不推进基点", s3.advance, false);
+        hp("settleP BP-2:git 事实取不到 ⇒ 回退语法计数(git add -A 计 0 + 触发与否)", JSON.stringify(s3.ledger), "null");
+        hp("settleP:git 事实通道没接 ⇒ 不推进基点", settleP(P_, sc({}), []).advance, false);
+        const all3 = [{ type: "tool_use", name: "Bash", input: { command: "node ~/.claude/scripts/codex-run.mjs --task t.md" } },
+          { type: "tool_use", name: "Agent", input: { subagent_type: "grill:testing" } }, { type: "tool_use", name: "WebSearch", input: { query: "先例" } }];
+        hp("settleP:三通道齐 ⇒ 清零(sha 照记)", JSON.stringify(settleP(P_, sc({ ledger: { carriers: 4 }, facts: law3, extra: all3 }), []).ledger),
+          JSON.stringify({ carriers: 0, shas: [S1, S2, S3] }));
+        // 红队 a9af71da BP-1:基点后 61 笔(readHeadFacts 走聚合)⇒ 事实不再 null;合回带进闸改动
+        //   ① 三通道齐(闸引擎面的独立视角 = 绑定红队)且 P 无命中 ⇒ advance=true(原 facts=null ⇒ 永不推进,G2)
+        //   ② 无红队 ⇒ P 命中、不推进
+        const PR = RULES.find((r) => r.id === "P");
+        const M61 = Array.from({ length: 61 }, (_, i) => `${i === 0 ? HD : String((i % 8) + 1).repeat(40)}\x1f1760000300\x1f\x1fx\n`).join("");
+        const g61 = (a) => {
+          if (a[0] === "rev-parse" && a[1] === "--show-toplevel") return "/repo\n";
+          if (a[0] === "rev-parse" && a[1] === "HEAD") return HD + "\n";
+          if (a[0] === "rev-parse" && a[1] === "--verify") return "a".repeat(40) + "\n";
+          if (a[0] === "merge-base") return "";
+          if (a[0] === "rev-list") return a.includes("--count") ? "61\n" : M61;
+          if (a[2] === "diff") return "M\0scripts/lib/gate-rules.mjs\0M\0docs/laws/collab.md\0";
+          if (a[0] === "log") return "1759999000\n";
+          return "";
+        };
+        const f61 = readHeadFacts("aaaaaaa", g61, P_.ENGINE_PATHSPECS);
+        hp("settleP a9af71da BP-1:基点后 61 笔 ⇒ readHeadFacts 不再 null(一笔聚合项)", f61 && `${f61.commits.length}:${f61.commits[0].aggregated}:${f61.commits[0].count}`, "1:true:61");
+        const merge = "git merge --no-ff worktree-agent-x -m m";
+        const hunter = { type: "tool_use", name: "Agent", input: { subagent_type: "_gate-bypass-hunter", prompt: "红队合回的 scripts/lib/gate-rules.mjs 改动" } };
+        const ok3 = [all3[0], hunter, all3[2]];
+        const c1 = sc({ ledger: { carriers: 0 }, facts: f61, cmd: merge, extra: ok3 });
+        const h1 = PR.detect(c1);
+        const st1 = settleP(P_, c1, h1.length ? [{ id: "P" }] : []);
+        hp("settleP a9af71da BP-1:聚合项 + 三通道齐 ⇒ P 无命中、advance=true、推进到 HEAD、账清零",
+          `${h1.length}:${st1.advance}:${st1.head === HD}:${st1.ledger && st1.ledger.carriers}`, "0:true:true:0");
+        const c2 = sc({ ledger: { carriers: 0 }, facts: f61, cmd: merge, extra: [all3[0], all3[1], all3[2]] });
+        const h2 = PR.detect(c2);
+        const st2 = settleP(P_, c2, h2.length ? [{ id: "P" }] : []);
+        hp("settleP a9af71da BP-1:聚合项带闸改动、无红队(只有 grill)⇒ P 命中(欠独立视角)、不推进、账按 count 计 61",
+          `${h2.map((h) => /独立视角/.test(h.ch) ? "hunter" : "other").join(",")}:${st2.advance}:${st2.ledger && st2.ledger.carriers}`, "hunter:false:61");
+      }
+      // ENGINE_PATHSPECS 与 ENGINE_REL 同一口径(改一处必改另一处)
+      const _Pp = RULES.find((r) => r.id === "P")._p;
+      const asRe = (s) => new RegExp("^" + s.replace(/^:\(glob\)/, "").replace(/[.]/g, "\\.").replace(/\*/g, "[^/]*") + "$", "i");
+      const samples = ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", "scripts/lib/gate-rules.mjs", "scripts/lib/gate-x-y.mjs",
+        "scripts/lib/ledger-chain.mjs", "scripts/gate-migrate-check.mjs", "clipboard/oss/public-repo/scripts/lib/gate-rules.mjs"];
+      hp("ENGINE_PATHSPECS 与 ENGINE_REL 对同一组路径判定一致",
+        samples.map((p) => `${_Pp.ENGINE_REL.test(p) ? 1 : 0}${_Pp.ENGINE_PATHSPECS.some((s) => asRe(s).test(p)) ? 1 : 0}`).join(" "),
+        "11 11 11 11 00 00 00");
     }
     // ── ranClear:参数面 vs 文本面(2026-08-20 实撞,写完当天被自己绊倒)──────────
     //   原写法 `[\s\S]*` 横跨整条命令 ⇒ 把 `--cond "K 的 --clear 阻断…"` 判成跑过结清。
@@ -3704,11 +4466,104 @@ function selfTest() {
       bashWriteTargets("cp scripts/a.mjs scripts/b.mjs & node scripts/run.mjs", RE), ["scripts/b.mjs"]);
     hp("D7:子 shell 括号里的 cp 目标仍取到",
       bashWriteTargets("(cp scripts/a.mjs scripts/b.mjs)", RE), ["scripts/b.mjs"]);
-    // 引号包分号:切段发生在引号解析之前 ⇒ 真目标 scripts/c.mjs 落进无动词的后段而**丢失**。
-    // 属函数头注已登记的「分段器不理解引号」族(修法试过、会弄坏主写入通道,不修)。
-    // 钉住现状让取舍**可见**:哪天有人改切段器,这条转红即知行为变了。
-    hp("D7:引号包分号——真目标丢失(已知取舍,钉现状)",
-      bashWriteTargets('cp "scripts/a;x.mjs" scripts/c.mjs', RE), []);
+    // 引号包分号:旧切段发生在引号解析之前 ⇒ 真目标丢失(原钉现状)。a2155edb 起切段走 gate-cmd `segments()`
+    //   (引号外才切)⇒ 真目标取到。这条转红曾是预告「切段器变了」——现按新行为改钉。
+    hp("D7:引号包分号——引号感知切段后真目标取到(a2155edb 改钉)",
+      bashWriteTargets('cp "scripts/a;x.mjs" scripts/c.mjs', RE), ["scripts/c.mjs"]);
+    // ── a2155edb BP-2 / BP-7:引号感知的写目标(ND 的 Bash 面出路改用本函数)──
+    {
+      const D = /(?:^|\/)docs\/noun-diary\.md$/i;
+      const Q = String.fromCharCode(39);   // 单引号
+      const P = String.fromCharCode(124);  // 竖线
+      // BP-7 真写入(旧式认不出)
+      hp("BP-7:sed -i 脚本里带 | 仍取到目标", bashWriteTargets(`sed -i ${Q}$a ${P} wg ${P} 包管理器 ${P}${Q} docs/noun-diary.md`, D), ["docs/noun-diary.md"]);
+      hp("BP-7:Add-Content -Path 反斜杠路径", bashWriteTargets(`Add-Content -Path docs\\noun-diary.md -Value ${Q}${P} wg ${P} x ${P}${Q}`, D), ["docs/noun-diary.md"]);
+      hp("BP-7:Add-Content 位置参数", bashWriteTargets(`${Q}${P} wg ${P}${Q} ${P} Add-Content E:\\work\\docs\\noun-diary.md`, D), ["E:/work/docs/noun-diary.md"]);
+      hp("BP-7:Out-File -Append -FilePath", bashWriteTargets(`${Q}x${Q} ${P} Out-File -Append -FilePath docs/noun-diary.md`, D), ["docs/noun-diary.md"]);
+      hp("BP-7:node appendFileSync(表格行带 |)", bashWriteTargets(`node -e "require('fs').appendFileSync('docs/noun-diary.md', '${P} wg ${P} x ${P}\\n')"`, D), ["docs/noun-diary.md"]);
+      hp("BP-7:python open(...,'a')", bashWriteTargets(`python -c "open('docs/noun-diary.md','a', encoding='utf-8').write('${P} wg ${P}')"`, D), ["docs/noun-diary.md"]);
+      hp("BP-7:cat heredoc 同行 >> 目标", bashWriteTargets(`cat <<${Q}EOF${Q} >> docs/noun-diary.md\n${P} wg ${P} x ${P}\nEOF`, D), ["docs/noun-diary.md"]);
+      hp("BP-7:tee -a 在管道下游", bashWriteTargets(`printf x ${P} tee -a docs/noun-diary.md`, D), ["docs/noun-diary.md"]);
+      // BP-2 假写入(旧式误认)
+      hp("BP-2:awk 引号里的 > 不是重定向", bashWriteTargets(`awk ${Q}NF > 3${Q} docs/noun-diary.md`, D), []);
+      hp("BP-2:--cond 引号里的 > 不是重定向", bashWriteTargets(`node scripts/batch-goal.mjs --cond "日志 >1MB" && grep x docs/noun-diary.md`, D), []);
+      hp("BP-2:箭头函数不是重定向", bashWriteTargets(`node -e "[1].map(x=>x)" docs/noun-diary.md`, D), []);
+      hp("BP-2:重定向写的是别的文件", bashWriteTargets("grep winget docs/noun-diary.md > clipboard/hits.txt", D), []);
+      hp("BP-2:heredoc 正文提到日记路径", bashWriteTargets(`cat <<${Q}EOF${Q} > clipboard/note.md\n见 docs/noun-diary.md\nEOF`, D), []);
+      hp("BP-2:grep 的参数 tee 不是命令", bashWriteTargets("grep -n tee docs/noun-diary.md", D), []);
+      hp("词界:committee / scp 不是 tee / cp", bashWriteTargets("committee docs/noun-diary.md; scp a docs/noun-diary.md", D), []);
+      hp("命令位:包装器(sudo / VAR=)之后的 sed -i 认", bashWriteTargets("LC_ALL=C sudo sed -i s/a/b/ docs/noun-diary.md", D), ["docs/noun-diary.md"]);
+      hp("sed 无 -i 不是写", bashWriteTargets("sed -n 1,5p docs/noun-diary.md", D), []);
+      // 语料对照(HEAD vs 新版,15379 条命令)逮到的两类回退,当批补上:
+      hp("语料回退①:git -C 路径 mv 的目标照认", bashWriteTargets("git -C \\repo mv .claude/commands/plan.md .claude/commands/kplan.md", /\.claude\//), [".claude/commands/kplan.md"]);
+      hp("语料回退①对照:git add 不是写", bashWriteTargets("git add docs/noun-diary.md", D), []);
+      hp("语料回退②:cmd /c 引号里的重定向递归认", bashWriteTargets(`cmd /c "cd /d \\repo && pnpm graph:check > clipboard\\x.log 2>&1"`, /clipboard\//), ["clipboard/x.log"]);
+      hp("语料回退②:bash -c 里的追加递归认", bashWriteTargets(`bash -c "printf x >> docs/noun-diary.md"`, D), ["docs/noun-diary.md"]);
+      hp("语料回退②对照:bash 跑脚本文件不递归", bashWriteTargets("bash scripts/x.sh docs/noun-diary.md", D), []);
+
+      // ── 红队 a811daae(对 b7ef430)──────────────────────────────────────────────
+      //   对照组口径:「旧」= b7ef430 的实现(派出方与本批语料对照实测),「f4b3a9e 正则」= a2155edb 之前的旧式。
+      const G = String.fromCharCode(62);   // >
+      const GR = /scripts\/lib\/gate-rules\.mjs$/;
+      // BP-4 漏放:段首 shell 保留字 / 带值包装器。旧:八条全 [];f4b3a9e 正则认得 `then cp …`(无词界的 `cp\s+`)。
+      hp("BP-4:if…then cp(派出方实测形)", bashWriteTargets("if [ -f clipboard/x.mjs ]; then cp clipboard/x.mjs scripts/lib/gate-rules.mjs; fi", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:for…do cp", bashWriteTargets("for f in a b; do cp clipboard/x.mjs scripts/lib/gate-rules.mjs; done", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:else cp", bashWriteTargets("if false; then :; else cp a scripts/lib/gate-rules.mjs; fi", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:{ cp …; } 组命令", bashWriteTargets("{ cp a scripts/lib/gate-rules.mjs; }", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:! cp 取反", bashWriteTargets("! cp a scripts/lib/gate-rules.mjs", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:xargs -I {} cp(带值选项)", bashWriteTargets(`ls ${P} xargs -I {} cp {} scripts/lib/gate-rules.mjs`, GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:nice -n 10 cp", bashWriteTargets("nice -n 10 cp a scripts/lib/gate-rules.mjs", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:sudo -u bob cp", bashWriteTargets("sudo -u bob cp a scripts/lib/gate-rules.mjs", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:sudo -Eu bob(簇尾带值字母取下一词)", bashWriteTargets("sudo -Eu bob cp a scripts/lib/gate-rules.mjs", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:busybox cp", bashWriteTargets("busybox cp a scripts/lib/gate-rules.mjs", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:timeout -s KILL 5 cp(带值选项 + 时长)", bashWriteTargets("timeout -s KILL 5 cp a scripts/lib/gate-rules.mjs", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("BP-4:find -exec cp … \\; 的终止符不是目标(旧取到 `;`)", bashWriteTargets("find . -name x -exec cp {} scripts/lib/gate-rules.mjs \\;", GR), ["scripts/lib/gate-rules.mjs"]);
+      hp("语料对照:find -exec mv -t DIR {} + 取 DIR(旧取到 `+`)", bashWriteTargets("find packets -name x -exec mv -t packets/math {} +", /[\s\S]/), ["packets/math"]);
+      hp("BP-4:PS if { Copy-Item } 的 `}` 不是参数", bashWriteTargets("if (Test-Path x) { Copy-Item a scripts/lib/gate-rules.mjs }", GR, "ps"), ["scripts/lib/gate-rules.mjs"]);
+      // BP-4 对照组(不得因跳保留字/包装器而多认)
+      hp("BP-4 对照:for 的变量名不是命令", bashWriteTargets("for cp in a scripts/lib/gate-rules.mjs; do :; done", GR), []);
+      hp("BP-4 对照:if 后的 grep 不是写", bashWriteTargets("if grep -q cp scripts/lib/gate-rules.mjs; then :; fi", GR), []);
+      hp("BP-4 对照:xargs 的 -I 值 `cp` 不是命令(旧把值当命令名)", bashWriteTargets(`ls ${P} xargs -I cp echo cp scripts/lib/gate-rules.mjs`, GR), []);
+      // BP-5 误拦(同根):旧 ND 正则认得、b7ef430 认不出
+      hp("BP-5:if ! grep …; then tee -a 日记 <<EOF", bashWriteTargets(`if ! grep -q winget docs/noun-diary.md; then tee -a docs/noun-diary.md <<${Q}EOF${Q}\n${P} winget ${P} pm ${P}\nEOF\nfi`, D), ["docs/noun-diary.md"]);
+      // BP-3 漏放:重定向词冒充「最后一个位置参数」。旧:cp 取到 `2>/dev/null`、tee 取到 `>`、`/dev/null`
+      const AG = /\.claude\/agents\//;
+      hp("BP-3:cp … 2>/dev/null 取真目标", bashWriteTargets(`cp clipboard/a.md .claude/agents/new.md 2${G}/dev/null`, AG), [".claude/agents/new.md"]);
+      hp("BP-3:cp … > log 2>&1 取真目标", bashWriteTargets(`cp clipboard/a.md .claude/agents/new.md ${G} clipboard/log 2${G}&1`, /[\s\S]/), ["clipboard/log", ".claude/agents/new.md"]);   // 重定向目标先收、命令目标后收
+      hp("BP-3:tee … > /dev/null 只取日记", bashWriteTargets(`printf x ${P} tee -a docs/noun-diary.md ${G} /dev/null`, /[\s\S]/), ["docs/noun-diary.md"]);
+      hp("BP-3:mv … &>/dev/null", bashWriteTargets(`mv a .claude/agents/x.md &${G}/dev/null`, AG), [".claude/agents/x.md"]);
+      hp("BP-3:sed -i … 2>/dev/null 不把重定向当文件", bashWriteTargets(`sed -i s/a/b/ docs/noun-diary.md 2${G}/dev/null`, /[\s\S]/), ["docs/noun-diary.md"]);
+      // BP-6 方言:掩码与分词同一方言
+      const PSX = `Set-Location "\\repo\\"; Add-Content docs\\noun-diary.md "${P} winget ${P} pm ${P}"`;
+      hp("BP-6:PowerShell `\"\\repo\\\"` 后的 Add-Content(按工具名 ps)", bashWriteTargets(PSX, D, "ps"), ["docs/noun-diary.md"]);
+      hp("BP-6:同串不给方言 ⇒ 自判 ps(cmdlet 形)", bashWriteTargets(PSX, D), ["docs/noun-diary.md"]);
+      hp("BP-6:Bash `sed -i \"s/a/\\\" b/\"` 目标(旧取成 `b/ docs/…`)", bashWriteTargets(`sed -i "s/a/\\" b/" docs/noun-diary.md`, D, "bash"), ["docs/noun-diary.md"]);
+      hp("BP-6:PS 反引号转义的引号不闭合字符串", bashWriteTargets('Add-Content docs/noun-diary.md "a`"b; c"', D, "ps"), ["docs/noun-diary.md"]);
+      hp("BP-6:PS here-string 正文里的 > 不是重定向", bashWriteTargets(`$t = @"\nx ${G} scripts/lib/gate-rules.mjs\n"@\nAdd-Content docs/noun-diary.md $t`, /[\s\S]/, "ps"), ["docs/noun-diary.md"]);
+      hp("BP-6 对照:方言给错(bash)⇒ 同串仍按 bash 解(不偷换方言)", bashWriteTargets(PSX, D, "bash"), []);
+      hp("BP-6:自判——cmdlet 形但 PS 口径不闭合、bash 闭合 ⇒ 换 bash", cmdDialect(`Set-Content x "a\\" b"`), "bash");
+      // 复核红队 aaf414b6 BP-2(365fd54 引入,漏放):PS 标记在未掩码原串上测 ⇒ 引号里的 `$env:` / `|Set-Content` 把 bash 判成 ps
+      //   ⇒ `\`+换行续行失效 ⇒ 续行后的目标丢。旧实现(365fd54^)给 ["AGENTS.md"],365fd54 给 [];现 ["AGENTS.md"]。
+      const SEDENV = `sed -i ${Q}s/$env:A/$env:B/g${Q} \\\n  AGENTS.md`;
+      hp("BP-2b:引号里的 $env: 不算 PS 标记(365fd54 判 ps)", cmdDialect(SEDENV), "bash");
+      hp("BP-2b:bash 续行后的目标(365fd54 给 [])", bashWriteTargets(SEDENV, /[\s\S]/), ["AGENTS.md"]);
+      hp("BP-2b:引号里的 |Set-Content 不算 cmdlet 段首(365fd54 判 ps)", cmdDialect(`grep -n ${Q}x${P}Set-Content y${Q} AGENTS.md`), "bash");
+      hp("BP-2b 对照:引号外的 $env: 仍判 ps", cmdDialect(`$env:X = 1; Add-Content docs/noun-diary.md "y"`), "ps");
+      hp("BP-2b 对照:段首 cmdlet 仍判 ps", cmdDialect(`Write-Output "a"`), "ps");
+      hp("BP-2b 对照:PS 口径引号外有 $env:、bash 口径(\\\" 转义)把它吞进引号且不闭合 ⇒ 取闭合的 ps", cmdDialect(`echo "a\\" $env:X "b"`), "ps");
+      hp("BP-2b:bash `\\`+换行续行整对删除(不留 \"\\n\" 词)", codexWords("cp a \\\n  b"), ["cp", "a", "b"]);
+      hp("BP-2b:bash 续行不断词", codexWords("ab\\\ncd"), ["abcd"]);
+      hp("BP-2b 对照:单引号内的 \\+换行是字面", codexWords(`${Q}a\\\nb${Q}`), ["a\\\nb"]);
+      // 复核红队 aaf414b6 BP-3(365fd54 引入,ND 误拦 / P·K0 漏放):重定向算子在分词后判、引号信息已丢 ⇒
+      //   `-Value ">"` 的 `">"` 被当裸算子连 `-Path` 一起剔 ⇒ `-Value` 吞掉真路径。365fd54 给 [],旧实现(365fd54^)按 -Path 取到。
+      hp("BP-3b:PS -Value \">\" -Path 日记(365fd54 给 [])", bashWriteTargets(`Add-Content -Value "${G}" -Path docs/noun-diary.md`, D, "ps"), ["docs/noun-diary.md"]);
+      hp("BP-3b:PS -Value \"<\" -Path AGENTS.md,自判(365fd54 给 [])", bashWriteTargets(`Set-Content -Value "<" -Path AGENTS.md`, /[\s\S]/), ["AGENTS.md"]);
+      hp("BP-3b:引号里的 > 是参数", dropRedirWords(codexWordsShaped(`cp a "${G}" b`)), ["cp", "a", G, "b"]);
+      hp("BP-3b:引号里的 >x 是参数", dropRedirWords(codexWordsShaped(`cp a "${G}x" b`)), ["cp", "a", G + "x", "b"]);
+      hp("BP-3b:bash 转义的 \\> 是参数", dropRedirWords(codexWordsShaped(`cp a \\${G} b`)), ["cp", "a", G, "b"]);
+      hp("BP-3b:PS 反引号转义的 `> 是参数", dropRedirWords(codexWordsShaped("cp a `" + G + " b", true)), ["cp", "a", G, "b"]);
+      hp("BP-3b 对照:裸 > 连目标照剔", dropRedirWords(codexWordsShaped(`cp a b ${G} log`)), ["cp", "a", "b"]);
+      hp("BP-3b 对照:算子在引号外、目标带引号 ⇒ 本词照剔", dropRedirWords(codexWordsShaped(`cp a b ${G}"log x" 2${G}&1`)), ["cp", "a", "b"]);    }
 
     // bashWrites —— 与上面同源,契约是「有没有写」而非「写了谁」
     hp("bashWrites:执行一个脚本 ≠ 写它",
