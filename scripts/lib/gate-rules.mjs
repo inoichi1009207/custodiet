@@ -3812,7 +3812,7 @@ const RULE_P = {
     //     理由与让出面见 commitOutsideRoot 头注):该调用内提交前 cwd 已在本仓根外,或提交段带 `git -C <根外>` / git-dir / work-tree 根外;
     //     没有 ⇒ 视为本仓提交失败(未暂存 / pre-commit 失败 / 权限被拒),不计。
     //     同调用内去向解不出(UNK_PARSE:变量、命令替换、`~user` 等)⇒ 按 0aa11fd 之前语义算别处;
-    //     「cd 本身失败」(结果正文带 cd 失败特征)⇒ 该调用的 cd 按原地(红队 a07e98e9 BP-1/BP-2、ad3e4f93 BP-1;详 commitOutsideRoot 头注)。
+    //     「cd 本身失败」(结果正文的失败行点名该 cd 的目标)⇒ 那个 cd 原地(红队 a07e98e9 BP-1/BP-2、ad3e4f93 BP-1;详 commitOutsideRoot 头注)。
     //   计数(a2a9f58b BP-1):宽限账与 detect 同取 `tally`——git 事实在 ⇒ 范围内带承重改动、且账上没记过 sha 的提交数;
     //     取不到 ⇒ 命令语法。原来计数仍是命令语法:`git add -A` / `commit -am` / merge 合回计 0 ⇒ 宽限账永不涨。
 
@@ -4051,9 +4051,9 @@ const RULE_P = {
      *    · 同一调用内去向解不出(UNK_PARSE:变量 / 命令替换 / `~user` / popd 栈空 / `cd -` 无前值 / 相对路径接在根外或解不出的位置后 /
      *      bash 下同盘的裸盘符)之后的提交段 ⇒ 按 0aa11fd 之前语义**算可能在别处**(0aa11fd~ba5c9c2 视为本仓 ⇒ `git -C ~/notes` 等一律漏放)。
      *  同一调用内 cd 本身失败:Bash `cd X && git commit` 的 `&&` 链 cd 失败则提交不跑,无需特判;结果报错且正文带 cd 失败特征
-     *    (`CD_FAIL`,codex 257-p-agg-r1「没问到」②)⇒ 该调用里的 cd **一律按原地**(没生效),两种 shell 同一处置——PowerShell 的
-     *    Set-Location 失败本就不改位置;bash 原记「未知」只在跨调用跟踪里与原地有别,跨调用删掉后原地更简单,且其后 `-C` 相对路径照常按根解。
-     *    其余失败(管道尾 grep 退 1 / push 失败 / 超时 / 打断)不抹 cd(红队 ad3e4f93 BP-1)。
+     *    (`CD_FAIL`,codex 257-p-agg-r1「没问到」②)⇒ **逐个 cd 判**(`cdFailedFor`):失败行点名这个 cd 的目标 ⇒ 它原地(没生效);
+     *    没点名(失败出自同调用里别的命令)⇒ 它照常生效。两种 shell 同一判法。此前「整次调用一刀切」按原地(10ccd42)或按未知
+     *    (b7b3bb1)各错一向,见 cdFailedFor 头注。其余失败(管道尾 grep 退 1 / push 失败 / 超时 / 打断)不抹 cd(红队 ad3e4f93 BP-1)。
      *  **为什么不做跨调用跟踪**(2026-10-11 派出方裁定,删掉 Bash 调用边界回置 / 回置声明采信 / PS·Bash 分账 / 未知跨调用 /
      *    认不出的 cd 外壳 / PS cd 失败原地 / pushd 栈跨调用整套):本批为它连修五轮(0aa11fd、afdd279、52779ec、620e556、f7306ec),
      *    每轮复核红队都在跨调用边界上找出新形态,而这些形态在语料里全是 0 次(派出方自统计,本机 182 份主转录:PS 1346 次调用、
@@ -4074,8 +4074,25 @@ const RULE_P = {
      *  正文缺(老转录 / 结果被截)⇒ 视为非 cd 失败、cd 照常生效(偏严);
      *  PS 内建 `cd..` / `cd\` / `cd~`(无空格的函数形,changelog 第 4856 行)与 `if …; then cd X; fi` / `do cd …` 等 cdOf 认不出的
      *  cd 外壳 ⇒ 当非 cd 段(漏放,登记);walk 的 cd 识别仍是 bash 专用、与本函数两套 cd 模型(BP-3)未动。 */
-    /** Bash 调用带 cd 失败特征时 cd 去向记「未知、不算证据」(true)还是按原地(false,10ccd42 的误拦形态);变异开关。 */
-    BASH_CDFAIL_UNKNOWN: true,
+    /** 这一个 cd(目标 `raw`)是不是**它自己**失败了:调用报错,且结果正文里有一行既命中 CD_FAIL、又点名这个目标
+     *  (Bash `cd: <目标>: No such file…`;PS `Set-Location : Cannot find path '<…目标…>'`)。点名了 ⇒ 这个 cd 原地;
+     *  没点名(失败出自同调用里别的命令,如 hook / cat / node ENOENT)⇒ 这个 cd 照常生效。
+     *  取代此前「整次调用一刀切」的两种语义——按原地(10ccd42:成功的 cd docs 被抹,其后相对路径误拦,红队 a90f6b3f BP-1)
+     *  与按未知(b7b3bb1:真失败的 cd 之后相对 -C 漏放,红队 aada7471 BP-1);两种 shell 同一判法(aada7471 BP-2)。
+     *  目标末段短于 3 字符时只认全串,防常见短名撞行。CEILING:失败行不带目标(定制 shell 提示)⇒ 当生效(偏严于原地、偏宽于未知)。 */
+    cdFailedFor(a, raw) {
+      if (!a || !a.err) return false;
+      const H = RULE_P._p;
+      const u = String(raw ?? "").replace(/^(["'])([\s\S]*)\1$/, "$2").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+      if (!u) return false;
+      const base = u.split("/").filter(Boolean).pop() || u;
+      const keys = base.length >= 3 && base !== u ? [u, base] : [u];
+      return String(a.errText || "").split(/\r?\n/).some((line) => {
+        if (!H.CD_FAIL.test(line)) return false;
+        const n = line.replace(/\\/g, "/").toLowerCase();
+        return keys.some((k) => n.includes(k));
+      });
+    },
     CD_FAIL: /No such file or directory|Not a directory|Cannot find path|找不到路径|does not exist|(?:^|[\s:])(?:cd|pushd|popd|chdir): |(?:Set|Push|Pop)-Location\s*:/im,
     commitOutsideRoot(ctx, root) {
       const H = RULE_P._p;
@@ -4083,11 +4100,8 @@ const RULE_P = {
       const R = H.resolve(null, root).replace(/\/+$/, "");
       if (!/^([A-Za-z]:)?\//.test(R)) return false;
       const home = /^((?:[A-Za-z]:)?\/(?:users|home)\/[^/]+)(?:\/|$)/i.exec(R)?.[1] ?? null;
-      // FAIL(复核红队 a90f6b3f BP-1):Bash 调用里出现 cd 失败特征时 cd 的去向 = 未知、**不算证据**(10ccd42 之前的 UNK_FAIL 语义)。
-      //   10ccd42 曾改成「两种 shell 都按原地」⇒ 成功的 `cd docs` 被抹回根,其后相对 `--git-dir=../.git` / `-C ..` 解到根外 ⇒ 本仓失败提交被计别处(诚实误拦)。
-      //   PowerShell 仍按原地(PS 的 Set-Location 失败本来就不移动;同调用内其后相对 `-C ../x` 照算别处,正例钉住)。
-      const OUT = "\0out", UNK = "\0unk-parse", FAIL = "\0unk-fail";
-      const isPath = (l) => l !== OUT && l !== UNK && l !== FAIL;
+      const OUT = "\0out", UNK = "\0unk-parse";
+      const isPath = (l) => l !== OUT && l !== UNK;
       const fix = (p) => String(p).replace(/\\/g, "/").replace(/^\/([a-z])(\/|$)/i, "$1:/");
       const abs = (p) => /^([A-Za-z]:)?\//.test(fix(p));
       const driveOf = (l) => (isPath(l) ? (/^([A-Za-z]):/.exec(l)?.[1] || "").toLowerCase() : "");
@@ -4110,7 +4124,7 @@ const RULE_P = {
         if (!isPath(base)) return base;              // 未知之后的相对路径:沿用未知
         return H.resolve(base, u);
       };
-      const isOut = (l) => l !== FAIL && (!isPath(l) || H.outside(l, R));
+      const isOut = (l) => !isPath(l) || H.outside(l, R);
       for (const a of Array.isArray(ctx.actions) ? ctx.actions : []) {
         const name = String((a && a.name) || "");
         if (!/^(Bash|PowerShell)$/.test(name) || typeof (a.input && a.input.command) !== "string") continue;
@@ -4118,8 +4132,7 @@ const RULE_P = {
         let segs = [];
         try { segs = segments(ps ? a.input.command : H.stripHeredoc(a.input.command), ps); } catch { continue; }
         st = H.callStart(st, R);
-        // 结果报错且正文带 cd 失败特征 ⇒ 本调用的 cd 一律按原地(见头注;其余失败不抹 cd,红队 ad3e4f93 BP-1)
-        const cdFailed = !!(a.err && H.CD_FAIL.test(String(a.errText || "")));
+        // 哪个 cd 失败按「失败行点名的目标」逐个判(cdFailedFor);点名了的那个 cd 原地,其余照常生效
         let { loc, prev, stack } = st;
         const frames = [];                           // 子 shell 层:进入前的 {loc, prev, stack, env}
         let env = {};                                // 本调用内设过的 GIT_DIR / GIT_WORK_TREE(原始串,提交时按当时 cwd 解)
@@ -4131,8 +4144,9 @@ const RULE_P = {
           const body = sc.body;
           const cd = body ? H.cdOf(body, ps) : null;
           if (cd) {
-            if (cdFailed && !ps && H.BASH_CDFAIL_UNKNOWN) { prev = loc; loc = FAIL; }   // Bash:cd 失败特征 ⇒ 去向未知、不算证据(PS 走下面的原地分支 = 不动)
-            else if (!cdFailed) {
+            const rawTarget = "to" in cd ? cd.to : ("home" in cd ? `~${cd.home ? "/" + cd.home : ""}` : null);
+            if (!(rawTarget !== null && H.cdFailedFor(a, rawTarget))) {   // 这个 cd 自己失败了 ⇒ 原地(不动)
+
               const was = loc;
               if (cd.pop) { loc = stack.length ? stack.pop() : UNK; prev = was; }
               else if (!cd.stay) {                   // PowerShell 无参:原地
@@ -4606,9 +4620,9 @@ const RULE_P = {
     { name: "git -C 根外不认(提交段的 -C 不叠;证人 = git -C ../elsewhere / ~/notes 正例)", apply: swapP({ commitTargets: (orig) => (g, env, loc, res) => orig(g ? { ...g, cdirs: [] } : g, env, loc, res) }) },
     { name: "段首 ( / { 不剥(cdOf 认不出子 shell 与大括号组里的 cd,a07e98e9 BP-1)", apply: swapP({ scope: () => (seg) => ({ body: String(seg || "").trim(), open: 0, close: 0 }) }) },
     { name: "子 shell 不开层(子 shell 里的 cd 当持久,a07e98e9 BP-1 反)", apply: swapP({ scope: (orig) => (seg, ps) => ({ ...orig(seg, ps), open: 0, close: 0 }) }) },
-    { name: "任何报错都抹 cd(不看结果正文的 cd 失败特征,ad3e4f93 BP-1)", apply: swapP({ CD_FAIL: () => /[\s\S]?/ }) },
+    { name: "任何报错都抹 cd(不看结果正文,ad3e4f93 BP-1)", apply: swapP({ cdFailedFor: () => (a) => !!(a && a.err) }) },
     { name: "结果正文不看(cd 失败也当生效,codex agg-r1 ② 反)", apply: swapP({ CD_FAIL: () => /(?!)/ }) },
-    { name: "Bash 调用 cd 失败特征按原地(其后相对 --git-dir=../.git 从根解到根外,复核红队 a90f6b3f BP-1)", apply: swapP({ BASH_CDFAIL_UNKNOWN: () => false }) },
+    { name: "失败行不认目标(同调用任一 cd 失败特征抹全部 cd,复核红队 a90f6b3f BP-1)", apply: swapP({ cdFailedFor: () => (a) => !!(a && a.err && RULE_P._p.CD_FAIL.test(String(a.errText || ""))) }) },
     { name: "聚合项按 1 笔计(不按范围提交数 count,a9af71da BP-1)", apply: swapP({ facts: (orig) => (ctx) => {
       const f = orig(ctx);
       return f ? { ...f, commits: f.commits.map((c) => ({ ...c, aggregated: false })) } : f;
@@ -4931,6 +4945,16 @@ const RULE_P = {
       //   「复核 620e556 BP-1(PS 切仓失败、插 Bash、PS 相对切他仓)」钉的「cd 失败 ⇒ 原地(不是未知)」改成同一调用形保住(下一条)。
       // cd 失败 ⇒ 原地(两种 shell 同):同一调用内 Set-Location 失败(正文带 cd 失败特征)⇒ 仍在根 ⇒ 其后 `git -C ../elsewhere` 解出根外 ⇒ 别处
       //   (原记「未知」时 -C 相对路径沿用未知、不算证据 ⇒ 漏放;「结果正文不看」变异下 cd 当生效 ⇒ -C 解到 /repo/elsewhere 根内 ⇒ 本条转红)
+      // 复核红队 aada7471 BP-1(b7b3bb1 引入的漏放):Bash 同调用 cd 真失败(报错点名该目标)⇒ 原地 ⇒ 其后相对 -C ../elsewhere 解到根外
+      { name: "aada7471 BP-1:Bash cd 真失败(报错点名目标)、其后 git -C ../elsewhere 提交 ⇒ 别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        then: [{ text: "提交", bash: "cd /repo/nope; git -C ../elsewhere add AGENTS.md; git -C ../elsewhere commit -m x", failed: "bash: cd: /repo/nope: No such file or directory" }],
+        headFacts: { root: "/repo", commits: [] } },
+      // D149⑱ BP-2(老问题,随按目标判一并修):他仓提交成功后链尾 cat 报 No such file(未点名 cd 目标)⇒ cd 照常生效 ⇒ 别处
+      { name: "D149⑱ BP-2:cd 他仓提交成功、链尾 cat 报 No such file ⇒ 仍算别处",
+        text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo", bash: ["sed -i s/a/b/ AGENTS.md"],
+        then: [{ text: "提交", bash: "cd E:/elsewhere && git add -A && git commit -m x && cat NOTES.md", failed: "cat: NOTES.md: No such file or directory" }],
+        headFacts: { root: "/repo", commits: [] } },
       { name: "cd 失败按原地:同一 PS 调用内切仓失败、其后 git -C ../elsewhere 提交 ⇒ 别处",
         text: "第五笔。", pLedger: { carriers: 4 }, hookCheckout: "/repo", bash: ["sed -i s/a/b/ AGENTS.md"],
         then: [{ text: "切了提交", ps: "Set-Location /repo/nope; git -C ../elsewhere add AGENTS.md; git -C ../elsewhere commit -m x",
@@ -5140,10 +5164,15 @@ const RULE_P = {
       // 2026-10-11 新增(删跨调用跟踪的接受侧,Bash / PS 各一):上一次调用 cd 他仓、本次调用本仓 `git commit` 失败 ⇒ 每次调用起点回根,不计别处
       //   (两条都在本轮,是「每次调用起点不回根」变异的证人;PS 一条正是让出面——PS 跨调用若保持 cwd、且那笔真提交进了他仓,这里会漏)
       // 复核红队 a90f6b3f BP-1(10ccd42 引入的诚实误拦):同调用 `cd docs` 成功,其后相对 git-dir 指回本仓,hook 里别的命令报
-      //   No such file ⇒ 提交没落盘;10ccd42 把 cd 一律按原地 ⇒ `../.git` 从根解到根外 ⇒ 计别处。现 Bash 记未知、不算证据 ⇒ 放行
+      //   No such file ⇒ 提交没落盘;10ccd42 把 cd 一律按原地 ⇒ `../.git` 从根解到根外 ⇒ 计别处。现按目标判:失败行没点名 docs ⇒ docs 照常生效 ⇒ 放行
       { name: "a90f6b3f BP-1:cd docs 成功、hook 报 No such file、--git-dir=../.git 本仓提交失败 ⇒ 不计别处",
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
         then: [{ text: "提交", bash: "cd docs && git --git-dir=../.git --work-tree=.. commit -m law", failed: ".git/hooks/pre-commit: line 2: node_modules/.bin/lint-staged: No such file or directory" }],
+        headFacts: { root: "/repo", commits: [] } },
+      // 复核红队 aada7471 BP-2:同形 PS 版——Set-Location docs 成功、hook 报 No such file(未点名 docs)⇒ docs 照常生效 ⇒ 放行
+      { name: "aada7471 BP-2:PS Set-Location docs 成功、hook 报 No such file、--git-dir=../.git 本仓提交失败 ⇒ 不计别处",
+        text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
+        then: [{ text: "提交", ps: "Set-Location docs; git --git-dir=../.git --work-tree=.. commit -m law", failed: ".git/hooks/pre-commit: line 2: node_modules/.bin/lint-staged: No such file or directory" }],
         headFacts: { root: "/repo", commits: [] } },
       { name: "上一次 Bash 调用 cd 他仓、本次调用本仓提交失败 ⇒ 起点回根,不计别处",
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
@@ -5175,7 +5204,7 @@ const RULE_P = {
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",
         then: [{ text: "切了再提交", ps: "Set-Location E:/elsewhere; git commit -m law", failed: "Set-Location : Cannot find path 'E:\\elsewhere' because it does not exist." }],
         headFacts: { root: "/repo", commits: [] } },
-      // ad3e4f93 BP-1 接受侧(bash 形):cd 本身失败的正文 ⇒ 该调用的 cd 按原地、不算证据
+      // ad3e4f93 BP-1 接受侧(bash 形):cd 本身失败的正文(点名该目标)⇒ 那个 cd 原地
       //   (原另有一条「上一次 bash cd 失败、本轮提交」跨调用形,2026-10-11 删跨调用跟踪后删除:起点一律回根,cd 失败与否无关)
       { name: "ad3e4f93 BP-1 反:同一调用内 bash cd 失败(No such file)、其后本仓提交失败 ⇒ 不计别处",
         text: "x", pLedger: { carriers: 4 }, hookCheckout: "/repo", write: "/repo/AGENTS.md",

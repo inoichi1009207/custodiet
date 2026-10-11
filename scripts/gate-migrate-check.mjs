@@ -376,7 +376,7 @@ const mkEntries = (c) => {
 // `failed: true`(codex 257-p-agg-r1「没问到」②):该项里的 Bash/PowerShell 调用全部失败——给 tool_use 编 id,
 //   并在其后补一条 `tool_result is_error:true`。没它,「失败的 cd 不算移出本仓」在规则层零证人。
 //   红队 ad3e4f93 BP-1:`failed` 可带结果正文——`true` ⇒ 正文 "Exit code 1"(非 cd 失败 ⇒ cd 照常生效);
-//   `failed: "<正文>"` ⇒ 用该正文(带 cd 失败特征时 P 才把该调用的 cd 按原地)。
+//   `failed: "<正文>"` ⇒ 用该正文(失败行带 cd 失败特征且点名某个 cd 的目标时,P 才把那个 cd 按原地)。
 // (原有 `result: "<正文>"` 键 = 成功结果正文,只为写出 CC 的回置声明供 P 的跨调用 cwd 跟踪;2026-10-11 P 删跨调用跟踪、
 //   gate-ctx 删 `cwdReset`,该键无消费者,一并删除——再写会被键名校验拦下。)
 const PRIOR_ASSISTANT_KEYS = ["text", "write", "skill", "bash", "ps", "agent", "web", "read", "grep", "commit", "mcp", "at", "failed"];
