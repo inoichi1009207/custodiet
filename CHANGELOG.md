@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.3 — 2026-10-17
+
+- **DP 不再把推公开远端当推私仓**:只有结构完整、远端是字面 `origin` / `custodiet` 的 `git push` 才不要求欠账探针。远端从原始命令按引号感知分词取,必须是裸 `git` 后跳过全局选项的 `push` 子命令;`-o` / `--push-option` / 短选项簇尾的 `o` / `--repo` 的值跳过,有位置参数时位置参数优先;命令里临时改 `remote.*.url` / `pushurl`、远端词带引号或变量、结构对不上的,一律按推私仓算。
+- **已知限制**:只按远端名判,不核实际推送 URL——持久把公开远端的 URL 改指私仓会漏;别的仓里推名为 `private` 的远端会被误拦。
+- isNewEvidence 的「新建」判定与追踪集同用 `core.quotepath=false -z`,中文路径不再一边转义一边原样。
+
 ## 0.6.2 — 2026-10-17
 
 - **heredoc 后接管道 / `&&` 的写命令不再静默放行**:`cat <<'EOF' | tee AGENTS.md`、`cat <<'EOF' && cp … AGENTS.md`、`cat <<'EOF' | bash` 现在都能认出写入;只做语法检查的下游(`bash -n` / `-nv`、`node --check`)与喂给脚本参数的数据不算执行。

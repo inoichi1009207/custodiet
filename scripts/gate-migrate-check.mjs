@@ -217,8 +217,9 @@ const say = (ok, s) => { console.log(`  ${ok ? "PASS" : "FAIL"}  ${s}`); if (!ok
 //   这与之前 `lastTurn` 那次是同一族错:比对两边的输入面必须一致。
 const REAL_TRACKED = (() => {
   try {
-    return new Set(execFileSync("git", ["ls-files"], { encoding: "utf8", cwd: process.cwd() })
-      .split("\n").map((s) => s.trim()).filter(Boolean));
+    // 批 261:与生产口径(hook-stop-closure isNewEvidence)一致,不转义非 ASCII 路径
+    return new Set(execFileSync("git", ["-c", "core.quotepath=false", "ls-files", "-z"], { encoding: "utf8", cwd: process.cwd() })
+      .split("\0").filter(Boolean));
   } catch { return null; }     // 取不到 ⇒ 两边都 fail-closed,仍然一致
 })();
 /** 旧实现在 `run()` 里读的那份批次快照。验收台**注入同一份**给引擎。

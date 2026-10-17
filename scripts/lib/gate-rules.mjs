@@ -7645,7 +7645,8 @@ const RULE_ND = {
  *  切段走唯一实现 `segments`/`stripQuoted` + `stripHeredoc`(红队 BP-13/5/6:朴素切段在引号、heredoc、注释里照切,
  *  `git commit -m "fix; git push later"` 被当成推、写在注释里的探针被当成跑过)。
  *  push 识别不锚段首(BP-3):段内任意位置的 git 可执行名 + push 子命令都算,`bash -c "…"`/`sh -c`/`pwsh -Command` 剥一层再判;
- *  bare `git push` 因 pushDefault=private 也算;远端名取第一个非选项参数,整词等于 origin 才排除(origin 已置 no-push://);
+ *  bare `git push` 因 pushDefault=private 也算;远端名取第一个非选项参数,只有字面等于 origin / custodiet(确知非私仓)才排除,
+ *  远端解不出(引号 / 变量 / 命令替换包住)按推 private 算(批 261);
  *  `--dry-run` / `-n` 只在参数面上认(BP-6/14)。
  *  探针识别同样不锚段首(BP-12:PowerShell `if ($?) { node … }`、`timeout 120 node …` 原被误拦),
  *  但 node 必须在引号外、且带 `--check`/`-e`/`-p` 的不算(BP-5)。
@@ -7695,6 +7696,8 @@ const DP_SEGS = (cmds, wrap = DP_WRAP) => (cmds || []).flatMap((c) =>
 const DP_PUSH_RE = /(?:^|[\s(&{`])(?:\S*[\\/])?git(?:\.exe)?(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace)(?:\s+\S+)?|\s+--?[\w-]+(?:=\S+)?)*\s+push\b(.*)$/i;
 // 段头是打印/写文本类命令 ⇒ 后面的 `git push` 只是它的参数(BP-E);`VAR=x` 前缀跳过
 const DP_PRINT_HEAD = /^(?:echo|printf|write-host|write-output|out-file|set-content|add-content|cat|grep|rg|select-string)$/i;
+// 确知不是本仓私有代码仓的远端名(批 261,D139⑤):origin 是公开壳(push 已置 no-push://),custodiet 是公开闸仓
+const DP_PUBLIC_REMOTES = new Set(["origin", "custodiet"]);
 const DP_IS_PUSH = (seg, { headCheck = true } = {}) => {
   const masked = stripQuoted(seg);
   const hit = masked.match(DP_PUSH_RE);
@@ -7715,14 +7718,44 @@ const DP_IS_PUSH = (seg, { headCheck = true } = {}) => {
   }
   const args = hit[1].trim().split(/\s+/).filter(Boolean);
   if (args.some((a) => a === "--dry-run" || a === "-n")) return false;
-  let remote = null;
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (/^(-o|--push-option|--receive-pack|--exec)$/.test(a)) { i++; continue; }
-    if (a.startsWith("-")) continue;
-    remote = a; break;
+  // 省略远端 = pushDefault=private。批 261(D139⑤):原为「远端 ≠ origin 即算」,推公开仓 custodiet 也被当成推 private(两批实撞多次)。
+  //   改为**只排除确知不是私仓的字面远端名**(origin 已置 no-push://、custodiet 是公开仓),其余一律算推 private(fail-closed)。
+  //   红队 a415bf26 BP-1~3:曾改成「只认 private / URL 含 app-private」——引号或变量包的 URL、`(git push private)` 这类粘了符号的远端、
+  //   另起的别名(kp)全漏;所以远端那一格在**原始命令**里只要带引号 / 变量 / 命令替换 / 括号 / 重定向 / 续行就当解不出,按推 private 算。
+  //   先例:git 的 pre-push 样例「$1 -- Name of the remote」「$2 -- URL」「If pushing without using a named remote those arguments will be equal」
+  //   codex 261-dp-r1:远端须从**原始命令**取(掩码串里 `-o "ci.skip"` 的值被抹掉,跳过「下一个词」就跳过了真远端);
+  //   push 只认前面是空白的那个(`git -C "E:/push" push` 的目录名不算);`--repo X` / `--repo=X` 跳值,有位置参数时位置参数优先(git 文档);
+  //   命令里临时改了 url / pushurl(`-c remote.custodiet.pushurl=…`)⇒ 名字不可信,按推 private 算
+  //   codex 261-dp-r2:「第一个空白后的 push」仍会错位(`echo $(git push) push origin`、`git -C "E:/x push custodiet y" push private`、
+  //   `-o "note custodiet build"` 按空白拆开)⇒ 改为**引号感知分词 + 结构绑定**:找到裸 `git` 词,跳过全局选项(带值的连值跳),
+  //   下一个词必须正好是 `push`;任何一处对不上结构(`$(git`、`push)`)就当解不出,按推 private 算。只有结构完整且远端是字面公开名才放。
+  if (/\s-c\s+["']?remote\.[\w.-]+\.(?:push)?url=/i.test(String(seg))) return true;
+  const ts = String(seg).match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || [];
+  let sawPublic = false;
+  for (let g = 0; g < ts.length; g++) {
+    if (!/^git(?:\.exe)?$/i.test(ts[g])) continue;
+    let i = g + 1;
+    while (i < ts.length && ts[i].startsWith("-")) {
+      if (/^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--exec-path|--super-prefix)$/.test(ts[i])) i++;
+      i++;
+    }
+    if (ts[i] !== "push") continue;
+    let rawTok = null, repoOpt = null;
+    for (i = i + 1; i < ts.length; i++) {
+      const t = ts[i];
+      if (/^(-o|--push-option|--receive-pack|--exec)$/.test(t)) { i++; continue; }
+      // 红队 r2:短选项簇 `-fo X`——o 在簇尾时下一个词是它的值(git parse-options)
+      if (/^-[A-Za-z]+$/.test(t) && t.endsWith("o")) { i++; continue; }
+      if (t === "--repo") { repoOpt = ts[i + 1] ?? null; i++; continue; }
+      if (/^--repo=/.test(t)) { repoOpt = t.slice(7); continue; }
+      if (t.startsWith("-")) continue;
+      rawTok = t; break;
+    }
+    const tok = rawTok ?? repoOpt;
+    if (tok === null || /["'`$()<>\\{}]/.test(tok) || !DP_PUBLIC_REMOTES.has(tok)) return true;
+    sawPublic = true;
   }
-  return remote !== "origin";   // 省略远端 = pushDefault=private
+  return !sawPublic;
 };
 // node 自身的旗只认白名单(BP-B:黑名单挡不住 -v/--help 这类「不执行脚本」的旗);白名单外一律不算探针
 const DP_NODE_OK_FLAG = /^--(?:no-[\w-]+|experimental-[\w-]+|enable-source-maps|max-old-space-size=\d+|stack-size=\d+|env-file=\S+|unhandled-rejections=[\w-]+|trace-[\w-]+)$/;
@@ -7834,6 +7867,22 @@ const RULE_DP = {
   cases: {
     pos: [
       { text: "推上去了。", bash: "git push private master" },
+      // 批 261(D139⑤):按 URL 直推 app-private 也算
+      { name: "261 D139⑤:按 URL 推 app-private 算推 private", text: "推了。", bash: "git push https://github.com/x/app-private.git master" },
+      // 红队 a415bf26 BP-1~3:引号 / 变量包的 URL、子 shell 里粘了括号的远端、别名远端,都按推 private 算
+      { name: "261 红队 BP-1:引号括 URL 推私仓", text: "推了。", bash: "git push \"https://github.com/x/app-private.git\" master" },
+      { name: "261 红队 BP-1:变量 URL 推私仓", text: "推了。", bash: "git push \"$PRIVATE_URL\" master" },
+      { name: "261 红队 BP-2:子 shell 推 private", text: "推了。", bash: "(git push private)" },
+      { name: "261 红队 BP-3:别名远端推私仓", text: "推了。", bash: "git push kp master" },
+      // codex 261-dp-r1:带值选项的值是引号串 / --repo 与位置参数并存(位置优先) / 命令里临时改 pushurl
+      { name: "261 codex r1:-o 引号值后推 private", text: "推了。", bash: "git push -o \"ci.skip\" private custodiet" },
+      { name: "261 codex r1:--repo 公开名 + 位置参数 private", text: "推了。", bash: "git push --repo custodiet private master" },
+      { name: "261 codex r1:-c pushurl 改指私仓", text: "推了。", bash: "git -c remote.custodiet.pushurl=https://github.com/x/app-private.git push custodiet" },
+      // codex 261-dp-r2:push 位置须绑定到 git 子命令;引号值含空格不得拆开
+      { name: "261 codex r2:-o 引号值含空格与公开名", text: "推了。", bash: "git push -o \"note custodiet build\" private" },
+      { name: "261 codex r2:命令替换里的 push 后跟普通文本 push origin", text: "推了。", bash: "echo $(git push) push origin" },
+      { name: "261 codex r2:-C 引号目录名里含 push custodiet", text: "推了。", bash: "git -C \"E:/x push custodiet y\" push private" },
+      { name: "261 红队 r2:短选项簇 -fo 吃掉公开名", text: "推了。", bash: "git push -fo custodiet private master" },
       // bare push:pushDefault=private
       { text: "推了。", bash: "git add docs/x.md && git commit -m y && git push" },
       // 探针在推之前跑的 ⇒ 量的是推之前的世界,不算
@@ -7893,6 +7942,10 @@ const RULE_DP = {
       { text: "推了。", bash: "echo $(printf x \\) \\) $(git push /srv/app-private.git master))", debtFacts: { lastPushTs: 1000, lastProbeTs: 1500 } },
     ],
     neg: [
+      // 批 261(D139⑤):推公开仓 / 别的远端不是推 private,不欠探针(原「≠ origin 即算」两批实撞误拦)
+      { name: "261 D139⑤:推 custodiet 公开仓不算推 private", text: "公开仓推了。", bash: "git -C clipboard/oss/public-repo push -q custodiet master:master" },
+      { name: "261 codex r1:-C 目录名含 push 不截错", text: "公开仓推了。", bash: "git -C \"E:/push\" push origin" },
+      { name: "261 codex r1:只给 --repo=custodiet", text: "公开仓推了。", bash: "git push --repo=custodiet" },
       { text: "推完查了欠账。", bash: ["git push private master", "node --no-warnings scripts/verify-prod.mjs --debt-only"] },
       { text: "推完跑全套。", bash: "git push private master 2>&1 | tail -3; node --no-warnings scripts/verify-prod.mjs > x.log" },
       // 窗口里推、窗口里也查过

@@ -2313,14 +2313,17 @@ function trackedInFs(root) {
 function isNewEvidence(sid) {
   let tracked = _trackedCache;
   if (tracked === undefined) try {
-    tracked = new Set(execFileSync("git", ["ls-files"], { encoding: "utf8", cwd: process.cwd() })
-      .split("\n").map((s2) => s2.trim()).filter(Boolean));
+    // 批 261(D138④):-c core.quotepath=false -z,中文 / 空格 / 特殊字符文件名不被转义成 "\346…" 引号串(否则被判新建)
+    tracked = new Set(execFileSync("git", ["-c", "core.quotepath=false", "ls-files", "-z"], { encoding: "utf8", cwd: process.cwd() })
+      .split("\0").filter(Boolean));
   } catch { tracked = null; }
   _trackedCache = tracked;
   let justAdded = _justAddedCache;
   if (justAdded === undefined) try {
-    justAdded = new Set(execFileSync("git", ["log", "-1", "--diff-filter=A", "--name-only", "--format="],
-      { encoding: "utf8", cwd: process.cwd() }).split("\n").map((s2) => s2.trim()).filter(Boolean));
+    // 批 261(红队 a415bf26 BP-4):与 tracked 同口径不转义(-c core.quotepath=false -z)——两边口径一分裂,
+    //   中文名新载体 justAdded 认不出、tracked 却认得 ⇒ isNew 判既有,G / I 静默
+    justAdded = new Set(execFileSync("git", ["-c", "core.quotepath=false", "log", "-1", "--diff-filter=A", "--name-only", "-z", "--format="],
+      { encoding: "utf8", cwd: process.cwd() }).split("\0").map((s2) => s2.replace(/^\n+/, "")).filter(Boolean));
   } catch { justAdded = null; }
   _justAddedCache = justAdded;
   const hookCheckout = checkoutOfFs(`${process.cwd()}/.probe`);
@@ -5096,7 +5099,10 @@ try {
   //   正是 2026-08-25 那次「审错树」事故的原状——修 cwd 的这行自己会在带空格的仓上失效。
   //   custodiet 已公开,`C:\Users\Some Name\...` 在 Windows 上是常态,故这条按公开面优先级修。
   process.chdir(fileURLToPath(new URL("..", import.meta.url)));
-} catch { /* 锚定失败按原 cwd 跑 */ }
+} catch (e) {
+  // 锚定失败按原 cwd 跑(fail-open),但要出声(批 261,D110:原先静默——审错树时没人知道)
+  console.error(`⚠ 收尾闸锚定仓根失败,按当前目录 ${process.cwd()} 审:${String(e && e.message || e).slice(0, 160)}`);
+}
 // 自测隔离 env 只属 --self-test 形态:外部把 STOP_CLOSURE_SELFTEST=1 带进生产环境时,
 // batch-goal 与 P-ledger 两处真读会被静默跳过(codex 104 复核「没问到的」)——生产段进门即清。
 delete process.env.STOP_CLOSURE_SELFTEST;
