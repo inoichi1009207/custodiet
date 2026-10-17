@@ -375,6 +375,25 @@ export function analyzeBash(cmd, opts = {}) {
         if (bodyNode) for (let i = 0; i < bodyNode.namedChildCount; i++) visit(bodyNode.namedChild(i), { ...state }, depth);
         // heredoc 后同行的 `> 文件`(`cat <<'EOF' > x`)在 heredoc_redirect 里作子节点
         for (let i = 0; i < r.namedChildCount; i++) { const k = r.namedChild(i); if (k.type === "file_redirect") handleRedirects([k], body, state, depth); }
+        // heredoc 起头那行后面接的管道 / `&&` 命令,tree-sitter 也挂在 heredoc_redirect 底下(D160①:原先不遍历 ⇒ 解析成功、效果为空、静默放行)。
+        //   `cat <<'EOF' | bash`:管道下游第一段是从 stdin 读程序的 shell ⇒ 正文就是被执行的脚本;`| tee AGENTS.md`、`&& cp …` 照常分析
+        for (let i = 0; i < r.namedChildCount; i++) {
+          const k = r.namedChild(i);
+          if (/^(?:heredoc_start|heredoc_body|heredoc_end|file_redirect)$/.test(k.type)) continue;
+          if (k.type === "pipeline" && k.namedChildCount > 0) {
+            const down = effCmd(k.namedChild(0));
+            // 只认「真从 stdin 执行程序」的下游(批 260 红队 a700dedc BP-1~3):
+            //   有脚本参数(含动态的 `"$F"`)⇒ 正文是喂给脚本的数据;shell 的 -n(含选项簇 -nv / -en)、node 的 --check / -c 只做语法检查
+            const hasScriptArg = (ws) => ws.some((w) => w.v == null || (!/^-/.test(w.v) && w.v !== "-"));
+            const shellNoexec = (ws) => ws.some((w) => w.v != null && /^-[A-Za-z]*n[A-Za-z]*$/.test(w.v) && !/^--/.test(w.v));
+            const interpCheckOnly = (ws) => ws.some((w) => w.v != null && /^(?:--check|-c)$/.test(w.v));
+            if (down && SHELLS.test(down.name) && !hasScriptArg(down.rest) && !shellNoexec(down.rest)) nested(text, state.cwd, depth + 1, `${down.name} ← heredoc 管道`);
+            else if (down && /^(?:node|nodejs|deno|bun)$/.test(down.name) && !hasScriptArg(down.rest) && !interpCheckOnly(down.rest)) scanPayload(text, state.cwd, `${down.name} ← heredoc 管道`);
+            else if (down && INTERP.test(down.name) && !/^(?:node|nodejs|deno|bun)$/.test(down.name) && !hasScriptArg(down.rest)
+              && !down.rest.some((w) => w.v === "-c")) scanPayload(text, state.cwd, `${down.name} ← heredoc 管道`);
+          }
+          visit(k, state, depth);
+        }
       } else if (r.type === "herestring_redirect") {
         // `bash <<< "…"`、`node <<< "…"`:与 heredoc 同一条「程序 vs 数据」分派(红队 259 BP-3 / BP-8)
         const name = cmdNameOf(body);

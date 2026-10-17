@@ -1013,6 +1013,8 @@ export const RULE_I = {
       { name: "259 红队二轮(b):curl -o 下载成新脚本 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "curl -o scripts/new-tool.mjs https://example.com/x" },
       { name: "259 红队二轮(b):git -C 下的 mv 新名 ⇒ 命中", text: "改名。", tracked: ["scripts/x.mjs", "scripts/old.mjs"], bash: "git -C scripts mv old.mjs new-tool.mjs" },
       { name: "259 收口轮 BP-3:从别的分支 checkout 拣回新脚本 ⇒ 命中", text: "从分支拿回脚本。", tracked: ["scripts/x.mjs"], bash: "git checkout agent-branch -- scripts/new-tool.mjs" },
+      // 批 260(D160①):heredoc 起头那行后接管道 / && 的写命令,原先解析成功却效果为空
+      { name: "260 D160①:cat heredoc 管道给 bash 新建脚本 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' | bash\ncp a scripts/new-tool.mjs\nEOF" },
     ],
     neg: [
       // 复核红队二轮 BP-6:读 / 检索命令带 2>&1、引号里有写词 ⇒ 不是写入(D148 复活形)
@@ -1200,7 +1202,10 @@ export const RULE_J = {
       { name: "259 codex 收口:copyFileSync 写到第二参 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"],
         bash: "node -e \"require('fs').copyFileSync('a','AGENTS.md')\"" },
       { name: "259 codex 收口二:renameSync 把宪法改名移走 ⇒ 拦", text: "备份了。", tracked: ["scripts/x.mjs"],
-        bash: "node -e \"require('fs').renameSync('AGENTS.md','backup.md')\"" }],
+        bash: "node -e \"require('fs').renameSync('AGENTS.md','backup.md')\"" },
+      // 批 260(D160①)
+      { name: "260 D160①:heredoc 管道给 tee 写宪法 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' | tee AGENTS.md\nx\nEOF" },
+      { name: "260 D160①:heredoc 后 && cp 写宪法 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' && cp /tmp/x AGENTS.md\nx\nEOF" }],
     neg: [
       { name: "259 红队 BP-13:touch -r 的参考文件不是目标", text: "改了时间戳。", tracked: ["scripts/x.mjs"], bash: "touch -r AGENTS.md /tmp/x" },
       // 批 259 红队(a391d46c)BP-3~6:提到不等于写、只动暂存区、备份文件、检索词恰好叫 cp
@@ -1211,6 +1216,11 @@ export const RULE_J = {
       { name: "259 红队二轮 BP-6:zgrep 的检索词叫 cp 不算写", text: "查一下。", tracked: ["scripts/x.mjs"], bash: "zgrep -n cp AGENTS.md docs/laws/collab.md" },
       { name: "259 收口轮 BP-9:uniq -f 1 查宪法不算改", text: "查重。", tracked: ["scripts/x.mjs"], bash: "uniq -f 1 AGENTS.md" },
       { name: "259 收口轮 BP-11:git rm --cached 只动索引", text: "取消跟踪。", tracked: ["scripts/x.mjs"], bash: "git rm --cached AGENTS.md" },
+      { name: "260 D160①:heredoc 管道给 grep 是读 不算改法", text: "查一下。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' | grep AGENTS.md\ncp a AGENTS.md\nEOF" },
+      // 批 260 红队(a700dedc)BP-1~3:只做语法检查 / 喂给变量脚本的下游不执行正文
+      { name: "260 红队 BP-1:heredoc 管道给 node --check 是语法检查", text: "查一下。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' | node --check\nrequire('fs').writeFileSync('AGENTS.md','x')\nEOF" },
+      { name: "260 红队 BP-2:heredoc 喂给变量脚本是数据", text: "跑一下。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' | python3 -c \"$PROG\"\nopen('AGENTS.md','w')\nEOF" },
+      { name: "260 红队 BP-3:bash -nv 是语法检查", text: "查一下。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' | bash -nv\ncp a AGENTS.md\nEOF" },
       { name: "259 codex 收口二:自定义函数叫 cp 不算写", text: "试一下。", tracked: ["scripts/x.mjs"], bash: "node -e \"const cp=(a,b)=>b; cp('a','AGENTS.md')\"" },
       // 复核红队四轮 BP-3:Tee-Object 存法条检索结果不是改法条
       { name: "258 复核四轮 BP-3:Tee-Object 存法条检索结果不算改法", text: "查一下。", tracked: ["scripts/x.mjs"],
@@ -4114,14 +4124,18 @@ const RULE_P = {
     //     取不到 ⇒ 命令语法。原来计数仍是命令语法:`git add -A` / `commit -am` / merge 合回计 0 ⇒ 宽限账永不涨。
 
     /** 本仓闸引擎(仓相对路径,锚定)。git 事实只用它;外发暂存树(clipboard/,gitignore)与 worktree 本就不在 diff 里。 */
-    ENGINE_REL: /^scripts\/(?:hook-stop-closure|hook-guard)\.mjs$|^scripts\/lib\/gate-[\w-]+\.mjs$/i,
+    // 批 260(D160⑥):写入效果分析器(I / J / G / L 的判据实现)、自签误报盲审、解析依赖清单也是闸引擎——
+    //   原先不在里面,改它们不被 P / start-gate 当成改闸引擎(收口轮红队 BP-16)
+    ENGINE_REL: /^scripts\/(?:hook-stop-closure|hook-guard|fp-audit)\.mjs$|^scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|^scripts\/gate-deps\/package(?:-lock)?\.json$/i,
     /** 与 ENGINE_REL 同一口径的 git pathspec(hook 取「上一次带闸改动的提交」时用;改一处必改另一处,自测钉着)。 */
-    ENGINE_PATHSPECS: ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", ":(glob)scripts/lib/gate-*.mjs"],
+    ENGINE_PATHSPECS: ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", "scripts/fp-audit.mjs", ":(glob)scripts/lib/gate-*.mjs",
+      "scripts/lib/write-effects.mjs", "scripts/gate-deps/package.json", "scripts/gate-deps/package-lock.json"],
     /** 聚合项(readHeadFacts 范围超 CAP=60)缺 `count` 时的计数下限 = CAP+1(范围至少这么多笔)。 */
     AGG_MIN: 61,
     /** 语法回退面的闸引擎路径:锚定文件名结尾,裸名只在路径**开头**认(`cd scripts/lib` 之后的相对形)。
      *  派出方裁定(a27628dd):`clipboard/oss/public-repo/**` 与 `.claude/worktrees/**` 下的闸副本不算本仓闸引擎。 */
-    ENGINE_PATH_RE: /(?:^|\/)scripts\/(?:hook-stop-closure|hook-guard)\.mjs$|(?:^|\/)scripts\/lib\/gate-[\w-]+\.mjs$|^(?:hook-stop-closure|hook-guard|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs$/i,
+    // 批 260(红队 a700dedc (b)-10):第四处口径——git 事实取不到时的回退面,与 ENGINE_REL 同步纳入 D160⑥ 的三类文件
+    ENGINE_PATH_RE: /(?:^|\/)scripts\/(?:hook-stop-closure|hook-guard|fp-audit)\.mjs$|(?:^|\/)scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|(?:^|\/)scripts\/gate-deps\/package(?:-lock)?\.json$|^(?:hook-stop-closure|hook-guard|fp-audit|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs$/i,
     WORKTREE_AREA: /(^|\/)\.claude\/worktrees\//i,
     /** root = hook 所在 checkout 根(ctx.hookCheckout):落在它下面的绝对路径先化成仓相对形再判区域——
      *  在 worktree 里开的会话,自己的闸文件路径本就含 `.claude/worktrees/`,不得当成别人的副本。 */
@@ -4497,10 +4511,11 @@ const RULE_P = {
      *  入参须提及闸引擎文件名 / 规则 id / diff 文件——只证发起,不证采纳(与另两通道同一 CEILING)。 */
     hunterBound(a) {
       const p = JSON.stringify((a && a.input) || {});
-      return /hook-stop-closure|hook-guard|gate-[\w-]+\.mjs|\.diff\b|规则 ?id|rule ids?|\bRULE_[A-Z0-9]+\b|批 ?\d{3}/i.test(p);
+      // 批 260(红队 a700dedc BP-5):绑定词表与引擎面同源——D160⑥ 纳入的文件名、欠账号(D160 这类)也算绑定
+      return /hook-stop-closure|hook-guard|gate-[\w-]+\.mjs|write-effects|fp-audit|gate-deps|\.diff\b|规则 ?id|rule ids?|\bRULE_[A-Z0-9]+\b|批 ?\d{3}|\bD\d{3}\b/i.test(p);
     },
     /** 旧整串正则(hook-start-gate 按名引用它判「本批碰没碰闸引擎」,口径与本条同源;P 自己改用上面三件)。 */
-    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard)\.mjs|scripts\/lib\/gate-[\w-]+\.mjs|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs\b/i,
+    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard|fp-audit)\.mjs|scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs|scripts\/gate-deps\/package(?:-lock)?\.json|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|fp-audit|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs\b/i,
 
     /** 本批提交是否**带进了闸引擎改动**(D11 收紧的适用面)。
      *  · git 事实在 ⇒ **只认** `基点..HEAD` 上被带进的提交里有没有本仓闸引擎文件(派出方 a27628dd 口径①:

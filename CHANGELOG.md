@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2 — 2026-10-17
+
+- **heredoc 后接管道 / `&&` 的写命令不再静默放行**:`cat <<'EOF' | tee AGENTS.md`、`cat <<'EOF' && cp … AGENTS.md`、`cat <<'EOF' | bash` 现在都能认出写入;只做语法检查的下游(`bash -n` / `-nv`、`node --check`)与喂给脚本参数的数据不算执行。
+- **闸引擎面纳入** `scripts/lib/write-effects.mjs`、`scripts/fp-audit.mjs` 与 `scripts/gate-deps/` 清单:改它们会被 P 当成改闸引擎;红队任务里点名这些文件名或欠账号即算绑定。
+- 更正 0.6.1 的说明:README 规则数改成的是 30(28 条引擎 + 2 条内建),不是 28。
+
 ## 0.6.1 — 2026-10-12
 
 - **补件**:0.6.0 的盲审硬调 `scripts/codex-run.mjs`,而公开包没带它,照安装步骤装完跑不了盲审。现在随包发布,安装器也拷它。

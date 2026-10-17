@@ -4533,10 +4533,18 @@ function selfTest() {
       const _Pp = RULES.find((r) => r.id === "P")._p;
       const asRe = (s) => new RegExp("^" + s.replace(/^:\(glob\)/, "").replace(/[.]/g, "\\.").replace(/\*/g, "[^/]*") + "$", "i");
       const samples = ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", "scripts/lib/gate-rules.mjs", "scripts/lib/gate-x-y.mjs",
-        "scripts/lib/ledger-chain.mjs", "scripts/gate-migrate-check.mjs", "clipboard/oss/public-repo/scripts/lib/gate-rules.mjs"];
+        "scripts/lib/ledger-chain.mjs", "scripts/gate-migrate-check.mjs", "clipboard/oss/public-repo/scripts/lib/gate-rules.mjs",
+        // 批 260(D160⑥):写入效果分析器、盲审、解析依赖清单进闸引擎面
+        "scripts/lib/write-effects.mjs", "scripts/fp-audit.mjs", "scripts/gate-deps/package.json", "scripts/gate-deps/node_modules/x.js"];
       hp("ENGINE_PATHSPECS 与 ENGINE_REL 对同一组路径判定一致",
         samples.map((p) => `${_Pp.ENGINE_REL.test(p) ? 1 : 0}${_Pp.ENGINE_PATHSPECS.some((s) => asRe(s).test(p)) ? 1 : 0}`).join(" "),
-        "11 11 11 11 00 00 00");
+        "11 11 11 11 00 00 00 11 11 11 00");
+      hp("GATE_ENGINE 认写入效果分析器与盲审", ["scripts/lib/write-effects.mjs", "scripts/fp-audit.mjs", "scripts/gate-deps/package.json"].map((p) => _Pp.GATE_ENGINE.test(p) ? 1 : 0).join(""), "111");
+      // 批 260(红队 a700dedc (b)-10):第四处口径——回退面 ENGINE_PATH_RE 须覆盖 ENGINE_REL 认的一切
+      //   (回退面本来就允许前缀目录,`clipboard/oss/public-repo/scripts/lib/…` 也认——偏严,不要求相等)
+      hp("ENGINE_PATH_RE 覆盖 ENGINE_REL", samples.filter((p) => _Pp.ENGINE_REL.test(p) && !_Pp.ENGINE_PATH_RE.test(p)).join(","), "");
+      // 红队 a700dedc BP-5:只点名新纳入文件的红队也算绑定
+      hp("hunterBound 认新纳入的引擎文件名", ["只看 scripts/lib/write-effects.mjs", "审 fp-audit 的改动", "D160 的修补"].map((t) => _Pp.hunterBound({ input: { prompt: t } }) ? 1 : 0).join(""), "111");
     }
     // ── ranClear:参数面 vs 文本面(2026-08-20 实撞,写完当天被自己绊倒)──────────
     //   原写法 `[\s\S]*` 横跨整条命令 ⇒ 把 `--cond "K 的 --clear 阻断…"` 判成跑过结清。
