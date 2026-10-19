@@ -510,16 +510,18 @@ const BLOCK_ENV = { A: "A", E0: "E", E1: "E", E2: "E", I: "I", J: "J", W: "W",
 //   环境变量那支已撤(红队 a9bf37ae BP-2:裸环境变量不绑仓,给比赛仓设了它,本仓的闸也跟着静音)。
 //   自测经 `_observeForTest` 注入,不读宿主仓的模式文件(BP-5)。
 let _observeForTest = null;
-/** 本仓是否立过批:本 checkout 或主 checkout 的批台账 / 状态文件在场(批 265;codex 265-r1 A3 补主 checkout)。 */
+/** 本仓是否立过批:本 checkout 或主 checkout 的批台账 / 状态文件在场(批 265;codex 265-r1 A3 补主 checkout)。
+ *  查不出主 checkout(git 失败 / 超时 / 太旧不认 --path-format)⇒ undefined(K0 照判),不落 false(红队 a363e144 BP-2:原先静默落「不判」)。 */
 function batchEverArmedHere() {
   const has = (root) => [".claude/.batch-goal.jsonl", ".claude/.batch-goal.json"].some((f) => fs.existsSync(path.join(root, f)));
   if (has(".")) return true;
+  let common = "";
   try {
-    const common = String(execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    common = String(execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"],
       { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true })).trim();
-    if (common && has(path.dirname(common))) return true;
-  } catch { /* 不是 git 仓 */ }
-  return false;
+  } catch { return undefined; }
+  if (!common) return undefined;
+  return has(path.dirname(common));
 }
 function observeMode() {
   if (_observeForTest !== null) return _observeForTest;
@@ -2690,7 +2692,8 @@ export function run(transcriptPath, ctx = {}) {
         //   codex 265-r1 A3:台账被 gitignore,新开的 worktree / 新 clone 里两份都缺 ⇒ 在用批的仓也会被当成「从没立过批」。
         //   ⇒ 本 checkout 没有时再看主 checkout(git common dir 的上一级)的台账。
         //   自测进程不注入(否则新装闸、还没立过批的仓,自测里 K0 全部静音而红;公开树 gate:accept 实撞)
-        batchEverArmed: ctx.batchGoal !== undefined || process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : batchEverArmedHere(),
+        //   红队 a363e144 BP-1:按 ctx.live 门控(离线 --audit / --dry-run 读的是现在的盘面,套到历史轮上是错配)
+        batchEverArmed: ctx.batchGoal !== undefined || !ctx.live || process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : batchEverArmedHere(),
         // 批 258:实时路径给批状态补 `turnBatchStart`(本轮开始时正开着的那一批的起点;W 按它切交付物)
         batchGoal: ctx.batchGoal !== undefined ? ctx.batchGoal : (() => {
           const g = readBatchGoal();
