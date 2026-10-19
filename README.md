@@ -147,7 +147,7 @@ node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
 - 把闸的运行时台账路径追加进目标的 `.gitignore`。
 - 生成《闸用语》`docs/gate-phrasebook.md`,在 `CLAUDE.md` 末尾加一段首尾标记圈住的托管块引用它(重跑只换标记之间的内容)。
 - 拷贝件已存在时不覆盖：内容不同时写旁件 `<名>.custodiet<扩展名>`,在 stdout 末行的 JSON 清单里逐个报出。`.claude/settings.json`、`.gitignore`、`CLAUDE.md` 是追加/合并，不是整文件替换。不提交、不联网、不碰 `~/.claude/`。
-- 加 `--observe` 装成观察档：只记账、不阻断、不对模型输出(调试变量 `STOP_CLOSURE_STDOUT=1` 例外);示例宪法只落旁件 `AGENTS.custodiet.md`,`CLAUDE.md` 不引入它(《闸用语》照挂)。把 `.claude/custodiet-mode` 提交后**新开的会话**才进观察档，装闸的这个会话照常阻断。适合先在一个在用的仓里攒数据。
+- 加 `--observe` 装成观察档：只记账、不阻断、不对模型输出(调试变量 `STOP_CLOSURE_STDOUT=1` 例外);示例宪法只落旁件 `AGENTS.custodiet.md`,`CLAUDE.md` 不引入它(《闸用语》照挂)。把 `.claude/custodiet-mode` 提交后**新开的会话**才进观察档，装闸的这个会话照常阻断。适合先在一个在用的仓里攒数据。切回阻断档：删掉 `.claude/custodiet-mode` 并提交，再不带 `--observe` 重跑一次安装器(示例宪法才落到根目录、`CLAUDE.md` 才引入它)。
 
 装完以后:
 

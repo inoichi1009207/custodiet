@@ -225,14 +225,15 @@ export function fpNetById(ledger) {
   return fp;
 }
 
+/** 误报率分母口径(fpTable 与 --fp-report 表头共用,红队 a30a87d8 BP-3):只数主 Stop 通道、不数 UNKNOWN。 */
+export const fpRowCounted = (a) => !!a && a.channel !== "SubagentStop";
+export const fpIdsOf = (a) => ((a && a.ids) || []).filter((id) => id !== "UNKNOWN");
 export function fpTable(alerts, ledger, { minAlerts = 20, minRate = 0.15 } = {}) {
   const per = {}, fp = {};
   // 只数主 Stop 通道、不数 UNKNOWN:子代理通道只在观察档落 I/M/L/B 提示行,混进来会摊薄分母、让规则掉出「待修」
   //   (红队 a0dfbfce BP-4);UNKNOWN 是「没判成」,不是一条规则
-  for (const a of alerts || []) {
-    if (!a || a.channel === "SubagentStop") continue;
-    for (const id of a.ids || []) if (id !== "UNKNOWN") per[id] = (per[id] || 0) + 1;
-  }
+  //   claimed_fp 不带通道:默认它针对主通道(本仓 211 笔里 0 笔属子代理通道);子代理行若有人记误报,分子会偏高(红队 a30a87d8 BP-4,D164⑬)
+  for (const a of (alerts || []).filter(fpRowCounted)) for (const id of fpIdsOf(a)) per[id] = (per[id] || 0) + 1;
   for (const [id, d] of Object.entries(fpNetById(ledger))) fp[id] = d;
   return Object.keys(per).map((id) => {
     const f = Math.max(0, fp[id] || 0), rate = per[id] ? f / per[id] : 0;
@@ -4879,6 +4880,7 @@ function selfTest() {
   // 此前 14+ 条锚点指向不存在的标题,阻断消息给人的是死指针——
   // 修完必须有机器判据看着,否则法典改个标题锚点又静默烂掉(自签条件 b 的反向探针)。
   let lawPass = 0, lawTotal = 0, lawSide = 0;
+  const lawObserve = (() => { try { return fs.readFileSync(".claude/custodiet-mode", "utf8").split(/\r?\n/)[0].trim() === "observe"; } catch { return false; } })();
   {
     const hnames = (p) => {
       const out = [];
@@ -4900,7 +4902,8 @@ function selfTest() {
       const [file, anchor] = String(r.law).split("#");
       // 观察档安装把示例宪法落成旁件 `AGENTS.custodiet.md`,目标仓自带宪法时也是旁件 ⇒ 主文件找不到时再看旁件,
       //   但**只在旁件里**的锚点单列 SIDE、不记 PASS:旁件模型不加载,指针仍是死的(红队 a0dfbfce BP-1:原先并入后判 PASS = 假绿)。
-      //   SIDE 不让自测变红(观察档安装后就是这个形态),但汇总行照实写出条数。
+      //   SIDE 只在观察档(模式文件首行 observe)下不让自测变红——那是观察档安装的正常形态;阻断档下照旧计失败
+      //   (红队 a30a87d8 BP-1:原先不分档,往自带宪法的仓里正常装闸,9 条锚点全死、自测却放行)。
       const side = file.replace(/(\.[^./]+)$/, ".custodiet$1");
       cacheH[file] ??= hnames(file);
       cacheH[side] ??= hnames(side);
@@ -4939,11 +4942,11 @@ function selfTest() {
     (hpTotal ? ` · 零件用例 ${hpPass}/${hpTotal}` : "") +
     (partTotal ? ` · 零件契约 ${partPass}/${partTotal}` : "") +
     (driftTotal ? ` · 承重面漂移 ${driftPass}/${driftTotal}` : "") +
-    (lawTotal ? ` · law锚点 ${lawPass}/${lawTotal}${lawSide ? `(另 ${lawSide} 条只在未加载的旁件里)` : ""}` : ""));
+    (lawTotal ? ` · law锚点 ${lawPass}/${lawTotal}${lawSide ? `(另 ${lawSide} 条只在未加载的旁件里${lawObserve ? ",观察档下不计失败" : ",阻断档下计失败"})` : ""}` : ""));
   return (pass === cases.length && driftPass === driftTotal && probePass === probeTotal
     && partPass === partTotal && hpPass === hpTotal && seamPass === seamTotal && escPass === escTotal
     && cxPass === cxTotal
-    && lawPass + lawSide === lawTotal && carrPass === carrTotal && dfPass === dfTotal) ? 0 : 1;
+    && lawPass + (lawObserve ? lawSide : 0) === lawTotal && carrPass === carrTotal && dfPass === dfTotal) ? 0 : 1;
 }
 
 // ── main
@@ -5053,15 +5056,16 @@ if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
     // 链的结构行(genesis/启用标记)不是事件,不进任何分母(批 102)
     const evRows = (rs) => rs.filter((r) => !r.genesis && r.kind !== "chain-enabled");
     const alerts = evRows(A.rows), led = evRows(L.rows);
-    const nAlert = alerts.reduce((n, a) => n + ((a.ids || []).length), 0);
+    const counted = alerts.filter(fpRowCounted);
+    const nAlert = counted.reduce((n, a) => n + fpIdsOf(a).length, 0);
     const per = {};
-    for (const a of alerts) for (const id of (a.ids || [])) per[id] = (per[id] || 0) + 1;
+    for (const a of counted) for (const id of fpIdsOf(a)) per[id] = (per[id] || 0) + 1;
     const claimed = led.filter((x) => x.kind === "claimed_fp").length;
     const audits = led.filter((x) => x.kind === "fp_audit");
     const reviews = led.filter((x) => x.kind === "miss_review");
     const sampled = reviews.reduce((n, r) => n + (r.sampled || 0), 0);
     const found = reviews.reduce((n, r) => n + (r.found || 0), 0);
-    console.log(`报警分母: ${nAlert} 规则次 / ${alerts.length} 轮` +
+    console.log(`报警分母: ${nAlert} 规则次 / ${counted.length} 轮(主 Stop 通道;子代理行 ${alerts.length - counted.length} 轮不计)` +
       (nAlert ? `(${Object.entries(per).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join(" ")})` : ""));
     // 人工撤回按笔计(codex 259-final2-r1 附节 3:同笔撤两次原先算式里记 2):带 ref 的按 ref 去重,老式无 ref 的逐行
     const manRows = led.filter((x) => x.kind === "retraction" && x.by !== "codex");

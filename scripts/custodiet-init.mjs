@@ -6,7 +6,7 @@
 //        把闸的运行时台账追加进目标的 `.gitignore`。stdout 末行是一行 JSON 清单。
 //
 // 不变量(改它们之前先想清楚为什么):
-//   · **已存在的文件一律不覆盖**:内容相同 ⇒ unchanged;不同 ⇒ 写旁件 `<名>.custodiet<扩展名>`
+//   · **已存在的拷贝件一律不覆盖**(`CLAUDE.md` 例外:托管块追加/替换,除托管块外为空时前置生成件):内容相同 ⇒ unchanged;不同 ⇒ 写旁件 `<名>.custodiet<扩展名>`
 //     并在清单里标 `sidecar`(旁件也已存在且不同 ⇒ `skipped`,一个字节都不写)。
 //     ⚠️ 对 `scripts/` 下的闸件这意味着:目标仓里**旧的那份仍是生效的那份**,清单如实报出。
 //   · `.claude/settings.json` 只做 JSON 合并去重(按命令串去重);解析不了 ⇒ 不碰它,写旁件。
@@ -18,7 +18,7 @@
 //   `node --no-warnings scripts/hook-stop-closure.mjs --self-test`。
 //   文本类规则的判据是中文句式 ⇒ 目前只适用于中文协作的仓(英文仓里这些规则不误拦,只会全哑)。
 //
-// 用法:  node scripts/custodiet-init.mjs --target <目标仓根> [--mode copy]
+// 用法:  node scripts/custodiet-init.mjs --target <目标仓根> [--mode copy] [--observe]
 // 退出码:0 完成(含有旁件/跳过的情形,看清单)  2 参数错  3 目标不存在或不是 git 仓根  4 node 版本过低
 //        5 插件模式尚未实现
 
@@ -77,6 +77,9 @@ function die(code, msg) {
   process.exit(code);
 }
 const sha = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
+// CLAUDE.md 比较口径:去掉托管块、统一换行、裁首尾空白(红队 a30a87d8 BP-5:原先幂等判断精确相等、前置判断裁空白,
+//   两者口径不一 ⇒ 末尾多一个空行或被 git 换成 CRLF 时,第二次重装就写出 CLAUDE.custodiet.md)
+const normClaude = (t) => String(t).replace(/\r\n/g, "\n").replace(/<!-- custodiet:begin[\s\S]*?<!-- custodiet:end -->\n?/, "").trim();
 const sidecarOf = (rel) => {
   const ext = path.extname(rel);
   return ext ? rel.slice(0, -ext.length) + ".custodiet" + ext : rel + ".custodiet";
@@ -95,7 +98,8 @@ for (let i = 0; i < argv.length; i++) {
       "  --observe  装成观察档:闸照常判、照常记 .claude/.gate-alerts.jsonl,但不阻断、不对模型输出;\n" +
       "             示例宪法只落旁件 AGENTS.custodiet.md、CLAUDE.md 不引入它(《闸用语》照挂)。\n" +
       "             生效:模式文件提交后**新开的会话**才进观察档;装闸的这个会话照常阻断。\n" +
-      "             删掉 .claude/custodiet-mode 立即恢复阻断(提交删除让它持久)\n");
+      "             删掉 .claude/custodiet-mode 立即恢复阻断(提交删除让它持久);再不带 --observe 重跑一次,\n" +
+      "             示例宪法才落到根目录、CLAUDE.md 才引入它\n");
     process.exit(0);
   } else die(2, `未知参数 ${a}`);
 }
@@ -136,12 +140,12 @@ function place(rel, buf, srcLabel) {
   const cur = fs.readFileSync(dst);
   if (sha(cur) === srcSha) { files.push({ ...rec, status: "unchanged", sha256: srcSha }); return; }
   // CLAUDE.md:去掉安装器自己的托管块后与生成件相同 ⇒ 就是上次装的那份,不写旁件(批 265:重跑幂等)
-  if (rel === "CLAUDE.md" && String(cur).replace(/<!-- custodiet:begin[\s\S]*?<!-- custodiet:end -->\n?/, "") === String(buf)) {
+  if (rel === "CLAUDE.md" && normClaude(cur) === normClaude(buf)) {
     files.push({ ...rec, status: "unchanged", sha256: sha(cur) }); return;
   }
   // CLAUDE.md 除托管块外是空的(观察档装过、现在不带 --observe 重装)⇒ 把生成件写在托管块前面,不写旁件
   //   (红队 a0dfbfce 附 3:原先写出 CLAUDE.custodiet.md,根宪法仍没被引入)
-  if (rel === "CLAUDE.md" && String(cur).replace(/<!-- custodiet:begin[\s\S]*?<!-- custodiet:end -->\n?/, "").trim() === "") {
+  if (rel === "CLAUDE.md" && normClaude(cur) === "") {
     fs.writeFileSync(dst, Buffer.concat([buf, cur]));
     changed++;
     files.push({ ...rec, status: "prepended", sha256: sha(fs.readFileSync(dst)) }); return;
@@ -246,6 +250,14 @@ if (observe) {
   const p = path.join(T, ".claude", "custodiet-mode");
   if (fs.existsSync(p)) observeFile.status = "exists-unchanged";
   else { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, "observe\n"); observeFile.status = "created"; changed++; }
+  // 先按阻断档装过、再带 --observe 重装:根目录的示例宪法与 CLAUDE.md 里的 @AGENTS.md 还在,模型照旧读到批流程 ⇒ 报出来,不替人删
+  //   (红队 a30a87d8 BP-6)
+  const leftover = [];
+  const rootA = path.join(T, "AGENTS.md");
+  if (fs.existsSync(rootA) && sha(fs.readFileSync(rootA)) === sha(fs.readFileSync(path.join(SRC, "AGENTS.md")))) leftover.push("AGENTS.md(示例宪法)");
+  const cmP = path.join(T, "CLAUDE.md");
+  if (fs.existsSync(cmP) && /^@AGENTS\.md\s*$/m.test(fs.readFileSync(cmP, "utf8"))) leftover.push("CLAUDE.md 里的 @AGENTS.md");
+  if (leftover.length) observeFile.leftover = leftover;
 }
 
 // ── .gitignore:追加闸的运行时台账 ─────────────────────────────────────
@@ -273,6 +285,7 @@ let version = null;
 try { version = JSON.parse(fs.readFileSync(path.join(SRC, "package.json"), "utf8")).version; } catch { /* 无版本 */ }
 const notInstalled = ["scripts/coverage-check.mjs", "scripts/gate-migrate-check.mjs", "scripts/lib/ledger-anchor.mjs"];
 const attention = files.filter((f) => !["created", "unchanged", "prepended"].includes(f.status));
+if (observeFile.leftover) process.stderr.write(`⚠ 观察档要求不加载示例宪法,但上次安装留下了:${observeFile.leftover.join("、")}——要观察档不改模型工作方式,自己删掉它们再提交。\n`);
 for (const f of files) process.stderr.write(`  ${f.status.padEnd(17)} ${f.path}${f.sidecar ? "  → " + f.sidecar : ""}\n`);
 process.stderr.write(`  ${settings.status.padEnd(17)} ${settings.path}\n  ${gitignore.status.padEnd(17)} ${gitignore.path}\n`);
 if (attention.length) process.stderr.write(`⚠ ${attention.length} 个文件目标里已有不同版本,未覆盖——看清单里的 sidecar/skipped,自己合并。\n`);
