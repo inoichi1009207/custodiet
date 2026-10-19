@@ -46,7 +46,7 @@
 
 **设计：造之前先查，结论过别人的眼**
 - **I**:新建工具 / 脚本前没有「扫过现成实现」(本地在册面和联网)的动作 ⇒ 拦。
-- **P**:承重改动要过三道独立复核：跨模型审、只读子代理、外部先例。只认工具动作，嘴上说跑过不算。改到闸引擎文件时，独立视角那一道只认随包的红队 agent `_gate-bypass-hunter`。
+- **P**:承重改动要过三道独立复核：跨模型审、只读子代理、外部先例。只认工具动作，嘴上说跑过不算。改到闸引擎文件时，独立视角那一道要随包的两个 agent 都跑过：红队 `_gate-bypass-hunter`(找漏放)和误拦猎手 `_gate-false-block-hunter`(用 `scripts/gate-replay.mjs` 在真实转录上回放改前 / 改后，找误拦)。
 - **E0 / E1 / E2**:「根因是 X」这类因果断言，要么带机械判据，要么过独立复核。
 - **W**:写给别人看的成品，收工前要有一道外部复核。
 
@@ -153,7 +153,7 @@ node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
 
 1. 在目标仓根目录装写入效果分析的解析依赖:`npm --prefix scripts/gate-deps install`(`tree-sitter` 与 `tree-sitter-bash`,装进 `scripts/gate-deps/node_modules`,不碰你仓的 `package.json`)。不装也能跑:I / J / G / L 判「这条 Bash 命令写了哪些文件」时退回较粗的旧判法。
 2. 在目标仓里自检:`node --no-warnings scripts/hook-stop-closure.mjs --self-test`。有 2 条 I 类用例读目标仓的真实 git 历史：闸件还没提交、或装闸那次提交正好是 HEAD 时会红，再有一次提交就转绿。
-3. 新开一个会话再提交。装闸的提交会触发 P 项，而 P 在闸引擎文件上只认红队 agent;新写入的 agent 在新会话里才保证调得起来。
+3. 提交。安装器写了 `.claude/custodiet-manifest.json`(闸引擎件的内容摘要),装闸提交里的引擎件和它一致、且安装源树没有未提交改动时,P 认作原样装入，不要求红队；清单被 `.gitignore` 挡住时安装器会提示先 `git add -f` 它。之后你自己改闸引擎文件，P 要红队 `_gate-bypass-hunter` 与误拦猎手 `_gate-false-block-hunter` 两者都跑过——新写入的 agent 在新会话里才保证调得起来。
 
 限制:
 

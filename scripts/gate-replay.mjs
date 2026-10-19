@@ -26,6 +26,9 @@
 //     后台任务载荷、观察档、连拦降级(yielding)也不模拟。P / DP / A / K 这类依赖实时面的规则,读数要打折看。
 //   · 每回合只取末尾 `--tail` 条条目,更早的历史证据看不到;解析依赖(tree-sitter,scripts/gate-deps)两版共用主 checkout 那一份,没随基线冻结。
 //   · 判「阻断」= finding.block 为真。语料是本人的历史会话:写规则的人与语料同源,新增阻断少不等于对别的仓也少。
+//   · **回放面小于闸引擎面**:改前版本只拷 hook-stop-closure.mjs 与 scripts/lib/**——hook-guard.mjs、fp-audit.mjs、gate-deps、本文件自己的改动
+//     回放恒为空,只能靠读 diff(误拦猎手回件 a48b3bca 附节二⑤)。
+//   · 语料含正在写的会话转录:两次运行之间可用回合数会变,洗牌后入样的回合就换一批;只有语料不动时种子才可复现(同上附节二③)。
 //   · 不写真台账:run() 不传 live,台账 / 心跳 / journal 的落盘都在 live 门后(hook-stop-closure.mjs)。
 import fs from "node:fs";
 import os from "node:os";

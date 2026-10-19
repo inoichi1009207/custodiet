@@ -64,7 +64,8 @@ const FILES = [
   "docs/laws/production.md",
   // 名词日记是 ND 项的 law 锚点所在;缺席时 ND 静默退场,但 law 锚点自测会报该锚点无目标。
   "docs/noun-diary.md",
-  // P 在「提交触及闸引擎文件」时,独立视角通道只认这个红队 agent。不随包装 ⇒ 新仓的装闸提交无出路阻断(第一刀 B1 实测)。
+  // P 在「提交触及闸引擎文件」时,独立视角通道要红队与误拦猎手两者(批 266);不随包装 ⇒ 改闸提交无出路阻断(第一刀 B1 实测)。
+  //   原样装入(引擎件与安装清单一致、源树干净)的装闸提交不要两者。
   // ⚠️ 落盘后 Claude Code 不一定在**同一会话**里就列出它(agent 清单的刷新时机未核实:本机 changelog 未检到明确条目);装完最好新开会话再提交。
   ".claude/agents/_gate-bypass-hunter.md",
 ];
@@ -291,6 +292,13 @@ const manifest = { path: ".claude/custodiet-manifest.json" };
   else { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, body); changed++; manifest.status = cur === null ? "created" : "replaced"; }
   manifest.engineFiles = Object.keys(entries).length;
   manifest.sourceClean = sourceClean;
+  // 误拦猎手回件 FB-3:目标仓 .gitignore 若挡住清单(例如整个忽略 .claude/),`git add -A` 不会把它带进装闸提交,
+  //   闸在提交树里找不到清单 ⇒ 原样装入豁免永远不生效。不替人改 .gitignore,报出来并给命令。
+  try {
+    const ig = spawnSync("git", ["-C", T, "check-ignore", "-q", manifest.path], { windowsHide: true, timeout: 20000 });
+    manifest.ignored = ig.status === 0;
+  } catch { manifest.ignored = null; }
+  if (sourceClean !== true) process.stderr.write(`⚠ 安装源树${sourceClean === false ? "有未提交的改动" : "不是 git 仓或读不到状态"}:清单照写,但闸不会把这次装闸认作原样装入(装闸提交要红队与误拦猎手两者)\n`);
 }
 
 // ── .gitignore:追加闸的运行时台账 ─────────────────────────────────────
@@ -326,6 +334,7 @@ process.stderr.write("未提交任何东西。下一步:在目标仓里跑 `node
   "  ⚠ 已知(第一刀实测):自测里有 2 条 I 类用例读的是目标仓**真实的 git 历史**(git ls-files / 末次提交新增的文件)——\n" +
   "    装闸件尚未提交、或装闸那次提交恰好是 HEAD 时,这 2 条会红;装闸提交之后再有一次提交即转绿。\n");
 const allOk = phrasebook.status === "generated";
+if (manifest.ignored) process.stderr.write(`⚠ ${manifest.path} 被目标仓的 .gitignore 挡住:装闸提交前先 \`git add -f ${manifest.path}\`,否则闸认不出这次是原样装入\n`);
 if (!allOk) process.stderr.write(`⚠ 《闸用语》手册没生成(${phrasebook.error || "未知原因"}),CLAUDE.md 未挂引用;闸件已装,手册要另跑 node --no-warnings scripts/gate-phrasebook.mjs\n`);
 process.stdout.write(JSON.stringify({
   ok: allOk, mode, target: T, source: { name: "custodiet", version },
