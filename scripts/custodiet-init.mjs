@@ -53,6 +53,9 @@ const FILES = [
   "scripts/codex-run.mjs",
   // 批 265:《闸用语》生成器;装完在目标仓里跑一次,手册挂进 CLAUDE.md,新会话一开始就读到闸认的说法
   "scripts/gate-phrasebook.mjs",
+  // 批 266:误拦通道回放器;P 的 D11 在闸引擎面要误拦猎手 `_gate-false-block-hunter` 跑它(改前 / 改后两版规则在真实转录上回放)
+  "scripts/gate-replay.mjs",
+  ".claude/agents/_gate-false-block-hunter.md",
   "scripts/lib/ledger-chain.mjs",
   "AGENTS.md",
   "docs/laws/collab.md",
@@ -260,13 +263,43 @@ if (observe) {
   if (leftover.length) observeFile.leftover = leftover;
 }
 
+// ── 安装清单(批 266):闸引擎文件的发布件内容摘要 ──────────────────────
+//   P 的 D11 要求「提交里改了闸引擎 ⇒ 红队」;装闸 / 升级那次提交全是原样拷入的发布件,审它没有意义
+//   (用户 10-19:「红队要么设置成可选,要么就把红队体系完善了」)。闸在 git 事实里核「提交树里的引擎文件 = 清单摘要」⇒ 不要红队。
+//   摘要 = CRLF 归一为 LF 后的 sha256,与 hook-stop-closure.mjs 的 contentDigest 同一口径。清单每次安装整份重写,随装闸提交一起提交。
+const manifest = { path: ".claude/custodiet-manifest.json" };
+{
+  const ENGINE = /^scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay)\.mjs$|^scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|^scripts\/gate-deps\/package(?:-lock)?\.json$/i;
+  const digest = (buf) => crypto.createHash("sha256").update(String(buf).replace(/\r\n/g, "\n"), "utf8").digest("hex");
+  let version = null;
+  try { version = JSON.parse(fs.readFileSync(path.join(SRC, "package.json"), "utf8")).version; } catch { /* 无版本 */ }
+  // 只记**真正落在原位**的文件(created / unchanged);已有不同版本而写成旁件的不记——那份不是本次装进去的(红队 aa75af79 BP-5)
+  const placed = new Set(files.filter((x) => x.status === "created" || x.status === "unchanged").map((x) => x.path));
+  const entries = {};
+  for (const rel of FILES) if (ENGINE.test(rel) && placed.has(rel)) entries[rel] = digest(fs.readFileSync(path.join(SRC, rel), "utf8"));
+  // 源树干净与否:安装器读的是源树当前内容,改过没提交的源装进来不算原样装入(红队 aa75af79 BP-1)。取不到 git ⇒ 记 null(闸按「不干净」处理)
+  let sourceClean = null, sourceCommit = null;
+  try {
+    const st = spawnSync("git", ["-C", SRC, "status", "--porcelain", "--", ...FILES], { encoding: "utf8", windowsHide: true, timeout: 20000 });
+    const hd = spawnSync("git", ["-C", SRC, "rev-parse", "HEAD"], { encoding: "utf8", windowsHide: true, timeout: 20000 });
+    if (st.status === 0 && hd.status === 0) { sourceClean = st.stdout.trim() === ""; sourceCommit = hd.stdout.trim(); }
+  } catch { /* 取不到 ⇒ null */ }
+  const body = JSON.stringify({ name: "custodiet", version, sourceCommit, sourceClean, note: "安装器生成;闸据此认「原样装入的闸引擎」,勿手改", files: entries }, null, 2) + "\n";
+  const p = path.join(T, manifest.path);
+  const cur = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null;
+  if (cur === body) manifest.status = "unchanged";
+  else { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, body); changed++; manifest.status = cur === null ? "created" : "replaced"; }
+  manifest.engineFiles = Object.keys(entries).length;
+  manifest.sourceClean = sourceClean;
+}
+
 // ── .gitignore:追加闸的运行时台账 ─────────────────────────────────────
 const gitignore = { path: ".gitignore" };
 {
   // 运行时台账 + 解析依赖的安装目录 + P 的会话基点目录(批 265 比赛用仓预演:原先只加 .claude/ 台账,
   //   `npm --prefix scripts/gate-deps install` 装出的 node_modules 与 .claude/.p-head/ 会被一起提交)
   const want = [...fs.readFileSync(path.join(SRC, ".gitignore"), "utf8").split(/\r?\n/)
-    .map((l) => l.trim()).filter((l) => l.startsWith(".claude/")), ".claude/.p-head/", "scripts/gate-deps/node_modules/"]
+    .map((l) => l.trim()).filter((l) => l.startsWith(".claude/")), ".claude/.p-head/", ".claude/.gate-replay/", "scripts/gate-deps/node_modules/"]
     .filter((l, i, a) => a.indexOf(l) === i);
   const p = path.join(T, ".gitignore");
   const cur = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
@@ -296,6 +329,6 @@ const allOk = phrasebook.status === "generated";
 if (!allOk) process.stderr.write(`⚠ 《闸用语》手册没生成(${phrasebook.error || "未知原因"}),CLAUDE.md 未挂引用;闸件已装,手册要另跑 node --no-warnings scripts/gate-phrasebook.mjs\n`);
 process.stdout.write(JSON.stringify({
   ok: allOk, mode, target: T, source: { name: "custodiet", version },
-  preExisting: pre, changed, files, settings, gitignore, observe: observeFile, phrasebook, notInstalled,
+  preExisting: pre, changed, files, settings, gitignore, observe: observeFile, phrasebook, manifest, notInstalled,
 }) + "\n");
 process.exit(allOk ? 0 : 6);

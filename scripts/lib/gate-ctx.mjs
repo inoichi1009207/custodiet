@@ -614,7 +614,9 @@ export function buildCtx(entries, extra = {}) {
             // 红队 a9af71da BP-1:范围超 CAP 时 hook 给的聚合项(整段范围当一笔;`count`=范围内首父链提交数,P 按它计账)。
             //   `count` 不是正整数 ⇒ null(P 侧按 61 计——61 是下界,不保证多计:实际 75 笔取不到总数时计 61;
             //   仍远超宽限门槛 5,方向上照拦,codex 257-p-agg-r1「没问到」①)。
-            ...(c.aggregated === true ? { aggregated: true, count: Number.isInteger(c.count) && c.count > 0 ? c.count : null } : {}) });
+            ...(c.aggregated === true ? { aggregated: true, count: Number.isInteger(c.count) && c.count > 0 ? c.count : null } : {}),
+            // 批 266:hook 侧核过「该提交里的闸引擎文件与安装清单逐个一致」(原样装入 / 升级的发布件)⇒ P 的 D11 不要红队。只收 true。
+            ...(c.vendoredEngine === true ? { vendoredEngine: true } : {}) });
         }
         // a2a9f58b BP-6:`head` = 读事实那一刻的 HEAD,hook 推进基点时用它(不再重新 rev-parse)。
         // `base`(codex 257-p-agg-r1 断言 2):聚合项按「基点..HEAD」范围去重,不按 HEAD sha 单独去重。
@@ -692,6 +694,9 @@ export function selfTest() {
   // ad3e4f93 附二:headFacts.base 只收全长 sha(短 sha ⇒ null ⇒ tally 不去重)
   chk("ad3e4f93:headFacts base 短 sha ⇒ null", buildCtx([A([txt("x")])], { headFacts: () => ({ base: "abc1234", commits: [] }) }).headFacts().base, null);
   chk("ad3e4f93:headFacts base 全长 ⇒ 透传", buildCtx([A([txt("x")])], { headFacts: () => ({ base: "b".repeat(40), commits: [] }) }).headFacts().base, "b".repeat(40));
+  // 批 266:vendoredEngine 只收 true(字符串 "true"、1 等一律不透传 ⇒ 照旧要红队)
+  chk("266:headFacts vendoredEngine:true ⇒ 透传", buildCtx([A([txt("x")])], { headFacts: () => ({ commits: [{ vendoredEngine: true, files: ["scripts/lib/gate-rules.mjs"] }] }) }).headFacts().commits[0].vendoredEngine, true);
+  chk("266:headFacts vendoredEngine 非 true ⇒ 不透传", buildCtx([A([txt("x")])], { headFacts: () => ({ commits: [{ vendoredEngine: "true", files: ["scripts/lib/gate-rules.mjs"] }] }) }).headFacts().commits[0].vendoredEngine, undefined);
   // headFacts 通道三态与形状校验
   const hf = (v) => buildCtx([A([txt("x")])], v === undefined ? {} : { headFacts: () => v }).headFacts;
   chk("headFacts 未接 ⇒ undefined", hf(undefined), undefined);

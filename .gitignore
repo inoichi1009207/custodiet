@@ -6,4 +6,6 @@
 .claude/.gate-fp-ledger.jsonl
 .claude/.p-ledger.json
 .claude/.hook-payload-keys.log
+.claude/.p-head/
+.claude/.gate-replay/
 node_modules/

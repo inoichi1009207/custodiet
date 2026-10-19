@@ -4154,16 +4154,16 @@ const RULE_P = {
     /** 本仓闸引擎(仓相对路径,锚定)。git 事实只用它;外发暂存树(clipboard/,gitignore)与 worktree 本就不在 diff 里。 */
     // 批 260(D160⑥):写入效果分析器(I / J / G / L 的判据实现)、自签误报盲审、解析依赖清单也是闸引擎——
     //   原先不在里面,改它们不被 P / start-gate 当成改闸引擎(收口轮红队 BP-16)
-    ENGINE_REL: /^scripts\/(?:hook-stop-closure|hook-guard|fp-audit)\.mjs$|^scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|^scripts\/gate-deps\/package(?:-lock)?\.json$/i,
+    ENGINE_REL: /^scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay)\.mjs$|^scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|^scripts\/gate-deps\/package(?:-lock)?\.json$/i,
     /** 与 ENGINE_REL 同一口径的 git pathspec(hook 取「上一次带闸改动的提交」时用;改一处必改另一处,自测钉着)。 */
-    ENGINE_PATHSPECS: ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", "scripts/fp-audit.mjs", ":(glob)scripts/lib/gate-*.mjs",
+    ENGINE_PATHSPECS: ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", "scripts/fp-audit.mjs", "scripts/gate-replay.mjs", ":(glob)scripts/lib/gate-*.mjs",
       "scripts/lib/write-effects.mjs", "scripts/gate-deps/package.json", "scripts/gate-deps/package-lock.json"],
     /** 聚合项(readHeadFacts 范围超 CAP=60)缺 `count` 时的计数下限 = CAP+1(范围至少这么多笔)。 */
     AGG_MIN: 61,
     /** 语法回退面的闸引擎路径:锚定文件名结尾,裸名只在路径**开头**认(`cd scripts/lib` 之后的相对形)。
      *  派出方裁定(a27628dd):`clipboard/oss/public-repo/**` 与 `.claude/worktrees/**` 下的闸副本不算本仓闸引擎。 */
     // 批 260(红队 a700dedc (b)-10):第四处口径——git 事实取不到时的回退面,与 ENGINE_REL 同步纳入 D160⑥ 的三类文件
-    ENGINE_PATH_RE: /(?:^|\/)scripts\/(?:hook-stop-closure|hook-guard|fp-audit)\.mjs$|(?:^|\/)scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|(?:^|\/)scripts\/gate-deps\/package(?:-lock)?\.json$|^(?:hook-stop-closure|hook-guard|fp-audit|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs$/i,
+    ENGINE_PATH_RE: /(?:^|\/)scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay)\.mjs$|(?:^|\/)scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|(?:^|\/)scripts\/gate-deps\/package(?:-lock)?\.json$|^(?:hook-stop-closure|hook-guard|fp-audit|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs$/i,
     WORKTREE_AREA: /(^|\/)\.claude\/worktrees\//i,
     /** root = hook 所在 checkout 根(ctx.hookCheckout):落在它下面的绝对路径先化成仓相对形再判区域——
      *  在 worktree 里开的会话,自己的闸文件路径本就含 `.claude/worktrees/`,不得当成别人的副本。 */
@@ -4189,7 +4189,10 @@ const RULE_P = {
       const H = RULE_P._p;
       return f.commits.filter((c) => H.touches(c, (p) => isCarrierPath(CARRIER_SURFACE, p) || H.ENGINE_REL.test(p)));
     },
-    gitEngineCommits(f) { const H = RULE_P._p; return f.commits.filter((c) => H.touches(c, (p) => H.ENGINE_REL.test(p))); },
+    // 批 266:`vendoredEngine` = hook 侧核过该提交里的闸引擎文件与安装清单(.claude/custodiet-manifest.json)逐个一致——
+    //   原样装入 / 升级的发布件,不是本仓改闸 ⇒ 不进 D11 的红队要求(用户 10-19:「红队要么设置成可选,要么就把红队体系完善了」;
+    //   新仓装闸那次提交必撞 D11,而审原样拷入的发布件没有意义)。内容有一处不一致、删除或改名 ⇒ 照旧要红队。
+    gitEngineCommits(f) { const H = RULE_P._p; return f.commits.filter((c) => !c.vendoredEngine && H.touches(c, (p) => H.ENGINE_REL.test(p))); },
 
     // ── 命令语法零件(回退与补充;唯一实现)──────────────────────────────────────
     stripHeredoc(cmd) { return String(cmd || "").replace(/<<-?\s*(['"]?)(\w+)\1[\s\S]*?^\s*\2\s*$/gm, " "); },
@@ -4535,6 +4538,23 @@ const RULE_P = {
       const t = String((a.input && (a.input.subagent_type || a.input.agentType)) || "");
       return /^_gate-bypass-hunter$/.test(t) && RULE_P._p.hunterBound(a);
     },
+    /** 批 266:误拦猎手 agent 且入参绑定闸文件/规则 id/diff(与红队同一绑定判据)。 */
+    isBoundFalseBlockHunter(a, ctx) {
+      if (!a || !/^(Agent|Task)$/.test(String(a.name || ""))) return false;
+      const t = String((a.input && (a.input.subagent_type || a.input.agentType)) || "");
+      // 误拦猎手草稿「你没问到」②:hunterBound 的 `gate-[w-]+.mjs` 本身就命中 gate-replay.mjs ⇒ 提一句「跑 gate-replay」就算绑定。
+      //   ⇒ 另要求入参给出改动前的提交(`--base <7–40 位 hex>`):没有 base,回放会拿 HEAD 对工作树,批内已提交时恒为「零新增」
+      const p = JSON.stringify((a && a.input) || {});
+      const m = /--base[\s=]+([0-9a-f]{7,40})\b/i.exec(p);
+      if (!(/^_gate-false-block-hunter$/.test(t) && RULE_P._p.hunterBound(a) && m)) return false;
+      // 红队 aa75af79 BP-3:批内已提交后填 HEAD(或范围内任一笔)当 base ⇒ 回放拿改后对改后,恒为零新增 ⇒ 不算绑定
+      const hex = m[1].toLowerCase(), f = ctx ? RULE_P._p.facts(ctx) : null;
+      if (f) {
+        const hit = (sha) => typeof sha === "string" && sha.toLowerCase().startsWith(hex);
+        if (hit(f.head) || (f.commits || []).some((c) => hit(c.sha))) return false;
+      }
+      return true;
+    },
     /** 红队 182 BP-9:起一次空 prompt 的 `_gate-bypass-hunter` 也满足收紧 ⇒ 与 W 的 reviewedOne 同法,
      *  入参须提及闸引擎文件名 / 规则 id / diff 文件——只证发起,不证采纳(与另两通道同一 CEILING)。 */
     hunterBound(a) {
@@ -4543,7 +4563,7 @@ const RULE_P = {
       return /hook-stop-closure|hook-guard|gate-[\w-]+\.mjs|write-effects|fp-audit|gate-deps|\.diff\b|规则 ?id|rule ids?|\bRULE_[A-Z0-9]+\b|批 ?\d{3}|\bD\d{3}\b/i.test(p);
     },
     /** 旧整串正则(hook-start-gate 按名引用它判「本批碰没碰闸引擎」,口径与本条同源;P 自己改用上面三件)。 */
-    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard|fp-audit)\.mjs|scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs|scripts\/gate-deps\/package(?:-lock)?\.json|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|fp-audit|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs\b/i,
+    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard|fp-audit|gate-replay)\.mjs|scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs|scripts\/gate-deps\/package(?:-lock)?\.json|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|fp-audit|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs\b/i,
 
     /** 本批提交是否**带进了闸引擎改动**(D11 收紧的适用面)。
      *  · git 事实在 ⇒ **只认** `基点..HEAD` 上被带进的提交里有没有本仓闸引擎文件(派出方 a27628dd 口径①:
@@ -4563,8 +4583,10 @@ const RULE_P = {
     engineBySyntax(ctx) {
       const H = RULE_P._p, w = H.win(ctx), root = ctx.hookCheckout || null;
       const acts = [...((w && Array.isArray(w.actions)) ? w.actions : []), ...(Array.isArray(ctx.actions) ? ctx.actions : [])];
-      let last = -1;
-      acts.forEach((a, i) => { if (H.isBoundHunter(a)) last = i; });
+      let lastB = -1, lastF = -1;
+      acts.forEach((a, i) => { if (H.isBoundHunter(a)) lastB = i; if (H.isBoundFalseBlockHunter(a, ctx)) lastF = i; });
+      // 批 266(codex 266-r1 §1):两个猎手都覆盖到的才算覆盖 ⇒ 取较早那次;只跑过一个 ⇒ -1(全部写入都算未覆盖)
+      const last = Math.min(lastB, lastF);
       const eng = (p) => H.isEnginePath(p, root);
       for (const a of acts.slice(last + 1)) {
         const name = String((a && a.name) || ""), inp = (a && a.input) || {};
@@ -4686,7 +4708,7 @@ const RULE_P = {
         test: (a, ctx) => {
           if (!/^(Agent|Task)$/.test(String(a.name || ""))) return false;
           const t = String((a.input && (a.input.subagent_type || a.input.agentType)) || "");
-          if (ctx && RULE_P._p.gateEngineTouched(ctx)) return /^_gate-bypass-hunter$/.test(t) && RULE_P._p.hunterBound(a);
+          if (ctx && RULE_P._p.gateEngineTouched(ctx)) return RULE_P._p.isBoundHunter(a) || RULE_P._p.isBoundFalseBlockHunter(a, ctx);
           return /^(grill:|_)/.test(t);
         } },
       { key: "外部先例(WebSearch/WebFetch:判「业界踩过没有」)",
@@ -4788,7 +4810,15 @@ const RULE_P = {
       const H = RULE_P._p, ch = H.hunterCh();
       // 点名覆盖(namedCover)已撤:codex 257-p-gitfacts-r2 断言 6 实证——prompt 只在背景里列了分支名、且明说不在审查范围,
       //   照样抵掉该分支带进的闸改动 ⇒ 它会放过真欠账,不是单纯收紧误拦,不属窄例外③;BP-8 误拦退回为残余(D149④)。
-      return H.hunterPool(ctx).some((a) => { try { return ch.test(a, ctx); } catch { return false; } });
+      // 批 266:闸引擎面要红队(找漏放)与误拦猎手(找误拦,跑 gate-replay 回放)两者都在——
+      //   用户 10-19:「我们设计了一堆防漏放,结果误拦了,得不偿失」「这样二者才等级」(ADR 0028 / 265b-D1)
+      return H.hunterMissingWhich(ctx).length === 0;
+    },
+    /** 闸引擎面上还缺哪个 agent(按名);detect 消息与 hunterMet 同一取值。 */
+    hunterMissingWhich(ctx) {
+      const H = RULE_P._p, pool = H.hunterPool(ctx);
+      const has = (pred) => pool.some((a) => { try { return pred(a); } catch { return false; } });
+      return [has(H.isBoundHunter) ? null : "_gate-bypass-hunter", has((a) => H.isBoundFalseBlockHunter(a, ctx)) ? null : "_gate-false-block-hunter"].filter(Boolean);
     },
     /** 三条通道各自是否已有凭证(与 detect 同一取值池、同一谓词)。 */
     channelsMet(ctx) {
@@ -4850,6 +4880,8 @@ const RULE_P = {
     const acts = H.scopeActions(ctx);
     const out = [];
     for (const ch of H.CH) {
+      // 批 266(codex 266-r1 §1 / 红队 aa75af79 BP-4):闸引擎格看 hunterMet(红队与误拦猎手两者都在),不按调用数
+      if (engine && ch === hunterCh) { if (hunterMissing) out.push({ ch: ch.key, got: 0, need: 1, commits, every: H.rearm() }); continue; }
       const pool = (engine && ch === hunterCh) ? hunterPool : acts;   // 红队凭证只认本批
       const mine = pool.filter((a) => { try { return ch.test(a, ctx); } catch { return false; } });   // 带 ctx:D11 闸引擎面收紧
       const got = mine.length;
@@ -4886,14 +4918,14 @@ const RULE_P = {
     // codex 185 Q5:只欠红队(闸引擎面、宽限内)时,消息按实际缺项说,别再念「三通道各需 1 遍」
     const hunterOnly = hits.length === 1 && /闸引擎面每批必跑/.test(String(h0.ch));
     if (hunterOnly) {
-      return `**闸引擎面提交,红队未跑**(D11,独立于「每 ${h0.every} 次武装一次」的宽限;本批累计 ${h0.commits} 次承重提交,另两通道仍在宽限内)。\n` +
-        `      处置只有一条:起 \`_gate-bypass-hunter\`,prompt 里带上本批闸文件名 / 规则 id / diff 文件(空 prompt 不算,` +
-        `上一批的红队调用不抵账),回件处置后再提交或关账。grill 在此格**不充分**。`;
+      return `**闸引擎面提交,红队 / 误拦猎手未跑齐**(D11,独立于「每 ${h0.every} 次武装一次」的宽限;本批累计 ${h0.commits} 次承重提交,另两通道仍在宽限内)。\n` +
+        `      处置:两个都要起——\`_gate-bypass-hunter\`(找漏放)与 \`_gate-false-block-hunter\`(找误拦,跑 scripts/gate-replay.mjs 回放),` +
+        `prompt 里带上本批闸文件名 / 规则 id / diff 文件(空 prompt 不算,上一批的调用不抵账);误拦猎手另须带 \`--base <本批改动前的提交>\`(不能填 HEAD 或本批里的提交——那样回放恒为零新增)。回件处置后再提交或关账。grill 在此格**不充分**。`;
     }
     return `承重面批次三通道未跑够(本批 ${h0.commits} 次承重面提交 ⇒ 各需 ${h0.need} 遍,` +
       `每 ${h0.every} 次重新武装一次)。缺:${hits.map((h) => `${h.ch} ${h.got}/${h.need}`).join(" / ")}\n` +
       (hits.some((h) => /闸引擎面每批必跑|独立视角/.test(String(h.ch))) && RULE_P._p ?
-        `      （闸引擎面的「独立视角」只认 \`_gate-bypass-hunter\` 且入参绑定闸文件/规则 id;grill 在该格不充分——D11。）\n` : "") +
+        `      （闸引擎面的「独立视角」要 \`_gate-bypass-hunter\` 与 \`_gate-false-block-hunter\` 两者都在,且入参绑定闸文件/规则 id;grill 在该格不充分——D11。）\n` : "") +
       `      **「本轮不需要」不是豁免**——当日自审第⑤⑥⑦问六次全答「不需要」、零次触发行动,\n` +
       `      而同日一跑三通道:codex 判死我 4/5 条诊断,grill 报出 97 条变异里 40 条在「全绿」下存活。\n` +
       `      (本批承重面改动若**全是测试文件**——*.test.* / *.spec.* / *.selftest.mjs / .nlpm-test/——跨模型与联网两条自动免,\n` +
@@ -5116,6 +5148,53 @@ const RULE_P = {
         text: "合回子代理。", pLedger: { carriers: 0 },
         bash: ["git merge --no-ff worktree-agent-x -m merge"],
         headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266:闸引擎提交只有红队、没有误拦猎手 ⇒ 仍欠",
+        text: "红队过了,提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266:闸引擎提交只有误拦猎手、没有红队 ⇒ 仍欠",
+        text: "回放过了,提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } }],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266:误拦猎手提到 gate-replay 与闸文件、但没给 --base ⇒ 不算绑定,仍欠",
+        text: "提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "跑 gate-replay.mjs 看 scripts/lib/gate-rules.mjs 的改动" } }],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 红队 BP-3:误拦猎手 --base 填了本批范围里的提交(回放恒零新增)⇒ 不算绑定,仍欠",
+        text: "提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base eeeeeeeeeeee" } }],
+        headFacts: { root: "/repo", head: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", commits: [{ sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 红队 BP-2:改回放器 scripts/gate-replay.mjs 也是改闸引擎 ⇒ 只有红队仍欠",
+        text: "改了回放器。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/gate-replay.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/gate-replay.mjs 的改动" } }],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/gate-replay.mjs", status: "M" }] }] } },
+      { name: "266 codex §1:git 事实缺席、改闸后先跑红队再提交、没跑误拦猎手 ⇒ 仍欠",
+        text: "红队过了,提交。", pLedger: { carriers: 0 },
+        write: "scripts/lib/gate-rules.mjs", bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }] },
+      { name: "266 红队 BP-4:pLedger 未接的老路,只有误拦猎手 ⇒ 仍欠",
+        text: "回放过了,提交。",
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } }],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266:误拦猎手空 prompt(未绑定闸文件)⇒ 不算,仍欠",
+        text: "提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "hi" } }],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266:装闸提交原样(vendoredEngine)、其后又改了闸引擎 ⇒ 仍欠红队",
+        text: "装完顺手改了一行。", pLedger: { carriers: 0 },
+        bash: ["git commit -am tweak"],
+        headFacts: { root: "/repo", commits: [{ vendoredEngine: true, files: [{ path: "scripts/lib/gate-rules.mjs", status: "A" }] },
+          { files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
       { name: "a27628dd BP-1:cherry-pick 带进闸引擎 ⇒ 欠红队",
         text: "摘过来。", pLedger: { carriers: 0 },
         bash: ["git cherry-pick abc1234"],
@@ -5471,6 +5550,17 @@ const RULE_P = {
         diffFacts: { root: "/repo", files: [{ path: "scripts/lib/ledger-chain.test.mjs", status: "M", readable: true }] } },
     ],
     neg: [
+      { name: "266:闸引擎提交,红队与误拦猎手都在且都绑定闸文件 ⇒ 放行",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } }],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      // 批 266:原样装入的闸引擎(hook 侧核过与安装清单一致)不是本仓改闸 ⇒ 不欠红队
+      { name: "266 装闸提交:闸引擎与安装清单逐个一致(vendoredEngine)⇒ 不欠红队",
+        text: "装好了。", pLedger: { carriers: 0 },
+        bash: ["git add -A && git commit -m install-gate"],
+        headFacts: { root: "/repo", commits: [{ vendoredEngine: true, files: [{ path: "scripts/lib/gate-rules.mjs", status: "A" }, { path: "scripts/hook-stop-closure.mjs", status: "A" }] }] } },
       // ══ 红队 a9af71da 的接受侧 ═════════════════════════════════════════════════════════════════
       // BP-5(误拦):本仓 `git commit` 没落盘(未暂存 / pre-commit 失败 / 权限被拒)⇒ 范围里无本轮提交,但没有任何离开本仓根的证据
       //   ⇒ 不是「落在别处」(原三通道全命中;b7ef430 上放行)
@@ -5572,6 +5662,7 @@ const RULE_P = {
         text: "合回并红队。", pLedger: { carriers: 0 },
         bash: ["git merge --no-ff worktree-agent-x -m merge"],
         agent: { type: "_gate-bypass-hunter", prompt: "红队合回的 scripts/lib/gate-rules.mjs 改动" },
+        prior: [{ text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放合回的 scripts/lib/gate-rules.mjs 改动 --base 1234567" } }],
         headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"] }] } },
       // BP-6 反(回退面):闸副本在外发暂存树 / cp 备份进 clipboard / git log -S / heredoc 提交信息 / grep "tee "
       //   ——之后一笔无关提交不得被要求红队(派出方裁定:暂存树与 worktree 下的副本不算本仓闸引擎)
@@ -5603,6 +5694,7 @@ const RULE_P = {
         prior: [{ text: "改闸", write: "scripts/lib/gate-rules.mjs" },
                 { text: "提交闸", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x" },
                 { text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } },
                 { text: "记台账", bash: "git add docs/gate-debts.md && git commit -m x" }] },
       { name: "a27628dd BP-7 反(git 面):本次范围只带进法典 ⇒ 窗口里旧的闸写入不算",
         text: "改法典,提交。", pLedger: { carriers: 0 },
@@ -5632,6 +5724,7 @@ const RULE_P = {
         prior: [{ text: "改闸", at: "2026-10-10T09:28:00Z", write: "scripts/lib/gate-rules.mjs" },
                 { text: "提交闸", at: "2026-10-10T09:29:00Z", bash: "git add scripts/lib/gate-rules.mjs && git commit -m x" },
                 { text: "红队", at: "2026-10-10T09:29:20Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", at: "2026-10-10T09:29:30Z", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } },
                 { text: "提交文档", at: "2026-10-10T09:30:00Z", bash: "git add docs/e.md && git commit -m x" }] },
       // 量化 a00051d BP-2:他仓提交与 --amend 不切凭证池(git 面切点只在本仓带闸改动的提交)
       { name: "a00051d BP-2(git 面):红队 → 他仓提交 → amend → 本仓闸修复提交 ⇒ 红队仍抵账",
@@ -5639,6 +5732,7 @@ const RULE_P = {
         batchGoal: { armedAt: "2026-10-10T08:00:00Z", conditions: ["甲"] },
         bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
         prior: [{ text: "红队", at: "2026-10-10T10:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", at: "2026-10-10T10:00:30Z", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } },
                 { text: "他仓提交", at: "2026-10-10T10:10:00Z", bash: "cd /d/dotfiles-claude && git add -A && git commit -m x" },
                 { text: "改提交信息", at: "2026-10-10T10:20:00Z", bash: "git commit --amend --no-edit" }],
         headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-10T10:30:00Z" }], engineAnchorAt: "2026-10-10T09:00:00Z" } },
@@ -5657,7 +5751,8 @@ const RULE_P = {
         bash: ["git add -A src/app/page.tsx && git commit -m x"],
         prior: [{ text: "改闸", at: "2026-10-10T09:00:00Z", write: "scripts/lib/gate-rules.mjs" },
                 { text: "提交闸", at: "2026-10-10T09:01:00Z", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x" },
-                { text: "红队", at: "2026-10-10T09:02:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }] },
+                { text: "红队", at: "2026-10-10T09:02:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", at: "2026-10-10T09:02:10Z", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } }] },
       // 量化 a00051d BP-4 / 派出方口径③:原 pos「回退路径 fail-closed:红队之后的 docs-only 提交也切」**翻成放行**——
       //   与原 neg「codex-185 ① 边界」只差中间一笔文档提交、一拦一放,自相矛盾。宽松口径:红队之后按回件修闸再提交
       //   算这一轮红队的处置。git 事实在 ⇒ 文档提交不切。(取不到 git 事实时的「任何提交都切」另有 pos 钉着。)
@@ -5665,6 +5760,7 @@ const RULE_P = {
         text: "本批收尾提交。", pLedger: { carriers: 0 },
         write: "scripts/lib/gate-rules.mjs", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x",
         prior: [{ text: "本批红队", agent: { type: "_gate-bypass-hunter", prompt: "红队本批 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "本批误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放本批 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } },
                 { text: "记台账", bash: "git add docs/gate-debts.md docs/product-diary.md && git commit -m x" }],
         headFacts: { root: "/repo", commits: [{ files: ["docs/gate-debts.md", "docs/product-diary.md"] }, { files: ["scripts/lib/gate-rules.mjs"] }] } },
       // 批 257 条件 3 分档的接受侧证人:只改测试文件 ⇒ 轻档 ⇒ 只欠独立视角,grill 在场即放行。
@@ -5678,7 +5774,8 @@ const RULE_P = {
       //   挪到下一条(法典提交)——两条合起来才证「收紧只作用于闸引擎面」。
       { text: "承重面改完并提交,三通道各跑一遍。",
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A scripts/hook-stop-closure.mjs && git commit -m x"],
-        agent: { type: "_gate-bypass-hunter", prompt: "红队本批对 scripts/hook-stop-closure.mjs 的改动,规则 id K/S" }, web: "业界先例" },
+        agent: { type: "_gate-bypass-hunter", prompt: "红队本批对 scripts/hook-stop-closure.mjs 的改动,规则 id K/S" }, web: "业界先例",
+        prior: [{ text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放本批 scripts/hook-stop-closure.mjs 的改动 --base 1234567" } }] },
       // D107 主路径证人的接受侧(191):同一形态,红队调用**晚于**武装时刻 ⇒ 在凭证池内 ⇒ 放行。
       //   与 pos 那条**只差一个时间戳**(正文同为「红队」,codex 191 指出原来正文不同 ⇒ 不是单变量对照)。
       //   ⚠️ 注意:主路径失效时本条**仍放行**(变异实测 neg 前后同为 hits=0),故它不是变异的证人——杀变异的是 pos。
@@ -5687,18 +5784,21 @@ const RULE_P = {
         batchGoal: { armedAt: "2026-09-09T10:00:00Z", conditions: ["甲"] },
         bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
         prior: [{ text: "红队", at: "2026-09-09T11:00:00Z",
-                  agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }] },
-      // D11 独立于宽限的另一半:计数不足时**只**要求红队,另两通道仍按宽限 ⇒ 只有红队在场也放行
+                  agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", at: "2026-09-09T11:01:00Z", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } }] },
+      // D11 独立于宽限的另一半:计数不足时**只**要求红队与误拦猎手(批 266 起两者),另两通道仍按宽限 ⇒ 两者在场即放行
       { name: "D11 独立于宽限:pLedger=0、只有绑定的红队在场 ⇒ 放行(另两通道仍按宽限)",
-        text: "第一笔,闸引擎批,红队跑过。", pLedger: { carriers: 0 },
+        text: "第一笔,闸引擎批,红队与误拦猎手跑过。", pLedger: { carriers: 0 },
         bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } }],
         agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
       // codex 185 ① 的边界:红队调用在窗口里**最后一次提交之后**(同一批内、隔轮跑的)⇒ 认
       { name: "codex-185 ① 边界:本批内隔轮跑的红队(晚于上次提交)⇒ 放行",
         text: "本批收尾提交。", pLedger: { carriers: 0 },
         write: "scripts/lib/gate-rules.mjs", bash: "git add -A scripts/lib/gate-rules.mjs && git commit -m x",
         prior: [{ text: "批 184 结束", commit: true },
-                { text: "本批红队", agent: { type: "_gate-bypass-hunter", prompt: "红队本批 scripts/lib/gate-rules.mjs 的改动" } }] },
+                { text: "本批红队", agent: { type: "_gate-bypass-hunter", prompt: "红队本批 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "本批误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放本批 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } }] },
       { name: "D11 边界:非闸引擎的承重提交,grill 仍充分",
         text: "法典改完并提交,三通道各跑一遍。",
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A docs/laws/collab.md && git commit -m x"],

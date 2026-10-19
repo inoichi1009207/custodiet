@@ -476,9 +476,12 @@ if (process.argv.includes("--migrate-check")) {
     ["装载期不变量过", () => validateRules([r]).length === 0,
       () => validateRules([r]).join(" | ")],
     ["正例 ≥1 且全命中", () => r.cases.pos.length >= 1 && r.cases.pos.every((c) => runRules([r], mkCtx(c)).length === 1),
-      () => `${r.cases.pos.filter((c) => runRules([r], mkCtx(c)).length === 1).length}/${r.cases.pos.length}`],
+      () => { const bad = r.cases.pos.filter((c) => runRules([r], mkCtx(c)).length !== 1);
+        return `${r.cases.pos.length - bad.length}/${r.cases.pos.length}` + (bad.length ? `;没命中:${bad.slice(0, 8).map((c) => `«${c.name}»`).join(" ")}` : ""); }],
     ["反例 ≥1 且全放行", () => r.cases.neg.length >= 1 && r.cases.neg.every((c) => runRules([r], mkCtx(c)).length === 0),
-      () => `${r.cases.neg.filter((c) => runRules([r], mkCtx(c)).length === 0).length}/${r.cases.neg.length}`],
+      // 批 266:未过时点名是哪几条(原来只报计数,排查要另写脚本)
+      () => { const bad = r.cases.neg.filter((c) => runRules([r], mkCtx(c)).length !== 0);
+        return `${r.cases.neg.length - bad.length}/${r.cases.neg.length}` + (bad.length ? `;误命中:${bad.slice(0, 8).map((c) => `«${c.name}»`).join(" ")}` : ""); }],
     ["≥2 变异且各有证人", () => {
       const ms = r.mutations || [];
       if (ms.length < 2) return false;

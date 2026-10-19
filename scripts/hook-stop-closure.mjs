@@ -57,6 +57,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 
 // ── 阻断项开关:四项**默认阻断**。
 //
@@ -241,7 +242,33 @@ export function fpTable(alerts, ledger, { minAlerts = 20, minRate = 0.15 } = {})
   }).sort((a, b) => b.alerts - a.alerts || a.id.localeCompare(b.id));
 }
 
-export function readHeadFacts(base, git = _gitHere, pathspecs = []) {
+/** 批 266:原样装入的闸引擎(用户 10-19「红队要么设置成可选,要么就把红队体系完善了」;新仓装闸那次提交必撞 D11,
+ *  而审原样拷入的发布件没有意义)。安装器写 `.claude/custodiet-manifest.json`:`{ files: { <仓相对路径>: <内容摘要> } }`;
+ *  一个提交里**每个**闸引擎文件都满足「该提交树里的清单有这条路径、该提交树里的文件内容摘要与之相等」⇒ `vendoredEngine`。
+ *  内容摘要 = CRLF 归一为 LF 后的 sha256(源仓 autocrlf 会让拷贝是 CRLF,目标仓存成什么取决于它自己的设置)。
+ *  删除、改名、清单缺条目、清单读不到、聚合项、**清单标了源树不干净(`sourceClean !== true`)** ⇒ 不算(偏严:照旧要两个猎手)。
+ *  能证明的只有「与安装清单一致」,不是「已审过的发布件」(codex 266-r1 §5):安装器从源树当前内容算摘要,
+ *  故清单另记源树干净与否与源提交号——从改过、没提交的源树装进来的不豁免(红队 aa75af79 BP-1)。
+ *  CEILING:手改清单去匹配改过的文件 ⇒ 认作原样装入——蓄意伪造形(用户代价模型不计)。 */
+export const CUSTODIET_MANIFEST = ".claude/custodiet-manifest.json";
+export const contentDigest = (s) => crypto.createHash("sha256").update(String(s).replace(/\r\n/g, "\n"), "utf8").digest("hex");
+export function vendoredEngineCommit(git, c, isEngine) {
+  if (!c || c.aggregated || typeof c.sha !== "string" || !Array.isArray(c.files) || typeof isEngine !== "function") return false;
+  const eng = c.files.filter((x) => isEngine(x.path) || (!!x.oldPath && isEngine(x.oldPath)));
+  if (!eng.length) return false;
+  let files = null, m = null;
+  try { m = JSON.parse(String(git(["show", `${c.sha}:${CUSTODIET_MANIFEST}`]) || "")); files = m && typeof m.files === "object" ? m.files : null; } catch { return false; }
+  if (!files || m.sourceClean !== true) return false;
+  return eng.every((x) => {
+    if (x.oldPath || /^D/.test(String(x.status || ""))) return false;
+    const want = files[x.path];
+    if (typeof want !== "string" || !/^[0-9a-f]{64}$/i.test(want)) return false;
+    let body; try { body = String(git(["show", `${c.sha}:${x.path}`])); } catch { return false; }
+    return contentDigest(body) === want.toLowerCase();
+  });
+}
+
+export function readHeadFacts(base, git = _gitHere, pathspecs = [], engineRe = null) {
   if (typeof base !== "string" || !/^[0-9a-f]{7,64}$/i.test(base)) return null;
   const HEX = /^[0-9a-f]{40,64}$/i;
   try {
@@ -306,6 +333,8 @@ export function readHeadFacts(base, git = _gitHere, pathspecs = []) {
       const xs = [at(full), ...(ancestor ? [] : [at(anchor)])].filter((x) => x !== null);
       engineAnchorAt = xs.length ? Math.max(...xs) : null;
     }
+    // 批 266:原样装入的闸引擎提交打标(见 vendoredEngineCommit);判不了一律不打标
+    if (engineRe instanceof RegExp) for (const c of commits) { try { if (vendoredEngineCommit(git, c, (p) => engineRe.test(p))) c.vendoredEngine = true; } catch { /* 不打标 */ } }
     return { base: full, head, root, commits, engineAnchorAt };
   } catch { return null; }
 }
@@ -2730,7 +2759,7 @@ export function run(transcriptPath, ctx = {}) {
             const pp = RULES.find((r) => r.id === "P")?._p;
             // 退路批基点取 hook 已有的批状态(带 cleared;a07e98e9 BP-5):已结清 ⇒ 无退路,不拿已关批的基点
             const batchBase = () => batchBaseOfGoal(ctx.batchGoal !== undefined ? ctx.batchGoal : readBatchGoal());
-            return readHeadFacts(pHeadBase(ctx.sessionId, _allEntriesCache, undefined, undefined, batchBase), undefined, pp ? pp.ENGINE_PATHSPECS : []);
+            return readHeadFacts(pHeadBase(ctx.sessionId, _allEntriesCache, undefined, undefined, batchBase), undefined, pp ? pp.ENGINE_PATHSPECS : [], pp ? pp.ENGINE_REL : null);
           } : undefined),
         // ⚠️ **跨轮窗口必须真的传进来**(2026-08-20 实撞)。
         //   `ctx.window()` 从落地起就没被生产路径喂过 `priorEntries` ⇒ **恒为 null**,
@@ -4594,7 +4623,9 @@ function selfTest() {
         hp("settleP a9af71da BP-1:基点后 61 笔 ⇒ readHeadFacts 不再 null(一笔聚合项)", f61 && `${f61.commits.length}:${f61.commits[0].aggregated}:${f61.commits[0].count}`, "1:true:61");
         const merge = "git merge --no-ff worktree-agent-x -m m";
         const hunter = { type: "tool_use", name: "Agent", input: { subagent_type: "_gate-bypass-hunter", prompt: "红队合回的 scripts/lib/gate-rules.mjs 改动" } };
-        const ok3 = [all3[0], hunter, all3[2]];
+        // 批 266:闸引擎面要红队与误拦猎手两者都在
+        const fbHunter = { type: "tool_use", name: "Agent", input: { subagent_type: "_gate-false-block-hunter", prompt: "回放合回的 scripts/lib/gate-rules.mjs 改动 --base 1234567" } };
+        const ok3 = [all3[0], hunter, fbHunter, all3[2]];
         const c1 = sc({ ledger: { carriers: 0 }, facts: f61, cmd: merge, extra: ok3 });
         const h1 = PR.detect(c1);
         const st1 = settleP(P_, c1, h1.length ? [{ id: "P" }] : []);
@@ -4617,6 +4648,24 @@ function selfTest() {
         samples.map((p) => `${_Pp.ENGINE_REL.test(p) ? 1 : 0}${_Pp.ENGINE_PATHSPECS.some((s) => asRe(s).test(p)) ? 1 : 0}`).join(" "),
         "11 11 11 11 00 00 00 11 11 11 00");
       hp("GATE_ENGINE 认写入效果分析器与盲审", ["scripts/lib/write-effects.mjs", "scripts/fp-audit.mjs", "scripts/gate-deps/package.json"].map((p) => _Pp.GATE_ENGINE.test(p) ? 1 : 0).join(""), "111");
+      // 批 266:原样装入的闸引擎(安装清单核对)。假 git:按 `<sha>:<path>` 返回树里的内容
+      {
+        const ENG = "export const x = 1;\r\n", isEng = (p) => _Pp.ENGINE_REL.test(p);
+        const tree = (over = {}) => ({ "c1:scripts/lib/gate-rules.mjs": ENG, "c1:scripts/hook-stop-closure.mjs": "h\n",
+          [`c1:${CUSTODIET_MANIFEST}`]: JSON.stringify({ sourceClean: true, files: { "scripts/lib/gate-rules.mjs": contentDigest(ENG), "scripts/hook-stop-closure.mjs": contentDigest("h\n") } }), ...over });
+        const fg = (t) => (args) => { if (args[0] !== "show" || !(args[1] in t)) throw new Error("no such object"); return t[args[1]]; };
+        const c = (files) => ({ sha: "c1", files });
+        const two = [{ path: "scripts/lib/gate-rules.mjs", oldPath: null, status: "A" }, { path: "scripts/hook-stop-closure.mjs", oldPath: null, status: "A" }];
+        hp("266 原样装入:两件引擎都与清单一致(CRLF 归一后)⇒ vendored", vendoredEngineCommit(fg(tree()), c(two), isEng), true);
+        hp("266 一件内容与清单不同 ⇒ 不算", vendoredEngineCommit(fg(tree({ "c1:scripts/lib/gate-rules.mjs": "export const x = 2;\n" })), c(two), isEng), false);
+        hp("266 清单缺这条路径 ⇒ 不算", vendoredEngineCommit(fg(tree({ [`c1:${CUSTODIET_MANIFEST}`]: JSON.stringify({ sourceClean: true, files: { "scripts/lib/gate-rules.mjs": contentDigest(ENG) } }) })), c(two), isEng), false);
+        hp("266 红队 BP-1:清单标源树不干净 / 没标 ⇒ 不算", [false, undefined].map((v) => vendoredEngineCommit(fg(tree({ [`c1:${CUSTODIET_MANIFEST}`]: JSON.stringify({ sourceClean: v, files: { "scripts/lib/gate-rules.mjs": contentDigest(ENG), "scripts/hook-stop-closure.mjs": contentDigest("h\n") } }) })), c(two), isEng)).join(","), "false,false");
+        hp("266 提交树里没有清单 ⇒ 不算", vendoredEngineCommit(fg({ "c1:scripts/lib/gate-rules.mjs": ENG }), c([two[0]]), isEng), false);
+        hp("266 删除 / 改名 ⇒ 不算", [vendoredEngineCommit(fg(tree()), c([{ ...two[0], status: "D" }]), isEng),
+          vendoredEngineCommit(fg(tree()), c([{ ...two[0], oldPath: "scripts/lib/gate-old.mjs", status: "R100" }]), isEng)].join(","), "false,false");
+        hp("266 聚合项 / 提交里没有引擎文件 ⇒ 不算", [vendoredEngineCommit(fg(tree()), { ...c(two), aggregated: true }, isEng),
+          vendoredEngineCommit(fg(tree()), c([{ path: "docs/x.md", oldPath: null, status: "M" }]), isEng)].join(","), "false,false");
+      }
       // 批 260(红队 a700dedc (b)-10):第四处口径——回退面 ENGINE_PATH_RE 须覆盖 ENGINE_REL 认的一切
       //   (回退面本来就允许前缀目录,`clipboard/oss/public-repo/scripts/lib/…` 也认——偏严,不要求相等)
       hp("ENGINE_PATH_RE 覆盖 ENGINE_REL", samples.filter((p) => _Pp.ENGINE_REL.test(p) && !_Pp.ENGINE_PATH_RE.test(p)).join(","), "");
