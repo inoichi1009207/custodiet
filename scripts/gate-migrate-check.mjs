@@ -286,7 +286,7 @@ console.log("正反例:");
 //   第十六次:`ps`(2026-10-11 红队 a811daae BP-6)——走 **PowerShell 工具**的命令(顶层与 `prior` 项同写法)。
 //     写目标解析按工具名选方言;平铺夹具只发 Bash ⇒「同一串、不同工具、不同结论」写不出来。
 //   第十七次:`batchEverArmed`(批 265,K0 在「从没立过批的仓」不判;实时 hook 才注入,夹具不加写不出这一形)。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "batchEverArmed", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "hookCheckout", "at", "then"]);
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "batchEverArmed", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "resolveRev", "hookCheckout", "at", "then"]);
 //   第十五次:`then`(2026-10-10 红队 a2155edb BP-1;与十三、十四次同日由另一 worktree 并行加,合并时重编号)——**本窗口内**主 assistant 条目之后再接的条目(写法同 `prior` 项),
 //   ND 的「出路要晚于最近一次名词提问」要写出 [问1, 写日记, 排队问2, 说] 这种窗口内时序;平铺夹具只有「一条用户行 + 一条
 //   assistant」,时序根本写不出来——与上面各次同族:夹具支持面不足会让规则「测不出来」。
@@ -442,6 +442,8 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...("debtFacts" in c ? { debtFacts: c.debtFacts } : {}),
   ...("diffFacts" in c ? { diffTier: () => c.diffFacts } : {}),
   ...("headFacts" in c ? { headFacts: () => c.headFacts } : {}),
+  // `resolveRev` = {ref: sha} 表,模拟 hook 实时路径的 `git rev-parse`(批 266,codex 266-r2 §1);表里没有 ⇒ null(解析失败)
+  ...("resolveRev" in c ? { resolveRev: (r) => (Object.prototype.hasOwnProperty.call(c.resolveRev, r) ? c.resolveRev[r] : null) } : {}),
   ...("hookCheckout" in c ? { hookCheckout: c.hookCheckout } : {}),
   // `pLedger` = P 的跨批持久账注入(2026-08-22 亲签)。与 batchGoal 同族:注入通道非动作。
   ...("pLedger" in c ? { pLedger: c.pLedger } : {}),

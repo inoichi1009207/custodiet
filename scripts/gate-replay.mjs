@@ -22,6 +22,7 @@
 //   · 外部状态**冻结为「无」**:回放前设 STOP_CLOSURE_SELFTEST=1,批目标、批日志基点、P 台账三处读盘一律返回 null
 //     (codex 266-r1 §3:不冻结时两版各读一遍磁盘,台账在两次之间变了,同一版规则也能读出「版本差异」)。
 //     ⇒ 读数反映的是「无批、无台账」处境下规则本身的变化,不是「那一刻的仓状态下会不会拦」。
+//   · 新证据(预检台账、git 索引、末次提交新增文件)取一次、两版共用;**改前版本早于批 266 时**它不认注入,仍各读一遍(codex 266-r2 §6)。
 //   · 不带 git 事实(P 的 headFacts)⇒ P 走语法回退;**原样装入豁免(vendoredEngine)这条路径根本不在回放覆盖面里**。
 //     后台任务载荷、观察档、连拦降级(yielding)也不模拟。P / DP / A / K 这类依赖实时面的规则,读数要打折看。
 //   · 每回合只取末尾 `--tail` 条条目,更早的历史证据看不到;解析依赖(tree-sitter,scripts/gate-deps)两版共用主 checkout 那一份,没随基线冻结。
@@ -172,7 +173,10 @@ async function main(argv) {
     }
   }
   const t0 = Date.now();
-  const r = diffRuns(jobs, (e) => before.run(null, { entries: e }), (e) => after.run(null, { entries: e }));
+  // 新证据(预检台账 / git 索引 / 末次提交新增文件)只取一次,两版共用(codex 266-r2 §6:各取一次时同一版规则也能读出「解除阻断」)。
+  //   改前版本若早于本改动(不认 ctx.newEvidence),它那一侧仍会自己读一遍——见 CEILING。
+  const ev = typeof after.isNewEvidence === "function" ? after.isNewEvidence(undefined) : undefined;
+  const r = diffRuns(jobs, (e) => before.run(null, { entries: e, newEvidence: ev }), (e) => after.run(null, { entries: e, newEvidence: ev }));
   for (const row of r.rows) delete row.entries;
   fs.mkdirSync(path.dirname(opt.out), { recursive: true });
   const rel = (f) => path.basename(path.dirname(f)) + "/" + path.basename(f).slice(0, 8);
@@ -182,7 +186,7 @@ async function main(argv) {
   try { worktree = git(["rev-parse", "HEAD"]).trim() + (git(["status", "--porcelain", "--", "scripts/hook-stop-closure.mjs", "scripts/lib"]).trim() ? "+dirty" : ""); } catch { /* 取不到不影响 */ }
   fs.writeFileSync(opt.out, JSON.stringify({ base: base.sha, after: "worktree", worktree, seed: opt.seed, max: opt.max, tail: opt.tail, corpus: dirs,
     turnsAvailable: all.length, ...r, rows: undefined, added: r.added, removed: r.removed, changed: r.changed, errored,
-    picked: jobs.map((j) => `${path.basename(j.file)}#${j.idx}`) }, null, 1));
+    picked: jobs.map((j) => `${j.file}#${j.idx}`) }, null, 1));   // 全路径:多语料目录有同名转录时也能唯一反查(codex 266-r2 表)
   const rules = Object.entries(r.newBlocksByRule).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join(" ") || "无";
   console.log(`gate-replay base=${base.sha.slice(0, 8)} → 工作树:回放 ${r.turns} 回合(可用 ${all.length};语料 ${files.length} 份转录;种子 ${opt.seed};${Math.round((Date.now() - t0) / 1000)} 秒)`);
   console.log(`  阻断回合:改前 ${r.blockedBefore} / 改后 ${r.blockedAfter};新增 ${r.added.length}、解除 ${r.removed.length}、规则变了 ${r.changed.length};出错 ${r.errors}`);

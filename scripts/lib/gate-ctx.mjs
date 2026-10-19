@@ -591,6 +591,8 @@ export function buildCtx(entries, extra = {}) {
      *  对象 `{ root, commits:[{sha, at, files:[{path, oldPath, status}]}], engineAnchorAt }`。
      *  `engineAnchorAt`=比本次范围**更早**的最后一次带闸引擎改动的提交时刻(ms;P 的红队凭证切点)。
      *  形状不对 ⇒ null(不透传任意结构)。 */
+    // 批 266(codex 266-r2 §1):把 rev 解析成 sha(hook 实时路径注入 `git rev-parse`);P 拿它核误拦猎手 `--base` 是否早于本批改闸
+    resolveRev: typeof extra.resolveRev === "function" ? extra.resolveRev : undefined,
     headFacts: typeof extra.headFacts === "function" ? (() => {
       let done = false, v = null;
       const ms = (x) => (typeof x === "number" ? (Number.isFinite(x) ? x : null) : (x == null ? null : (Number.isFinite(Date.parse(String(x))) ? Date.parse(String(x)) : null)));

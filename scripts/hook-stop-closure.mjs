@@ -2384,7 +2384,7 @@ function trackedInFs(root) {
  *   ④`relOf` 的字符串规则与 gate-carriers 的 `normPath`/`NON_CARRIER_AREA` 未动(红队 BP-5/BP-6,另批)。
  *   ⑤SubagentStop 仍是提示面不阻断;本批只补证据,不改其升档判据。
  *  @param {string} [sid] 本会话 id(`preExistedSet` 按会话过滤) */
-function isNewEvidence(sid) {
+export function isNewEvidence(sid) {
   let tracked = _trackedCache;
   if (tracked === undefined) try {
     // 批 261(D138④):-c core.quotepath=false -z,中文 / 空格 / 特殊字符文件名不被转义成 "\346…" 引号串(否则被判新建)
@@ -2672,7 +2672,8 @@ export function run(transcriptPath, ctx = {}) {
   // ── **tracked/justAdded 生产者**(2026-08-22 第二刀时从被删的 I 内联块里救出——
   //   删块当轮自测立刻逮到 I 全误报:引擎经缝拿的就是这两个缓存,删了生产者=断粮)──
   //   批 255:生产者抽成 `isNewEvidence()`(与 SubagentStop 通道共用),此处只调一次、结果交给下面的缝。
-  const newEv = isNewEvidence(ctx.sessionId);
+  // 批 266(codex 266-r2 §6):回放器注入同一份 newEvidence,两版不各读一遍预检台账 / git 索引
+  const newEv = ctx.newEvidence !== undefined ? ctx.newEvidence : isNewEvidence(ctx.sessionId);
   // 史注(削删前原文):形态选替换不选删除…(2026-08-20)
   //   我原本把它们当「僵尸代码,待清扫」——**那个理解是错的**。它们是**回退路径**:
   //     · `STOP_CLOSURE_ENGINE=0` 时用它们(我一直在宣传的「一行可退」);
@@ -2754,6 +2755,16 @@ export function run(transcriptPath, ctx = {}) {
           : (ctx.live ? () => { const g = ctx.batchGoal !== undefined ? ctx.batchGoal : readBatchGoal(); return readDiffFacts(g && g.baseCommit); } : undefined),
         // P 的 HEAD 移动事实(红队 a27628dd):惰性,只在实时路径接(离线回放拿到的是「现在」的 HEAD,套到历史轮上是错配 ⇒
         //   undefined ⇒ P 回退命令语法判据)。基点 = 本会话上次 P 结清时的 HEAD,没有就取会话开始时刻的 HEAD(reflog)。
+        // 批 266(codex 266-r2 §1):误拦猎手 `--base <ref>` 的 ref 解析(只在实时路径;缓存;取不到 ⇒ null)
+        resolveRev: ctx.resolveRev !== undefined ? ctx.resolveRev : (ctx.live ? (() => {
+          const memo = new Map();
+          return (r) => {
+            if (memo.has(r)) return memo.get(r);
+            let v = null;
+            try { v = String(_gitHere(["rev-parse", "--verify", "--quiet", `${r}^{commit}`]) || "").trim() || null; } catch { v = null; }
+            memo.set(r, v); return v;
+          };
+        })() : undefined),
         headFacts: ctx.headFacts !== undefined ? ctx.headFacts
           : (ctx.live ? () => {
             const pp = RULES.find((r) => r.id === "P")?._p;
