@@ -2696,7 +2696,7 @@ export function run(transcriptPath, ctx = {}) {
         //   自测从 34/34 掉到 13/34,而代码一行没改。
         //   自测隔离(STOP_CLOSURE_SELFTEST)靠的也是这个:注入 undefined 即可,不必改判据。
         // 批 265:本仓**从来没立过批**(台账与状态文件都不在)⇒ K0 不判。「批」是可选做法;
-        //   test2 回放 2,837 回合里 K0 阻断 257 次、全是不用批的仓被要求立批(用户:「那你要不改一下」)。
+        //   一个比赛用仓 2,837 回合的模拟回放里,K0 的阻断抽样所见都是不用批的仓被要求立批(用户:「那你要不改一下」)。
         //   只在实时路径注入;夹具与自测不注入(undefined)⇒ K0 判法照旧。
         //   codex 265-r1 A3:台账被 gitignore,新开的 worktree / 新 clone 里两份都缺 ⇒ 在用批的仓也会被当成「从没立过批」。
         //   ⇒ 本 checkout 没有时再看主 checkout(git common dir 的上一级)的台账。
@@ -3017,7 +3017,7 @@ function emit(findings, streak = 0, opts = {}) {
   const CAP = Math.max(4, Number(process.env.STOP_CLOSURE_BLOCK_CAP || 8));
   // 观察档(批 265,新仓上线用):`.claude/custodiet-mode` 首行为 observe(生效条件见 observeMode 头注)⇒
   //   照常判、照常落报警台账(本该拦的记进 `observed`),但**不阻断、不向模型输出任何提示**。
-  //   为什么要有:test2 2,837 个真实回合回放,装上即阻断 30.7% 的回合(K0 / E0 / E2 / M 为主)——新仓先攒数据,
+  //   为什么要有:一个比赛用仓 2,837 个真实回合的模拟回放,装上即阻断 30.7% 的回合——新仓先攒数据,
   //   按规则量出误报率、把误报多的规则本身修掉,再整体切回阻断(不做逐条开关,用户 265 原话);一刀切开阻断就是用户说的「磕磕绊绊、大量影响生产的误报」。
   //   失效条件:观察档里的仓连续 30 天无人看台账 ⇒ 等于没装,复议是否改为默认开低误报规则。
   const OBSERVE = observeMode();

@@ -263,7 +263,7 @@ if (observe) {
 // ── .gitignore:追加闸的运行时台账 ─────────────────────────────────────
 const gitignore = { path: ".gitignore" };
 {
-  // 运行时台账 + 解析依赖的安装目录 + P 的会话基点目录(批 265 test2 预演:原先只加 .claude/ 台账,
+  // 运行时台账 + 解析依赖的安装目录 + P 的会话基点目录(批 265 比赛用仓预演:原先只加 .claude/ 台账,
   //   `npm --prefix scripts/gate-deps install` 装出的 node_modules 与 .claude/.p-head/ 会被一起提交)
   const want = [...fs.readFileSync(path.join(SRC, ".gitignore"), "utf8").split(/\r?\n/)
     .map((l) => l.trim()).filter((l) => l.startsWith(".claude/")), ".claude/.p-head/", "scripts/gate-deps/node_modules/"]
