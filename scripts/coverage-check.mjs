@@ -34,7 +34,7 @@ import { spawnSync } from "node:child_process";
 /** 跑一次命令并收集 V8 覆盖率,返回 {file -> [{name, count}]}(只含具名函数)。 */
 export function collect(cmd, cwd = process.cwd()) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cov-"));
-  const r = spawnSync(cmd, { shell: true, cwd, env: { ...process.env, NODE_V8_COVERAGE: dir }, stdio: "ignore" });
+  const r = spawnSync(cmd, { windowsHide: true, shell: true, cwd, env: { ...process.env, NODE_V8_COVERAGE: dir }, stdio: "ignore" });
   const out = {};
   let files = [];
   try { files = fs.readdirSync(dir); } catch { /* 没产出 */ }
@@ -99,7 +99,7 @@ export function zeroExec(cov, fileSuffix) {
 //   ③覆盖只证执行,不证断言(归变异验收)——三条与函数模式同族,只是粒度更细。
 export function branchReport(cmd, targetFile, cwd = process.cwd()) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "covbr-"));
-  spawnSync(cmd, { shell: true, cwd, env: { ...process.env, NODE_V8_COVERAGE: dir }, stdio: "ignore" });
+  spawnSync(cmd, { windowsHide: true, shell: true, cwd, env: { ...process.env, NODE_V8_COVERAGE: dir }, stdio: "ignore" });
   const suffix = targetFile.replace(/\\/g, "/");
   const ranges = new Map();                     // "start-end" -> 跨进程 max count
   let seen = false;

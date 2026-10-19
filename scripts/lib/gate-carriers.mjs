@@ -59,7 +59,7 @@ export const CARRIERS = [
   //   与前两次同形——它一进 `gate:self-test`,漂移检查当场转红(29/30)。
   //   背景:它此前**全库零引用**、自己 exit=1 无人撞上,D59② 那条红因此活了 94 批;
   //   修完夹具接线,连锁把它抬进承重面 —— 正是这条设计想要的结果。
-  { re: /scripts\/(hook-|verify-laws|batch-goal|session-triage|tool-usage-census|test-freshness|gate-migrate-check|coverage-check|task-brief-check|report-gate|tplan-gate|l4-fast-ruler|lib\/)/,
+  { re: /scripts\/(hook-|verify-laws|batch-goal|session-triage|tool-usage-census|test-freshness|gate-migrate-check|coverage-check|task-brief-check|report-gate|tplan-gate|l4-fast-ruler|check-windows-hide|lib\/)/,
     creation: true, loadBearing: true,
     why: "闸自身的机件:改它就改了闸的行为" },
   // ⚠️ **不许带 `$` 锚**(2026-08-20 自测当场逮到):派生正则是把各类 `source` 用 `|` 拼起来的,

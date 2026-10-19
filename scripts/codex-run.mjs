@@ -456,7 +456,8 @@ async function runWorker(jobId) {
 
 function codexVersion() {
   const { bin, shell } = resolveCodexBin();
-  const r = spawnSync(bin, ["--version"], { shell, encoding: "utf8" });
+  // windowsHide:shell:true 起 cmd.exe;从 detached 链(fp-audit)调进来时不加这条会闪窗口(2026-10-17 用户报)
+  const r = spawnSync(bin, ["--version"], { shell, encoding: "utf8", windowsHide: true });
   return (r.stdout || r.stderr || "").trim() || "(未取到)";
 }
 
@@ -467,7 +468,7 @@ function doctor(cwd) {
   process.stdout.write(`codex 定位: ${found ? "在场" : "缺席"}(${how})\n`);
   process.stdout.write(`codex 版本: ${ver}\n`);
   const { bin: b2, shell } = resolveCodexBin();
-  const login = spawnSync(b2, ["login", "status"], { shell, encoding: "utf8" });
+  const login = spawnSync(b2, ["login", "status"], { shell, encoding: "utf8", windowsHide: true });
   const loginLine = ((login.stdout || login.stderr || "").trim().split("\n")[0] || "(未取到)");
   process.stdout.write(`认证状态: ${loginLine}\n`);
 

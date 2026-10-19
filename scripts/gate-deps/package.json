@@ -3,6 +3,7 @@
   "private": true,
   "description": "收尾闸自用的解析依赖,与网站依赖隔开(不进根 package.json / pnpm 锁文件,服务器部署不装)。装:npm --prefix scripts/gate-deps install。缺席时闸退回旧判法。",
   "dependencies": {
+    "@babel/parser": "8.0.7",
     "tree-sitter": "0.25.1",
     "tree-sitter-bash": "0.25.1"
   }

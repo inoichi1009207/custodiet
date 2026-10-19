@@ -13,6 +13,7 @@ import { classifyDiffTier, coversWrites } from "./gate-difftier.mjs";
 
 import { quoteUntrusted, gitArgs, isCommitSeg } from "./gate-ctx.mjs";
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 
 /** 那个件在本仓在不在?**消息里凡是让人去跑某个脚本的,都要先问这一句。**
  *
@@ -149,9 +150,22 @@ const G_CHECK = {
     if (!this.wroteRegister(ctx) || /失效条件/.test(ctx.written)) return null;
     return "② 失效条件:本轮写入 tool-register 的正文里没有「失效条件」——从第一天带,不得后补(造物两约束二)";
   },
-  // ④ 关账义务:触闸机件的提交须有自测动作(gate 面=hook-*/lib/gate-*/gate-* 三形态)
+  // ④ 关账义务:触闸机件的提交须有自测动作(gate 面=hook-*/lib/gate-*/gate-* 三形态 ∪ scripts/ 下的承重面 ∪ P 的闸引擎面)
+  //   红队 aeddae61(批 262)BP-1/BP-2:原只认手写三形态,本批抬进承重面的 check-windows-hide.mjs 与 P 认的
+  //   fp-audit.mjs / lib/write-effects.mjs 改完不跑自测也不响——面改为与承重面、闸引擎面对账,不再只靠手写前缀
+  //   红队 accbe4c9 BP-4/BP-8:第二支前缀须不分大小写(NTFS 上 `Scripts/` 是同一文件),且只看 `scripts/` 起的那一段
+  //   (原先两个条件可命中路径不同部分:`~/.claude/skills/x/scripts/run.py` 误报);第二、三支都剔 NON_CARRIER_AREA(暂存树)
+  _gateFile(p) {
+    const s = String(p).replace(/\\/g, "/");
+    if (/scripts\/(hook-|lib\/gate-|gate-)/.test(s)) return true;
+    if (NON_CARRIER_AREA.test(s)) return false;
+    const m = s.match(/(?:^|\/)(scripts\/.*)$/i);
+    if (m && isCarrierPath(CARRIER_SURFACE, m[1].replace(/^scripts\//i, "scripts/"))) return true;
+    const eng = RULE_P && RULE_P._p && RULE_P._p.GATE_ENGINE;
+    return !!eng && eng.test(s);
+  },
   accept(ctx, win) {
-    const touchedGate = ctx.writes.some((w) => /scripts\/(hook-|lib\/gate-|gate-)/.test(String(w).replace(/\\/g, "/")));
+    const touchedGate = ctx.writes.some((w) => this._gateFile(w));
     const ran = (c) => !!c && c.ranBash(/--self-test|gate:self-test|gate:accept|gate-migrate-check/);
     if (!touchedGate || ran(ctx) || ran(win)) return null;
     return "④ 关账义务:本轮提交触及闸机件,而本轮∪批窗口没有自测/验收动作(--self-test 或 gate:accept)";
@@ -208,12 +222,22 @@ export const RULE_G = {
       // ④ 改闸机件并提交而无自测动作 ⇒ 命中(杀「④ 不查关账自测」)。tracked 供上不触 ①。
       { text: "改好了,提交。", commit: true, write: "scripts/lib/gate-rules.mjs",
         tracked: ["scripts/lib/gate-rules.mjs"] },
+      // 红队 aeddae61 BP-1/BP-2:承重面里的检查脚本、P 的闸引擎面文件,改完提交不跑自测 ⇒ 命中
+      { name: "262 红队 BP-1:改承重面检查脚本不跑自测", text: "改好了,提交。", commit: true, write: "scripts/check-windows-hide.mjs",
+        tracked: ["scripts/check-windows-hide.mjs"] },
+      { name: "262 红队 BP-2:改 fp-audit 不跑自测", text: "改好了,提交。", commit: true, write: "scripts/fp-audit.mjs",
+        tracked: ["scripts/fp-audit.mjs"] },
+      { name: "262 红队 accbe4c9 BP-4:大写 Scripts 改承重面检查脚本", text: "改好了,提交。", commit: true, write: "/repo/Scripts/check-windows-hide.mjs",
+        tracked: ["scripts/check-windows-hide.mjs"] },
     ],
     neg: [
       // 新建载体但**没提交** ⇒ 不追(杀「去掉 didCommit 前置闸」)
       { text: "写了个新零件,还没提交。", write: "scripts/zzz-new-widget.mjs" },
       // 普通提交轮:不触造物面/register/闸机件 ⇒ 一个字的仪式文本都不要求(v1 的 21 次噪声消失)
       { text: "文档改完,提交。", commit: true, write: "docs/notes.md", tracked: ["docs/notes.md"] },
+      // 红队 accbe4c9 BP-8:公开暂存树里的同名文件不是本仓闸机件(用户级 skill 那条另由 ① 合法命中,不作 ④ 的反例)
+      { name: "262 红队 accbe4c9 BP-8:暂存树里的 fp-audit 不是闸机件", text: "改好了,提交。", commit: true,
+        write: "clipboard/oss/public-repo/scripts/fp-audit.mjs", tracked: ["clipboard/oss/public-repo/scripts/fp-audit.mjs"] },
       // ① 的窗口豁免:造物在本轮、入册在窗口里 ⇒ 放行(取证窗=批,同 I 项)
       { text: "零件提交。", commit: true, write: "scripts/zzz-new-widget.mjs",
         prior: [{ text: "先入册。", write: "docs/tool-register.md" }] },
@@ -2565,6 +2589,8 @@ const RULE_K = {
  *  保证变异体消息逐字一致、只 differ 豁免那一行(G 项验收台教训)。 */
 function k0Core(ctx) {
   const g = ctx.batchGoal;
+  // 批 265:本仓从来没立过批 ⇒ 不判(批是可选做法;test2 回放 K0 阻断 257 回合全是这一形)。只认实时注入的 false。
+  if (!g && ctx.batchEverArmed === false) return [];
   if (g?.cleared && g.closedCount > 0 && properClose(ctx) && !ranArm(ctx)) {
     const done = confirmedConditions(ctx.text);
     let win = null;
@@ -3220,6 +3246,8 @@ const RULE_K0 = {
     neg: [
       // 纯问答,没动工作面
       { text: "这个字段是干嘛的?", batchGoal: null },
+      // 批 265:从来没立过批的仓(实时注入 batchEverArmed:false),动了工作面也不追「先立批」——批是可选做法
+      { name: "265 从未立批的仓不追 K0", text: "改好了。", write: "src/app.py", commit: true, batchGoal: null, batchEverArmed: false },
       // ⚠️ D90 回归钉:簿记豁免要够得着 **Bash 面**的写(我改台账几乎都走 node heredoc)。
       { text: "登记。", batchGoal: { cleared: true },
         bash: `node -e "fs.writeFileSync('docs/gate-debts.md','x')"\ngit commit -m x` },
@@ -7689,16 +7717,89 @@ const DP_UNWRAP = (seg, wrap, depth = 0) => {
   const w = depth < 10 ? DP_WRAP_AT(seg, wrap) : null;
   return w ? segments(DP_UNCOMMENT(w[2])).flatMap((s) => DP_UNWRAP(s.trim(), wrap, depth + 1)) : [seg];
 };
-const DP_SEGS = (cmds, wrap = DP_WRAP) => (cmds || []).flatMap((c) =>
-  segments(DP_UNCOMMENT(stripHeredoc(String(c)))).flatMap((seg) => DP_UNWRAP(seg, wrap)))
-  .map((s) => s.trim()).filter(Boolean);
+// heredoc 喂 shell(`bash <<'EOF' … git push private … EOF`):切段前要剥 heredoc,正文里的推送会跟着丢(D161⑫)。
+//   含 heredoc 的整条命令先交语法树看一眼,看到推送就把整条命令作为该命令的第一段放进去(段序不变,其后的探针照常算在推送之后)
+const DP_SEGS = (cmds, wrap = DP_WRAP) => (cmds || []).flatMap((c) => {
+  const segs = segments(DP_UNCOMMENT(stripHeredoc(String(c)))).flatMap((seg) => DP_UNWRAP(seg, wrap));
+  return /<</.test(String(c)) && DP_AST(String(c)) === true ? [String(c), ...segs] : segs;
+}).map((s) => s.trim()).filter(Boolean);
 // 前导锚含反引号(BP-G2:`` echo `git push …` `` 反引号命令替换原完全认不出,段头 guard 里的反引号判断成了死码)
 const DP_PUSH_RE = /(?:^|[\s(&{`])(?:\S*[\\/])?git(?:\.exe)?(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace)(?:\s+\S+)?|\s+--?[\w-]+(?:=\S+)?)*\s+push\b(.*)$/i;
 // 段头是打印/写文本类命令 ⇒ 后面的 `git push` 只是它的参数(BP-E);`VAR=x` 前缀跳过
 const DP_PRINT_HEAD = /^(?:echo|printf|write-host|write-output|out-file|set-content|add-content|cat|grep|rg|select-string)$/i;
 // 确知不是本仓私有代码仓的远端名(批 261,D139⑤):origin 是公开壳(push 已置 no-push://),custodiet 是公开闸仓
 const DP_PUBLIC_REMOTES = new Set(["origin", "custodiet"]);
-const DP_IS_PUSH = (seg, { headCheck = true } = {}) => {
+// D161⑨(批 262):先走语法树(write-effects 的 tree-sitter-bash)——引号、续行、命令替换、bash -c / eval / heredoc 喂 shell、
+//   包装器都由解析器处理,远端位置按 git 子命令的真实实参取,不再靠字符串扫描找 push(DP_IS_PUSH 字符串版连续四轮出新形态)。
+//   只在「解析成功、无未处理节点、且树里看到了 git push」时由语法树定案;否则(解析失败、动态命令名、ssh 等语法树不下钻处)
+//   交回下面的字符串判法(fail-closed 不变)。返回 true / false / null(=交回)。
+const DP_PUSH_VAL_OPTS = /^(?:-o|--push-option|--receive-pack|--exec)$/;
+// git 别名(D161⑫:`git -c alias.p=push p private`、配置里的别名):命令里 `-c alias.<名>=` 优先,否则读本仓 git 配置(只读,进程内缓存)
+let DP_ALIAS_CACHE;
+const dpConfigAliases = () => {
+  if (DP_ALIAS_CACHE !== undefined) return DP_ALIAS_CACHE;
+  DP_ALIAS_CACHE = new Map();
+  try {
+    const out = execFileSync("git", ["config", "--get-regexp", "^alias\\."], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    for (const l of out.split("\n")) { const m = l.match(/^alias\.(\S+)\s+(.*)$/); if (m) DP_ALIAS_CACHE.set(m[1].toLowerCase(), m[2]); }
+  } catch { /* 无别名或不在仓里 */ }
+  return DP_ALIAS_CACHE;
+};
+const dpResolveAlias = (g) => {
+  if (typeof g.sub !== "string" || g.sub === "push") return g;
+  let exp = null;
+  for (let i = 0; i < g.globals.length; i++) {
+    const v = g.globals[i] === "-c" ? g.globals[i + 1] : g.globals[i];
+    const m = typeof v === "string" && v.match(/^alias\.([^=]+)=(.*)$/i);
+    if (m && m[1].toLowerCase() === g.sub.toLowerCase()) exp = m[2];
+  }
+  if (exp === null) exp = dpConfigAliases().get(g.sub.toLowerCase()) ?? null;
+  if (exp === null) return g;
+  if (/^!/.test(exp)) return /\bpush\b/.test(exp) ? { ...g, sub: null } : g;   // shell 别名里有 push ⇒ 判不出,按推 private
+  const w = exp.trim().split(/\s+/);
+  return w[0] === "push" ? { ...g, sub: "push", args: [...w.slice(1), ...g.args] } : g;
+};
+const DP_AST = (seg) => {
+  let r;
+  try { r = analyzeBash(String(seg)); } catch { return null; }
+  // 语法树只用来判严(见 DP_IS_PUSH),所以「没看全」不妨碍它报出看到了的推送;没看到的交字符串判法
+  if (!r || !r.ok) return null;
+  const pushes = (r.gitCalls || []).map(dpResolveAlias).filter((g) => g.sub === "push" || g.sub === null);
+  if (!pushes.length) return null;
+  if (/\bGIT_(?:CONFIG|DIR|WORK_TREE)\w*\s*=/.test(String(seg))) return true;   // 环境变量改配置 / 仓位置:名字不可信
+  for (const g of pushes) {
+    if (g.sub === null) return true;                                               // 子命令是展开 ⇒ 判不出
+    if (g.globals.some((v) => v === null || /url|insteadof|--config-env/i.test(v))) return true;
+    const a = g.args;
+    // dry-run 只认作开关出现的(codex 262-dp-ast-r1:`git push -o --dry-run private` 里它是 -o 的值)
+    let dry = false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] != null && (DP_PUSH_VAL_OPTS.test(a[i]) || a[i] === "--repo" || (/^-[A-Za-z]+$/.test(a[i]) && a[i].endsWith("o")))) { i++; continue; }
+      if (a[i] === "--dry-run" || a[i] === "-n") dry = true;
+    }
+    if (dry) continue;
+    let tok, repo;
+    for (let i = 0; i < a.length; i++) {
+      const v = a[i];
+      if (v === null) { tok = null; break; }                                       // 远端位置之前就有展开 ⇒ 判不出
+      if (DP_PUSH_VAL_OPTS.test(v) || (/^-[A-Za-z]+$/.test(v) && v.endsWith("o"))) { i++; continue; }
+      if (v === "--repo") { repo = a[i + 1]; i++; continue; }
+      if (v.startsWith("--repo=")) { repo = v.slice(7); continue; }
+      if (v === "--") continue;
+      if (v.startsWith("-")) continue;
+      tok = v; break;
+    }
+    if (tok === undefined) tok = repo === undefined ? undefined : repo;
+    if (tok === undefined || tok === null) return true;                            // 省略远端 = pushDefault=private;判不出同算
+    if (!DP_PUBLIC_REMOTES.has(tok)) return true;
+  }
+  return false;   // 看到的 push 全是 dry-run 或推字面公开远端
+};
+// 语法树只许把结果判严,不许判松:AST 判「要探针」即定;AST 判「不要」仍交字符串判法再核,两边取并集
+//   (codex 262-dp-ast-r1 A1:`git push origin $(flock lock git push private)`——flock 不在包装器表里,内层推送语法树没收到,
+//   AST 判「只推 origin」放行;字符串判法拦得住)。代价:引号包的公开远端名照旧误拦(当场可见,跑一次探针即解除)
+const DP_IS_PUSH = (seg, { headCheck = true, ast = true } = {}) => {
+  if (ast && DP_AST(seg) === true) return true;
   const masked = stripQuoted(seg);
   const hit = masked.match(DP_PUSH_RE);
   if (!hit) return false;
@@ -7717,7 +7818,11 @@ const DP_IS_PUSH = (seg, { headCheck = true } = {}) => {
     if (head && DP_PRINT_HEAD.test(head) && !/[({`]/.test(masked.slice(0, hit.index + 1))) return false;
   }
   const args = hit[1].trim().split(/\s+/).filter(Boolean);
-  if (args.some((a) => a === "--dry-run" || a === "-n")) return false;
+  // dry-run 只认作开关出现的;带值选项的值跳过(codex 262-dp-ast-r1:`-o --dry-run` 里它是 -o 的值)
+  for (let i = 0; i < args.length; i++) {
+    if (/^(-o|--push-option|--receive-pack|--exec|--repo)$/.test(args[i]) || (/^-[A-Za-z]+$/.test(args[i]) && args[i].endsWith("o"))) { i++; continue; }
+    if (args[i] === "--dry-run" || args[i] === "-n") return false;
+  }
   // 省略远端 = pushDefault=private。批 261(D139⑤):原为「远端 ≠ origin 即算」,推公开仓 custodiet 也被当成推 private(两批实撞多次)。
   //   改为**只排除确知不是私仓的字面远端名**(origin 已置 no-push://、custodiet 是公开仓),其余一律算推 private(fail-closed)。
   //   红队 a415bf26 BP-1~3:曾改成「只认 private / URL 含 app-private」——引号或变量包的 URL、`(git push private)` 这类粘了符号的远端、
@@ -7814,14 +7919,14 @@ const DP_FACTS = (f) => {
   const at = new Date(f.lastPushTs * 1000).toISOString().replace("T", " ").slice(0, 16);
   return [`${f.pushRef || "private"} 于 ${at}Z 推送(reflog);其后无欠账探针标记`];
 };
-const DP_DETECT = (ctx, { ordered = true, useWindow = true, wrap = DP_WRAP, probe = DP_IS_PROBE, headCheck = true, useFacts = true, facts = DP_FACTS } = {}) => {
+const DP_DETECT = (ctx, { ordered = true, useWindow = true, wrap = DP_WRAP, probe = DP_IS_PROBE, headCheck = true, useFacts = true, facts = DP_FACTS, ast = true } = {}) => {
   if (!toolPresent("scripts/verify-prod.mjs")) return [];
   const byFacts = useFacts && ctx.debtFacts && typeof ctx.debtFacts === "object" ? facts(ctx.debtFacts) : [];
   if (byFacts.length) return byFacts;   // 事实这一路判出即拦,文本声明不认
   const w = useWindow && typeof ctx.window === "function" ? ctx.window() : null;
   const segs = DP_SEGS([...((w && w.bashCmds) || []), ...(ctx.bashCmds || [])], wrap);
   let lastPush = -1;
-  segs.forEach((s, i) => { if (DP_IS_PUSH(s, { headCheck })) lastPush = i; });
+  segs.forEach((s, i) => { if (DP_IS_PUSH(s, { headCheck, ast })) lastPush = i; });
   if (lastPush < 0) return [];
   if ((ordered ? segs.slice(lastPush + 1) : segs).some(probe)) return [];
   return [segs[lastPush].slice(0, 60)];
@@ -7845,6 +7950,8 @@ const RULE_DP = {
     `      天花板:只证「推之后发起过探针」——探针查出 FAIL/UNKNOWN 后是清是停,归收尾报告的四级欠账行(生产法三);只提交不推本项不响(批 205 前复议)。`,
   mutations: [
     { name: "不看先后(推之前跑过探针也放行)", apply: (r) => ({ ...r, detect: (ctx) => DP_DETECT(ctx, { ordered: false }) }) },
+    // D161⑨:关掉语法树路径 ⇒ 续行推送、--config-env 改 pushurl 回到字符串判法的老漏放
+    { name: "关掉语法树推送识别(D161⑨)", apply: (r) => ({ ...r, detect: (ctx) => DP_DETECT(ctx, { ast: false }) }) },
     { name: "只看本轮(BP-1:被拦一次后直接再结束即解除)", apply: (r) => ({ ...r, detect: (ctx) => DP_DETECT(ctx, { useWindow: false }) }) },
     { name: "按字符串出现判 push(echo/提交信息里提到 git push 也拦)", apply: (r) => ({ ...r, detect: (ctx) => {
       if (!toolPresent("scripts/verify-prod.mjs")) return [];
@@ -7883,6 +7990,17 @@ const RULE_DP = {
       { name: "261 codex r2:命令替换里的 push 后跟普通文本 push origin", text: "推了。", bash: "echo $(git push) push origin" },
       { name: "261 codex r2:-C 引号目录名里含 push custodiet", text: "推了。", bash: "git -C \"E:/x push custodiet y\" push private" },
       { name: "261 红队 r2:短选项簇 -fo 吃掉公开名", text: "推了。", bash: "git push -fo custodiet private master" },
+      // D161⑨ 语法树路径:续行(入口正则不跨行,字符串判法放行)、--config-env 改 pushurl(D161⑪)、引号拆开的远端名
+      { name: "262 D161⑨:续行推送(事实路径干净)", text: "推了。", bash: "git push \\\nprivate master" },
+      { name: "262 D161⑪:--config-env 改 pushurl", text: "推了。", bash: "git --config-env=remote.custodiet.pushurl=PU push custodiet" },
+      { name: "262 D161⑨:bash -c 里续行推送", text: "推了。", bash: "bash -c 'git push \\\n private'" },
+      // codex 262-dp-ast-r1:语法树没收到的内层推送(flock 不在包装器表)、-o 的值恰好是 --dry-run
+      { name: "262 codex dp-ast A1:flock 包的内层推送", text: "推了。", bash: "git push origin $(flock lock git push private)" },
+      { name: "262 codex dp-ast:-o 的值是 --dry-run", text: "推了。", bash: "git push -o --dry-run private" },
+      // D161⑫(批 263):别名推送、heredoc 喂 shell、重定向目标里的命令替换
+      { name: "263 D161⑫:-c 定义别名后推送", text: "推了。", bash: "git -c alias.p=push p private" },
+      { name: "263 D161⑫:heredoc 喂 bash 里推送", text: "推了。", bash: "bash <<'EOF'\ngit push private master\nEOF" },
+      { name: "263 D161⑫:重定向目标里的命令替换推送", text: "推了。", bash: "git push origin >$(git push private)" },
       // bare push:pushDefault=private
       { text: "推了。", bash: "git add docs/x.md && git commit -m y && git push" },
       // 探针在推之前跑的 ⇒ 量的是推之前的世界,不算
@@ -7946,6 +8064,8 @@ const RULE_DP = {
       { name: "261 D139⑤:推 custodiet 公开仓不算推 private", text: "公开仓推了。", bash: "git -C clipboard/oss/public-repo push -q custodiet master:master" },
       { name: "261 codex r1:-C 目录名含 push 不截错", text: "公开仓推了。", bash: "git -C \"E:/push\" push origin" },
       { name: "261 codex r1:只给 --repo=custodiet", text: "公开仓推了。", bash: "git push --repo=custodiet" },
+      // 提交信息里的 push 字样不算(引号包 / 续行推公开仓的放行已随「语法树只判严」撤回,照旧误拦)
+      { name: "262 D161⑨:提交信息里写了 git push private", text: "提交了。", bash: "git commit -m \"docs: 记 git push private 的坑\"" },
       { text: "推完查了欠账。", bash: ["git push private master", "node --no-warnings scripts/verify-prod.mjs --debt-only"] },
       { text: "推完跑全套。", bash: "git push private master 2>&1 | tail -3; node --no-warnings scripts/verify-prod.mjs > x.log" },
       // 窗口里推、窗口里也查过

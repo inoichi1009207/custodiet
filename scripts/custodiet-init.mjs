@@ -25,6 +25,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -50,6 +51,8 @@ const FILES = [
   //   没装 codex 时盲审只出一行 ⚠,不拦结清。
   "scripts/fp-audit.mjs",
   "scripts/codex-run.mjs",
+  // 批 265:《闸用语》生成器;装完在目标仓里跑一次,手册挂进 CLAUDE.md,新会话一开始就读到闸认的说法
+  "scripts/gate-phrasebook.mjs",
   "scripts/lib/ledger-chain.mjs",
   "AGENTS.md",
   "docs/laws/collab.md",
@@ -81,13 +84,15 @@ const sidecarOf = (rel) => {
 
 // ── 参数 ───────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
-let target = null, mode = "copy";
+let target = null, mode = "copy", observe = false;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === "--target") target = argv[++i];
   else if (a === "--mode") mode = argv[++i];
+  else if (a === "--observe") observe = true;   // 批 265:装成观察档(只落账不阻断),新仓先攒数据再逐条开阻断
   else if (a === "-h" || a === "--help") {
-    process.stdout.write("用法: node scripts/custodiet-init.mjs --target <目标仓根> [--mode copy]\n");
+    process.stdout.write("用法: node scripts/custodiet-init.mjs --target <目标仓根> [--mode copy] [--observe]\n" +
+      "  --observe  装成观察档:闸照常判、照常记 .claude/.gate-alerts.jsonl,但不阻断、不对模型输出;删掉 .claude/custodiet-mode 即恢复阻断\n");
     process.exit(0);
   } else die(2, `未知参数 ${a}`);
 }
@@ -127,6 +132,10 @@ function place(rel, buf, srcLabel) {
   }
   const cur = fs.readFileSync(dst);
   if (sha(cur) === srcSha) { files.push({ ...rec, status: "unchanged", sha256: srcSha }); return; }
+  // CLAUDE.md:去掉安装器自己的托管块后与生成件相同 ⇒ 就是上次装的那份,不写旁件(批 265:重跑幂等)
+  if (rel === "CLAUDE.md" && String(cur).replace(/<!-- custodiet:begin[\s\S]*?<!-- custodiet:end -->\n?/, "") === String(buf)) {
+    files.push({ ...rec, status: "unchanged", sha256: sha(cur) }); return;
+  }
   const sc = sidecarOf(rel), scAbs = path.join(T, sc);
   if (!fs.existsSync(scAbs)) {
     fs.writeFileSync(scAbs, buf);
@@ -189,11 +198,46 @@ const settings = { path: ".claude/settings.json" };
   }
 }
 
+// ── 《闸用语》:在目标仓里跑生成器,手册挂进 CLAUDE.md 的托管块(批 265;用户:「可以让模型学会闸的语言风格」) ──
+//   托管块用首尾标记圈住,重跑只换标记之间的内容,标记之外一字不动(先例:mise / Ansible blockinfile)。
+//   只有开头没有结尾、或标记重复 ⇒ 不动,标 `malformed` 交人看。
+const phrasebook = { path: "docs/gate-phrasebook.md", claudeMd: "CLAUDE.md" };
+{
+  const gen = spawnSync(process.execPath, ["--no-warnings", path.join(T, "scripts", "gate-phrasebook.mjs")], { cwd: T, encoding: "utf8", windowsHide: true, timeout: 60000 });
+  phrasebook.status = gen.status === 0 ? "generated" : "failed";
+  if (gen.status !== 0) phrasebook.error = String(gen.stdout || gen.stderr || "").split("\n")[0];
+}
+// 生成失败 ⇒ 不挂引用(挂了 CLAUDE.md 就指向一个不存在或过期的手册),安装器整体报 ok:false(codex 265-r1 附 5)
+if (phrasebook.status === "generated") {
+  const BEGIN = "<!-- custodiet:begin(安装器托管,勿手改标记之间) -->", END = "<!-- custodiet:end -->";
+  const block = `${BEGIN}\n@docs/gate-phrasebook.md\n${END}\n`;
+  const p = path.join(T, "CLAUDE.md");
+  const cur = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
+  const nb = cur.split(BEGIN).length - 1, ne = cur.split(END).length - 1;
+  if (nb === 0 && ne === 0) {
+    fs.writeFileSync(p, cur + (cur && !cur.endsWith("\n") ? "\n" : "") + block); phrasebook.claudeMdStatus = cur ? "appended" : "created"; changed++;
+  } else if (nb === 1 && ne === 1 && cur.indexOf(BEGIN) < cur.indexOf(END)) {
+    const next = cur.slice(0, cur.indexOf(BEGIN)) + block.trimEnd() + cur.slice(cur.indexOf(END) + END.length);
+    if (next !== cur) { fs.writeFileSync(p, next); changed++; phrasebook.claudeMdStatus = "replaced"; } else phrasebook.claudeMdStatus = "unchanged";
+  } else phrasebook.claudeMdStatus = "malformed";
+}
+
+// ── 观察档(--observe):写 .claude/custodiet-mode;已有该文件不动(用户可能已切回阻断档) ──
+const observeFile = { path: ".claude/custodiet-mode", status: "not-requested" };
+if (observe) {
+  const p = path.join(T, ".claude", "custodiet-mode");
+  if (fs.existsSync(p)) observeFile.status = "exists-unchanged";
+  else { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, "observe\n"); observeFile.status = "created"; changed++; }
+}
+
 // ── .gitignore:追加闸的运行时台账 ─────────────────────────────────────
 const gitignore = { path: ".gitignore" };
 {
-  const want = fs.readFileSync(path.join(SRC, ".gitignore"), "utf8").split(/\r?\n/)
-    .map((l) => l.trim()).filter((l) => l.startsWith(".claude/"));
+  // 运行时台账 + 解析依赖的安装目录 + P 的会话基点目录(批 265 test2 预演:原先只加 .claude/ 台账,
+  //   `npm --prefix scripts/gate-deps install` 装出的 node_modules 与 .claude/.p-head/ 会被一起提交)
+  const want = [...fs.readFileSync(path.join(SRC, ".gitignore"), "utf8").split(/\r?\n/)
+    .map((l) => l.trim()).filter((l) => l.startsWith(".claude/")), ".claude/.p-head/", "scripts/gate-deps/node_modules/"]
+    .filter((l, i, a) => a.indexOf(l) === i);
   const p = path.join(T, ".gitignore");
   const cur = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
   const have = new Set(cur.split(/\r?\n/).map((l) => l.trim()));
@@ -217,8 +261,10 @@ if (attention.length) process.stderr.write(`⚠ ${attention.length} 个文件目
 process.stderr.write("未提交任何东西。下一步:在目标仓里跑 `node --no-warnings scripts/hook-stop-closure.mjs --self-test`。\n" +
   "  ⚠ 已知(第一刀实测):自测里有 2 条 I 类用例读的是目标仓**真实的 git 历史**(git ls-files / 末次提交新增的文件)——\n" +
   "    装闸件尚未提交、或装闸那次提交恰好是 HEAD 时,这 2 条会红;装闸提交之后再有一次提交即转绿。\n");
+const allOk = phrasebook.status === "generated";
+if (!allOk) process.stderr.write(`⚠ 《闸用语》手册没生成(${phrasebook.error || "未知原因"}),CLAUDE.md 未挂引用;闸件已装,手册要另跑 node --no-warnings scripts/gate-phrasebook.mjs\n`);
 process.stdout.write(JSON.stringify({
-  ok: true, mode, target: T, source: { name: "custodiet", version },
-  preExisting: pre, changed, files, settings, gitignore, notInstalled,
+  ok: allOk, mode, target: T, source: { name: "custodiet", version },
+  preExisting: pre, changed, files, settings, gitignore, observe: observeFile, phrasebook, notInstalled,
 }) + "\n");
-process.exit(0);
+process.exit(allOk ? 0 : 6);

@@ -35,7 +35,7 @@ export function bashParser() {
   const here = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "gate-deps");
   const cands = [here];
   try {
-    const common = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: path.dirname(here), encoding: "utf8", timeout: 5000 });
+    const common = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: path.dirname(here), encoding: "utf8", timeout: 5000, windowsHide: true });
     if (common.status === 0 && common.stdout.trim()) cands.push(path.join(path.dirname(common.stdout.trim()), "scripts", "gate-deps"));
   } catch { /* 不是 git 仓 */ }
   PARSER = null;
@@ -186,7 +186,9 @@ function rootForms(root) {
 /** 主入口。opts.root = 仓根(用于把仓内绝对路径转相对);opts.cwd = 起始相对目录(缺省仓根)。 */
 export function analyzeBash(cmd, opts = {}) {
   const parser = bashParser();
-  const res = { ok: false, effects: [], incomplete: [] };
+  // gitCalls:每个 git 命令节点的 { globals, sub, args }(值是字面量,含展开 ⇒ null);供 DP 判推送(D161⑨,批 262)。
+  //   nestedIncomplete:内层脚本(bash -c / eval / heredoc 喂 shell)有没处理的节点 ⇒ 调用方不得把「没看到 push」当证明
+  const res = { ok: false, effects: [], incomplete: [], gitCalls: [], nestedIncomplete: false };
   if (!parser) { res.incomplete.push("解析器缺席(scripts/gate-deps 未装)"); return res; }
   let tree;
   try { tree = parser.parse(String(cmd)); } catch (e) { res.incomplete.push("解析异常:" + String(e && e.message || e)); return res; }
@@ -252,6 +254,8 @@ export function analyzeBash(cmd, opts = {}) {
     const sub = analyzeBash(script, { root, cwd });
     if (!sub.ok) { res.incomplete.push(`${via} 内层解析失败`); res.effects.push({ known: false, expr: via + " 内层脚本", suffix: "", hint: String(script), via }); return; }
     for (const e of sub.effects) res.effects.push({ ...e, via: via + "→" + e.via });
+    res.gitCalls.push(...sub.gitCalls);
+    if (sub.incomplete.length || sub.nestedIncomplete) res.nestedIncomplete = true;
   };
 
   // 走树。state.cwd 在同一序列里被字面量 cd 改写;子壳 / 管道各段拿副本。
@@ -355,6 +359,8 @@ export function analyzeBash(cmd, opts = {}) {
         const op = r.text;
         const dest = r.childForFieldName("destination") || r.namedChild(r.namedChildCount - 1);
         if (!dest || dest.type === "file_descriptor") continue;
+        // 重定向目标里的命令替换会执行(`>$(git push private)`;codex 262-dp-ast-r1 附节 ⇒ D161⑫):照常遍历
+        visit(dest, { ...state }, depth);
         if (/^\s*(?:\d+)?</.test(op) && !/>/.test(op)) continue;         // 输入重定向
         if (/>&\s*\d+\s*$|>&-/.test(op)) continue;                        // fd 复制 / 关闭
         add(dest, state.cwd, "重定向");
@@ -563,6 +569,7 @@ export function analyzeBash(cmd, opts = {}) {
           if (/^(?:-C|-c|--git-dir|--work-tree|--namespace)$/.test(ws[j].v)) j++;
           j++;
         }
+        res.gitCalls.push({ globals: ws.slice(0, j).map((w) => w.v), sub: ws[j] ? ws[j].v : undefined, args: ws.slice(j + 1).map((w) => w.v) });
         const gAdd = (w, via, op) => add(w.node, gs.cwd, via, op);
         const sub = ws[j] && ws[j].v;
         const rest = ws.slice(j + 1);
@@ -634,6 +641,14 @@ export function analyzeBash(cmd, opts = {}) {
     if (!READ_ONLY_CMDS.test(name)) {
       const k = ws.findIndex((w) => w.v != null && WRITE_CMDS.test(baseName(w.v)));
       if (k >= 0) dispatch(baseName(ws[k].v), args.slice(k + 1), { ...state }, depth, cmdNode);
+      // 未知包装器里的 git 调用只收进 gitCalls(供 DP 判推送),不产写入效果(D161⑫:`flock lock git push private`)
+      const g = ws.findIndex((w) => w.v != null && baseName(w.v) === "git");
+      if (g >= 0 && (k < 0 || g < k)) {
+        const gw = ws.slice(g + 1);
+        let j = 0;
+        while (j < gw.length && gw[j].v != null && /^-/.test(gw[j].v)) { if (/^(?:-C|-c|--git-dir|--work-tree|--namespace)$/.test(gw[j].v)) j++; j++; }
+        res.gitCalls.push({ globals: gw.slice(0, j).map((w) => w.v), sub: gw[j] ? gw[j].v : undefined, args: gw.slice(j + 1).map((w) => w.v) });
+      }
     }
   };
   visit(tree.rootNode, { cwd: opts.cwd ?? "" }, 0);

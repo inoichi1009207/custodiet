@@ -547,6 +547,9 @@ export function buildCtx(entries, extra = {}) {
   return {
     text, userText, actions, bashCmds, bashDialects, commits, writes, reads, toolNames, skills, written, isNew,
     window, batchGoal, turnLog,
+    /** 批 265:本仓是否立过批(实时 hook 注入:台账或状态文件在场)。false ⇒ K0 不判(批是可选做法);
+     *  undefined = 没接这条通道(夹具 / 自测)⇒ 判法照旧。 */
+    batchEverArmed: typeof extra.batchEverArmed === "boolean" ? extra.batchEverArmed : undefined,
     /** hook 所在 checkout 的根(批 255 已注入、此前只在 isNew 内部用)。P 的语法回退面用它把绝对路径化成仓相对形,
      *  再判「是不是 worktree / 暂存树下的闸副本」——否则在 worktree 里开的会话,自己的闸文件路径里就带 `.claude/worktrees/`,
      *  会被当成别人的副本(红队 a27628dd 口径的反面)。未注入 ⇒ null(按整条路径判)。 */

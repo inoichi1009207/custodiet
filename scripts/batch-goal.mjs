@@ -1188,7 +1188,7 @@ function fpReport(extra = []) {
   const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "hook-stop-closure.mjs");
   if (!fs.existsSync(script)) return "";   // 本仓没有收尾闸脚本:无从出表,不算故障
   try {
-    const r = spawnSync(process.execPath, ["--no-warnings", script, "--fp-report", ...extra], { encoding: "utf8", timeout: 60000 });
+    const r = spawnSync(process.execPath, ["--no-warnings", script, "--fp-report", ...extra], { windowsHide: true, encoding: "utf8", timeout: 60000 });
     if (r.status === 0) return String(r.stdout || "");
     const why = r.error ? String(r.error.message || r.error) : `退出码 ${r.status}${r.signal ? `(${r.signal})` : ""}`;
     console.log(`⚠ 误报率表跑不出来(${why}):${String(r.stderr || "").split("\n")[0].slice(0, 160)}——待修与收尾表本次缺,不拦`);

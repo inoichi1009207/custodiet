@@ -249,8 +249,10 @@ export function projectDir(cwd) {
 /** 规则快照:报警时刻之前最后一个提交里的 gate-rules.mjs + AGENTS.md + docs/laws/*.md,写进 <snap>/rules/<sha8>/。
  *  codex 在 <snap> 里跑:看得到当时的规则与法条,看不到误报台账、以往盲审结果和执行方理由(grill 259 F2 / F5a)。 */
 function git(args) {
-  const r = spawnSync("git", args, { encoding: "utf8", maxBuffer: 1 << 26 });
-  if (r.status !== 0) throw new Error(`git ${args.join(" ")} 失败:${String(r.stderr || "").split("\n")[0]}`);
+  // windowsHide:本进程由 batch-goal 以 detached 起(Node 文档:detached 子进程自带控制台,windowsHide 默认 false);
+  //   2026-10-17 用户报「闪了一堆 cmd 窗口」,这里是最可疑的来源之一,未证实(codex 262-final-r1)
+  const r = spawnSync("git", args, { encoding: "utf8", maxBuffer: 1 << 26, windowsHide: true });
+  if (r.status !== 0) throw new Error(`git ${args.join(" ")} 失败:${String(r.stderr || r.error?.message || `status=${r.status} signal=${r.signal}`).split("\n")[0]}`);
   return String(r.stdout);
 }
 function snapshotRules(snap, at) {
@@ -272,7 +274,7 @@ function snapshotRules(snap, at) {
 
 function runCodex(taskFile, cwd, outFile) {
   const r = spawnSync(process.execPath, ["--no-warnings", path.join(HERE, "codex-run.mjs"), "--task", taskFile, "--cwd", cwd, "--out", outFile,
-    "--wait-ms", "900000", "--timeout-ms", "900000"], { encoding: "utf8", timeout: 960000, maxBuffer: 1 << 26 });
+    "--wait-ms", "900000", "--timeout-ms", "900000"], { encoding: "utf8", timeout: 960000, maxBuffer: 1 << 26, windowsHide: true });
   const out = String(r.stdout || "");
   const m = out.match(/CODEX_BODY_BEGIN=[^\n]*\n([\s\S]*?)\nCODEX_BODY_END/);
   const job = (out.match(/^CODEX_JOB=(\S+)/m) || [])[1] || "";

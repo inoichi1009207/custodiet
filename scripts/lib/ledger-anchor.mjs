@@ -269,7 +269,7 @@ if (IS_MAIN) {
     const script = fileURLToPath(import.meta.url);
     const tr = `"${node}" --no-warnings "${script}" snapshot`;
     execFileSync("schtasks", ["/Create", "/F", "/SC", "DAILY", "/ST", "05:33",
-      "/TN", "custodiet-anchor-" + repoKeyOf(repoRootOf()), "/TR", tr], { stdio: "inherit" });
+      "/TN", "custodiet-anchor-" + repoKeyOf(repoRootOf()), "/TR", tr], { windowsHide: true, stdio: "inherit" });
     console.log("已装每日 05:33 计划任务(每用户级,agent 会话外执行;任务名带仓键防同名仓覆盖;" +
       "node/仓路径固化——移动仓或换 node 安装位后须重跑本命令)");
     process.exit(0);

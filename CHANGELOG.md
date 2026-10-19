@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0 — 2026-10-19
+
+- **观察档**:`node scripts/custodiet-init.mjs --target <仓> --mode copy --observe` 装成观察档——闸照常判、照常记 `.claude/.gate-alerts.jsonl`(本该拦的记进 `observed`),但不阻断、不向模型输出。新仓先攒数据,再按规则逐条开阻断。生效条件:`.claude/custodiet-mode` 首行 observe,且该文件已提交、工作树与 HEAD 一致、最后改它的提交早于本会话开始——会话里写入或写入后提交都不生效。删掉该文件即回到阻断档。
+- **K0 不追不用批的仓**:本 checkout 与主 checkout 都没有批台账时,K0(「动了工作面却没立完成条件」)不判。批是可选做法;在一个从不立批的真实仓的 2,837 个回合回放里,K0 阻断 257 次,全是这一形。
+- **《闸用语》**:新增 `scripts/gate-phrasebook.mjs`,从规则的 `escapes` 字段生成 `docs/gate-phrasebook.md`(每条出路标〔动作〕/〔说法〕;`--check` 查是否与规则同步)。安装器在目标仓里跑它,并在 `CLAUDE.md` 里加一段首尾标记圈住的托管块 `@docs/gate-phrasebook.md`,新会话开局就读到;重跑只换标记之间的内容。生成失败时安装器报 `ok:false`、退出 6,不挂引用。
+- **安装器**:`.gitignore` 追加 `.claude/.p-head/` 与 `scripts/gate-deps/node_modules/`;重跑对已有 `CLAUDE.md` 幂等。
+- **已知限制**:观察档里没有自签误报,`--fp-report` 的误报率分子恒为 0,不能当误报率用;示例宪法「执行共识」「恒定条款」两节只有标题、正文没承接 Q / C 的义务。
+
 ## 0.6.3 — 2026-10-17
 
 - **DP 不再把推公开远端当推私仓**:只有结构完整、远端是字面 `origin` / `custodiet` 的 `git push` 才不要求欠账探针。远端从原始命令按引号感知分词取,必须是裸 `git` 后跳过全局选项的 `push` 子命令;`-o` / `--push-option` / 短选项簇尾的 `o` / `--repo` 的值跳过,有位置参数时位置参数优先;命令里用 `-c remote.*.url=` / `-c remote.*.pushurl=` 临时改地址的、远端词带引号或变量的、结构对不上的,都按推私仓算。

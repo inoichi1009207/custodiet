@@ -54,6 +54,7 @@
 
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 
@@ -152,7 +153,7 @@ function readBatchGoal() {
 
 /** 给批状态补 `batchLog`(`git log <baseCommit>..HEAD` 的提交全文,每条一项)。纯函数式:git 可注入(自测)。
  *  不该查 / 取不到 ⇒ 原样返回(不加键 ⇒ ctx 里 batchLog=null ⇒ AD 沉默;提示面 fail-open)。 */
-function attachBatchLog(g, git = (args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] })) {
+function attachBatchLog(g, git = (args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], windowsHide: true })) {
   if (!g || typeof g !== "object" || g.cleared || !Array.isArray(g.conditions)) return g;
   if (typeof g.baseCommit !== "string" || !/^[0-9a-f]{7,64}$/i.test(g.baseCommit)) return g;
   if (Array.isArray(g.decisions) && g.decisions.length) return g;
@@ -162,7 +163,7 @@ function attachBatchLog(g, git = (args) => execFileSync("git", args, { encoding:
   } catch { return g; }
 }
 
-const _gitHere = (args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+const _gitHere = (args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
 
 /** `git diff --name-status -M -z <range>` 的解析(唯一实现;分档事实与 HEAD 移动事实共用)。 */
 function gitNameStatus(git, range) {
@@ -402,7 +403,7 @@ export function pHeadBase(sid, entries, git = _gitHere, reflogFirst = _reflogFir
  *  (提交后又在工作树还原的,两边任一处出现都算,红队 c3 BP-7 同族),带状态、改名的旧路径、新内容读不读得到。
  *  只在 P 真欠跨模型/联网时由 ctx.diffTier 惰性调用;只用 `--name-status`,不取全文(红队 c3 BP-8:逐文件 git show 会撞 hook 超时)。
  *  取不到(无基点、git 失败、文件过多)⇒ null(不分档)。git / exists 可注入(自测)。 */
-export function readDiffFacts(base, git = (args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] }),
+export function readDiffFacts(base, git = (args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], windowsHide: true }),
   exists = (p) => fs.existsSync(p), readText = (p) => fs.readFileSync(p, "utf8")) {
   if (typeof base !== "string" || !/^[0-9a-f]{7,64}$/i.test(base)) return null;
   try {
@@ -502,6 +503,40 @@ const BLOCK_ENV = { A: "A", E0: "E", E1: "E", E2: "E", I: "I", J: "J", W: "W",
 // ⚠️ **由 BLOCK_ENV 计算得出,不再是第二张手写表**(D21 结案,codex 072 裁决原话:
 //   「对账只能发现漂移,不能阻止漂移」——一份表按构造不漂)。
 //   E1 刻意不在 BLOCK_ENV(非阻断);P 刻意不在(**无逃生口**,用户裁定,对账测试同步注册例外)。
+/** 观察档开关(批 265):`.claude/custodiet-mode` 首行 = observe,且该文件已提交、未改动、早于本会话开始提交。读不到 ⇒ 不是观察档(照常阻断)。 */
+//   逃生口封堵(批 265):文件若会话里随手写一行就生效,等于一个对**所有**规则(含无逃生口的 P)零成本的总开关。
+//   ⇒ 文件只在三件都成立时算数:已提交进 git、工作树与 HEAD 一致、最后改它的提交**早于本会话开始**。
+//   会话里新写 / 改 / 写完再提交,都不生效(照常阻断);装闸(提交)之后新开的会话才进观察档。
+//   环境变量那支已撤(红队 a9bf37ae BP-2:裸环境变量不绑仓,给比赛仓设了它,本仓的闸也跟着静音)。
+//   自测经 `_observeForTest` 注入,不读宿主仓的模式文件(BP-5)。
+let _observeForTest = null;
+/** 本仓是否立过批:本 checkout 或主 checkout 的批台账 / 状态文件在场(批 265;codex 265-r1 A3 补主 checkout)。 */
+function batchEverArmedHere() {
+  const has = (root) => [".claude/.batch-goal.jsonl", ".claude/.batch-goal.json"].some((f) => fs.existsSync(path.join(root, f)));
+  if (has(".")) return true;
+  try {
+    const common = String(execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true })).trim();
+    if (common && has(path.dirname(common))) return true;
+  } catch { /* 不是 git 仓 */ }
+  return false;
+}
+function observeMode() {
+  if (_observeForTest !== null) return _observeForTest;
+  const F = ".claude/custodiet-mode";
+  try { if (fs.readFileSync(F, "utf8").split(/\r?\n/)[0].trim() !== "observe") return false; } catch { return false; }
+  try {
+    const git = (a) => execFileSync("git", a, { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    git(["ls-files", "--error-unmatch", "--", F]);
+    git(["diff", "--quiet", "HEAD", "--", F]);              // 工作树与 HEAD 不同 ⇒ 抛 ⇒ 不算
+    const ct = Number(String(git(["log", "-1", "--format=%ct", "--", F])).trim());
+    if (!Number.isFinite(ct) || ct <= 0) return false;
+    const first = (_allEntriesCache || []).find((e) => e && typeof e.timestamp === "string" && Number.isFinite(Date.parse(e.timestamp)));
+    if (!first) return false;                                 // 不知道会话何时开始 ⇒ 不认(fail-closed)
+    // git 提交时间只有秒精度:按该秒的最后一毫秒算(codex 265-r1 附 3:同秒稍后的会话内提交原先会被认)
+    return ct * 1000 + 999 < Date.parse(first.timestamp);
+  } catch { return false; }
+}
 const BLOCK_OFF = Object.fromEntries(
   Object.entries(BLOCK_ENV).map(([id, sfx]) => [id, process.env[`STOP_CLOSURE_BLOCK_${sfx}`] !== "0"]));
 /** 引擎是否为已迁规则的**权威**。已硬编码 true,**无运行时回退**——回退=git revert 切换 commit(见下)。
@@ -2291,7 +2326,7 @@ function trackedInFs(root) {
   let set;
   try {
     set = new Set(execFileSync("git", ["-C", key, "-c", "core.quotepath=false", "ls-files", "-z", "--full-name"],
-      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] })
+      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], windowsHide: true })
       .split("\0").filter(Boolean));
   } catch { set = null; }
   _trackedInCache.set(key, set);
@@ -2314,7 +2349,7 @@ function isNewEvidence(sid) {
   let tracked = _trackedCache;
   if (tracked === undefined) try {
     // 批 261(D138④):-c core.quotepath=false -z,中文 / 空格 / 特殊字符文件名不被转义成 "\346…" 引号串(否则被判新建)
-    tracked = new Set(execFileSync("git", ["-c", "core.quotepath=false", "ls-files", "-z"], { encoding: "utf8", cwd: process.cwd() })
+    tracked = new Set(execFileSync("git", ["-c", "core.quotepath=false", "ls-files", "-z"], { encoding: "utf8", cwd: process.cwd(), windowsHide: true })
       .split("\0").filter(Boolean));
   } catch { tracked = null; }
   _trackedCache = tracked;
@@ -2323,7 +2358,7 @@ function isNewEvidence(sid) {
     // 批 261(红队 a415bf26 BP-4):与 tracked 同口径不转义(-c core.quotepath=false -z)——两边口径一分裂,
     //   中文名新载体 justAdded 认不出、tracked 却认得 ⇒ isNew 判既有,G / I 静默
     justAdded = new Set(execFileSync("git", ["-c", "core.quotepath=false", "log", "-1", "--diff-filter=A", "--name-only", "-z", "--format="],
-      { encoding: "utf8", cwd: process.cwd() }).split("\0").map((s2) => s2.replace(/^\n+/, "")).filter(Boolean));
+      { encoding: "utf8", cwd: process.cwd(), windowsHide: true }).split("\0").map((s2) => s2.replace(/^\n+/, "")).filter(Boolean));
   } catch { justAdded = null; }
   _justAddedCache = justAdded;
   const hookCheckout = checkoutOfFs(`${process.cwd()}/.probe`);
@@ -2649,6 +2684,13 @@ export function run(transcriptPath, ctx = {}) {
         //   规则自读的代价已实测过:同一条用例在「当前批 arm 过」与「没 arm」下结果不同,
         //   自测从 34/34 掉到 13/34,而代码一行没改。
         //   自测隔离(STOP_CLOSURE_SELFTEST)靠的也是这个:注入 undefined 即可,不必改判据。
+        // 批 265:本仓**从来没立过批**(台账与状态文件都不在)⇒ K0 不判。「批」是可选做法;
+        //   test2 回放 2,837 回合里 K0 阻断 257 次、全是不用批的仓被要求立批(用户:「那你要不改一下」)。
+        //   只在实时路径注入;夹具与自测不注入(undefined)⇒ K0 判法照旧。
+        //   codex 265-r1 A3:台账被 gitignore,新开的 worktree / 新 clone 里两份都缺 ⇒ 在用批的仓也会被当成「从没立过批」。
+        //   ⇒ 本 checkout 没有时再看主 checkout(git common dir 的上一级)的台账。
+        //   自测进程不注入(否则新装闸、还没立过批的仓,自测里 K0 全部静音而红;公开树 gate:accept 实撞)
+        batchEverArmed: ctx.batchGoal !== undefined || process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : batchEverArmedHere(),
         // 批 258:实时路径给批状态补 `turnBatchStart`(本轮开始时正开着的那一批的起点;W 按它切交付物)
         batchGoal: ctx.batchGoal !== undefined ? ctx.batchGoal : (() => {
           const g = readBatchGoal();
@@ -2749,7 +2791,7 @@ export function run(transcriptPath, ctx = {}) {
         if (live && wroteDoc && fs.existsSync("scripts/tool-usage-census.mjs")) {
           try {
             execFileSync(process.execPath, ["--no-warnings", "scripts/tool-usage-census.mjs", "--doc-drift"],
-              { encoding: "utf8", timeout: 15000 });
+              { encoding: "utf8", timeout: 15000, windowsHide: true });
           } catch (de) {
             const out = String((de && de.stdout) || safeErrMsg(de)).slice(0, 600);
             eFindings.push({ id: "DRIFT", block: false,
@@ -2961,13 +3003,20 @@ function emit(findings, streak = 0, opts = {}) {
   //   而降级轮实际投递的是提示——字段与真实投递不符且无标记。最失真的恰是闸自己
   //   承认「可能拦错」的那几轮)。CAP/yielding 在此处一次算清,下方不再重复声明。
   const CAP = Math.max(4, Number(process.env.STOP_CLOSURE_BLOCK_CAP || 8));
-  const yielding = blocking.length > 0 && streak >= CAP - 2;
+  // 观察档(批 265,新仓上线用):`.claude/custodiet-mode` 首行为 observe(生效条件见 observeMode 头注)⇒
+  //   照常判、照常落报警台账(本该拦的记进 `observed`),但**不阻断、不向模型输出任何提示**。
+  //   为什么要有:test2 2,837 个真实回合回放,装上即阻断 30.7% 的回合(K0 / E0 / E2 / M 为主)——新仓先攒数据,
+  //   按规则量出误报率后再逐条开阻断;一刀切开阻断就是用户说的「磕磕绊绊、大量影响生产的误报」。
+  //   失效条件:观察档里的仓连续 30 天无人看台账 ⇒ 等于没装,复议是否改为默认开低误报规则。
+  const OBSERVE = observeMode();
+  const yielding = !OBSERVE && blocking.length > 0 && streak >= CAP - 2;
   if (live) try {
     // D1/批 102:走 ledger-chain(接线点一)。
     ledgerAppend(".claude/.gate-alerts.jsonl", {
       ts: new Date().toISOString(), ids: findings.map((f) => f.id),
-      // `blocked` = 本轮**真实投递**为阻断的;降级轮记进 `demoted`,并带 yielding 标记
-      blocked: yielding ? [] : blocking.map((f) => f.id),
+      // `blocked` = 本轮**真实投递**为阻断的;降级轮记进 `demoted`,并带 yielding 标记;观察档记进 `observed`
+      blocked: yielding || OBSERVE ? [] : blocking.map((f) => f.id),
+      ...(OBSERVE ? { observed: blocking.map((f) => f.id), observe: true } : {}),
       ...(yielding ? { demoted: blocking.map((f) => f.id), yielding: true } : {}),
       streak,
       perf: perfLine(),   // D53:同一笔耗时账进报警台账,分母侧也可算 p95
@@ -2976,6 +3025,7 @@ function emit(findings, streak = 0, opts = {}) {
     // 台账写不了不影响闸,但**必须出声**——静默吞掉=新报警从分母无声消失(codex 四眼判词)
     try { process.stderr.write("LEDGER-WRITE-FAILED(.gate-alerts): " + safeErrMsg(e) + "\n"); } catch { /* 空 */ }
   }
+  if (OBSERVE) return 0;   // 观察档:只落账,不对模型说一个字
   // 输出瘦身(2026-08-19 用户实撞:「hook 中间说的内容太多了」)。
   // 提示项只留首行——多行说明是给「第一次撞到」的人看的,重复刷屏反而淹没结论;
   // 阻断项保留全文,因为那几行写的是**出路**,是收到即可执行的东西。
@@ -3041,6 +3091,7 @@ function emit(findings, streak = 0, opts = {}) {
 // ── 自测:六条正反用例,不依赖真 transcript
 function selfTest() {
   process.env.STOP_CLOSURE_SELFTEST = "1";   // 隔离 K 类的外部状态依赖
+  _observeForTest = false;                   // 批 265:自测不吃宿主仓的观察档文件(红队 a9bf37ae BP-5)
   const mk = (arr) => arr.map((o) => JSON.stringify(o)).join("\n");
   const U = (t) => ({ type: "user", message: { role: "user", content: [{ type: "text", text: t }] } });
   const A = (t, tu = []) => ({ type: "assistant", message: { role: "assistant", content: [
@@ -4168,6 +4219,12 @@ function selfTest() {
     const held = capture(() => emit(boom, 0));          // streak 0 ⇒ 正常阻断
     sc("降级时用户侧看得见(systemMessage 里说明白)", yielded.includes("自行降级"), true);
     sc("降级时确实不再阻断", yielded.includes('"decision":"block"'), false);
+    // 批 265 观察档:有阻断项也不阻断、对模型零输出;关掉观察档同一批项照常阻断(注入,不读宿主仓的模式文件)
+    let observed = "";
+    try { _observeForTest = true; observed = capture(() => emit(boom, 0)); } finally { _observeForTest = false; }
+    sc("观察档:有阻断项也不阻断", observed.includes('"decision":"block"'), false);
+    sc("观察档:对模型零输出", observed.trim() === "", true);
+    sc("观察档关掉后同一批项照常阻断", capture(() => emit(boom, 0)).includes('"decision":"block"'), true);
     sc("未降级时照常阻断", held.includes('"decision":"block"'), true);
     sc("未降级时不谎称降级", held.includes("自行降级"), false);
 
@@ -4211,7 +4268,7 @@ function selfTest() {
       try {
         out = execFileSync(process.execPath, ["--no-warnings", process.argv[1]], {
           input: JSON.stringify({ last_assistant_message: "x", transcript_path: "scripts" }),
-          encoding: "utf8", timeout: 30_000,
+          encoding: "utf8", timeout: 30_000, windowsHide: true,
         });
       } catch (e) { code = e.status ?? -1; out = String(e.stdout || ""); }
       sc("D45:外层 catch fail-open ⇒ 子进程真实退出码 0", code, 0);
@@ -5196,6 +5253,24 @@ if (hookInput.hook_event_name === "SubagentStop") {
     }
   } catch (e) {
     out = `⟦子代理闸 UNKNOWN⟧ ${who}:读转录失败(${String(e.message).slice(0, 60)})——本分支全部项(含 A 的 codex 账)未跑,报出来不静默。`;
+  }
+  // 批 265 观察档同样覆盖子代理通道(红队 a9bf37ae BP-4):不阻断、不输出。
+  //   会话起点取**父会话**转录的首条时间戳(`transcript_path` 指父会话,见上)——子代理自己的转录起点更晚,用它会让
+  //   父会话里写入并提交的模式文件在子代理收尾时被认。读不到父会话起点 ⇒ 不认观察档(照常判)。
+  try {
+    const fd = fs.openSync(String(hookInput.transcript_path || ""), "r");
+    const buf = Buffer.alloc(65536); const n = fs.readSync(fd, buf, 0, buf.length, 0); fs.closeSync(fd);
+    const t = buf.toString("utf8", 0, n).split("\n").map((l) => { try { return JSON.parse(l).timestamp; } catch { return null; } })
+      .find((x) => typeof x === "string" && Number.isFinite(Date.parse(x)));
+    _allEntriesCache = t ? [{ timestamp: t }] : [];
+  } catch { _allEntriesCache = []; }
+  if (observeMode()) {
+    // 观察档也要落账(codex 265-r1 附 1:原先直接退出,本该阻断的子代理收尾零记录)
+    if (aBlock.length || out) try {
+      ledgerAppend(".claude/.gate-alerts.jsonl", { ts: new Date().toISOString(), ids: aBlock.length ? ["A"] : [], blocked: [],
+        observed: aBlock.length ? ["A"] : [], observe: true, channel: "SubagentStop", streak: 0 });
+    } catch { /* 台账写不了不影响 */ }
+    process.exit(0);
   }
   if (aBlock.length) {
     // 阻断形态与主 Stop 通道同口径(stdout decision:block + stderr 同文 + exit 2)。
