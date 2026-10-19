@@ -2,11 +2,19 @@
 
 ## 0.7.0 — 2026-10-19
 
-- **观察档**:`node scripts/custodiet-init.mjs --target <仓> --mode copy --observe` 装成观察档——闸照常判、照常记 `.claude/.gate-alerts.jsonl`(本该拦的记进 `observed`),但不阻断、不向模型输出。新仓先攒数据,再按规则逐条开阻断。生效条件:`.claude/custodiet-mode` 首行 observe,且该文件已提交、工作树与 HEAD 一致、最后改它的提交早于本会话开始——会话里写入或写入后提交都不生效。删掉该文件即回到阻断档。
-- **K0 不追不用批的仓**:本 checkout 与主 checkout 都没有批台账时,K0(「动了工作面却没立完成条件」)不判。批是可选做法;在一个从不立批的真实仓的 2,837 个回合回放里,K0 阻断 257 次,全是这一形。
-- **《闸用语》**:新增 `scripts/gate-phrasebook.mjs`,从规则的 `escapes` 字段生成 `docs/gate-phrasebook.md`(每条出路标〔动作〕/〔说法〕;`--check` 查是否与规则同步)。安装器在目标仓里跑它,并在 `CLAUDE.md` 里加一段首尾标记圈住的托管块 `@docs/gate-phrasebook.md`,新会话开局就读到;重跑只换标记之间的内容。生成失败时安装器报 `ok:false`、退出 6,不挂引用。
-- **安装器**:`.gitignore` 追加 `.claude/.p-head/` 与 `scripts/gate-deps/node_modules/`;重跑对已有 `CLAUDE.md` 幂等。
-- **已知限制**:观察档里没有自签误报,`--fp-report` 的误报率分子恒为 0,不能当误报率用;示例宪法「执行共识」「恒定条款」两节只有标题、正文没承接 Q / C 的义务。
+- **观察档**:`node scripts/custodiet-init.mjs --target <仓> --mode copy --observe` 装成观察档——闸照常判、照常记 `.claude/.gate-alerts.jsonl`(本该拦的记进 `observed`;主 Stop 行带会话号 `sid` 与截至本轮解析出的转录条目数 `at`——不是物理行号;SubagentStop 行带父会话号、子代理全号与子代理转录路径;有项没判成时记 `UNKNOWN`),但不阻断、不向模型输出(主 Stop 与 SubagentStop 两条通道都是;调试变量 `STOP_CLOSURE_STDOUT=1` 下干净回合的心跳仍会输出)。观察档安装不新增示例宪法的自动加载:示例宪法只落旁件 `AGENTS.custodiet.md`(该位置已有不同内容则不写),`CLAUDE.md` 不引入它;《闸用语》照挂。重跑 `--observe` 不清理以前安装留下的根宪法或引用。新仓先攒数据,按数据把误报多的规则本身修掉,再整体切回阻断(没有逐条开关)。模式文件提交后**新开的会话**才进观察档,装闸的那个会话照常阻断。生效条件:`.claude/custodiet-mode` 首行 observe,且该文件已提交、工作树与 HEAD 一致、最后改它的提交早于本会话转录的首条时间戳;判定出错一律按阻断档跑。删掉该文件立即回到阻断档(提交删除让它持久)。
+- **K0 不追不用批的仓**:本 checkout 与主 checkout 都没有批台账文件时,K0(「动了工作面却没立完成条件」)不判。批是可选做法;在一个从不立批的真实仓的 2,837 个回合模拟回放里,这一改把阻断回合从 870 降到 754(30.7% → 26.6%)。
+- **《闸用语》**:新增 `scripts/gate-phrasebook.mjs`,从规则的 `escapes` 字段生成 `docs/gate-phrasebook.md`(每条出路标〔动作〕/〔说法〕;`--check` 查是否与规则同步;目标路径已有非生成件时拒写、退出 3)。安装器在目标仓里跑它,并在 `CLAUDE.md` 里加一段首尾标记圈住的托管块 `@docs/gate-phrasebook.md`,新会话开局就读到;重跑只换标记之间的内容。生成失败时安装器报 `ok:false`、退出 6,不挂引用。
+- **安装器**:`.gitignore` 追加 `.claude/.p-head/` 与 `scripts/gate-deps/node_modules/`;重跑对已有 `CLAUDE.md` 幂等。law 锚点自测在目标文件里找不到锚点时再看同名旁件(`AGENTS.custodiet.md` 等):只在旁件里命中的单列为 SIDE,不记 PASS、不让自测变红,汇总行写出条数。观察档装过后不带 `--observe` 重装:`@AGENTS.md` 前置进 `CLAUDE.md`,不写 `CLAUDE.custodiet.md`。`--fp-report` 只数主 Stop 通道,不数子代理行与 `UNKNOWN`。
+- **已知限制**:
+  - 观察档的时间判据比的是 git 提交时间(`%ct`)与转录首条时间戳,两者都能被本机改写(伪造提交日期、改转录首部);它防的是会话里顺手写一行关闸,不防蓄意伪造。
+  - 观察档里不拦人,也就很少有人登记误报;`--fp-report` 的零值不能证明没有误报,要靠事后对 `observed` 行抽样复核。
+  - K0 看的是批台账文件此刻在不在,不是历史上立没立过批:新 clone 不带被忽略的本地台账,曾用过批的仓也会被当成不用批。
+  - 观察档安装后规则与手册里写的仍是 `AGENTS.md#…`,根宪法缺席时这些指针指不到文件(自测里这些锚点显示为 SIDE)。
+  - 观察档照挂《闸用语》:模型照手册写出说法类出路的回合不会进 `observed`,抽样量出的是模型学会措辞之后的误报率。
+  - 会话中 merge / switch 进一个早于会话、含模式文件的提交,当前会话即进观察档(比的是该文件原提交的时间)。
+  - S 的「把决定推回用户」分支不依赖批,不用批的仓照样会判。
+  - 示例宪法「执行共识」「恒定条款」两节的正文没有承接 Q / C 的义务。
 
 ## 0.6.3 — 2026-10-17
 

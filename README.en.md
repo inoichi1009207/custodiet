@@ -145,7 +145,9 @@ What it does:
 - Copies the gate files (`scripts/hook-stop-closure.mjs`, `scripts/batch-goal.mjs`, the engine files under `scripts/lib/`), the sample constitution `AGENTS.md`, the sample codes (`docs/laws/collab.md`, `docs/laws/reporting.md`, `docs/laws/production.md`), `docs/noun-diary.md` and the red-team agent `.claude/agents/_gate-bypass-hunter.md` into the target, and creates `CLAUDE.md` (content: `@AGENTS.md`).
 - Merges the `Stop` and `SubagentStop` hooks into the target's `.claude/settings.json` (deduplicated by command).
 - Appends the gate's runtime ledger paths to the target's `.gitignore`.
-- Never overwrites existing files: when contents differ it writes a sibling `<name>.custodiet<ext>` and lists each one in the JSON manifest on the last line of stdout. No commits, no network, no changes under `~/.claude/`.
+- Generates the gate phrasebook `docs/gate-phrasebook.md` and appends a marker-delimited managed block to `CLAUDE.md` that imports it (re-runs only replace what is between the markers).
+- Never overwrites copied files: when contents differ it writes a sibling `<name>.custodiet<ext>` and lists each one in the JSON manifest on the last line of stdout. `.claude/settings.json`, `.gitignore` and `CLAUDE.md` are appended to or merged, not replaced. No commits, no network, no changes under `~/.claude/`.
+- With `--observe` it installs in observe mode: alerts are logged, nothing is blocked and nothing is shown to the model (except under the debug variable `STOP_CLOSURE_STDOUT=1`); the sample constitution goes to the sibling `AGENTS.custodiet.md` and `CLAUDE.md` does not import it (the phrasebook is still imported). Observe mode applies only to sessions started after `.claude/custodiet-mode` is committed; the session that installs the gate is still blocked as usual. Use it to collect data in a repo already in use.
 
 After installing:
 

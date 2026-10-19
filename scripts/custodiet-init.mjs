@@ -89,10 +89,13 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === "--target") target = argv[++i];
   else if (a === "--mode") mode = argv[++i];
-  else if (a === "--observe") observe = true;   // 批 265:装成观察档(只落账不阻断),新仓先攒数据再逐条开阻断
+  else if (a === "--observe") observe = true;   // 批 265:装成观察档(只落账不阻断),新仓先攒数据,按数据修规则后整体切回阻断
   else if (a === "-h" || a === "--help") {
     process.stdout.write("用法: node scripts/custodiet-init.mjs --target <目标仓根> [--mode copy] [--observe]\n" +
-      "  --observe  装成观察档:闸照常判、照常记 .claude/.gate-alerts.jsonl,但不阻断、不对模型输出;删掉 .claude/custodiet-mode 即恢复阻断\n");
+      "  --observe  装成观察档:闸照常判、照常记 .claude/.gate-alerts.jsonl,但不阻断、不对模型输出;\n" +
+      "             示例宪法只落旁件 AGENTS.custodiet.md、CLAUDE.md 不引入它(《闸用语》照挂)。\n" +
+      "             生效:模式文件提交后**新开的会话**才进观察档;装闸的这个会话照常阻断。\n" +
+      "             删掉 .claude/custodiet-mode 立即恢复阻断(提交删除让它持久)\n");
     process.exit(0);
   } else die(2, `未知参数 ${a}`);
 }
@@ -136,6 +139,17 @@ function place(rel, buf, srcLabel) {
   if (rel === "CLAUDE.md" && String(cur).replace(/<!-- custodiet:begin[\s\S]*?<!-- custodiet:end -->\n?/, "") === String(buf)) {
     files.push({ ...rec, status: "unchanged", sha256: sha(cur) }); return;
   }
+  // CLAUDE.md 除托管块外是空的(观察档装过、现在不带 --observe 重装)⇒ 把生成件写在托管块前面,不写旁件
+  //   (红队 a0dfbfce 附 3:原先写出 CLAUDE.custodiet.md,根宪法仍没被引入)
+  if (rel === "CLAUDE.md" && String(cur).replace(/<!-- custodiet:begin[\s\S]*?<!-- custodiet:end -->\n?/, "").trim() === "") {
+    fs.writeFileSync(dst, Buffer.concat([buf, cur]));
+    changed++;
+    files.push({ ...rec, status: "prepended", sha256: sha(fs.readFileSync(dst)) }); return;
+  }
+  // 目标路径本身就是旁件(观察档把示例宪法定向到 AGENTS.custodiet.md)⇒ 不再套一层旁件,一个字节都不写(codex 265-deliverables-r2 §5)
+  if (/\.custodiet(\.[^./]+)?$/.test(rel)) {
+    files.push({ ...rec, status: "skipped", sha256: sha(cur), note: "旁件位置已有不同内容,未覆盖;自己合并" }); return;
+  }
   const sc = sidecarOf(rel), scAbs = path.join(T, sc);
   if (!fs.existsSync(scAbs)) {
     fs.writeFileSync(scAbs, buf);
@@ -151,9 +165,13 @@ function place(rel, buf, srcLabel) {
 for (const rel of FILES) {
   const s = path.join(SRC, rel);
   if (!fs.existsSync(s)) die(3, `源文件缺失:${rel}(custodiet 仓不完整)`);
-  place(rel, fs.readFileSync(s), rel);
+  // 观察档不改模型的工作方式(codex 265-deliverables-r1 附 1:示例宪法写着「开工 batch-goal --arm」,
+  //   装成根目录 AGENTS.md 再经 CLAUDE.md 引入 ⇒ 模型照做、开始走「批」流程,闸没拦人却先改了生产流程;
+  //   Codex CLI 也原生读根目录 AGENTS.md)。⇒ 示例宪法只落旁件 AGENTS.custodiet.md(law 锚点自测会回退到旁件),
+  //   CLAUDE.md 不生成 `@AGENTS.md`,只挂《闸用语》托管块。
+  place(observe && rel === "AGENTS.md" ? sidecarOf(rel) : rel, fs.readFileSync(s), rel);
 }
-for (const [rel, body] of Object.entries(GENERATED)) place(rel, Buffer.from(body, "utf8"), "(generated)");
+if (!observe) for (const [rel, body] of Object.entries(GENERATED)) place(rel, Buffer.from(body, "utf8"), "(generated)");
 
 // ── settings.json:JSON 合并去重 ───────────────────────────────────────
 const settings = { path: ".claude/settings.json" };
@@ -254,7 +272,7 @@ const gitignore = { path: ".gitignore" };
 let version = null;
 try { version = JSON.parse(fs.readFileSync(path.join(SRC, "package.json"), "utf8")).version; } catch { /* 无版本 */ }
 const notInstalled = ["scripts/coverage-check.mjs", "scripts/gate-migrate-check.mjs", "scripts/lib/ledger-anchor.mjs"];
-const attention = files.filter((f) => f.status !== "created" && f.status !== "unchanged");
+const attention = files.filter((f) => !["created", "unchanged", "prepended"].includes(f.status));
 for (const f of files) process.stderr.write(`  ${f.status.padEnd(17)} ${f.path}${f.sidecar ? "  → " + f.sidecar : ""}\n`);
 process.stderr.write(`  ${settings.status.padEnd(17)} ${settings.path}\n  ${gitignore.status.padEnd(17)} ${gitignore.path}\n`);
 if (attention.length) process.stderr.write(`⚠ ${attention.length} 个文件目标里已有不同版本,未覆盖——看清单里的 sidecar/skipped,自己合并。\n`);

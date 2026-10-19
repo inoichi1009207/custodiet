@@ -227,7 +227,12 @@ export function fpNetById(ledger) {
 
 export function fpTable(alerts, ledger, { minAlerts = 20, minRate = 0.15 } = {}) {
   const per = {}, fp = {};
-  for (const a of alerts || []) for (const id of (a && a.ids) || []) per[id] = (per[id] || 0) + 1;
+  // 只数主 Stop 通道、不数 UNKNOWN:子代理通道只在观察档落 I/M/L/B 提示行,混进来会摊薄分母、让规则掉出「待修」
+  //   (红队 a0dfbfce BP-4);UNKNOWN 是「没判成」,不是一条规则
+  for (const a of alerts || []) {
+    if (!a || a.channel === "SubagentStop") continue;
+    for (const id of a.ids || []) if (id !== "UNKNOWN") per[id] = (per[id] || 0) + 1;
+  }
   for (const [id, d] of Object.entries(fpNetById(ledger))) fp[id] = d;
   return Object.keys(per).map((id) => {
     const f = Math.max(0, fp[id] || 0), rate = per[id] ? f / per[id] : 0;
@@ -2213,6 +2218,8 @@ function _priorWindow(turn) {
 }
 /** 整份 transcript 的缓存,由 `run()` 填。只为 `_priorWindow` 服务。 */
 let _allEntriesCache;
+/** 本次 `run()` 的会话号,只给 emit 落报警台账用(批 265:观察档数据事后要能回到原会话)。 */
+let _ledgerSid;
 
 /** P 的跨批持久账(2026-08-22 亲签)。读不到/坏 ⇒ null(首跑语义,宽限计 0)。
  *  为什么不怕坏账读成 null:方向是**少收一轮税**,而下一次真提交会重新开始累计;
@@ -2494,6 +2501,7 @@ export function gateMachineryFiles(settingsDir = ".claude") {
 }
 
 export function run(transcriptPath, ctx = {}) {
+  _ledgerSid = typeof ctx.sessionId === "string" && ctx.sessionId ? ctx.sessionId : undefined;
   // D40:生产形态一律以**显式语境**声明(`ctx.live === true`),不再用 `process.argv.length<=2`
   // 推断——argv 判的是「进程怎么起的」不是「这次调用什么语境」:settings.json 的 hook command
   // 一旦加任何 flag,心跳与分母会**同时无声停摆**;被测试 import 直调时又会把测试写入混进真账。
@@ -3009,7 +3017,7 @@ function emit(findings, streak = 0, opts = {}) {
   // 观察档(批 265,新仓上线用):`.claude/custodiet-mode` 首行为 observe(生效条件见 observeMode 头注)⇒
   //   照常判、照常落报警台账(本该拦的记进 `observed`),但**不阻断、不向模型输出任何提示**。
   //   为什么要有:test2 2,837 个真实回合回放,装上即阻断 30.7% 的回合(K0 / E0 / E2 / M 为主)——新仓先攒数据,
-  //   按规则量出误报率后再逐条开阻断;一刀切开阻断就是用户说的「磕磕绊绊、大量影响生产的误报」。
+  //   按规则量出误报率、把误报多的规则本身修掉,再整体切回阻断(不做逐条开关,用户 265 原话);一刀切开阻断就是用户说的「磕磕绊绊、大量影响生产的误报」。
   //   失效条件:观察档里的仓连续 30 天无人看台账 ⇒ 等于没装,复议是否改为默认开低误报规则。
   const OBSERVE = observeMode();
   const yielding = !OBSERVE && blocking.length > 0 && streak >= CAP - 2;
@@ -3017,6 +3025,9 @@ function emit(findings, streak = 0, opts = {}) {
     // D1/批 102:走 ledger-chain(接线点一)。
     ledgerAppend(".claude/.gate-alerts.jsonl", {
       ts: new Date().toISOString(), ids: findings.map((f) => f.id),
+      // 会话号 + 截至本轮解析出的转录条目数(不是物理行号:空行与坏行不计):事后抽样复核时据此回到那一轮
+      //   (codex 265-deliverables-r1 附 3:原先只有时间戳,观察档攒的数据回溯不到原文)
+      sid: _ledgerSid, at: Array.isArray(_allEntriesCache) ? _allEntriesCache.length : undefined,
       // `blocked` = 本轮**真实投递**为阻断的;降级轮记进 `demoted`,并带 yielding 标记;观察档记进 `observed`
       blocked: yielding || OBSERVE ? [] : blocking.map((f) => f.id),
       ...(OBSERVE ? { observed: blocking.map((f) => f.id), observe: true } : {}),
@@ -4498,6 +4509,8 @@ function selfTest() {
         hp("误报率表:K 30% 但报警只有 10 次 ⇒ 不进待修", k.hot, false);
         hp("误报率表:报警 20 次、误报 3 笔(15%)⇒ 进待修", fpTable(al, lg.filter((x) => x.kind !== "retraction")).find((r) => r.id === "S").hot, true);
         hp("误报率表:撤回多于误报 ⇒ 不低于 0", fpTable([{ ids: ["V"] }], [{ kind: "retraction", id: "V" }])[0].fp, 0);
+        hp("265 误报率表:子代理通道行与 UNKNOWN 不计入分母(红队 a0dfbfce BP-4)",
+          JSON.stringify(fpTable([{ ids: ["M"] }, { ids: ["M", "UNKNOWN"], channel: "SubagentStop" }, { ids: ["UNKNOWN"] }], []).map((r) => [r.id, r.alerts])), '[["M",1]]');
         hp("误报率表:按报警量降序", tb.map((r) => r.id).join(","), "S,K");
         // 2026-10-12:confirmed_fp 是对已有自签的加签,不另计一笔(原先 K 会计 3)
         hp("误报率表:加签行不重复计数(K 自签 2 + 加签 1 = 2)", k.fp, 2);
@@ -4865,7 +4878,7 @@ function selfTest() {
   // (法典义务多以 `- **X**:` 形存在,只认 # 标题会误判 8 条)。
   // 此前 14+ 条锚点指向不存在的标题,阻断消息给人的是死指针——
   // 修完必须有机器判据看着,否则法典改个标题锚点又静默烂掉(自签条件 b 的反向探针)。
-  let lawPass = 0, lawTotal = 0;
+  let lawPass = 0, lawTotal = 0, lawSide = 0;
   {
     const hnames = (p) => {
       const out = [];
@@ -4885,11 +4898,18 @@ function selfTest() {
       if (!r.law) continue;
       lawTotal++;
       const [file, anchor] = String(r.law).split("#");
+      // 观察档安装把示例宪法落成旁件 `AGENTS.custodiet.md`,目标仓自带宪法时也是旁件 ⇒ 主文件找不到时再看旁件,
+      //   但**只在旁件里**的锚点单列 SIDE、不记 PASS:旁件模型不加载,指针仍是死的(红队 a0dfbfce BP-1:原先并入后判 PASS = 假绿)。
+      //   SIDE 不让自测变红(观察档安装后就是这个形态),但汇总行照实写出条数。
+      const side = file.replace(/(\.[^./]+)$/, ".custodiet$1");
       cacheH[file] ??= hnames(file);
-      const ok = !!anchor && cacheH[file].some((h) =>
-        norm(h).includes(norm(anchor)) || norm(anchor).includes(norm(h)));
-      console.log(`${ok ? "PASS" : "FAIL"}  law 锚点:${r.id} → ${r.law}${ok ? "" : "  ← 目标文件无此标题/句名"}`);
+      cacheH[side] ??= hnames(side);
+      const hit = (hs) => !!anchor && hs.some((h) => norm(h).includes(norm(anchor)) || norm(anchor).includes(norm(h)));
+      const ok = hit(cacheH[file]), sideOnly = !ok && hit(cacheH[side]);
+      console.log(`${ok ? "PASS" : sideOnly ? "SIDE" : "FAIL"}  law 锚点:${r.id} → ${r.law}` +
+        (ok ? "" : sideOnly ? `  ← 只在未加载的旁件 ${side} 里;并进 ${file} 才算接通` : "  ← 目标文件无此标题/句名"));
       if (ok) lawPass++;
+      else if (sideOnly) lawSide++;
     }
   }
 
@@ -4919,11 +4939,11 @@ function selfTest() {
     (hpTotal ? ` · 零件用例 ${hpPass}/${hpTotal}` : "") +
     (partTotal ? ` · 零件契约 ${partPass}/${partTotal}` : "") +
     (driftTotal ? ` · 承重面漂移 ${driftPass}/${driftTotal}` : "") +
-    (lawTotal ? ` · law锚点 ${lawPass}/${lawTotal}` : ""));
+    (lawTotal ? ` · law锚点 ${lawPass}/${lawTotal}${lawSide ? `(另 ${lawSide} 条只在未加载的旁件里)` : ""}` : ""));
   return (pass === cases.length && driftPass === driftTotal && probePass === probeTotal
     && partPass === partTotal && hpPass === hpTotal && seamPass === seamTotal && escPass === escTotal
     && cxPass === cxTotal
-    && lawPass === lawTotal && carrPass === carrTotal && dfPass === dfTotal) ? 0 : 1;
+    && lawPass + lawSide === lawTotal && carrPass === carrTotal && dfPass === dfTotal) ? 0 : 1;
 }
 
 // ── main
@@ -5198,22 +5218,52 @@ if (hookInput.hook_event_name === "SubagentStop") {
   }));
   const at = hookInput.agent_transcript_path;
   const who = `${hookInput.agent_type || "?"}/${String(hookInput.agent_id || "?").slice(0, 8)}`;
+  // 批 265 观察档同样覆盖子代理通道(红队 a9bf37ae BP-4):不阻断、不输出。**先判观察档再决定说不说话**
+  //   (codex 265-deliverables-r1 §10:原先缺字段那条 UNKNOWN 在判观察档之前就输出了)。
+  //   会话起点取**父会话**转录的首条时间戳(`transcript_path` 指父会话,见上)——子代理自己的转录起点更晚,用它会让
+  //   父会话里写入并提交的模式文件在子代理收尾时被认。读不到父会话起点 ⇒ 不认观察档(照常判)。
+  try {
+    const fd = fs.openSync(String(hookInput.transcript_path || ""), "r");
+    const buf = Buffer.alloc(65536); const n = fs.readSync(fd, buf, 0, buf.length, 0); fs.closeSync(fd);
+    const t = buf.toString("utf8", 0, n).split("\n").map((l) => { try { return JSON.parse(l).timestamp; } catch { return null; } })
+      .find((x) => typeof x === "string" && Number.isFinite(Date.parse(x)));
+    _allEntriesCache = t ? [{ timestamp: t }] : [];
+  } catch { _allEntriesCache = []; }
+  const SUB_OBSERVE = observeMode();
+  const subLedger = (ids, observed) => {
+    try {
+      ledgerAppend(".claude/.gate-alerts.jsonl", { ts: new Date().toISOString(), ids, blocked: [], observed, observe: true,
+        channel: "SubagentStop", sid: String(hookInput.session_id || "") || undefined,
+        // 子代理全号 + 它自己的转录路径:事后回到原文用(codex 265-deliverables-r2 §3:原先只有截成 8 位的 who)
+        agent: `${hookInput.agent_type || "?"}/${hookInput.agent_id || "?"}`, agentTranscript: typeof at === "string" && at ? at : undefined, streak: 0 });
+    } catch (e) {
+      // 观察档下这行台账是唯一痕迹 ⇒ 写不了必须出声(红队 a0dfbfce BP-3;与主通道 LEDGER-WRITE-FAILED 同口径)
+      try { process.stderr.write("LEDGER-WRITE-FAILED(.gate-alerts,SubagentStop): " + safeErrMsg(e) + "\n"); } catch { /* 空 */ }
+    }
+  };
   if (typeof at !== "string" || !at) {
+    if (SUB_OBSERVE) { subLedger(["UNKNOWN"], []); process.exit(0); }
     say(`⟦子代理闸 UNKNOWN⟧ ${who}:payload 里没有 agent_transcript_path(官方 SubagentStop 字段,可能已改名)。`
       + `本分支全部项(含 A 的 codex 账)判不了 ⇒ 按 fail-closed 报出来,不当作「没问题」。`);
     process.exit(0);
   }
   let out = "";
   let aBlock = [];   // A 的 codex 账在子代理边界上的阻断行(v3:运行中 / 已产出待读 / 失败未处理)
+  let hitIds = [];   // I/M/L/B 命中的规则号(观察档落账用)
+  let aNote = false;        // A 有提示行(账出错 / 降为提示)
+  let subUnknown = false;   // 有项没判成(超预算 / 读转录失败 / A 账出错)——与命中并存时也要记(codex 265-deliverables-r2 §4)
   try {
     const st = fs.statSync(at);
     const CAP = 4_000_000;                       // 字节预算:超了报 UNKNOWN,不截断继续
     if (st.size > CAP) {
+      subUnknown = true;
       out = `⟦子代理闸 UNKNOWN⟧ ${who}:转录 ${(st.size / 1e6).toFixed(1)}MB 超预算 `
         + `${CAP / 1e6}MB,I/M/L/B 不截断继续(截断=fail-open)。A 项(codex 账)只读尾段照跑(BP4-13)。`;
       const v = subagentCodexSafe(readTranscriptTail(at, CAP), liveCodexEnv());
       aBlock = v.block;
       if (v.notes.length) out += `\n  · ${v.notes.join("\n  · ")}`;
+      if (v.notes.some((n) => /^A:UNKNOWN/.test(n))) subUnknown = true;
+      if (v.notes.some((n) => /^A:/.test(n))) aNote = true;
     } else {
       const entries = readTranscript(at);
       // 批 255:原为 `{ tracked: _trackedCache … }`,而本分支跑在 `run()` 之前、缓存从未初始化
@@ -5232,7 +5282,9 @@ if (hookInput.hook_event_name === "SubagentStop") {
       //   ≥10 次命中且 fp 台账零条 —— 有了这个分母才谈得上升档;
       //   在那之前升档等于拿一个没量过误报率的判据去拦人。
       const only = new Set(["I", "M", "L", "B"]);
-      const hits = runRules(RULES.filter((r) => only.has(r.id)), sCtx)
+      const subFindings = runRules(RULES.filter((r) => only.has(r.id)), sCtx);
+      hitIds = subFindings.map((f) => f.id);
+      const hits = subFindings
         // finding 形状 = `{ id, block, msg }`(gate-registry.mjs:174);msg 是多行数组或字符串。
         .map((f) => {
           const m = Array.isArray(f.msg) ? f.msg.join(" ") : String(f.msg || "");
@@ -5244,6 +5296,8 @@ if (hookInput.hook_event_name === "SubagentStop") {
       const v = subagentCodexSafe(entries, liveCodexEnv());
       aBlock = v.block;
       hits.push(...v.notes);
+      if (v.notes.some((n) => /^A:UNKNOWN/.test(n))) subUnknown = true;
+      if (v.notes.some((n) => /^A:/.test(n))) aNote = true;
       if (hits.length) {
         out = `⟦子代理闸⟧ ${who} 收尾时命中 ${hits.length} 项(提示面,不阻断):\n  · `
           + hits.join("\n  · ")
@@ -5255,24 +5309,16 @@ if (hookInput.hook_event_name === "SubagentStop") {
       }
     }
   } catch (e) {
+    subUnknown = true;
     out = `⟦子代理闸 UNKNOWN⟧ ${who}:读转录失败(${String(e.message).slice(0, 60)})——本分支全部项(含 A 的 codex 账)未跑,报出来不静默。`;
   }
-  // 批 265 观察档同样覆盖子代理通道(红队 a9bf37ae BP-4):不阻断、不输出。
-  //   会话起点取**父会话**转录的首条时间戳(`transcript_path` 指父会话,见上)——子代理自己的转录起点更晚,用它会让
-  //   父会话里写入并提交的模式文件在子代理收尾时被认。读不到父会话起点 ⇒ 不认观察档(照常判)。
-  try {
-    const fd = fs.openSync(String(hookInput.transcript_path || ""), "r");
-    const buf = Buffer.alloc(65536); const n = fs.readSync(fd, buf, 0, buf.length, 0); fs.closeSync(fd);
-    const t = buf.toString("utf8", 0, n).split("\n").map((l) => { try { return JSON.parse(l).timestamp; } catch { return null; } })
-      .find((x) => typeof x === "string" && Number.isFinite(Date.parse(x)));
-    _allEntriesCache = t ? [{ timestamp: t }] : [];
-  } catch { _allEntriesCache = []; }
-  if (observeMode()) {
-    // 观察档也要落账(codex 265-r1 附 1:原先直接退出,本该阻断的子代理收尾零记录)
-    if (aBlock.length || out) try {
-      ledgerAppend(".claude/.gate-alerts.jsonl", { ts: new Date().toISOString(), ids: aBlock.length ? ["A"] : [], blocked: [],
-        observed: aBlock.length ? ["A"] : [], observe: true, channel: "SubagentStop", streak: 0 });
-    } catch { /* 台账写不了不影响 */ }
+  if (SUB_OBSERVE) {
+    // 观察档也要落账(codex 265-r1 附 1:原先直接退出,本该阻断的子代理收尾零记录);
+    //   提示项 I/M/L/B 的规则号也记上(codex 265-deliverables-r1 §10:原先只记 A),读转录出错记 UNKNOWN
+    // A 的提示行(账出错 / 被 STOP_CLOSURE_BLOCK_A=0 降为提示)也记 A,不让它被同轮的 I/M/L/B 命中吞掉(红队 a0dfbfce BP-2)
+    const aNoted = aBlock.length > 0 || aNote;
+    const ids = [...(aNoted ? ["A"] : []), ...hitIds, ...(subUnknown ? ["UNKNOWN"] : [])];
+    if (ids.length) subLedger(ids, aBlock.length ? ["A"] : []);
     process.exit(0);
   }
   if (aBlock.length) {
