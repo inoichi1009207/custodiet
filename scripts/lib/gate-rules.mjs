@@ -2589,7 +2589,7 @@ const RULE_K = {
  *  保证变异体消息逐字一致、只 differ 豁免那一行(G 项验收台教训)。 */
 function k0Core(ctx) {
   const g = ctx.batchGoal;
-  // 批 265:本仓从来没立过批 ⇒ 不判(批是可选做法;比赛用仓的模拟回放里 K0 的阻断抽样所见都是这一形)。只认实时注入的 false。
+  // 批 265:本仓从来没立过批 ⇒ 不判(批是可选做法;比赛用仓的模拟回放里抽样发现 K0 的阻断有这一形)。只认实时注入的 false。
   if (!g && ctx.batchEverArmed === false) return [];
   if (g?.cleared && g.closedCount > 0 && properClose(ctx) && !ranArm(ctx)) {
     const done = confirmedConditions(ctx.text);
