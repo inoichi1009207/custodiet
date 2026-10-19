@@ -4,10 +4,10 @@
 // 为什么要有(批 266,用户 10-19 签:「我们设计了一堆防漏放,结果误拦了,得不偿失」;ADR 0028 / 265b-D1):
 //   红队(_gate-bypass-hunter)按设计找的是「怎样不被拦住」,误拦要靠真实语料才看得出——批 265 用一个比赛用仓
 //   2,837 个真实回合回放,才量出直接开阻断会拦 30.7% 的回合。本工具把那次一次性回放做成每次改规则都能跑的默认件:
-//   误拦猎手 agent(.claude/agents/_gate-false-block-hunter.md)的固定动作就是跑它、再对「新增阻断」逐条抽样判拦对 / 误拦。
+//   误拦猎手 agent(用户级 ~/.claude/agents/_gate-false-block-hunter.md,权威在 dotfiles-claude)的固定动作就是跑它、再对「新增阻断」逐条抽样判拦对 / 误拦。
 //
 // 做什么:
-//   · 改前 = `--base <rev>`(缺省 HEAD)时刻的 scripts/hook-stop-closure.mjs + scripts/lib/**,落到 .claude/.gate-replay/<sha8>/(gitignore 面);
+//   · 改前 = `--base <rev>`(工具缺省 HEAD;误拦猎手不许靠缺省——批内已提交时 HEAD 对工作树恒为零新增,P 也不认)时刻的 scripts/hook-stop-closure.mjs + scripts/lib/**,落到 .claude/.gate-replay/<sha8>/(gitignore 面);
 //     改后 = 当前工作树。两版的 `run()` 都在**本进程内**直接调(`ctx.entries` 入口,不起子进程、不写临时转录)。
 //   · 语料 = 本项目转录目录(~/.claude/projects/<项目名>/*.jsonl,不含子代理转录)+ `--corpus <目录>` 追加的;
 //     每个主线 assistant 的 end_turn 是一个回合,截该处之前最多 `--tail` 条条目当转录前缀。
@@ -176,6 +176,7 @@ async function main(argv) {
   // 新证据(预检台账 / git 索引 / 末次提交新增文件)只取一次,两版共用(codex 266-r2 §6:各取一次时同一版规则也能读出「解除阻断」)。
   //   改前版本若早于本改动(不认 ctx.newEvidence),它那一侧仍会自己读一遍——见 CEILING。
   const ev = typeof after.isNewEvidence === "function" ? after.isNewEvidence(undefined) : undefined;
+  const evShared = typeof before.isNewEvidence === "function";   // 导出与 run 认注入是同一次改动加的,以导出在否作代理
   const r = diffRuns(jobs, (e) => before.run(null, { entries: e, newEvidence: ev }), (e) => after.run(null, { entries: e, newEvidence: ev }));
   for (const row of r.rows) delete row.entries;
   fs.mkdirSync(path.dirname(opt.out), { recursive: true });
@@ -185,7 +186,7 @@ async function main(argv) {
   let worktree = null;
   try { worktree = git(["rev-parse", "HEAD"]).trim() + (git(["status", "--porcelain", "--", "scripts/hook-stop-closure.mjs", "scripts/lib"]).trim() ? "+dirty" : ""); } catch { /* 取不到不影响 */ }
   fs.writeFileSync(opt.out, JSON.stringify({ base: base.sha, after: "worktree", worktree, seed: opt.seed, max: opt.max, tail: opt.tail, corpus: dirs,
-    turnsAvailable: all.length, ...r, rows: undefined, added: r.added, removed: r.removed, changed: r.changed, errored,
+    turnsAvailable: all.length, evidenceShared: evShared, ...r, rows: undefined, added: r.added, removed: r.removed, changed: r.changed, errored,
     picked: jobs.map((j) => `${j.file}#${j.idx}`) }, null, 1));   // 全路径:多语料目录有同名转录时也能唯一反查(codex 266-r2 表)
   const rules = Object.entries(r.newBlocksByRule).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join(" ") || "无";
   console.log(`gate-replay base=${base.sha.slice(0, 8)} → 工作树:回放 ${r.turns} 回合(可用 ${all.length};语料 ${files.length} 份转录;种子 ${opt.seed};${Math.round((Date.now() - t0) / 1000)} 秒)`);
@@ -195,6 +196,8 @@ async function main(argv) {
   for (const x of [...r.added, ...r.changed].slice(0, 10)) console.log(`  + ${rel(x.file)}#${x.idx} [${x.before.join(",") || "-"}→${x.after.join(",")}] «${x.text.slice(0, 80)}»`);
   console.log(`  全量:${path.relative(ROOT, opt.out).replace(/\\/g, "/")}`);
   console.log("  CEILING: 外部状态冻结为「无批、无台账」;不带 git 事实(原样装入豁免不在覆盖面)/ 后台任务载荷 / 观察档;每回合只看末尾 --tail 条;P / DP / A / K 读数打折看");
+  // codex 266-r3 补充事实:改前版本不认 newEvidence 注入时,它自己读预检台账 / git 索引,同一份规则也能读出假的新增 I——明说,别让人当真
+  if (!evShared) console.log("  ⚠ 改前版本早于「新证据注入」接口(批 266):两版的新证据读数不同源,I 等依赖新证据的规则新增 / 解除不可比,按「判不了」处理");
   return 0;
 }
 
