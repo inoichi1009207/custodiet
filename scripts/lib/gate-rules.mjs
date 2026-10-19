@@ -4550,7 +4550,20 @@ const RULE_P = {
       // 被否定的 base 已在 fbBases 里剔掉;剩下的**全部**合格才认。沿革:取第一处误拦「先举反例再写真 base」(FB-2),
       //   取最后一处误拦「真 base 后提醒不要用 HEAD」(FB-16),任一合格即认又放过「do not use --base <好>; only use --base <坏>」(codex 266-r3 §1)
       //   ——三种都是诚实写法,分界在否定词,不在位置
-      return bases.every((b) => RULE_P._p.fbBaseOk(b, ctx));
+      //   红队第三轮 BP-4:`--base must predate…` 里的 must 被当成候选 ⇒ 误拦。剔掉英文虚词 / 说明词(fbResolvable);
+      //   codex 266-r5 §6:原先「解析不了就剔掉」连拼错的 ref 一起剔,「先前用 --base <好>;本次改用 --base <拼错>」放行 ⇒ 撤回,只按词表剔
+      //   误拦猎手第三轮 FB-26:「use --base <好> rather than --base HEAD」「注意 --base HEAD 会给假零新增」——提醒别用 HEAD 是 agent 定义与 P 消息都在提倡的
+      //   ⇒ 有别的候选时,字面 HEAD / @ 当提及剔掉。取舍:与它句式对称的「先前用 <好>,本次改用 --base HEAD」(codex 266-r4 §2)因此放行,登记 D167㉒
+      let usable = bases.filter((b) => RULE_P._p.fbResolvable(b, ctx));
+      const isHeadLit = (b) => /^(HEAD|@)([~^]0*)?$/i.test(String(b).trim());
+      if (usable.some((b) => !isHeadLit(b))) usable = usable.filter((b) => !isHeadLit(b));
+      if (!usable.length) return false;
+      return usable.every((b) => RULE_P._p.fbBaseOk(b, ctx));
+    },
+    /** 这个候选是不是在给 rev(而不是英文说明里的虚词 / 说明词)。只按词表剔;拼错、不存在的 ref 照样留下交 fbBaseOk 判坏(codex 266-r5 §6) */
+    fbResolvable(rev) {
+      const r = String(rev || "").trim();
+      return !!r && !/^(must|should|shall|may|be|is|are|was|the|a|an|to|and|or|of|for|which|that|this|here|value|option|flag|rev|ref|commit|sha|needs?|will|can|has|have|with|from|in|on|at|as|not|only|use|given|required|argument|parameter|before|after|earlier|older)$/i.test(r);
     },
     /** 入参里所有 `--base <rev>` / `base=<rev>` 的 rev(去引号、反引号)。误拦猎手回件 FB-1:法条与 agent 定义都写 `--base <rev>`,
      *  回放器 `rev-parse --verify <rev>^{commit}` 认任意 ref——判据原只认 7–40 位 hex,`--base master`、`--base "4b62334"`、64 位 sha 全被拒。 */
@@ -4559,9 +4572,11 @@ const RULE_P = {
       const out = [];
       // 第二轮 FB-17:全角冒号「：」也认;入参是 JSON 串,换行在里面是 `\n` 两个字符 ⇒ 当空白
       // codex 266-r3 表:CRLF 的 `\r\n` 同样当空白
-      const re = /(?:--base(?:[\s=]|\\[rn])+|\bbase\s*[=:\uFF1A]\s*)["'\x60]?([\w./~^@{}+:-]+)/gi;
+      //   误拦猎手第三轮 FB-26:`merge-base:` 不是 base;附节二③:agent 定义自己的入参格式 `**base**:\`sha\``、`base(改动前的提交):sha`、`「sha」` 都认
+      const re = /(?:--base(?:[\s=]|\\[rn])+|(?<![\w-])base\**(?:\([^)]{0,20}\))?\s*[=:\uFF1A]\s*\**\s*)["'\x60「]?([\w./~^@{}+:-]+)/gi;
       // codex 266-r3 §1:前面紧挨着否定词(「不要用」「别填」「do not use」…)的那一处是在排除它,不是在给 base
-      const NEG = /(?:不要|不许|不能|不得|别|勿|禁止|避免|而非|不是|do\s+not|don'?t|never|not|avoid|instead\s+of)\s*(?:用|填|写|使用|传|给|use|pass)?\s*[「"'\x60(]?\s*$/i;
+      //   红队第三轮 BP-3:「分别用 --base X」的「别」不是否定 ⇒ 单字「别」前面是构词字时不算
+      const NEG = /(?:不要|不许|不能|不得|(?<![分区特告差级识鉴辨派类性个])别|勿|禁止|避免|而非|不是|do\s+not|don'?t|never|not|avoid|instead\s+of)\s*(?:用|填|写|使用|传|给|use|pass)?\s*[「"'\x60(]?\s*$/i;
       let m; while ((m = re.exec(p))) { if (!NEG.test(p.slice(Math.max(0, m.index - 24), m.index))) out.push(m[1]); }
       return out;
     },
@@ -4618,6 +4633,7 @@ const RULE_P = {
     engineBySyntax(ctx) {
       const H = RULE_P._p, w = H.win(ctx), root = ctx.hookCheckout || null;
       const acts = [...((w && Array.isArray(w.actions)) ? w.actions : []), ...(Array.isArray(ctx.actions) ? ctx.actions : [])];
+      const nPrior = (w && Array.isArray(w.actions)) ? w.actions.length : 0;
       let lastB = -1, lastF = -1, lastBatchEdge = -1;
       acts.forEach((a, i) => {
         if (H.isBoundHunter(a)) lastB = i;
@@ -4627,7 +4643,9 @@ const RULE_P = {
         //   `rg "batch-goal.mjs --arm"`、echo 这串字都不算。判定复用 K/K0 的 `batchGoalOps`(读命令 / 打印段头不算执行、去引号后取开关;唯一实现),解析失败 ⇒ 不算批界(多追一段,宁拦)
         if (/^(Bash|PowerShell)$/.test(String(a && a.name || ""))) {
           let ops = []; try { ops = batchGoalOps({ actions: [a] }); } catch { ops = []; }
-          if (ops.some((o) => o.op === "clear")) lastBatchEdge = i;
+          // 红队第三轮 BP-1 / BP-2:批界的意思是「上一批的 P 在当时那次 Stop 已结清过」——本轮自己的 --clear 还没经过 Stop,
+          //   `改闸 → 红队 → git add -A && commit && --clear` 一轮做完时它不是批界 ⇒ 只认前几轮窗口(w.actions)里的
+          if (ops.some((o) => o.op === "clear") && i < nPrior) lastBatchEdge = i;
         }
       });
       // 误拦猎手第二轮附节二①(漏放):`batch-goal --clear && git add -A && git commit`、或结清后才 `git add -A` ⇒
@@ -5295,12 +5313,30 @@ const RULE_P = {
                 { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "scripts/lib/gate-rules.mjs: do not use --base 4b62334; only use --base HEAD~1" } }],
         resolveRev: { "HEAD~1": "c".repeat(40) },
         headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "c".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
-      { name: "266 codex r4 §2:先前用过 --base <好>、本次改用 --base HEAD ⇒ 两处都要合格,仍欠",
+      { name: "266 FB-2 反面(占位,原 r4 §2 已移到反例):只写 --base HEAD ⇒ 仍欠",
         text: "提交。", pLedger: { carriers: 0 },
         bash: ["git commit -am x"],
         prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
-                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "先前回放命令是 gate-replay.mjs --base 4b62334;本次改用 gate-replay.mjs --base HEAD,改 scripts/lib/gate-rules.mjs" } }],
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 改动:gate-replay.mjs --base HEAD" } }],
         headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "c".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 红队第三轮 BP-1:改闸→红队→本轮一条命令 add -A && commit && --clear,无误拦猎手 ⇒ 本轮的 --clear 不是批界,仍欠",
+        text: "提交并结清。", pLedger: { carriers: 0 },
+        bash: ["git add -A && git commit -q -m done && node --no-warnings scripts/batch-goal.mjs --clear"],
+        prior: [{ text: "改闸", write: "scripts/lib/gate-rules.mjs" },
+                { text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }] },
+      { name: "266 红队第三轮 BP-2:改闸→整提交→红队→本轮 --clear(另一条),无误拦猎手 ⇒ 仍欠",
+        text: "结清。", pLedger: { carriers: 0 },
+        bash: ["git add -A && git commit -q -m y", "node --no-warnings scripts/batch-goal.mjs --clear"],
+        prior: [{ text: "改闸", write: "scripts/lib/gate-rules.mjs" },
+                { text: "提交", bash: "git add -A && git commit -q -m x" },
+                { text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }] },
+      { name: "266 codex r5 §6:先前 --base <好>、本次改用 --base <拼错的 ref> ⇒ 拼错的照样判坏,仍欠",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "先前回放 scripts/lib/gate-rules.mjs --base a1b2c3d;本次改用 --base missing-release" } }],
+        resolveRev: {},
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
       { name: "266 FB-2 反面:base 填 HEAD 字面 ⇒ 仍欠",
         text: "提交。", pLedger: { carriers: 0 },
         bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
@@ -5735,6 +5771,44 @@ const RULE_P = {
         prior: [{ text: "改闸", write: "scripts/lib/gate-rules.mjs" },
                 { text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
                 { text: "提交并结清", bash: "git add -A && git commit -q -m done && node --no-warnings scripts/batch-goal.mjs --clear" }] },
+      { name: "266 红队第三轮 BP-3:「两笔改闸分别用 --base 4b62334」的「别」不是否定 ⇒ 放行",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs:两笔改闸分别用 --base 4b62334 起跑" } }],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 红队第三轮 BP-4:英文说明「--base must predate…; use --base 4b62334」⇒ must 解析不了、剔掉,放行",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 },
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "scripts/lib/gate-rules.mjs: --base must predate the first gate commit; use --base 4b62334" } }],
+        resolveRev: {},
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 误拦猎手第三轮 FB-26:真 base 后接「rather than --base HEAD」⇒ 放行",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 }, bash: ["git commit -am x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs:use --base a1b2c3d rather than --base HEAD" } }],
+        headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 误拦猎手第三轮 FB-26:「上轮误用了 --base HEAD,本轮改用 --base <好>」⇒ 放行",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 }, bash: ["git commit -am x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs:上轮误用了 --base HEAD,本轮改用 --base a1b2c3d" } }],
+        headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 误拦猎手第三轮 FB-26:git merge-base: <改闸提交> 不是 base ⇒ 放行",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 }, bash: ["git commit -am x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs --base a1b2c3d(git merge-base: eeeeeee)" } }],
+        headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 误拦猎手第三轮附节二③:agent 定义格式 **base**:`<sha>` ⇒ 放行",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 }, bash: ["git commit -am x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs\n- **base**:`a1b2c3d`" } }],
+        headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 取舍(D167㉒):先前用 --base <好>、本次改用 --base HEAD ⇒ HEAD 当提及剔掉,放行",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 }, bash: ["git commit -am x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "先前回放命令是 gate-replay.mjs --base a1b2c3d;本次改用 gate-replay.mjs --base HEAD,改 scripts/lib/gate-rules.mjs" } }],
+        headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
       { name: "266 误拦猎手 FB-2:base 是范围里早于全部改闸提交的纯文档提交 ⇒ 放行",
         text: "提交。", pLedger: { carriers: 0 },
         bash: ["git commit -am x"],
