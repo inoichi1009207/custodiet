@@ -134,6 +134,7 @@ async function main(argv) {
   const opt = { base: "HEAD", corpus: [], max: 1500, seed: 20261019, tail: 4000, out: path.join(ROOT, ".claude", ".gate-replay", "last.json") };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i], v = argv[i + 1];
+    if (k.startsWith("--base=")) { opt.base = k.slice("--base=".length); continue; }   // codex 266-r7 §1:与 P 认的写法对齐
     if (k === "--base") { opt.base = v; i++; }
     else if (k === "--corpus") { opt.corpus.push(path.resolve(v)); i++; }
     else if (k === "--max") { opt.max = Number(v); i++; }

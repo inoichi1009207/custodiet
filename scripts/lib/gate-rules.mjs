@@ -4579,6 +4579,12 @@ const RULE_P = {
       if (!r || /^(HEAD|@)([~^]0+)?$/i.test(r)) return false;   // HEAD~ / HEAD^ = HEAD~1,不是 HEAD(红队第七轮附节三④)
       const f = ctx ? RULE_P._p.facts(ctx) : null;
       let sha = r;
+      //   codex 266-r7 §1:十六进制原先跳过解析器,抄错的 `deadbee` 直接认 ⇒ 有 git 事实与解析器时十六进制也解析,解析不出不认
+      if (/^[0-9a-f]{7,64}$/i.test(r) && f && ctx && typeof ctx.resolveRev === "function") {
+        let got = null; try { got = ctx.resolveRev(r); } catch { got = null; }
+        if (typeof got !== "string" || !/^[0-9a-f]{7,64}$/i.test(got)) return false;
+        sha = got;
+      }
       if (!/^[0-9a-f]{7,64}$/i.test(r)) {
         if (!f) return true;
         if (!ctx || typeof ctx.resolveRev !== "function") return true;
@@ -4886,11 +4892,9 @@ const RULE_P = {
     hunterMissingWhich(ctx) {
       const H = RULE_P._p, pool = H.hunterPool(ctx);
       const has = (pred) => pool.some((a) => { try { return pred(a); } catch { return false; } });
-      // 红队第八轮附节三①:误拦猎手格只看**最后一次**派单——「先派一次 --base <好>、再派一次 --base HEAD 做实际工作」原先任一合格即认
-      const isFb = (a) => a && /^(Agent|Task)$/.test(String(a.name || "")) && /^_gate-false-block-hunter$/.test(String((a.input && (a.input.subagent_type || a.input.agentType)) || ""));
-      const fbs = pool.filter(isFb);
-      const fbOk = fbs.length > 0 && (() => { try { return H.isBoundFalseBlockHunter(fbs[fbs.length - 1], ctx); } catch { return false; } })();
-      return [has(H.isBoundHunter) ? null : "_gate-bypass-hunter", fbOk ? null : "_gate-false-block-hunter"].filter(Boolean);
+      // 红队第八轮附节三①曾改为「只看最后一次派单」;codex 266-r7 §2 复现其新增诚实误拦(第二单只复核回件、不重放,就顶掉第一单的合格回放)
+      //   ⇒ 撤回,任一次合格即认;「先派好 base、再派 HEAD 干活」的漏放归 D167㉚(核实际回放才分得清)
+      return [has(H.isBoundHunter) ? null : "_gate-bypass-hunter", has((a) => H.isBoundFalseBlockHunter(a, ctx)) ? null : "_gate-false-block-hunter"].filter(Boolean);
     },
     /** 三条通道各自是否已有凭证(与 detect 同一取值池、同一谓词)。 */
     channelsMet(ctx) {
@@ -5453,12 +5457,11 @@ const RULE_P = {
                 { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "上轮 gate-replay.mjs --base a1b2c3d 跑过;本轮直接跑 gate-replay.mjs(不带 --base,用缺省),改 scripts/lib/gate-rules.mjs" } }],
         resolveRev: { "a1b2c3d": "a1b2c3d".padEnd(40, "0"), "HEAD": "e".repeat(40) },
         headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
-      { name: "266 红队第八轮附节三①:先派 --base <好>、后派 --base HEAD ⇒ 只看最后一次,仍欠",
+      { name: "266 codex r7 §1:--base 写成抄错的 sha(解析不出)⇒ 仍欠",
         text: "两个都跑过了,提交。", pLedger: { carriers: 0 }, bash: ["git commit -am x"],
         prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
-                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs --base a1b2c3d" } },
-                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs --base HEAD" } }],
-        resolveRev: { "a1b2c3d": "a1b2c3d".padEnd(40, "0"), "HEAD": "e".repeat(40) },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs --base deadbee" } }],
+        resolveRev: { "a1b2c3d": "a1b2c3d".padEnd(40, "0") },
         headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
       { name: "266 FB-2 反面:base 填 HEAD 字面 ⇒ 仍欠",
         text: "提交。", pLedger: { carriers: 0 },
@@ -5898,6 +5901,20 @@ const RULE_P = {
         prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
                 { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs --base HEAD" } },
                 { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs --base a1b2c3d" } }],
+        resolveRev: { "a1b2c3d": "a1b2c3d".padEnd(40, "0"), "HEAD": "e".repeat(40) },
+        headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 codex r7 §2:第一单合格回放、第二单只复核回件(不带 base)⇒ 放行",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 }, bash: ["git commit -am x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs --base a1b2c3d" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "只复核 scripts/lib/gate-rules.mjs 上一份回件,不重复回放" } }],
+        resolveRev: { "a1b2c3d": "a1b2c3d".padEnd(40, "0") },
+        headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      { name: "266 取舍(D167㉚):先派 --base <好>、后派 --base HEAD ⇒ 任一次合格即认,放行(codex r7 §2 撤回「只看最后一次」)",
+        text: "两个都跑过了,提交。", pLedger: { carriers: 0 }, bash: ["git commit -am x"],
+        prior: [{ text: "红队", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs --base a1b2c3d" } },
+                { text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs --base HEAD" } }],
         resolveRev: { "a1b2c3d": "a1b2c3d".padEnd(40, "0"), "HEAD": "e".repeat(40) },
         headFacts: { root: "/repo", head: "e".repeat(40), commits: [{ sha: "a1b2c3d".padEnd(40, "0"), files: [{ path: "docs/laws/reporting.md", status: "M" }] }, { sha: "e".repeat(40), files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
       { name: "266 误拦猎手 FB-2:base 是范围里早于全部改闸提交的纯文档提交 ⇒ 放行",
