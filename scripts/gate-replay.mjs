@@ -14,7 +14,7 @@
 //   · 抽样:全部回合按 `--seed` 洗牌后取前 `--max` 个(缺省 1500;按 mtime 排序会只取到写规则的那个会话 = 拿训练集测,见 hook run() 头注)。
 //   · 产出:一屏摘要(阻断回合改前 / 改后、新增 / 解除、按规则分、前 10 条新增样例)+ 全量 JSON(`--out`,缺省 .claude/.gate-replay/last.json)。
 //
-// 用法:node --no-warnings scripts/gate-replay.mjs [--base <rev>] [--corpus <目录>]... [--max N] [--seed S] [--tail N] [--out 文件]
+// 用法:node --no-warnings scripts/gate-replay.mjs [--base <rev> | --base=<rev>] [--corpus <目录>]... [--max N] [--seed S] [--tail N] [--out 文件]
 //       node --no-warnings scripts/gate-replay.mjs --self-test
 // 退出码:0 跑完(有没有新增阻断都是 0——判拦对 / 误拦是误拦猎手的活,不是本工具的);2 参数错;3 改前版本取不到;4 语料为空
 //
