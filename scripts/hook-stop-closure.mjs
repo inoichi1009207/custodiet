@@ -236,10 +236,21 @@ export function fpTable(alerts, ledger, { minAlerts = 20, minRate = 0.15 } = {})
   //   claimed_fp 不带通道:默认它针对主通道(本仓 211 笔里 0 笔属子代理通道);子代理行若有人记误报,分子会偏高(红队 a30a87d8 BP-4,D164⑬)
   for (const a of (alerts || []).filter(fpRowCounted)) for (const id of fpIdsOf(a)) per[id] = (per[id] || 0) + 1;
   for (const [id, d] of Object.entries(fpNetById(ledger))) fp[id] = d;
+  const confirmed = fpConfirmedById(ledger);
   return Object.keys(per).map((id) => {
     const f = Math.max(0, fp[id] || 0), rate = per[id] ? f / per[id] : 0;
-    return { id, alerts: per[id], fp: f, rate, hot: per[id] >= minAlerts && rate >= minRate };
+    return { id, alerts: per[id], fp: f, rate, confirmed: confirmed[id] || 0, hot: per[id] >= minAlerts && rate >= minRate };
   }).sort((a, b) => b.alerts - a.alerts || a.id.localeCompare(b.id));
+}
+/** 批 272(交接 clipboard/272-gate-handoff.md 第一节):按规则数**盲审已确认的误拦**——每笔(ref)取最后一个 codex 结论,为「拦错了」计 1。
+ *  与净误报列不同:它不依赖自签减法,只数独立模型确认过的笔数(只会少算不会多算;没人喊冤的误拦进不来)。只改工装输出,不改判据。 */
+export function fpConfirmedById(ledger) {
+  const last = new Map();
+  // 红队 a47d383e 附节三④:同一 ref 下可能有多条规则的结论 ⇒ 按 ref + 规则 id 取最后结论,不互相覆盖
+  for (const x of ledger || []) if (x && x.kind === "fp_audit" && x.ref && x.id) last.set(`${x.ref}\u0000${x.id}`, x);
+  const out = {};
+  for (const x of last.values()) if (x.verdict === "拦错了") out[x.id] = (out[x.id] || 0) + 1;
+  return out;
 }
 
 /** 批 266:原样装入的闸引擎(用户 10-19「红队要么设置成可选,要么就把红队体系完善了」;新仓装闸那次提交必撞 D11,
@@ -607,7 +618,12 @@ export const PAT = {
   defect: [
     /(还)?(没|未)(有)?(落盘|入仓|接线|生效|实现|覆盖|做完)/,
     /(缺|少)(了|一个|一条|一处)/,
-    /只(有|看得到).{0,12}(没|缺)/,
+    // 批 273:「只有 A,<新主语/副词>没 V过」不算(「只有英文版，我没见过」「只有 705 字节,还没做过任何事」
+    //   是另起一句讲经历/状态,不是「只有 A 没 B」的缺件)。**两件同时成立才让**:没前是分句界 + 1–3 字主语/副词,
+    //   且没后 1–2 字接「过」。只占一件照拦:「只有两条没通过」「只有记录项，没有通过门槛」「只有单测,没跑过端到端」「只有一处没过复核」。
+    //   已知洞:「只有单测,还没跑过端到端」也被让(分不出「还没做过任何事」)——语料 5010 回合里未观测到此形。
+    // 批 273 红队 a47d383e BP-4:经历体主语只认「我 / 还 / 我还 / 我们」——「后端没测过」「代码还没动过」这种名词主语照拦
+    /只(有|看得到).{0,12}(缺|(?<![,，;；、]\s*(?:我们?还?|还))没|没(?![^\s,，。;；:：]{1,2}过))/,
     /(不在|没进)(仓|索引|白名单)/,
   ],
   downgrade: [
@@ -4550,6 +4566,9 @@ function selfTest() {
         hp("误报率表:K 30% 但报警只有 10 次 ⇒ 不进待修", k.hot, false);
         hp("误报率表:报警 20 次、误报 3 笔(15%)⇒ 进待修", fpTable(al, lg.filter((x) => x.kind !== "retraction")).find((r) => r.id === "S").hot, true);
         hp("误报率表:撤回多于误报 ⇒ 不低于 0", fpTable([{ ids: ["V"] }], [{ kind: "retraction", id: "V" }])[0].fp, 0);
+        hp("272 盲审确认误拦列:每笔取最后结论,拦错了才计(先判不出后拦错了 = 1;先拦错了后拦对了 = 0)",
+          JSON.stringify(fpConfirmedById([{ kind: "fp_audit", id: "S", ref: "a", verdict: "判不出" }, { kind: "fp_audit", id: "S", ref: "a", verdict: "拦错了" },
+            { kind: "fp_audit", id: "S", ref: "b", verdict: "拦错了" }, { kind: "fp_audit", id: "S", ref: "b", verdict: "拦对了" }, { kind: "claimed_fp", id: "S", ref: "c" }])), '{"S":1}');
         hp("265 误报率表:子代理通道行与 UNKNOWN 不计入分母(红队 a0dfbfce BP-4)",
           JSON.stringify(fpTable([{ ids: ["M"] }, { ids: ["M", "UNKNOWN"], channel: "SubagentStop" }, { ids: ["UNKNOWN"] }], []).map((r) => [r.id, r.alerts])), '[["M",1]]');
         hp("误报率表:按报警量降序", tb.map((r) => r.id).join(","), "S,K");
@@ -5145,8 +5164,9 @@ if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
     // 批 258 条件 4:按规则的报警量 × 误报率表;误报率 ≥15% 且报警 ≥20 ⇒ 下一批待修(`--hot` 只印待修行,供 batch-goal 开批时列出)
     const tbl = fpTable(alerts, led);
     const hotOnly = argv.includes("--hot");
-    if (!hotOnly) console.log("\n规则  报警  误报  误报率  待修");
-    for (const r of tbl) if (!hotOnly || r.hot) console.log(`${hotOnly ? "待修 " : ""}${r.id.padEnd(4)}  ${String(r.alerts).padStart(4)}  ${String(r.fp).padStart(4)}  ${(r.rate * 100).toFixed(1).padStart(5)}%  ${r.hot ? "← 下一批待修" : ""}`);
+    // 批 272:加「盲审确认误拦」列——独立模型判「拦错了」的笔数,不受自签减法与阈值边界影响;排修理优先级先看这一列
+    if (!hotOnly) console.log("\n规则  报警  误报  误报率  盲审确认误拦  待修");
+    for (const r of tbl) if (!hotOnly || r.hot) console.log(`${hotOnly ? "待修 " : ""}${r.id.padEnd(4)}  ${String(r.alerts).padStart(4)}  ${String(r.fp).padStart(4)}  ${(r.rate * 100).toFixed(1).padStart(5)}%  ${String(r.confirmed).padStart(12)}  ${r.hot ? "← 下一批待修" : ""}`);
   }
   process.exit(0);
 }

@@ -309,12 +309,52 @@ export const RULE_B = {
   },
 };
 
+// 批 273(盲审判「拦错了」且现行重放仍拦的 5 条):C 一直在**原文整行**上跑 PAT.defect,
+//   于是把**状态描述**读成本仓缺陷陈述——引文里的标签(「…没覆盖的…」)、讲经历的「我没见过 / 还没做过」、
+//   行内已指向债表的「已登记债(D95)」、子代理「没有做完」而批账上已挂着「条件N:未达成」。
+//   共同机制:**命中片段不是一句由我说出、尚未入账的缺件断言**。四处收窄,各管一面,都只删命中、不加词:
+//     ① 先过 `maskQuoted`(E0/E2/R/S 同一份口径:引文=提及不是使用;等长保行,回显仍取原文);
+//     ② PAT.defect 第 3 条:「只有 A,我/还没 V过」(分句界后另起主语/副词 **且** 经历体「V过」)不算;
+//        只占一件照拦(「只有两条没通过」「只有单测,没跑过端到端」)——改在 hook 的 PAT 表,头注写明已知洞;
+//     ③ 同一**句**(。！？;；切)里出现「已登记」⇒ 该句不算(与「未覆盖」同属登记面的文字声明;
+//        只认同句,比「未覆盖」的全文口径窄;「D95 已登记。另外 X 还没接线。」后句照拦);
+//     ④ 「没(有)做完」是**进度**不是缺件:本轮写了「条件N:未达成」时它归 K 的条件账,C 不重报(B 与 Q 双报的同一病,
+//        见 PAT.promise 头注);没写条件账的「没做完」照拦。
+//   量过(本批语料扫描,5010 回合、C 判据文本层近似):四刀合计解除 13 回合,逐条判诚实(q5 / done5 / ②2 / ③1)。
+//   让出面(被关机打断的前一代理所记,读数本批未复核):把 `.{0,12}` 限在分句内(会放走「只有文档,碰不到它;它缺的那份…」这类跨分句真缺件)、
+//   把「做完」整个移出 PAT.defect(会放走「缺一份事实索引…要我现在就动吗」这类同轮真缺件)、
+//   把「条件N:未达成」当全文登记(17 条解除里含「跨批次串号…没有批号」这类真缺件)——三者都是收窄过头。
+//   红队 a47d383e(批 273 收口)四处再收:
+//     BP-1 ① 引文前紧跟「报 / 说 / 指出 / 发现 / 提到 / 反映」的不剥——那是在转述别人报的缺件(「红队报:「X 没覆盖」。先不修」);
+//     BP-2 ③ 「已登记」只遮它自己所在的**分句**(逗号 / 冒号 / 竖线也切),且前面紧跟否定(不是 / 并非 / 没 / 未 / 非)的不遮;
+//     BP-3 ④ 「没做完」只在其分句里出现某条「条件N:未达成(X …)」括注主语 X 时才遮——豁免绑到那个条件,不按全文;
+//     BP-4 ② 经历体主语只认「我 / 还」(改在 hook 的 PAT 表):「后端没测过」这种名词主语照拦。
+const defectText = (ctx) => {
+  const raw = String(ctx.text || "");
+  const keepQuote = /(?:报|说|指出|发现|提到|反映)\s*[:：]?\s*$/;
+  // ① 逐个引文判:前文以转述动词收尾的引文原样保留,其余按 maskQuoted 口径等长抹去
+  const masked = maskQuoted(raw);                                    // 等长抹引文
+  const q = /「[^」\n]*」|“[^”\n]*”|"[^"\n]*"/g;
+  let kept = masked, m;
+  while ((m = q.exec(raw)) !== null) if (keepQuote.test(raw.slice(Math.max(0, m.index - 8), m.index))) kept = kept.slice(0, m.index) + raw.slice(m.index, q.lastIndex) + kept.slice(q.lastIndex);
+  const notes = [...maskQuoted(raw).matchAll(/条件\s*\d+\s*[:：]\s*未达成\s*[（(]([^）)\n]{1,40})[）)]/g)]
+    .map((x) => x[1].replace(/\s*(?:在跑|在审|还在|还没|未|没|仍在|正在).*$/, "").trim()).filter((s) => s.length >= 1);
+  const blank = (s) => " ".repeat(s.length);                          // 等长保行:回显仍取原文同号行
+  return kept.split("\n").map((l) => {
+    // 误拦猎手 ae8ef771 附节二②:无句读长行上不限长的两侧量词是平方级(20 万字 33 秒,超 Stop 30 秒)⇒ 两侧各限 200
+    l = l.replace(/[^。！？!?;；，,：:|]{0,200}已登记[^。！？!?;；，,：:|]{0,200}/g, (s) => (/(?:不是|并非|没有?|未|非)\s*已登记/.test(s) ? s : blank(s)));   // ③ 同分句
+    if (!notes.length) return l;
+    // codex 273-r1:分句也在逗号处断——「组 G 在跑,迁移脚本还没做完」的前分句主语不得借给后分句
+    return l.replace(/[^。！？!?;；，,\n]{0,200}?(还)?(没|未)(有)?做完[^。！？!?;；，,\n]{0,200}/g, (s) => (notes.some((n) => s.includes(n)) ? s.replace(/(还)?(没|未)(有)?做完/g, blank) : s));   // ④ 绑条件
+  }).join("\n");
+};
+
 export const RULE_C = {
   id: "C",
   blocking: false,
   law: "AGENTS.md#恒定条款",
   detect: (ctx) => {
-    const hits = matchAny(ctx.text, PAT.defect);
+    const hits = matchAny(defectText(ctx), PAT.defect, ctx.text);
     if (!hits.length) return [];
     if (ctx.writes.length) return [];                                  // 动手处置了
     // 登记面:写进未覆盖栏 / 落进 clipboard/prompts / 事件流。只看**我说的**与**我写的**,
@@ -341,10 +381,34 @@ export const RULE_C = {
     } }) },
   ],
   cases: {
-    pos: [{ text: "那条还没落盘,也没入仓。" }],
+    pos: [
+      { text: "那条还没落盘,也没入仓。" },
+      // 批 273 贴边正例:各卡在一刀的边界外
+      { text: "只有两条没通过复核。" },                                  // ② 没前无分句界+主语
+      { text: "只有单测,没跑过端到端。" },                              // ② 分句界后直接「没」
+      { text: "D95 已登记。另外 hook 还没接线。" },                      // ③ 已登记在前一句
+      { text: "那段「示例」之外,模块还没接线。" },                        // ① 命中在引文外
+      { text: "「条件1:未达成」是 K 的写法。组 G 没有做完。" },            // ④ 条件账只在引文里 ⇒ 不算记账
+      // 红队 a47d383e(批 273 收口)BP-1–4
+      { text: "红队报:「O 的退回分支没覆盖 markdown 链接」。我先不修。" },    // BP-1 转述别人报的缺件
+      { text: "D95 已登记,另外 hook 还没接线。" },                        // BP-2 逗号同句
+      { text: "这不是已登记的债,是新的:hook 还没接线。" },                // BP-2 否定形
+      { text: "| D95 已登记 | hook 还没接线 |" },                          // BP-2 表格行
+      { text: "条件2:未达成(组 G 在跑)\n另外迁移脚本的回滚分支还没做完,先不管。" },   // BP-3 条件账不罩无关缺件
+      { text: "条件2:未达成(组 G 在跑)\n组 G 在跑,迁移脚本还没做完,先不管。" },          // codex 273-r1:主语不跨逗号借
+      { text: "只有前端测了,后端没测过。" },                              // BP-4 名词主语经历体
+    ],
     neg: [
       { text: "那条还没落盘,已写进未覆盖栏。" },
       { text: "那条还没落盘,我现在就补。", write: "docs/x.md" },   // 动手改了 ⇒ 已处置
+      // 批 273 样本形态(盲审判拦错):
+      { text: "它只有英文版，我没见过合法的免费中文版。" },               // ② 经历体
+      { text: "转录只有 705 字节,还没做过任何事。" },                     // ② 状态描述
+      { text: "取页核实的结果里有一条不成立:「覆盖到但断言弱的行比没覆盖的更险」这句不在那一页上。" },   // ① 引文
+      // ③ 同分句已登记。让出面(红队 a47d383e BP-2 收口后):原样本末分句「本会话没有入仓写入」是状态描述却与「还没入仓」字面同形,
+      //   ③ 收到分句后它单独露出、照提示——C 不阻断,取「逗号连写的真缺件不被已登记吃掉」一侧
+      { text: "收尾闸只剩 CW 一项,是超时的已登记债(D95)。" },
+      { text: "组 G 没有做完:分支还停在 d3567e1,我已经把它叫醒接着做。\n\n条件1:达成\n条件2:未达成(组 G 在跑)" },   // ④ 进度已入条件账
     ],
   },
 };
@@ -1310,6 +1374,77 @@ function writeTargets(rawCmd) {
   return out;
 }
 
+// 批 273 M:盲审判「拦错了」的三份诚实样本,共同机制 = **把探针 / 夹具的临时路径当成真改动文件**。
+//   三个结构信号各管一形(都只**剔除**目标,不改 writeTargets——它另有消费者 :6521):
+//   ① 位置:路径以临时目录环境变量开头(`"$TEMP/bg-before.json"`)。旧滤只认 `/tmp/`、`/temp/` 带前导斜杠。
+//   ② 语境:`>` 落在**非 shell 解释器**(node/python/perl/ruby/deno/bun 的 -e/-c/-p)程序串的引号里
+//      ⇒ 那是该语言里的字符串字面量,不是 shell 重定向(`node -e "for(c of ['echo x > a/config.json'])…"`)。
+//      程序串里有起子进程的 API 时不剔(`execSync('echo x > f')` 是真写)。只动重定向那一种抽取;
+//      `writeFileSync('…')` 本来就住在引号里,照常计入。
+//   ③ 动作:同一条命令里该路径**写后**又被 `rm` 删掉(`printf … > b1.json; curl --data-binary @b1.json; rm -f b1.json`)
+//      ⇒ rm 若执行了,就没有「静默没改成」可言。必须同一条命令、写段是 printf/echo 的引号外重定向、
+//      写段在前、rm 操作数与目标逐字相等,且 rm 前的连接符是 `;` / 换行,或紧跟写段的 `&&`
+//      (中间步骤后的 `&& rm` 与 `|| rm` 在前步失败 / 成功时不执行,不算——codex 273-r1、红队 BP-11)。
+//      天花板:只看命令文本,不看工具结果;`;` 后的 rm 本身失败(权限 / 占用)判不出。
+//   全语料(17,901 条去重命令)逐条比对改前改后写目标:剔掉的 14 条命令全是上面三形,无真改动文件。
+const M_TEMP_VAR = /^(?:\$\{?(?:TEMP|TMP|TMPDIR)\}?|%(?:TEMP|TMP)%|\$env:(?:TEMP|TMP))\//i;
+const M_INTERP = /^(?:node|python3?|py|perl|ruby|deno|bun)(?:\.exe)?\s(?:.*\s)?(?:-[ecp]|--eval|--print)\s/i;
+// 红队 a47d383e(批 273 收口)BP-10:`os.popen` 也起 shell;perl / ruby 的反引号同理;解释器输出再 `| sh` 交给 shell 执行
+const M_SPAWN = /child_process|subprocess|os\.system|\bpopen\b|\bsystem\s*\(|Popen|\bexec(?:Sync|File|FileSync)?\s*\(|\bspawn(?:Sync)?\s*\(/i;
+const M_PIPE_SHELL = /\|\s*(?:ba|z|da)?sh\b|\|\s*(?:pwsh|powershell|cmd)(?:\.exe)?\b/i;
+/** 把「非 shell 解释器程序串引号里的 `>`」抹成空格(其余不动),供与 writeTargets 原式对照。 */
+function mNeutralizeProgramRedirs(rawCmd) {
+  const s = stripHeredoc(String(rawCmd));
+  if (M_PIPE_SHELL.test(s)) return s;   // BP-10:程序串可能被 shell 执行 ⇒ 一个都不抹
+  const out = s.split("");
+  let from = 0;
+  for (const seg of segments(s)) {
+    const at = s.indexOf(seg, from);
+    if (at < 0) continue;
+    from = at + seg.length;
+    const head = seg.replace(/^(?:\w+=\S*\s+)+/, "");
+    if (!M_INTERP.test(stripQuoted(head)) || M_SPAWN.test(seg)) continue;   // 段头按掩码判:引号里的 -e 不算
+    if (/^(?:perl|ruby)/i.test(head) && /`/.test(seg)) continue;            // BP-10:perl / ruby 反引号起 shell
+    const mk = stripQuoted(seg);
+    for (let i = 0; i < seg.length; i++) if (seg[i] === ">" && mk[i] === " ") out[at + i] = " ";
+  }
+  return out.join("");
+}
+/** 该命令里 t 是否「写后被 rm」:最后一个写 t 的段之后,有一段以 rm 开头且操作数逐字等于 t。 */
+function mRemovedAfterWrite(rawCmd, t) {
+  const segs = segments(stripHeredoc(String(rawCmd)));
+  const norm = (x) => x.replace(/\\/g, "/").replace(/^["'`]|["'`]$/g, "").replace(/^\.\//, "");
+  const want = norm(t);
+  let lastWrite = -1;
+  segs.forEach((seg, i) => { if (writeTargets(seg).some((w) => norm(w) === want)) lastWrite = i; });
+  if (lastWrite < 0) return false;
+  // 只认 `printf` / `echo` 段的重定向:它们吐的是字面量,不存在「替换没命中、内容静默不变」。
+  //   `writeFileSync(p, s.replace(a,b))` 写变异体再 rm 掉的探针**不放**——replace 没命中时变异体与原件一字不差,
+  //   正是本条要逮的失败形(全语料 diff 逮到 11 条这种,收窄前曾被一并放掉)。
+  if (!/^(?:printf|echo)\s[^]*>/.test(stripQuoted(segs[lastWrite].replace(/^(?:\w+=\S*\s+)+/, "")))) return false;   // 引号外的 `>` 才是重定向
+  // writeTargets 的重定向抽取会把 `b1.json` 截成 `b1.js`(扩展名分支顺序;它另有消费者,本批不动)。
+  //   故认写段里**逐字出现**、以目标开头且只多出字母数字的那个 token 为真名;`b1.json.bak` 多出了点,不认。
+  const names = new Set([want]);
+  for (const tok of segs[lastWrite].split(/\s+/)) {
+    const x = norm(tok.replace(/^\d?>>?/, ""));
+    if (x.startsWith(want) && /^[A-Za-z0-9]*$/.test(x.slice(want.length))) names.add(x);
+  }
+  // 红队 a47d383e(批 273 收口)BP-11:`… || rm -f X` 只在前段失败时才删——成功路径上文件留下 ⇒ 不算写后删除;
+  //   只认前面连接符是 `;` / `&&` / 换行的 rm 段。连接符从原串里按段位置取(segments 不带连接符)。
+  const s = stripHeredoc(String(rawCmd));
+  let from = 0;
+  const joinerBefore = segs.map((seg) => { const at = s.indexOf(seg, from); const j = at < 0 ? "" : s.slice(from, at); if (at >= 0) from = at + seg.length; return j; });
+  // codex 273-r1:`&& rm` 在前一步失败时同样不执行(「构建失败、配置文件还在」)⇒ 只认 `;` / 换行前接的 rm,
+  //   或紧跟在写段之后的 `&& rm`(写成功才轮到它,那时文件确实被删)。
+  return segs.slice(lastWrite + 1).some((seg, k) => {
+    const j = joinerBefore[lastWrite + 1 + k];
+    if (/\|\|\s*$/.test(j)) return false;
+    if (/&&\s*$/.test(j) && k > 0) return false;
+    const toks = seg.replace(/^(?:\w+=\S*\s+)+/, "").split(/\s+/);
+    return toks[0] === "rm" && toks.slice(1).filter((x) => !x.startsWith("-")).map(norm).some((x) => names.has(x));
+  });
+}
+
 export const RULE_M = {
   id: "M",
   blocking: true,
@@ -1322,12 +1457,15 @@ export const RULE_M = {
       //   命令的其余写入照常计入。夹具上下文的排除仍然需要:改自测用例时,
       //   用例文本里的路径是被替换的字符串字面量,不是真写入目标。
       const fixtureCtx = /want:\s*\[|lines:\s*\[|cases:\s*\{|name:\s*"[A-Z]\d?\s/.test(cmd);
+      const realRedir = new Set(writeTargets(mNeutralizeProgramRedirs(cmd)));   // 批 273 ②
       for (const t of writeTargets(cmd)) {
         if (fixtureCtx && /^(scripts|docs)\/(foo|bar|x|a|b)\./.test(t)) continue;   // 明显的示例名
+        if (!realRedir.has(t)) continue;                                           // 批 273 ②:解释器字符串里的 `>`
+        if (mRemovedAfterWrite(cmd, t)) continue;                                  // 批 273 ③:写后同命令 rm
         targets.push(t);
       }
     }
-    const uniq = [...new Set(targets)].filter((p) => !/\/(tmp|temp)\//i.test(p) && !/^\.claude\/\./.test(p));
+    const uniq = [...new Set(targets)].filter((p) => !/\/(tmp|temp)\//i.test(p) && !M_TEMP_VAR.test(p) && !/^\.claude\/\./.test(p));
     if (!uniq.length) return [];
 
     // 回读证据面。M-6:**必须认 Grep 工具**——它的入参是 `{pattern, path}`,
@@ -1434,6 +1572,21 @@ export const RULE_M = {
       { text: "追加了一段。", bash: "cat >> docs/report.md <<EOF\nx\nEOF" },
       // 旧 M 的写动作预筛清单里**没有 cp/mv** ⇒ 纯 cp 完全失明。新实现必须命中
       { text: "复制了一份。", bash: "cp a/src.md docs/dest.md" },
+      // 批 273:贴着新边界仍须拦的
+      { name: "273 ②边界:bash -c 引号里的 > 是真重定向 ⇒ 仍拦", text: "改完了。", bash: `bash -c "echo x > docs/real.md"` },
+      { name: "273 ②边界:node 程序里 execSync 起 shell 的 > 是真写 ⇒ 仍拦", text: "改完了。",
+        bash: `node -e "require('child_process').execSync('echo x > docs/real.md')"` },
+      { name: "273 ①边界:$TEMPLATES 不是临时目录 ⇒ 仍拦", text: "复制了一份。", bash: `cp a/src.md "$TEMPLATES/dest.md"` },
+      { name: "273 ③边界:rm 的是别的文件 ⇒ 仍拦", text: "写了请求体。", bash: `printf '{}' > b1.json; curl --data-binary @b1.json http://127.0.0.1:1/; rm -f b1.json.bak` },
+      { name: "273 ③边界:rm 在写之前 ⇒ 仍拦", text: "写了请求体。", bash: `rm -f b1.json; printf '{}' > b1.json` },
+      { name: "273 ③边界:rm 在下一条命令不算(只认同一条命令)", text: "写了请求体。", bash: [`printf '{}' > b1.json`, `rm -f b1.json`] },
+      { name: "273 ③边界:replace 写变异体再 rm——replace 没命中会静默一字不差 ⇒ 仍拦", text: "变异体转红了。",
+        bash: `node -e "const fs=require('fs');fs.writeFileSync('scripts/.mut.mjs',fs.readFileSync('scripts/a.mjs','utf8').replace('x','y'))" && node scripts/.mut.mjs --self-test; rm -f scripts/.mut.mjs` },
+      // 红队 a47d383e(批 273 收口)BP-10 / BP-11
+      { name: "273 收口:python os.popen 起 shell 写真文件 ⇒ 仍拦", text: "改完了。", bash: `python -c "import os; os.popen('echo x > docs/real.md').read()"` },
+      { name: "273 收口:解释器输出 | sh ⇒ 仍拦", text: "改完了。", bash: `node -e "console.log('echo x > docs/real.md')" | sh` },
+      { name: "273 收口:失败才 || rm ⇒ 成功路径文件留下,仍拦", text: "改完了。", bash: `printf '{}' > config/app.json && node build.mjs || rm -f config/app.json` },
+      { name: "273 codex r1:中间步骤 && rm,构建失败则不删 ⇒ 仍拦", text: "构建失败,配置文件还在;本轮先结束。", bash: `printf '{}' > config/app.json && node build.mjs && rm -f config/app.json` },
     ],
     neg: [
       // 真回读(Bash 面)
@@ -1459,6 +1612,13 @@ export const RULE_M = {
       { text: "追加后回读。", bash: ["cat >> docs/report.md <<EOF\nx\nEOF", "grep -c x docs/report.md"] },
       { text: "复制后回读。", bash: ["cp a/src.md docs/dest.md", "cat docs/dest.md"] },
       { text: "本轮没有经 Bash 写文件。" },
+      // 批 273:盲审判「拦错了」的三形(clipboard/273-samples/M.jsonl)
+      { name: "273 ①:cp 到 $TEMP 下做快照不是改动", text: "测了一字未动。",
+        bash: `cp .claude/.batch-goal.json "$TEMP/bg-before.json" && node x.mjs --clear; diff -q "$TEMP/bg-before.json" .claude/.batch-goal.json && echo ok` },
+      { name: "273 ②:node -e 字符串数组里的 > 不是重定向", text: "复现了截断。",
+        bash: `node -e " const RE=/x/g; for(const cmd of ['echo x > a/config.json','echo x > a/view.tsx']){ console.log(cmd.split('> ')[1]); }"` },
+      { name: "273 ③:写请求体、curl 用完、同命令 rm 掉", text: "冒烟通过。",
+        bash: `cd /d/app && printf '{"u":"demo"}' > b1.json; printf '{"t":"x"}' > b2.json; curl -s -X POST http://127.0.0.1:8766/api/register --data-binary @b1.json; curl -s --data-binary @b2.json http://127.0.0.1:8766/api/x | head -c 200; rm -f c.txt b1.json b2.json smoke.db` },
     ],
   },
 };
@@ -1732,10 +1892,40 @@ function eFacts(ctx) {
   //  「真断言被当叙事放走」一次,即回收本项(方向:漏放比误拦贵)。
   const NARRATIVE = /(未|没|还没|尚未|来不及)[^\n。]{0,6}(跑|做|改|查|写|修|走到|来得及|落地)|(我|我们)[^\n。]{0,8}(说|判|想|搞|记|算)错|停在[^\n。]{0,8}那里/;
 
+  // ── 使令义「让」不进因果面(批 273,盲审 3/3 判拦错、现行仍拦)────────────────
+  //  `PAT.causal` 的「(导致|造成|使得|让)…(这|它|我)」一支把**使令义**的「让」(请/叫某方做某事)
+  //  当成**致使义**(X 使 Y 发生)。实况三句:「已再发一次明确指令**让它**只回报告正文」
+  //  「已**让它**把报告正文重发」(两轮都真发了 SendMessage)、「如果还想**让我**把…对到日志时刻上」。
+  //  三句都在交代本方/对方的请求,不是关于世界的可证伪判断(D70 口径)。
+  //  只**涂掉那个「让」字**再跑全表 ⇒ 同行其余因果形态(根因是/导致…)照拦,不整行放行。
+  //  判据刻意窄,三形态各带结构锚:
+  //   ① 意愿义:「想让/希望让 + 人称」——表愿望,不是断言(无动作面要求)。
+  //   ② 指令义:「指令/消息/要求/提示 + 让 + 它/他/她/对方」——致使者本身就是一条指令;
+  //   ③ 零主语:分句起头(可带 已/再/又/先/刚 等副词)「让 + 它/他/她/对方 + 把」——主语省略=说话人。
+  //   ②③ **须本轮真有派发动作**(SendMessage / Agent / Task):嘴上说「让它重发」不算,
+  //   与 crossChecked 认动作面同一口径。前面有名词性致使者的(「缓存过期让它…」「这让它…」)一律不涂。
+  //  天花板:措辞锚,判不出语义;「已让它把缓存清空了」这类零主语自述的结果句会被放行。
+  //  失效条件:fp 台账出现「真断言因本涂改被放行」一次 ⇒ 回收 ②③(只留 ①)。
+  const dispatched = (ctx.toolNames || []).some((n) => /^(SendMessage|Agent|Task)$/.test(String(n)));
+  //  红队 a47d383e(批 273 收口):
+  //   BP-8 ② 须有派发动词在前(发 / 下 / 送 + ≤12 字 + 指令 / 消息…):「闸的拦截消息让它把出路词抄进了正文」是名词致使者,照拦;
+  //   BP-7 ③ 句首(行首 / 。！？后)可不带副词;**逗号 / 冒号后须带「已 / 再 / 又 / 先 / 刚」**——
+  //         「pushDefault 没设,让它把代码推到了 origin」的前分句是致使事件,照拦。
+  const unDirective = (line) => {
+    let s = line.replace(/(想|希望)让(?=(它|他|她|我|你|对方))/g, "$1▯");
+    if (dispatched) {
+      s = s.replace(/((?:发|下|送)了?[^，,。\n]{0,12}(?:指令|消息|要求|提示))让(?=(它|他|她|对方))/g, "$1▯")
+        .replace(/(^|[。！!？?])(\s*)((?:已经?|再|又|先|刚|也)*)让(?=(它|他|她|对方)把)/g, "$1$2$3▯")
+        .replace(/([，,；;：:\s])((?:已经?|再|又|先|刚)+)让(?=(它|他|她|对方)把)/g, "$1$2▯");
+    }
+    return s;
+  };
+  const cLines = eLines.map(unDirective);
+
   const hitIdx = [];
   for (const re of PAT.causal) {
     for (let i = 0; i < eLines.length; i++) {
-      if (!re.test(eLines[i])) continue;
+      if (!re.test(cLines[i])) continue;
       if (NARRATIVE.test(eLines[i])) continue;   // 叙事行整行不进因果面
       hitIdx.push(i);
     }
@@ -2011,8 +2201,27 @@ export const RULE_E0 = {
       // D72 最小步(四眼 Q3):两条断言分行,只标了下面那条 ⇒ 上面那条仍须报。
       //   旧的整轮布尔在这里会把两条一起豁免。
       { text: "根因是鉴权被绕过。\n根因是缓存没刷新，这条只是我的猜测。" },
+      // ── 批 273 使令义「让」的边界钉(贴着新边界、仍须拦)──────────────────────
+      // 本轮真派发过,但「让」前有名词性致使者 ⇒ 致使义,照拦。
+      { text: "缓存过期让它返回了旧数据。", mcp: "SendMessage" },
+      // 「想」不紧贴「让」⇒ 不是意愿义,是带口头犹疑的因果断言(「我想」不在自标表)。
+      { text: "我想是缓存过期让它返回了旧数据。" },
+      // 零主语分句起头、本轮也派发过,但没有「把」⇒ 是「我的动作致使系统状态」的结果句,照拦。
+      { text: "重启服务后,已让它恢复正常。", mcp: "SendMessage" },
+      // 同行另有因果形态 ⇒ 只涂「让」字,不整行放行。
+      { text: "根因是缓存过期,已让它把报告正文重发。", mcp: "SendMessage" },
+      // 嘴上说「让它重发」而本轮没有派发动作 ⇒ ③ 的动作面门槛,照拦。
+      { text: "已让它把缓存整个清空了。" },
+      // 红队 a47d383e BP-7 / BP-8:前分句是致使事件 / 名词致使者,本轮派发过也照拦
+      { text: "pushDefault 没设,让它把代码推到了 origin。", mcp: "Agent" },
+      { text: "路径正则少了一个斜杠,让它把 $TEMP 也当成了改动文件。", mcp: "SendMessage" },
+      { text: "闸的拦截消息让它把出路词抄进了正文。", mcp: "Agent" },
     ],
     neg: [
+      // ── 批 273 盲审 3/3 拦错的三种形态(使令义「让」,不是因果)──────────────
+      { text: "我在等后台红队回件。\n\n你那边的问题已经答完。如果还想让我把排查步骤对到日志时刻上,把对话贴过来就行。" },
+      { text: "已再发一次明确指令让它只回报告正文。回件后我核逐条状态与新发现,再关账。", mcp: "SendMessage" },
+      { text: "grill 回件只回了一个「Complete」,已让它把报告正文重发;codex 轮询在跑。", mcp: "SendMessage" },
       { text: "根因是路径写错。这是我的推断。" },
       // 真跑过跨模型 —— **动作面**,不是嘴上说
       { text: "根因是路径写错。", bash: "node ~/.claude/scripts/codex-run.mjs --task t.md" },
@@ -3803,6 +4012,8 @@ const RULE_S = {
 // 与 Q 的分工：Q 管「把活推出批」；本条管「声称已处置但没有回收机制」。
 // CEILING：它只看有没有**写**失效期，判不了那个失效期到时会不会真的被执行
 //   —— 那需要跨会话的欠账账本，本条不假装自己能代替它。
+// 批 273 停止出口①(codex 273-r1 / r2 / 红队 a38dd2da 三轮复核连续出新形态):RULE_T 整段退回 c9112e2 实现;
+//   触发这串修补的盲审误拦(「用 --outcome 登记了本批成果」「登记可见成果。登记了,…」两形)登记为让出面,见 docs/gate-debts.md D171⑧。
 const RULE_T = {
   id: "T",
   blocking: true,          // 用户常设授权：「新增阻断项一律授权自动化」
@@ -7566,10 +7777,45 @@ export const RULE_V = {
   blocking: false,
   law: "AGENTS.md#决策边界",
   detect: (ctx) => {
-    if (!/需你裁|呈签|请亲签|待你亲签|需要你亲签/.test(ctx.text)) return [];
+    if (!RULE_V._calls(ctx.text)) return [];
     if (/免签例外已核/.test(ctx.text)) return [];
     if (RULE_V._fourEach(ctx.text)) return [];
     return ["呈签/裁决请求未附「免签例外已核」行"];
+  },
+  // 批 273(窄例外③,盲审「拦错了」5/5 且现行重放仍拦):五份样本**唯一**的触发词都是名词「呈签单」——
+  //   「按 202b 呈签单原文落进…」「2c9a1c4 在呈签单戊里」「核落笔正文和呈签单是否逐字一致」「呈签单 `…` 顶部已注明撤回」
+  //   都是**提到一份已签 / 已撤回的单子**(条件对照、下一步、回报),本轮没向用户要任何东西;
+  //   旧前置把名词当成了动词「呈签」。
+  //   修:名词「呈签单」单独出现时**不再自成呼签**,须本轮同时有**对用户的待办口**才算:
+  //   ⏸(宪法唯一通用等待标识)或第二人称的待签 / 待裁句式(`_ASK`,在去掉 「」『』“” 与反引号引文后的正文上找)。
+  //   其余触发词(需你裁 / 动词呈签 / 请亲签 / 待你亲签 / 需要你亲签)一字未动;「呈签件 / 呈签稿 / 呈签项」等同族名词**没放**(只收到样本为止)。
+  //   语料核对(本仓 189 份转录、4990 回合,改前 169 命中):只靠「呈签单」命中的 46 回合里,
+  //   「等你点头 / 由你来定 / 还在等你签 / 只能摊给你 / 挂在你那儿 / 呈给你 / 给你签 / 需你亲签 / 等两件事:你对…的签字」这些**真把事摊给用户**的形态都仍拦;
+  //   放出 19 回合(改后 150 命中、新增 0),逐条读过都是条件对照 / 下一步 / 「V 已处置」回报 / 外审核对,没有一条在本轮摊新事。
+  //   残余:①只靠「呈签单」+ 不在 `_ASK` 里的第二人称说法(如「一并给你」)摊事会漏——下一步叙述与真摊同形时按 `_ASK` 不认处理;
+  //   ②`_ASK` 是**短句式表**不是语义判断,`请你签的…不用你签` 这类否定 / 定语用法靠 `(?<!不用…)` 与 `(?![的过])` 排除,别的否定写法会误拦(不是漏放)。
+  //   续修(同批复核,全语料 5010 回合重放):首版还放走了**本轮新起一张呈签单**的形态——「趁这段时间把待签事项整理进一张呈签单」
+  //   「趁自测在跑,我把条件 3 的呈签单写出来」;起单就是摊给用户的动作,当年 V 正是在这里响、执行方随后才去核①–④(转录可见),
+  //   放走 = 真漏放。故名词「呈签单」再认一种结构信号:**起单**(`_NEW`:不定量词「一张 / 一份」、或「写 / 拟 / 整理 / 起草」出来 /
+  //   整理成 / 整理进),同样在去引文后的正文上找;「这一张 / 那一份」是回指已有的单子,排除。五份样本都只是回指已有单子,不受影响。
+  //   改后全语料 V 提示 606 → 601(解除 5、新增 0;口径 = 每回合末尾 300 条条目建 ctx,与上段 169 / 150 口径不同),解除 5 回合逐条读过:
+  //   条件对照里「呈签单…已落盘,四段全文已给你看过」与「V 项已处理…核对结果写在呈签单开头」两类,都没在本轮摊新事。
+  //   红队 a47d383e(批 273 收口)BP-5:往**已有**单子里加项同样是摊事(本仓比新起一张更常见)——「补进 / 列进 / 放进 / 加进 / 写进」呈签单;
+  //   待办口另认无人称 / 第三人称的等签:「待签 / 等签 / 签了再 / 需用户…签 / 请过目」(只认这几个短句式,不判语义)。
+  _NEW: /(?<![这那同每])(?:一张|一份)呈签单|呈签单(?:写|拟|整理|起草)(?:出来|好)|(?:整理|写|做|拟|汇总|归并?)成(?:一张|一份)?呈签单|整理进(?:一张|一份)?呈签单|(?:补|列|放|加|写|并)进了?(?:一张|一份)?呈签单|呈签单[^。！？!?\n]{0,30}(?:已更新|新增|加了|补了)/,
+  _CALL: /需你裁|呈签(?!单)|请亲签|待你亲签|需要你亲签/,
+  _ASK: /⏸|等[^。！？!?\n]{0,8}你|需你|由你|要你|摊给你|呈给你|挂在你|给你签|(?<!不用|不必|无需|无须|不需)你来?(?:签|裁|定|点头|拍板|确认)(?![的过])|待签|等签|签了再|需用户[^。！？!?\n]{0,6}签|请过目/,
+  _ASK_LOOSE: /⏸|等[^。！？!?\n]{0,8}你|需你|由你|要你|摊给你|呈给你|挂在你|给你签|你来?(?:签|裁|定|点头|拍板|确认)/,
+  /** 本轮算不算呼签。变异证人:`opt.nounOld` = 273 之前「名词呈签单也直接算」;`opt.nounNever` = 名词一律不算;
+   *  `opt.noStrip` = 待办口不去引文;`opt.askLoose` = 待办口不排除否定 / 定语用法;`opt.noNew` = 不认起单信号。 */
+  _calls: (text, opt = {}) => {
+    const t = String(text || "");
+    if (opt.nounOld) return /需你裁|呈签|请亲签|待你亲签|需要你亲签/.test(t);
+    if (RULE_V._CALL.test(t)) return true;
+    if (!/呈签单/.test(t) || opt.nounNever) return false;
+    const bare = opt.noStrip ? t : t.replace(/「[^」]*」|『[^』]*』|“[^”]*”|`[^`\n]*`/g, " ");
+    if (!opt.noNew && RULE_V._NEW.test(bare)) return true;
+    return (opt.askLoose ? RULE_V._ASK_LOOSE : RULE_V._ASK).test(bare);
   },
   // 批 253(窄例外③,fp 9/56):台账里数笔是**真核过、写的是同义改写**
   //   (「①不适用…②…③…④…」逐条带理由),只因没写那六个字被拦(D113 史)。
@@ -7711,8 +7957,14 @@ export const RULE_V = {
       ["特征词退回 253b 窄表(253c V-2 误拦回来)", { featureOld: true }],
       // 批 253d:判词退回 253c 的裸「否」表。
       ["判词认裸「否」(253d BP-6「是否」漏放回来)", { verdictBareFou: true }],
+      // 批 273:四条各钉呼签前置的一处改动(前置改走 `r._calls`,开关直达)。
+      ["名词「呈签单」照旧自成呼签(273 误拦回来)", { nounOld: true }],
+      ["名词「呈签单」一律不算呼签(真摊事漏放)", { nounNever: true }],
+      ["待办口不去引文(引号里的「你定」也算)", { noStrip: true }],
+      ["待办口不排除否定 / 定语(「请你签的…不用你签」也算)", { askLoose: true }],
+      ["不认起单信号(「整理进一张呈签单」漏放)", { noNew: true }],
     ].map(([name, opt]) => ({ name, apply: (r) => ({ ...r, detect: (ctx) =>
-      !/需你裁|呈签|请亲签|待你亲签|需要你亲签/.test(ctx.text) || /免签例外已核/.test(ctx.text)
+      !r._calls(ctx.text, opt) || /免签例外已核/.test(ctx.text)
         || r._fourEach(ctx.text, opt) ? [] : ["变异"] }) })),
   ],
   cases: {
@@ -7737,6 +7989,27 @@ export const RULE_V = {
       // 批 253d BP-6(第三份红队):逐条只列「是否…」问题、没下判断 ⇒「是否」里的否不算判词,照拦。
       { name: "253d BP-6:「是否」里的否不是判词",
         text: "需你裁:发布授权。例外逐条:①是否属纠错,待定 ②是否已入册,待查 ③是否闸过重,待查 ④是否可逆,待查。" },
+      // 批 273 新边界:名词「呈签单」+ 本轮真把事摊给用户(第二人称待办口 / ⏸)⇒ 仍拦。
+      { name: "273:呈签单 + 等你点头(不可逆项摊给用户)",
+        text: "两件事还要你处理:\n- 257 呈签单第 2 项:删除那个被锁定的 worktree,不可逆,等你点头。" },
+      { name: "273:呈签单 + 还在等你签(引文路径之外的待办口)",
+        text: "法条第 135 行那两处措辞,还在等你签,呈签单是 `clipboard/266-law-signoff.md`;签不签都不挡关账。" },
+      { name: "273:呈签单 + 只有 ⏸",
+        text: "D121 呈签单如下:A 进程表判活,B 维持现状。\n⏸ 选哪个?" },
+      { name: "273:呈签单 + 需你亲签(不在旧触发词表里的说法)",
+        text: "D121 属承重八族「串行写」,**需你亲签**。D121 整理成呈签单时一并给你。" },
+      { name: "273:呈签单 + 由你来定(否定排除只排「不用你…」)",
+        text: "呈签单 `clipboard/257-sign-sheet.md` 第 1 项要不要补停止出口,由你来定。" },
+      // 批 273 续修:本轮新起一张呈签单 = 摊给用户的动作,无第二人称待办口也仍拦(全语料重放里被首版放走的两种真形态)。
+      { name: "273 续:整理进一张呈签单(起单,无待办口)",
+        text: "红队在跑。趁这段时间把待签事项整理进一张呈签单。\n迁移检查重跑全绿,现在等红队回件,回来后分拣再提交。" },
+      { name: "273 续:把呈签单写出来(起单,无待办口)",
+        text: "趁自测在跑,我把条件 3 的呈签单写出来。\n合并后的 master 验收通过(exit 0,0 条 FAIL)。终审红队和 codex 在跑。" },
+      // 红队 a47d383e BP-5:往已有单子里加项 / 无人称等签
+      { name: "273 收口:补进呈签单 + 签了再删", text: "删除锁定 worktree 属不可逆,已补进呈签单第 3 项,签了再删。" },
+      { name: "273 收口:列进呈签单 + 需用户亲签", text: "D121 已列进呈签单,需用户亲签后再动。" },
+      { name: "273 收口:放进呈签单等签", text: "这两项我拿不准,放进呈签单等签。" },
+      { name: "273 收口:呈签单已更新新增一项 + 请过目", text: "呈签单 `clipboard/273-sign.md` 已更新,新增 D122(改守卫语义),请过目。" },
     ],
     neg: [
       // 批 253b BP-11:「否,不是纠错」、④ 理由换到下一行、锚写「免签核过:」
@@ -7753,6 +8026,19 @@ export const RULE_V = {
       { name: "V-1 反向钉:④ 理由缩进续行",
         text: "需你裁:发布授权。免签核过:①否,不是纠错 ②不属已入册条款 ③不是闸判据过重 ④不适用。\n  理由:对外发布不可逆,不是机械改动。" },
       { text: "普通汇报:三件全绿,已提交。" },
+      // 批 273(盲审拦错 5/5):名词「呈签单」只是提到一份已签 / 已撤回的单子,本轮没向用户要东西 ⇒ 放行。
+      { name: "273 样本形态:撤回记录 + 下一步(含「请你签的…不用你签」)",
+        text: "上一轮请你签的法条改动,我撤回了,不用你签。两处都符合窄例外④,可以自签。呈签单 `clipboard/266-law-signoff.md` 顶部已注明撤回。\n回来后的顺序是:\n1. 分拣意见。\n2. 法条改动单独提交。\n3. 推 private,关账。" },
+      { name: "273 样本形态:追述呈签单某节的历史",
+        text: "**constraint-register 追认行,改写为如实记载:** 三个提交都没有援引四之二。2c9a1c4 在呈签单戊里;643d21c 和 ab50e8e 的追认清单,是在你答复之前在会话里摊出的。\n**批 203b 条件对照**\n- 条件 1:**未达成**。第二轮四眼还在跑。" },
+      { name: "273 样本形态:外审核对正文与呈签单是否一致",
+        text: "codex 在做法典两件交付物的四眼复核:它核落笔的正文和呈签单是否逐字一致;四之二改完之后内部是否自洽。\n**下一步**:处置这份回件,然后开修闸批。" },
+      { name: "273 样本形态:按呈签单原文落笔的回报",
+        text: "四之二已经按 202b 呈签单原文落进 `lawmaking.md`(甲乙丙丁),里面记了复议结论以及你的原话。`verify-laws` PASS。机器触发层还没建,到期没建成就回报你。\n**下一步**:单独提交 → 推送 → 探针 → 关 203。" },
+      { name: "273 续:回指「那一份呈签单」不是起单",
+        text: "四之二已按那一份呈签单原文落笔,`verify-laws` PASS。\n**下一步**:单独提交 → 推送。" },
+      { name: "273 样本形态:完成条件对照(引号里的「你定」不算待办口)",
+        text: "- **条件 1:达成。** 呈签单 `202-auto-deploy-sign.md` 在;新条文 21 行,都曾逐字给你看过。\n- 随做:第 2 项按你的「你定」撤回,撤回理由写在呈签单里。\n还不 `--clear`:正在等 codex 和第五轮红队复核。\n**下一步**:处置发现 → 单独提交 → 推送。" },
     ],
   },
 };
@@ -7787,7 +8073,7 @@ export const RULE_O = {
   //   取页集合里(归一后)出现;差一个就报那一个。
   //   b9986f7 的**抽样口径**(引了几个、取过其中一个即全放行)已于 253b 撤回(用户裁定):
   //   全局规范 §1.1 是**发送端**规则(只认本次真取到的 URL),§1.2 的抽样重取是**汇总方**义务,
-  //   不能拿接收端的宽度去放松发送端。依据段一个 URL 都没有 ⇒ 退回全文所有 URL,同样逐网址。
+  //   不能拿接收端的宽度去放松发送端。依据段一个 URL 都没有 ⇒ 退回分支(批 273 起不再退回全文,见 `_cited` 头注),同样逐网址。
   //   取页通道三条:WebFetch 的 `url`;段头为 node 且**首个位置参数**的 basename 为
   //   `fetch-quote-check.mjs`(BP-9:脚本名在**原串**上认——整条路径住在引号里时,
   //   去引号串上它会整个消失,那是误拦);段头为 curl/wget/Invoke-WebRequest 族的取页命令。
@@ -7849,11 +8135,34 @@ export const RULE_O = {
     return q ? `${path}?${q}` : path;
   },
   _urls: (s) => String(s || "").match(RULE_O._URL_RE) || [],
-  /** 被当依据用的 URL(原样,已剥尾标点)。 */
-  _cited: (t) => {
+  /** 被当依据用的 URL(原样,已剥尾标点)。
+   *  批 273 收窄**退回分支**(依据段里一个 URL 都没有时):不再退回全文所有 URL,只认两种结构位置——
+   *  ① 紧跟在依据段**后一段**里的 URL(「出处见下表」「## 出处」后接网址列表;pos 16 那种);
+   *  ② 全文里写成 markdown 链接 `[标题](url)` 的 URL(检索得来的 Sources 列表就是这个形态)。
+   *  病例(盲审判拦错、273-samples/O.jsonl 三条):依据词落在一段与网址无关的话里(「先抽样重取出处」
+   *  「第一轮核实了出处」「在用户原话里找到出处」),旧退回把同一回合里**给用户点的授权链接、
+   *  本机服务地址 `http://127.0.0.1:3000`、自己刚开的 PR 网址**这类裸网址全当成引文。
+   *  `opt.oldFallback` = 变异用的 273 之前那式(退回全文);`opt.noNext` / `opt.noMd` = 各去掉①/②一半。
+   *  天花板:依据词在 B 段、裸网址出处在隔一段以上的 C 段(中间夹着引文块之类)且不写成 markdown 链接 ⇒ 放过;
+   *  反向:给用户点的链接若恰好紧跟在含依据词的那一段之后,或写成 markdown 链接,仍会响(多拦一侧)。 */
+  _cited: (t, opt = {}) => {
     const paras = t.split(/\n\s*\n/);
-    const inCue = paras.filter((p) => RULE_O._CUE_RE.test(p)).flatMap(RULE_O._urls);
-    const pick = inCue.length ? inCue : RULE_O._urls(t);
+    const isCue = paras.map((p) => RULE_O._CUE_RE.test(p));
+    const inCue = paras.filter((p, i) => isCue[i]).flatMap(RULE_O._urls);
+    let pick = inCue;
+    if (!inCue.length) {
+      if (opt.oldFallback) pick = RULE_O._urls(t);
+      else {
+        const next = opt.noNext ? [] : paras.flatMap((p, i) => (i > 0 && isCue[i - 1] ? RULE_O._urls(p) : []));
+        // 红队 a47d383e(批 273 收口)BP-9:「先贴网址、下一段再说原文写的是…」——依据段的**前一段**也收;
+        //   前一段是引文块(以 > 起头)时再往前看一段(「网址 / > 原文 / 以上是原文」三段式)
+        const prev = opt.noPrev ? [] : paras.flatMap((p, i) => ((isCue[i + 1] || (isCue[i + 2] && /^\s*>/.test(paras[i + 1] || ""))) ? RULE_O._urls(p) : []));
+        const md = opt.noMd ? [] : [...t.matchAll(/\]\(\s*<?(https?:\/\/[^)\s>]+)/g)].flatMap((m) => RULE_O._urls(m[1]));
+        // 本机 / 内网地址不可能是外部引文(样本 2 的 127.0.0.1 恰在依据段前一段)——只在退回分支里剔
+        const LOCAL = /^https?:\/\/(?:localhost|127(?:\.\d+){3}|0\.0\.0\.0|\[::1\]|10(?:\.\d+){3}|192\.168(?:\.\d+){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d+){2})(?::\d+)?(?:[/?#]|$)/i;
+        pick = [...next, ...prev, ...md].filter((u) => !LOCAL.test(u));
+      }
+    }
     return [...new Set(pick.map(RULE_O._clean))];
   },
   /** 命令切词:引号内的空白不切,引号本身剥掉(BP-9:引号里的脚本路径必须仍看得见)。 */
@@ -8023,7 +8332,7 @@ export const RULE_O = {
     if (!RULE_O._CUE_RE.test(t)) return [];
     const { got, wild } = RULE_O._fetched(ctx, opt);
     if (wild) return [];
-    const cited = RULE_O._cited(t);
+    const cited = RULE_O._cited(t, opt);
     // 变异用的抽样口径(253b 已撤回):取过其中一个就全放行。
     if (opt.sample) return cited.some((u) => got.has(RULE_O._norm(u, opt))) ? [] : cited;
     return cited.filter((u) => !got.has(RULE_O._norm(u, opt)));
@@ -8035,7 +8344,7 @@ export const RULE_O = {
     //   现改为真调 `toolPresent()`,与 L 项同一条口径。
     // `forPos`:样例只取 `https://x.test/a` 一个网址,而 pos[15..17] 引的是**两个**网址
     //   ——逐网址口径下,取一个当然清不掉另一个。缩小适用面写在明处,不是悄悄只测第一条。
-    { forPos: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    { forPos: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 19, 20, 21, 22],
       say: toolPresent("scripts/fetch-quote-check.mjs")
         ? "真取页核实**那一个网址**:node --no-warnings scripts/fetch-quote-check.mjs <url> \"引文\""
         : "真取页核实——**本仓没装取页核实件**(`scripts/fetch-quote-check.mjs` 不在)," +
@@ -8048,7 +8357,7 @@ export const RULE_O = {
     //   批 253:夹具造的 WebFetch 不带 url ⇒ 此样例走通配分支(天花板④);按网址配对由「取了别的网址」正例钉。
     { say: "或用 **WebFetch** 亲自取**同一网址**(注意:**WebSearch 不算**——搜索给的是摘要不是页面)",
       sample: { mcp: "WebFetch" } },
-    { forPos: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    { forPos: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 19, 20, 21, 22],
       say: "或用 curl 真取**同一网址**的页面内容(`curl -sL <url>`;只取响应头 `-I`(含 `-sIL` 这类组合)、" +
         "输出丢进空设备、下游只 `wc`/`Select-Object StatusCode` 都不算)",
       sample: { bash: "curl -sL https://x.test/a | grep -c 某句" } },
@@ -8104,9 +8413,18 @@ export const RULE_O = {
       detect: (ctx) => RULE_O._detect(ctx, { rawQuery: true }) }) },
     { name: "抽样口径(引几个、取过一个就全放行)", apply: (r) => ({ ...r,
       detect: (ctx) => RULE_O._detect(ctx, { sample: true }) }) },
+    // ── 批 273:依据段无网址时的退回分支收窄(三条各钉一处) ─────────────────────
+    { name: "退回全文所有 URL(273 前口径:授权链接 / 本机地址 / 自开 PR 被当引文)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_O._detect(ctx, { oldFallback: true }) }) },
+    { name: "退回分支不认依据段后一段的网址", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_O._detect(ctx, { noNext: true }) }) },
+    { name: "退回分支不认 markdown 链接", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_O._detect(ctx, { noMd: true }) }) },
+    { name: "退回分支不认依据段前一段的网址(红队 BP-9)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_O._detect(ctx, { noPrev: true }) }) },
   ],
   cases: {
-    // ⚠️ pos 的**下标被 escapes 的 forPos 引用**:0–14 只引一个网址(样例取得动),
+    // ⚠️ pos 的**下标被 escapes 的 forPos 引用**:0–14、19–20 只引一个网址(样例取得动),
     //   15–17 引两个网址(逐网址口径下样例天然清不掉)。往中间插用例要同步改 forPos。
     pos: [
       { text: "出处:https://x.test/a 里写着那句话。" },                                       // 0
@@ -8140,6 +8458,15 @@ export const RULE_O = {
         prior: [{ text: "上一轮", bash: "curl -sL https://x.test/a" }] },                       // 17
       // ── 批 253c O-1:查询串是页面身份的一部分,`?id=1` 不是 `?id=2` ────────────
       { text: "出处:https://x.test/a?id=2 里写着那句话。", bash: "curl -sL \"https://x.test/a?id=1\"" }, // 18
+      // ── 批 273:退回分支收窄后的两条贴边正例(依据段里没有网址)────────────────
+      //   引文离依据词隔了几段,但写成 markdown 链接(检索得来的 Sources 列表形态)⇒ 仍拦
+      { text: "两条承重断言都逐字核过原文。\n\n另外顺手修了一处措辞。\n\nSources: [A 页](https://x.test/a)" }, // 19
+      //   依据段只有一句「原文如下」,裸网址紧跟在下一段 ⇒ 仍拦
+      { text: "那句话的原文如下。\n\nhttps://x.test/a" },                                       // 20
+      // 红队 a47d383e BP-9:先贴网址、下一段再引原文 ⇒ 仍拦(依据段前一段)
+      { text: "Claude Code changelog:https://x.test/a\n\n原文写的是「Hooks now receive cwd」,所以 cwd 字段可用。" }, // 21
+      //   网址 / 引文块 / 「以上是原文」三段式 ⇒ 仍拦
+      { text: "官方文档 https://x.test/a 第三节。\n\n> PreToolUse hooks can deny.\n\n以上是原文。" }, // 22
     ],
     neg: [
       // 真取过页
@@ -8166,6 +8493,17 @@ export const RULE_O = {
       { text: "出处:https://x.test/a。", bash: "curl -sG --data-urlencode \"q=某句\" https://x.test/a" },
       // `-qO-` 是写到标准输出再读,不是丢进空设备
       { text: "出处:https://x.test/a。", bash: "wget -qO- https://x.test/a | grep 某句" },
+      // ── 批 273(盲审判拦错的三条形态):依据词在一段与网址无关的话里,网址在别处且是裸网址 ⇒ 放行
+      { name: "273 样本1:发给用户点的授权链接",
+        text: "回来后合成一份调研,先抽样重取出处、过外审,再给你。\n\n**exa 需要你在浏览器里授权一次**,打开这个链接:\n\n" +
+          "https://auth.x.test/oauth/authorize?response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A39279%2Fcallback&state=abc\n\n" +
+          "如果跳转后页面连不上,把地址栏里的完整网址贴给我。" },
+      { name: "273 样本2:本机服务地址(表格里)",
+        text: "| 环境 | 结果 |\n|---|---|\n| 同步服务 | 实读的目标地址是本机明文 HTTP(`http://127.0.0.1:3000`),不受影响 |\n\n" +
+          "**外审**:第一轮核实了出处,指出 3 处说法强于证据。\n\n**还剩的事**\n1. 本机 Node 升级。" },
+      { name: "273 样本3:自己刚开的 PR 网址",
+        text: "第二批已经推上去,开成了 PR #11:https://github.test/o/r/pull/11 。\n\n这批包括:\n\n" +
+          "- 新增任务状态表,每一条都要能在用户原话里找到出处。\n- 本机测试全绿。\n\n后台在等 CI。" },
       // 只是给了个地址,没当依据用
       { text: "仓库在 https://example.test/repo,回头看。" },
       { text: "今天没有引任何外部页面。" },
