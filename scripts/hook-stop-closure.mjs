@@ -225,6 +225,17 @@ export function fpNetById(ledger) {
   for (const [ref, id] of right) if (!manual.has(ref)) fp[id] = (fp[id] || 0) - 1;
   return fp;
 }
+/** 批 276b(附节三①):`--fp-report` 减法式里「盲审判拦对了」的笔数——与 `fpNetById` 扣减口径逐字同源:
+ *  codex(by:codex)判「拦对了」的 ref,且该笔**没有**人工撤回(fp_audit「已人工撤回」或带 ref 的非 codex retraction)。 */
+export function fpRightNotManual(ledger) {
+  const manual = new Set(), right = new Set();
+  for (const x of ledger || []) {
+    if (!x || !x.id) continue;
+    if ((x.kind === "fp_audit" && x.verdict === "已人工撤回") || (x.kind === "retraction" && x.by !== "codex")) { if (x.ref) manual.add(x.ref); }
+    if (x.kind === "fp_audit" && x.ref && x.by === "codex" && x.verdict === "拦对了") right.add(x.ref);
+  }
+  return [...right].filter((r) => !manual.has(r)).length;
+}
 
 /** 误报率分母口径(fpTable 与 --fp-report 表头共用,红队 a30a87d8 BP-3):只数主 Stop 通道、不数 UNKNOWN。 */
 export const fpRowCounted = (a) => !!a && a.channel !== "SubagentStop";
@@ -242,12 +253,16 @@ export function fpTable(alerts, ledger, { minAlerts = 20, minRate = 0.15 } = {})
     return { id, alerts: per[id], fp: f, rate, confirmed: confirmed[id] || 0, hot: per[id] >= minAlerts && rate >= minRate };
   }).sort((a, b) => b.alerts - a.alerts || a.id.localeCompare(b.id));
 }
-/** 批 272(交接 clipboard/272-gate-handoff.md 第一节):按规则数**盲审已确认的误拦**——每笔(ref)取最后一个 codex 结论,为「拦错了」计 1。
- *  与净误报列不同:它不依赖自签减法,只数独立模型确认过的笔数(只会少算不会多算;没人喊冤的误拦进不来)。只改工装输出,不改判据。 */
+/** 批 272(交接 clipboard/272-gate-handoff.md 第一节):按规则数**盲审已确认的误拦**——每笔(ref + 规则 id)取最后一个
+ *  **`by:"codex"`** 的 fp_audit 结论,为「拦错了」计 1(与 `fpNetById` 认 codex 结论同一口径)。
+ *  批 276(核查代理 rules-probe 内存探针):原实现不看 `by`——`--fp-retract` 写的「已人工撤回」(by:assistant)、
+ *  `fp-audit` 写的「取证失败」都会顶掉 codex 的「拦错了」把该列清零,非 codex 手写的「拦错了」又会加数。现只认 codex 行。
+ *  口径如实说:只数**被送去盲审、且 codex 最后一次判「拦错了」**的笔;没人记自签的误拦进不来(漏数),
+ *  codex 判错的笔照计(这一列是「独立模型确认过」,不是「真误拦」)。只改工装输出,不改判据。 */
 export function fpConfirmedById(ledger) {
   const last = new Map();
   // 红队 a47d383e 附节三④:同一 ref 下可能有多条规则的结论 ⇒ 按 ref + 规则 id 取最后结论,不互相覆盖
-  for (const x of ledger || []) if (x && x.kind === "fp_audit" && x.ref && x.id) last.set(`${x.ref}\u0000${x.id}`, x);
+  for (const x of ledger || []) if (x && x.kind === "fp_audit" && x.by === "codex" && x.ref && x.id) last.set(`${x.ref}\u0000${x.id}`, x);
   const out = {};
   for (const x of last.values()) if (x.verdict === "拦错了") out[x.id] = (out[x.id] || 0) + 1;
   return out;
@@ -544,7 +559,7 @@ function priorClosedFromJournal(rows, g) {
  *  ⇒ 派生而非并列。**共用一个环境变量这件事本身仍在**(K/K0 同开关),
  *    但现在它至少是**印出来那个**,不再骗人;要拆成独立开关是另一批。 */
 const BLOCK_ENV = { A: "A", E0: "E", E1: "E", E2: "E", I: "I", J: "J", W: "W",
-  K: "K", K0: "K", M: "M", R: "R", Q: "Q", S: "S", T: "T", U: "U", ND: "ND", DP: "DP", X: "X" };
+  K: "K", K0: "K", M: "M", R: "R", Q: "Q", S: "S", T: "T", U: "U", ND: "ND", DP: "DP", X: "X", MF: "MF" };   // MF:批 276 D179
 
 // ⚠️ **由 BLOCK_ENV 计算得出,不再是第二张手写表**(D21 结案,codex 072 裁决原话:
 //   「对账只能发现漂移,不能阻止漂移」——一份表按构造不漂)。
@@ -4567,8 +4582,21 @@ function selfTest() {
         hp("误报率表:报警 20 次、误报 3 笔(15%)⇒ 进待修", fpTable(al, lg.filter((x) => x.kind !== "retraction")).find((r) => r.id === "S").hot, true);
         hp("误报率表:撤回多于误报 ⇒ 不低于 0", fpTable([{ ids: ["V"] }], [{ kind: "retraction", id: "V" }])[0].fp, 0);
         hp("272 盲审确认误拦列:每笔取最后结论,拦错了才计(先判不出后拦错了 = 1;先拦错了后拦对了 = 0)",
-          JSON.stringify(fpConfirmedById([{ kind: "fp_audit", id: "S", ref: "a", verdict: "判不出" }, { kind: "fp_audit", id: "S", ref: "a", verdict: "拦错了" },
-            { kind: "fp_audit", id: "S", ref: "b", verdict: "拦错了" }, { kind: "fp_audit", id: "S", ref: "b", verdict: "拦对了" }, { kind: "claimed_fp", id: "S", ref: "c" }])), '{"S":1}');
+          JSON.stringify(fpConfirmedById([{ kind: "fp_audit", id: "S", ref: "a", verdict: "判不出", by: "codex" }, { kind: "fp_audit", id: "S", ref: "a", verdict: "拦错了", by: "codex" },
+            { kind: "fp_audit", id: "S", ref: "b", verdict: "拦错了", by: "codex" }, { kind: "fp_audit", id: "S", ref: "b", verdict: "拦对了", by: "codex" }, { kind: "claimed_fp", id: "S", ref: "c" }])), '{"S":1}');
+        // 批 276(§4②):只认 by:codex——执行方 --fp-retract 的「已人工撤回」、fp-audit 的「取证失败」不清零 codex 的确认;
+        //   非 codex 手写的「拦错了」不加数
+        hp("276 盲审确认误拦列:--fp-retract / 取证失败 不清零 codex 确认,非 codex 的拦错了不加数",
+          JSON.stringify(fpConfirmedById([{ kind: "fp_audit", id: "S", ref: "a", verdict: "拦错了", by: "codex" },
+            { kind: "fp_audit", id: "S", ref: "a", verdict: "已人工撤回", by: "assistant" }, { kind: "fp_audit", id: "S", ref: "a", verdict: "取证失败", by: "fp-audit" },
+            { kind: "fp_audit", id: "S", ref: "z", verdict: "拦错了", by: "assistant" }, { kind: "fp_audit", id: "V", ref: "y", verdict: "拦错了" }])), '{"S":1}');
+        hp("276b --fp-report 减法:同一笔既有 codex 拦对了又已人工撤回 ⇒ 只扣一次(与 fpNetById 同口径)",
+          (() => { const L = [{ kind: "claimed_fp", id: "V", h: "h1" }, { kind: "claimed_fp", id: "V", h: "h2" },
+            { kind: "retraction", id: "V", ref: "h1", by: "assistant" }, { kind: "fp_audit", id: "V", ref: "h1", by: "assistant", verdict: "已人工撤回" },
+            { kind: "fp_audit", id: "V", ref: "h1", by: "codex", verdict: "拦对了" }, { kind: "fp_audit", id: "V", ref: "h2", by: "codex", verdict: "拦对了" }];
+            return `${fpRightNotManual(L)}:${fpNetById(L).V}`; })(), "1:0");
+        hp("276 盲审确认误拦列反向钉:codex 后一次判拦对了仍清零该笔",
+          JSON.stringify(fpConfirmedById([{ kind: "fp_audit", id: "S", ref: "a", verdict: "拦错了", by: "codex" }, { kind: "fp_audit", id: "S", ref: "a", verdict: "拦对了", by: "codex" }])), "{}");
         hp("265 误报率表:子代理通道行与 UNKNOWN 不计入分母(红队 a0dfbfce BP-4)",
           JSON.stringify(fpTable([{ ids: ["M"] }, { ids: ["M", "UNKNOWN"], channel: "SubagentStop" }, { ids: ["UNKNOWN"] }], []).map((r) => [r.id, r.alerts])), '[["M",1]]');
         hp("误报率表:按报警量降序", tb.map((r) => r.id).join(","), "S,K");
@@ -4673,11 +4701,23 @@ function selfTest() {
       const samples = ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", "scripts/lib/gate-rules.mjs", "scripts/lib/gate-x-y.mjs",
         "scripts/lib/ledger-chain.mjs", "scripts/gate-migrate-check.mjs", "clipboard/oss/public-repo/scripts/lib/gate-rules.mjs",
         // 批 260(D160⑥):写入效果分析器、盲审、解析依赖清单进闸引擎面
-        "scripts/lib/write-effects.mjs", "scripts/fp-audit.mjs", "scripts/gate-deps/package.json", "scripts/gate-deps/node_modules/x.js"];
+        "scripts/lib/write-effects.mjs", "scripts/fp-audit.mjs", "scripts/gate-deps/package.json", "scripts/gate-deps/node_modules/x.js",
+        // 批 276(D171③):远端守卫进闸引擎面,它的自测文件不进
+        "scripts/hook-remote-check.mjs", "scripts/hook-remote-check.selftest.mjs",
+        // 批 276b(红队 BP-7):装钩子脚本与钩子本体进,钩子目录下的非 .mjs 与更深一层不进
+        "scripts/install-git-hooks.mjs", "scripts/git-hooks/pre-push.mjs", "scripts/git-hooks/README.md", "scripts/git-hooks/sub/x.mjs"];
       hp("ENGINE_PATHSPECS 与 ENGINE_REL 对同一组路径判定一致",
         samples.map((p) => `${_Pp.ENGINE_REL.test(p) ? 1 : 0}${_Pp.ENGINE_PATHSPECS.some((s) => asRe(s).test(p)) ? 1 : 0}`).join(" "),
-        "11 11 11 11 00 00 00 11 11 11 00");
+        "11 11 11 11 00 00 00 11 11 11 00 11 00 11 11 00 00");
+      // 批 276c(误拦猎手 FB-5):通用名只认仓相对形——裸名、别的仓里的同名绝对路径不算闸引擎(hunterBound 是绑定词,照认)
+      hp("276b/c GATE_ENGINE / ENGINE_PATH_RE / hunterBound 认装钩子脚本与钩子本体(BP-7),不认他仓同名(FB-5)",
+        ["scripts/install-git-hooks.mjs", "scripts/git-hooks/pre-push.mjs", "install-git-hooks.mjs", "scripts/git-hooks/README.md",
+          "E:/lacuna/scripts/install-git-hooks.mjs", "E:/lacuna/scripts/git-hooks/pre-commit.mjs"]
+          .map((p) => `${_Pp.GATE_ENGINE.test(p) ? 1 : 0}${_Pp.ENGINE_PATH_RE.test(p) ? 1 : 0}${_Pp.hunterBound({ input: { prompt: "只看 " + p } }) ? 1 : 0}`).join(" "),
+        "111 111 001 000 001 001");
       hp("GATE_ENGINE 认写入效果分析器与盲审", ["scripts/lib/write-effects.mjs", "scripts/fp-audit.mjs", "scripts/gate-deps/package.json"].map((p) => _Pp.GATE_ENGINE.test(p) ? 1 : 0).join(""), "111");
+      hp("276 GATE_ENGINE / ENGINE_PATH_RE 认 hook-remote-check、不认其 .selftest(D171③)",
+        ["scripts/hook-remote-check.mjs", "scripts/hook-remote-check.selftest.mjs", "hook-remote-check.mjs"].map((p) => `${_Pp.GATE_ENGINE.test(p) ? 1 : 0}${_Pp.ENGINE_PATH_RE.test(p) ? 1 : 0}`).join(" "), "11 00 11");
       // 批 266:原样装入的闸引擎(安装清单核对)。假 git:按 `<sha>:<path>` 返回树里的内容
       {
         const ENG = "export const x = 1;\r\n", isEng = (p) => _Pp.ENGINE_REL.test(p);
@@ -4701,6 +4741,8 @@ function selfTest() {
       hp("ENGINE_PATH_RE 覆盖 ENGINE_REL", samples.filter((p) => _Pp.ENGINE_REL.test(p) && !_Pp.ENGINE_PATH_RE.test(p)).join(","), "");
       // 红队 a700dedc BP-5:只点名新纳入文件的红队也算绑定
       hp("hunterBound 认新纳入的引擎文件名", ["只看 scripts/lib/write-effects.mjs", "审 fp-audit 的改动", "D160 的修补"].map((t) => _Pp.hunterBound({ input: { prompt: t } }) ? 1 : 0).join(""), "111");
+      hp("276 hunterBound 认 hook-remote-check、不认只点名其 .selftest(D171③)",
+        ["只看 scripts/hook-remote-check.mjs 的改动", "只看 scripts/hook-remote-check.selftest.mjs"].map((t) => _Pp.hunterBound({ input: { prompt: t } }) ? 1 : 0).join(""), "10");
     }
     // ── ranClear:参数面 vs 文本面(2026-08-20 实撞,写完当天被自己绊倒)──────────
     //   原写法 `[\s\S]*` 横跨整条命令 ⇒ 把 `--cond "K 的 --clear 阻断…"` 判成跑过结清。
@@ -5152,10 +5194,18 @@ if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
     // 总数与 fpTable 同一算法(fpNetById:按规则扣、各自不低于 0 再求和;含报警台账里没出现过的规则)
     const net = Object.values(fpNetById(led)).reduce((n, v) => n + Math.max(0, v), 0);
     // 盲审按笔去重计(grill 259 F12:原数 fp_audit 行数,重试与取证失败都算进「已审」)——每笔取最后一个结论
-    const lastByRef = new Map();
-    for (const x of audits) if (x.ref) lastByRef.set(x.ref, x.verdict);
-    const byV = (v) => [...lastByRef.values()].filter((y) => y === v).length;
-    console.log(`误报: ${net}(自签 ${claimed} − 人工撤回 ${manualRetracted} − 盲审判拦对了 ${byV("拦对了")})` +
+    //   批 276(D175④,与 fpConfirmedById 同病同修):只认审核管线自己写的行(by:codex 结论 / by:fp-audit 取证失败);
+    //   执行方 --fp-retract 的「已人工撤回」不得覆盖 codex 的结论,单独按笔计
+    const lastByRef = new Map(), manualRefs = new Set();
+    for (const x of audits) {
+      if (!x.ref) continue;
+      if (x.verdict === "已人工撤回") manualRefs.add(x.ref);
+      else if (x.by === "codex" || x.by === "fp-audit") lastByRef.set(x.ref, x.verdict);
+    }
+    const byV = (v) => (v === "已人工撤回" ? manualRefs.size : [...lastByRef.values()].filter((y) => y === v).length);
+    // 批 276b(附节三①):减法式里的「盲审判拦对了」与 fpNetById 同口径——已人工撤回的那笔不再算(否则同一笔扣两次);
+    //   下一行「独立盲审(codex)」照实列 codex 结论,不受影响
+    console.log(`误报: ${net}(自签 ${claimed} − 人工撤回 ${manualRetracted} − 盲审判拦对了 ${fpRightNotManual(led)})` +
       (nAlert ? `  (误报/报警 = ${(net / nAlert * 100).toFixed(1)}%)` : ""));
     // 2026-10-12:自签误报的独立核对 = codex 盲审(scripts/fp-audit.mjs);未审的笔数照实印,不让「自签」冒充「已核」
     console.log(`独立盲审(codex): 自签 ${claimed} 笔中已审 ${lastByRef.size}——拦错了 ${byV("拦错了")} / 拦对了 ${byV("拦对了")}(计为撤回)/ 判不出 ${byV("判不出")} / 取证失败 ${byV("取证失败")} / 已人工撤回 ${byV("已人工撤回")}`);
@@ -5365,7 +5415,9 @@ if (hookInput.hook_event_name === "SubagentStop") {
       // **升阻断的判据**(不再含糊):本项保持**非阻断**,直到子代理面累计出现
       //   ≥10 次命中且 fp 台账零条 —— 有了这个分母才谈得上升档;
       //   在那之前升档等于拿一个没量过误报率的判据去拦人。
-      const only = new Set(["I", "M", "L", "B"]);
+      //   · `MF`(批 276 红队 r6 BP-6):触发与出路只吃本轮写入与那份 memory 的盘上全文,在子代理边界上语义完整
+      //     ⇒ **接入**(否则把「存一条 memory」派给子代理写即绕过);SE 吃的是认错措辞,子代理的自述不是执行方本人,不接。
+      const only = new Set(["I", "M", "L", "B", "MF"]);
       const subFindings = runRules(RULES.filter((r) => only.has(r.id)), sCtx);
       hitIds = subFindings.map((f) => f.id);
       const hits = subFindings

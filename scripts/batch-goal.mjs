@@ -23,6 +23,7 @@
 //   node --no-warnings scripts/batch-goal.mjs --arm <批号> --cond "…" [--cond "…"]
 //   node --no-warnings scripts/batch-goal.mjs --status
 //   node --no-warnings scripts/batch-goal.mjs --decision "<本批决定一句话>"   ⇒ 自动编号 <批号>-D<n>(批 256)
+//   node --no-warnings scripts/batch-goal.mjs --no-decision "<为什么本批没有决定>"   ⇒ 承重面批零决定时的声明(批 276,D177)
 //   node --no-warnings scripts/batch-goal.mjs --outcome "<可见成果一句话>"    ⇒ 自动序号 O<n>(批 256)
 //   node --no-warnings scripts/batch-goal.mjs --withdraw <批号-Dn | On> --reason "<理由>"   撤回误登记的一项(批 256b)
 //   node --no-warnings scripts/batch-goal.mjs --clear
@@ -42,6 +43,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { ledgerAppend } from "./lib/ledger-chain.mjs";
 import { quoteUntrusted } from "./lib/gate-ctx.mjs";
+import { isLoadBearing } from "./lib/gate-carriers.mjs";
 const JOURNAL = path.join(".claude", ".batch-goal.jsonl");
 // 盲审日志(fpAudit / fpAuditLast 用)。须在顶部定义:--clear / --arm 分支在文件中段执行并 exit,
 //   定义在函数旁边时落在暂时性死区,发车与读结论都会失败(codex 259-final-r1 附节 1 实测)
@@ -476,16 +478,43 @@ export function diaryAddedLines(baseCommit, git = gitRun) {
   return { lines: String(r.stdout || "").split(/\r?\n/).filter((l) => l.startsWith("+") && !l.startsWith("+++")).map((l) => l.slice(1)) };
 }
 
-/** --clear 的两道新检查。io 可注入:{git, readDiary():string|null(不存在=null), adrNames():string[]}。 */
+// 批 276(D177②,用户 2026-10-24「你觉得是把 ADR 管理做成 skill 还是加进闸来的好?自己选吧」⇒ 选闸):
+//   原先「登记了决定才核 ADR」——零登记即零核对,改了既有机制的批可以一张 ADR 都不碰就结清(本批实撞:开工至用户发问,
+//   `docs/adr/` 零读取、`--decision` 零登记)。补一格:本批基点之后的提交触及**承重面**而零登记 ⇒ 拒清,
+//   除非 `--no-decision "<为什么本批没有决定>"` 留一句话(只数格子,不判理由对不对)。
+//   承重面 = 汇报法「三通道必跑」的触发面(hook-* / docs/laws / AGENTS.md / .claude 的 agents·skills·commands)∪ 闸引擎(lib/gate-* 与推送钩子);自测文件不算。
+//   无基点(早于批 256 的武装)⇒ 跳过并提示;git 判不了 ⇒ unknown 拒清。
+//   失效条件:实现后连续 20 个承重面批 `--no-decision` 占比 >80% ⇒ 它成了仪式,复议(D177)。
+//   红队 r4 BP-2:原表漏了闸引擎的其余成员(write-effects / fp-audit / gate-replay / gate-deps)与 settings.json、CLAUDE.md、两份寄存器、batch-goal 自身。
+const LOAD_BEARING_PATH = /^(?:AGENTS\.md$|CLAUDE\.md$|docs\/laws\/|docs\/(?:constraint|tool)-register\.md$|\.claude\/(?:agents|skills|commands)\/|\.claude\/settings(?:\.[\w-]+)?\.json$|scripts\/hook-[^/]+\.mjs$|scripts\/lib\/(?:gate-[^/]+|write-effects)\.mjs$|scripts\/(?:fp-audit|gate-replay|batch-goal|install-git-hooks)\.mjs$|scripts\/gate-deps\/package(?:-lock)?\.json$|scripts\/git-hooks\/)/i;
+export function loadBearingTouched(baseCommit, git = gitRun) {
+  if (!(typeof baseCommit === "string" && baseCommit)) return { paths: [], note: "本批武装时没记基点——「承重面零决定」核对跳过" };
+  //   --no-renames:改名时两侧路径都列出(红队 r4 BP-4:把 skill 挪出承重面,原先 diff 只剩新路径)
+  let r; try { r = git(["diff", "--name-only", "--no-renames", "-z", baseCommit, "HEAD"]); } catch (e) { return { unknown: true, why: e.message }; }
+  if (!r || r.status !== 0) return { unknown: true, why: String(r?.stderr || "git diff 失败").trim() || "git diff 失败" };
+  const paths = String(r.stdout || "").split("\0").map((x) => x.trim().replace(/\\/g, "/")).filter(Boolean)
+    //   红队 r6 BP-20:手抄表只是子集(漏 package.json / verify-laws / perm-match…)⇒ 并上 P 的判据面 isLoadBearing,不再另抄
+    .filter((p) => (LOAD_BEARING_PATH.test(p) || isLoadBearing(p)) && !/\.(?:selftest|test|spec)\.[cm]?[jt]s$/i.test(p));
+  return { paths };
+}
+
+/** --no-decision 的理由是不是照抄了拒清消息里的模板(红队 r6 BP-23:「决定在批 N」/「<为什么…>」原样贴回)。 */
+export const isTemplateReason = (t) => /批\s*N\b|<[^>]*>/.test(String(t || ""));
+
+/** --clear 的检查。io 可注入:{git, readDiary():string|null(不存在=null), adrNames():string[]}。 */
 export function obligationCheck(goal, io = {}) {
   const git = io.git || gitRun;
-  const out = { notes: [], missingDecisions: [], diaryMissing: false, unknown: null };
+  const out = { notes: [], missingDecisions: [], diaryMissing: false, noDecisionTouched: [], unknown: null };
   const decisions = arr(goal?.decisions), outcomes = arr(goal?.outcomes);
   const unk = [];
   if (decisions.length) {
     const c = adrCoverage(decisions, goal?.baseCommit, git);
     if (c.unknown) unk.push(`ADR 覆盖:${c.why || "git 不可用"}`);
     else { out.notes.push(...c.notes); out.missingDecisions = c.missing; }
+  } else if (!goal?.noDecision || isTemplateReason(goal.noDecision.text)) {
+    const lb = loadBearingTouched(goal?.baseCommit, git);
+    if (lb.unknown) unk.push(`承重面零决定核对:${lb.why}`);
+    else { if (lb.note) out.notes.push(lb.note); out.noDecisionTouched = lb.paths; }
   }
   if (outcomes.length) {
     // BP-4:只有 ENOENT 算「这个仓没有日记」;其它读错误判不了 ⇒ unknown 拒清(与 ADR 一侧同口径)。
@@ -515,6 +544,12 @@ function nextAdrNumber() {
 }
 function printObligationRefusal(goal, obl) {
   const batch = goal?.batch;
+  if (obl.noDecisionTouched.length) {
+    console.error(`拒绝结清:本批基点到 HEAD 之间触及承重面(${obl.noDecisionTouched.slice(0, 5).join("、")}${obl.noDecisionTouched.length > 5 ? ` 等 ${obl.noDecisionTouched.length} 个` : ""};按树差判,含合并带入的别批改动),却一条决定都没登记(D177)。`);
+    console.error(`  若这些改动是合并带入、不是本批做的(另一会话的批里已登记过决定),\`--no-decision "合并带入,决定在批 <那一批的真实批号>"\` 即可(占位原样贴回会被拒)。`);
+    console.error(`  先翻 ${ADR_DIR}/README.md:本批是否改了某张 ADR 记载的决定?改了 ⇒ \`--decision "<一句话>"\` 登记并写 / 改 ADR;`);
+    console.error(`  确实没有决定(纯修笔误、只补测试……)⇒ \`--no-decision "<为什么本批没有决定>"\`,再 --clear。`);
+  }
   if (obl.missingDecisions.length) {
     const byId = new Map(arr(goal?.decisions).map((d) => [d.id, d.text]));
     console.error(`拒绝结清:${obl.missingDecisions.length} 个已登记决定还没有 ADR —— 缺:${obl.missingDecisions.join("、")}`);
@@ -741,7 +776,7 @@ function selfTest() {
   t("BP-7:「批 255 和用户讨论 256」不把 256 并进来", diaryHasBatch("| d | 批 255 和用户讨论 256 | y | e |", "256"), false);
   t("BP-7:正序在前时反序量词不抢位(批 255:回顾 256 批)", diaryHasBatch("| d | 批 255:回顾 256 批 | y | e |", "256"), false);
   t("BP-4:日记读错误(非 ENOENT)⇒ unknown", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => { const e = new Error("busy"); e.code = "EBUSY"; throw e; } }); return [!!o.unknown, o.diaryMissing]; })(), [true, false]);
-  t("BP-4:日记 ENOENT ⇒ 只提示", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => { const e = new Error("no"); e.code = "ENOENT"; throw e; } }); return [!!o.unknown, o.notes.length]; })(), [false, 1]);
+  t("BP-4:日记 ENOENT ⇒ 只提示", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => { const e = new Error("no"); e.code = "ENOENT"; throw e; } }); return [!!o.unknown, o.notes.filter((n) => /product-diary|日记/.test(n)).length]; })(), [false, 1]);
   const diffGit = (added) => (a) => a[0] === "diff" ? { status: 0, stdout: `--- a/docs/product-diary.md\n+++ b/docs/product-diary.md\n@@ -9 +9,1 @@\n${added.map((l) => "+" + l).join("\n")}\n` } : { status: 1, stdout: "" };
   t("BP-2:有基点时日记行须在新增行里(旧行不抵)", obligationCheck({ batch: "256", baseCommit: "abc1234", outcomes: [{ text: "x" }] }, { readDiary: () => "| d | 批 256:旧 | y | e |", git: diffGit(["| d | 批 255:别的 | y | e |"]) }).diaryMissing, true);
   t("BP-2:有基点、新增行有本批 ⇒ 过", obligationCheck({ batch: "256", baseCommit: "abc1234", outcomes: [{ text: "x" }] }, { readDiary: () => "| d | 批 256:新 | y | e |", git: diffGit(["| d | 批 256:新 | y | e |"]) }).diaryMissing, false);
@@ -749,10 +784,26 @@ function selfTest() {
   t("BP-9:--withdraw 必须带非空 --reason", (() => { try { parseWithdraw(["--withdraw", "256-D1"]); return "no-throw"; } catch { return "throw"; } })(), "throw");
   t("BP-9:定位决定(前导零也认)与成果序号", [locateWithdraw({ decisions: [{ id: "256-D1" }, { id: "256-D2" }] }, "256-D02").index, locateWithdraw({ outcomes: [{ n: 3, text: "a" }] }, "O3").index, !!locateWithdraw({ decisions: [{ id: "256-D1" }] }, "257-D1").error], [1, 0, true]);
   t("ADR:没登记决定 ⇒ 不查(不调 git)", adrCoverage([], "abc", () => { throw new Error("不该调"); }).missing, []);
-  t("义务:日记不存在 ⇒ 只提示不拒", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => null }); return [o.diaryMissing, o.notes.length]; })(), [false, 1]);
+  t("义务:日记不存在 ⇒ 只提示不拒", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => null }); return [o.diaryMissing, o.notes.filter((n) => /product-diary|日记/.test(n)).length]; })(), [false, 1]);
   t("义务:没登记成果 ⇒ 不读日记", obligationCheck({ batch: "256" }, { readDiary: () => { throw new Error("不该读"); } }).diaryMissing, false);
   t("义务:登记了成果、日记无本批 ⇒ 缺", obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => "| d | 批 2560:x | y | e |" }).diaryMissing, true);
   t("义务:git 判不了 ⇒ unknown", !!obligationCheck({ batch: "256", decisions: dec }, { git: () => ({ status: 128, stdout: "" }) }).unknown, true);
+  // 批 276(D177②):承重面零决定
+  {
+    const names = (list) => (a) => (a[0] === "diff" && a.includes("--name-only") ? { status: 0, stdout: list.join("\0") + "\0" } : { status: 1, stdout: "" });
+    const g0 = { batch: "276", baseCommit: "abc1234" };
+    t("D177:触及承重面且零决定 ⇒ 列出", obligationCheck(g0, { git: names(["scripts/hook-remote-check.mjs", "docs/x.md"]) }).noDecisionTouched, ["scripts/hook-remote-check.mjs"]);
+    t("D177:触及法典 / AGENTS.md / 闸引擎 / 推送钩子都算", obligationCheck(g0, { git: names(["docs/laws/collab.md", "AGENTS.md", "scripts/lib/gate-rules.mjs", "scripts/git-hooks/pre-push.mjs", "scripts/install-git-hooks.mjs"]) }).noDecisionTouched.length, 5);
+    t("D177:只改自测文件与普通文档 ⇒ 不拦", obligationCheck(g0, { git: names(["scripts/hook-remote-check.selftest.mjs", "docs/gate-debts.md", "app/page.tsx"]) }).noDecisionTouched, []);
+    t("D177:声明过 --no-decision ⇒ 不核", obligationCheck({ ...g0, noDecision: { text: "只修笔误" } }, { git: names(["scripts/hook-guard.mjs"]) }).noDecisionTouched, []);
+    t("D177 r6 BP-23:照抄消息模板的理由不算声明", obligationCheck({ ...g0, noDecision: { text: "合并带入,决定在批 N" } }, { git: names(["scripts/hook-guard.mjs"]) }).noDecisionTouched.length, 1);
+    t("D177 r6 BP-20:手抄表外的承重件(package.json / verify-laws / perm-match)也核", obligationCheck(g0, { git: names(["package.json", "scripts/verify-laws.mjs", "scripts/lib/perm-match.mjs"]) }).noDecisionTouched.length, 3);
+    t("D177:登记了决定 ⇒ 走 ADR 覆盖,不走本格", obligationCheck({ ...g0, decisions: dec }, { git: () => ({ status: 0, stdout: "" }) }).noDecisionTouched, []);
+    t("D177:没基点 ⇒ 跳过并提示", (() => { const o = obligationCheck({ batch: "276" }, { git: names(["scripts/hook-guard.mjs"]) }); return [o.noDecisionTouched.length, o.notes.length]; })(), [0, 1]);
+    t("D177:git 判不了 ⇒ unknown", !!obligationCheck(g0, { git: () => ({ status: 128, stdout: "" }) }).unknown, true);
+    t("D177 r4 BP-2:闸引擎其余成员 / settings / 寄存器 / CLAUDE.md 都算", obligationCheck(g0, { git: names(["scripts/lib/write-effects.mjs", "scripts/fp-audit.mjs", "scripts/gate-replay.mjs", "scripts/gate-deps/package.json", ".claude/settings.json", "CLAUDE.md", "docs/tool-register.md", "scripts/batch-goal.mjs"]) }).noDecisionTouched.length, 8);
+    t("D177 r4 BP-4:取改动清单时带 --no-renames(改名两侧都列)", (() => { let seen = null; obligationCheck(g0, { git: (a) => { if (a[0] === "diff") seen = a.includes("--no-renames"); return { status: 0, stdout: "" }; } }); return seen; })(), true);
+  }
 
   // ── 批 256 集成:真 CLI 跑在临时 git 仓里(**不碰真台账**:cwd=临时目录,状态与台账都写在那里)──
   const integ = (() => {
@@ -973,11 +1024,11 @@ if (argv.includes("--clear")) {
     if (obl.unknown) {
       refuse("obligation-unknown");
       console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev?.batch} reason=obligation-unknown`);
-      console.error(`拒绝结清:本批登记了决定或成果,但判不了核对(${obl.unknown})。判不了按没过算。`);
+      console.error(`拒绝结清:决定 / 成果 / 承重面的核对判不了(${obl.unknown})。判不了按没过算。`);
       process.exit(2);
     }
-    if (obl.missingDecisions.length || obl.diaryMissing) {
-      const why = [obl.missingDecisions.length ? "adr-missing" : "", obl.diaryMissing ? "diary-missing" : ""].filter(Boolean).join("+");
+    if (obl.missingDecisions.length || obl.diaryMissing || obl.noDecisionTouched.length) {
+      const why = [obl.missingDecisions.length ? "adr-missing" : "", obl.diaryMissing ? "diary-missing" : "", obl.noDecisionTouched.length ? "no-decision" : ""].filter(Boolean).join("+");
       refuse(why);
       console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev?.batch} reason=${why}`);
       printObligationRefusal(prev, obl);
@@ -1007,6 +1058,21 @@ if (argv.includes("--clear")) {
   process.exit(0);
 }
 
+if (argv.includes("--no-decision")) {
+  // 批 276(D177②):承重面批声明「本批没有决定」——留一句理由,--clear 不再要求决定编号;台账记 no-decision 行
+  const i = argv.indexOf("--no-decision"), text = argv[i + 1];
+  if (text === undefined || !String(text).trim() || /^--/.test(text)) { console.error('用法: --no-decision "<为什么本批没有决定>"'); process.exit(2); }
+  if (isTemplateReason(text)) { console.error("--no-decision 的理由照抄了模板(含「批 N」或尖括号占位)——写本批真实的理由 / 真实批号"); process.exit(2); }
+  let cur;
+  try { cur = load(); } catch (e) { console.error(`拒绝:${e.message}`); process.exit(2); }
+  if (!cur || cur.cleared || !Array.isArray(cur.conditions) || !cur.conditions.length) { console.error("拒绝:盘上没有未结清的批。"); process.exit(2); }
+  if (arr(cur.decisions).length) { console.error(`拒绝:本批已登记 ${arr(cur.decisions).length} 条决定,不能再声明「没有决定」(登记错了用 --withdraw)。`); process.exit(2); }
+  const item = { text: String(text), at: new Date().toISOString() };
+  try { atomicWrite({ ...cur, noDecision: item }, Number(cur.version) || 0); } catch (e) { console.error(e.message); process.exit(2); }
+  journal("no-decision", { batch: cur.batch, ...item });
+  console.log(`已声明批 ${cur.batch} 没有决定:${item.text}`);
+  process.exit(0);
+}
 if (argv.includes("--decision")) appendItem("decision", argv);
 if (argv.includes("--outcome")) appendItem("outcome", argv);
 if (argv.includes("--withdraw")) withdrawItem(argv);
@@ -1074,7 +1140,8 @@ if (argv.includes("--arm")) {
   //   旧批没有基点 ⇒ 保持 null 不补记(补记的 HEAD 比真基点晚,会误拦,见 headCommit 上方头注 ①)。
   const sameOpen = !!(cur && !cur.cleared && cur.batch === batch);
   const baseCommit = sameOpen ? (typeof cur.baseCommit === "string" ? cur.baseCommit : null) : headCommit();
-  const kept = sameOpen ? { decisions: arr(cur.decisions), outcomes: arr(cur.outcomes), withdrawn: arr(cur.withdrawn) } : { decisions: [], outcomes: [], withdrawn: [] };
+  // 批 276(误拦猎手 FB-13):同号重放时 --no-decision 声明一并保留,原先被静默丢掉 ⇒ --clear 拒清
+  const kept = sameOpen ? { decisions: arr(cur.decisions), outcomes: arr(cur.outcomes), withdrawn: arr(cur.withdrawn), ...(cur.noDecision ? { noDecision: cur.noDecision } : {}) } : { decisions: [], outcomes: [], withdrawn: [] };
   if (!baseCommit) console.log(sameOpen ? "注意:本批武装于基点功能之前,基点保持空;--clear 的 ADR 核对会退回全部 ADR。" : "注意:取不到 HEAD(非 git 仓或零提交),本批没有基点;--clear 的 ADR 核对会退回全部 ADR。");
   // 批 256b BP-3:--force 换批覆盖带决定/成果的未结清批 ⇒ 点名丢了什么,并记台账(此前静默丢掉)。
   if (cur && !cur.cleared && !sameOpen && (arr(cur.decisions).length || arr(cur.outcomes).length)) {
@@ -1227,6 +1294,6 @@ if (argv.includes("--history")) {
 // ⚠️ 被 import 时到此**什么都不做**。原实现在这里无条件 `exit(2)`,
 //   于是守卫算对了也没用——调用方照样被这句用法错误杀掉(实测复现)。
 if (IS_MAIN) {
-  console.error("用法: --arm <批号> --cond \"…\" [--check \"命令\" [--expect \"子串\" | --expect-re \"正则\"]] [--force] | --decision \"<决定>\" | --outcome \"<成果>\" | --withdraw <批号-Dn | On> --reason \"<理由>\" | --status | --dry-check | --clear | --history [n] | --self-test");
+  console.error("用法: --arm <批号> --cond \"…\" [--check \"命令\" [--expect \"子串\" | --expect-re \"正则\"]] [--force] | --decision \"<决定>\" | --no-decision \"<为什么本批没有决定>\" | --outcome \"<成果>\" | --withdraw <批号-Dn | On> --reason \"<理由>\" | --status | --dry-check | --clear | --history [n] | --self-test");
   process.exit(2);
 }

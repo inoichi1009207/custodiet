@@ -155,18 +155,25 @@ const G_CHECK = {
   //   fp-audit.mjs / lib/write-effects.mjs 改完不跑自测也不响——面改为与承重面、闸引擎面对账,不再只靠手写前缀
   //   红队 accbe4c9 BP-4/BP-8:第二支前缀须不分大小写(NTFS 上 `Scripts/` 是同一文件),且只看 `scripts/` 起的那一段
   //   (原先两个条件可命中路径不同部分:`~/.claude/skills/x/scripts/run.py` 误报);第二、三支都剔 NON_CARRIER_AREA(暂存树)
-  _gateFile(p) {
+  //   批 276(规则层红队 r3 BP-3):GATE_ENGINE 的通用名两支(install-git-hooks / git-hooks/*.mjs)只认仓相对形,
+  //   而 Edit / Write 给的路径恒为绝对路径 ⇒ 另走 P 的 isEnginePath(先按 hook checkout 化相对形,与 P 同一口径)
+  _gateFile(p, root = null) {
     const s = String(p).replace(/\\/g, "/");
     if (/scripts\/(hook-|lib\/gate-|gate-)/.test(s)) return true;
     if (NON_CARRIER_AREA.test(s)) return false;
     const m = s.match(/(?:^|\/)(scripts\/.*)$/i);
     if (m && isCarrierPath(CARRIER_SURFACE, m[1].replace(/^scripts\//i, "scripts/"))) return true;
-    const eng = RULE_P && RULE_P._p && RULE_P._p.GATE_ENGINE;
-    return !!eng && eng.test(s);
+    const H = RULE_P && RULE_P._p;
+    if (H && typeof H.isEnginePath === "function" && H.isEnginePath(s, root)) return true;
+    return !!(H && H.GATE_ENGINE) && H.GATE_ENGINE.test(s);
   },
   accept(ctx, win) {
-    const touchedGate = ctx.writes.some((w) => this._gateFile(w));
-    const ran = (c) => !!c && c.ranBash(/--self-test|gate:self-test|gate:accept|gate-migrate-check/);
+    const touchedGate = ctx.writes.some((w) => this._gateFile(w, ctx.hookCheckout || null));
+    // 批 276(红队 r4 BP-14):推送防线的真自测是 hook-remote-check.selftest.mjs,跑它也算
+    //   r5 BP-8:只认用 node 真跑它,`git add … hook-remote-check.selftest.mjs` / `cat` 这个文件不算
+    //   r6 BP-15:node 须是该段命令首词、自测文件须是脚本参数(`node --check …selftest.mjs` / `grep node …` 不算);
+    //   误拦 r6 FB-14:容 `\` 续行
+    const ran = (c) => !!c && c.ranBash(/--self-test|gate:self-test|gate:accept|gate-migrate-check|(?:^|[;&|(])\s*node(?:\s+(?:--(?!check\b|eval\b|print\b)[\w-]+(?:=\S+)?|\\\r?\n))*\s+[^\s|;&-][^\s|;&]*hook-remote-check\.selftest\.mjs/);
     if (!touchedGate || ran(ctx) || ran(win)) return null;
     return "④ 关账义务:本轮提交触及闸机件,而本轮∪批窗口没有自测/验收动作(--self-test 或 gate:accept)";
   },
@@ -227,10 +234,24 @@ export const RULE_G = {
         tracked: ["scripts/check-windows-hide.mjs"] },
       { name: "262 红队 BP-2:改 fp-audit 不跑自测", text: "改好了,提交。", commit: true, write: "scripts/fp-audit.mjs",
         tracked: ["scripts/fp-audit.mjs"] },
+      // 批 276(规则层红队 r3 BP-3):推送主防线是闸引擎件,Edit 给的是绝对路径——也要认
+      { name: "276 红队 r3 BP-3:绝对路径改 pre-push 钩子不跑自测", text: "改好了,提交。", commit: true,
+        write: "/repo/.claude/worktrees/w1/scripts/git-hooks/pre-push.mjs", hookCheckout: "/repo/.claude/worktrees/w1",
+        tracked: ["scripts/git-hooks/pre-push.mjs"] },
       { name: "262 红队 accbe4c9 BP-4:大写 Scripts 改承重面检查脚本", text: "改好了,提交。", commit: true, write: "/repo/Scripts/check-windows-hide.mjs",
         tracked: ["scripts/check-windows-hide.mjs"] },
+      // 批 276 红队 r6 BP-15:只做语法检查 / grep 自测文件不算跑了自测
+      { name: "276 r6 BP-15:node --check 自测文件不算", text: "改好了,提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "node --check scripts/hook-remote-check.selftest.mjs" },
+      { name: "276 r6 BP-15:grep node 自测文件不算", text: "改好了,提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "grep -n node scripts/hook-remote-check.selftest.mjs" },
     ],
     neg: [
+      // 批 276 误拦 r6 FB-14:续行写法真跑了推送防线自测 ⇒ 放行;cd 之后跑也放
+      { name: "276 误拦 r6 FB-14:续行跑推送防线自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "node --no-warnings \\\n  scripts/hook-remote-check.selftest.mjs" },
+      { name: "276:cd 后 && node 跑推送防线自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "cd /repo && node --no-warnings scripts/hook-remote-check.selftest.mjs" },
       // 新建载体但**没提交** ⇒ 不追(杀「去掉 didCommit 前置闸」)
       { text: "写了个新零件,还没提交。", write: "scripts/zzz-new-widget.mjs" },
       // 普通提交轮:不触造物面/register/闸机件 ⇒ 一个字的仪式文本都不要求(v1 的 21 次噪声消失)
@@ -313,7 +334,9 @@ export const RULE_B = {
 //   于是把**状态描述**读成本仓缺陷陈述——引文里的标签(「…没覆盖的…」)、讲经历的「我没见过 / 还没做过」、
 //   行内已指向债表的「已登记债(D95)」、子代理「没有做完」而批账上已挂着「条件N:未达成」。
 //   共同机制:**命中片段不是一句由我说出、尚未入账的缺件断言**。四处收窄,各管一面,都只删命中、不加词:
-//     ① 先过 `maskQuoted`(E0/E2/R/S 同一份口径:引文=提及不是使用;等长保行,回显仍取原文);
+//     ① 引文=提及不是使用(等长保行,回显仍取原文)。⚠️ 批 276 起**不再过 `maskQuoted`**:C① 自带逐个判的循环
+//        (见下方 defectText),只认「」“”"" 三种引号(『』«» 不算引文),且只抹前有提及标记 / 后接「这句」类回指的那些;
+//        条件账 notes 仍取自 maskQuoted 后的文本;
 //     ② PAT.defect 第 3 条:「只有 A,我/还没 V过」(分句界后另起主语/副词 **且** 经历体「V过」)不算;
 //        只占一件照拦(「只有两条没通过」「只有单测,没跑过端到端」)——改在 hook 的 PAT 表,头注写明已知洞;
 //     ③ 同一**句**(。！？;；切)里出现「已登记」⇒ 该句不算(与「未覆盖」同属登记面的文字声明;
@@ -329,20 +352,46 @@ export const RULE_B = {
 //     BP-2 ③ 「已登记」只遮它自己所在的**分句**(逗号 / 冒号 / 竖线也切),且前面紧跟否定(不是 / 并非 / 没 / 未 / 非)的不遮;
 //     BP-3 ④ 「没做完」只在其分句里出现某条「条件N:未达成(X …)」括注主语 X 时才遮——豁免绑到那个条件,不按全文;
 //     BP-4 ② 经历体主语只认「我 / 还」(改在 hook 的 PAT 表):「后端没测过」这种名词主语照拦。
+// 批 276(BP-8,核查代理 rules-probe 语料实证):① 原为「默认抹、转述动词前置才留」⇒ 执行方给**自己的**缺件加引号当标签
+//   (「又一个「做了但没生效」」「报告不显示"这里缺了 6 格"」「表现是「开了但没效果」」)整句被抹,语料 3 块真缺件因此放走。
+//   改为「默认留、只抹**提及**」:引文前紧跟提及标记(原话 / 原文 / 写着 / 标题 / 名为 / 叫做 / 所谓 / 字样 / 条件N …)
+//   或引文后紧跟「这句 / 那句 / 这段 / 字样 / 的说法」才抹——那才是「引文=提及不是使用」的本意(批 273 立这刀的样本
+//   「…:「覆盖到但断言弱的行比没覆盖的更险」这句不在那一页上」后接「这句」,照抹)。BP-1 的转述动词(报 / 说 / 指出…)仍优先保留。
+//   残余:没有提及标记的纯引用(「页面上写的:「X 没覆盖」」以外的写法,如裸「「X 没覆盖」不成立」)照拦——C 不阻断,取多拦一侧。
+const C_MENTION_BEFORE = /(?:原话|原文|原句|写着|写的是|写道|标题|题为|名为|叫做?|称为|所谓|字样|条件\s*\d+)(?:是|为)?\s*[:：]?\s*$/;
+const C_MENTION_AFTER = /^\s*(?:这一?句|那一?句|这段话?|那段话?|这行字?|这条(?:话|说法)|一句|字样|的(?:说法|原话|字样|原文)|这个(?:标签|说法|词))/;
+// 批 276(BP-6):③ 的分句切点补顿号与转折 / 递进连接词——「D95 已登记、hook 还没接线」「D95 已登记但 hook 还没接线」
+//   的后半是另一件缺件,不得被前半的「已登记」吃掉。连接词表只收**独立成词**时几乎必是分句界的几个。
+const C3_CLAUSE = "(?:(?!但|另外|不过|然而|可是|此外|而且|并且|同时)[^。！？!?;；，,：:|、])";
+const C3_RE = new RegExp(`${C3_CLAUSE}{0,200}已登记${C3_CLAUSE}{0,200}`, "g");
+// 批 276b(红队 BP-8,本批引入的误拦):「已登记」**紧跟**在顿号 / 但 之后起头(可带 也 / 均 / 都 / 现),回指的是**前一分句**
+//   ——「hook 还没接线、已登记(D172)」「hook 还没接线但已登记(D172)」⇒ 前一分句连同本分句一起遮。
+//   方向只此一种:「D95 已登记、hook 还没接线」(已登记在前、缺件在后)不受影响,照提示。逗号连写照旧不回指(BP-2 口径)。
+const C3_BACK_RE = new RegExp(`${C3_CLAUSE}{0,200}(?:、|但是?)\\s*(?:也|均|都|现)?已登记${C3_CLAUSE}{0,200}`, "g");
 const defectText = (ctx) => {
   const raw = String(ctx.text || "");
   const keepQuote = /(?:报|说|指出|发现|提到|反映)\s*[:：]?\s*$/;
-  // ① 逐个引文判:前文以转述动词收尾的引文原样保留,其余按 maskQuoted 口径等长抹去
-  const masked = maskQuoted(raw);                                    // 等长抹引文
+  // ① 逐个引文判(批 276 起):只抹「提及」型引文(前有提及标记 / 后接「这句」类回指),且前文不是转述动词;其余原样保留
   const q = /「[^」\n]*」|“[^”\n]*”|"[^"\n]*"/g;
-  let kept = masked, m;
-  while ((m = q.exec(raw)) !== null) if (keepQuote.test(raw.slice(Math.max(0, m.index - 8), m.index))) kept = kept.slice(0, m.index) + raw.slice(m.index, q.lastIndex) + kept.slice(q.lastIndex);
+  let kept = raw, m;
+  while ((m = q.exec(raw)) !== null) {
+    // 批 276b(BP-1 同病):ASCII 引号数为奇数的行不配对——**只此 C① 一处**;maskQuoted 的同一改动已随 E0 / E2 退回 fd83576(停止出口①),两处现为两套口径
+    if (m[0][0] === '"') {
+      const a = raw.lastIndexOf("\n", m.index - 1) + 1, b = raw.indexOf("\n", m.index);
+      if (((raw.slice(a, b < 0 ? raw.length : b).match(/"/g) || []).length % 2) === 1) continue;
+    }
+    const before = raw.slice(Math.max(0, m.index - 8), m.index);
+    if (keepQuote.test(before)) continue;
+    if (!C_MENTION_BEFORE.test(before) && !C_MENTION_AFTER.test(raw.slice(q.lastIndex, q.lastIndex + 8))) continue;
+    kept = kept.slice(0, m.index) + m[0].replace(/[^\n]/g, " ") + kept.slice(q.lastIndex);   // 等长抹
+  }
   const notes = [...maskQuoted(raw).matchAll(/条件\s*\d+\s*[:：]\s*未达成\s*[（(]([^）)\n]{1,40})[）)]/g)]
     .map((x) => x[1].replace(/\s*(?:在跑|在审|还在|还没|未|没|仍在|正在).*$/, "").trim()).filter((s) => s.length >= 1);
   const blank = (s) => " ".repeat(s.length);                          // 等长保行:回显仍取原文同号行
   return kept.split("\n").map((l) => {
     // 误拦猎手 ae8ef771 附节二②:无句读长行上不限长的两侧量词是平方级(20 万字 33 秒,超 Stop 30 秒)⇒ 两侧各限 200
-    l = l.replace(/[^。！？!?;；，,：:|]{0,200}已登记[^。！？!?;；，,：:|]{0,200}/g, (s) => (/(?:不是|并非|没有?|未|非)\s*已登记/.test(s) ? s : blank(s)));   // ③ 同分句
+    l = l.replace(C3_BACK_RE, (s) => (/(?:不是|并非|没有?|未|非)\s*已登记/.test(s) ? s : blank(s)));   // ③′ 回指前一分句(批 276b BP-8)
+    l = l.replace(C3_RE, (s) => (/(?:不是|并非|没有?|未|非)\s*已登记/.test(s) ? s : blank(s)));   // ③ 同分句(批 276 BP-6:切点含 、/但/另外…)
     if (!notes.length) return l;
     // codex 273-r1:分句也在逗号处断——「组 G 在跑,迁移脚本还没做完」的前分句主语不得借给后分句
     return l.replace(/[^。！？!?;；，,\n]{0,200}?(还)?(没|未)(有)?做完[^。！？!?;；，,\n]{0,200}/g, (s) => (notes.some((n) => s.includes(n)) ? s.replace(/(还)?(没|未)(有)?做完/g, blank) : s));   // ④ 绑条件
@@ -397,6 +446,14 @@ export const RULE_C = {
       { text: "条件2:未达成(组 G 在跑)\n另外迁移脚本的回滚分支还没做完,先不管。" },   // BP-3 条件账不罩无关缺件
       { text: "条件2:未达成(组 G 在跑)\n组 G 在跑,迁移脚本还没做完,先不管。" },          // codex 273-r1:主语不跨逗号借
       { text: "只有前端测了,后端没测过。" },                              // BP-4 名词主语经历体
+      // 批 276 BP-8:自己的缺件加引号当标签(语料 某会话:4006 / 某会话:451 / 某会话:3812 三形)⇒ 不是提及,照拦
+      { text: "又一个「做了但没生效」,这是今天第二次。" },
+      { text: "某一级抛错会把条目丢成 null,最终报告也不显示\"这里缺了 6 格\"。下次再加 try/catch。" },
+      { text: "「回滚分支还没接线」,先不修。" },
+      // 批 276 BP-6:「已登记」与另一件缺件以顿号 / 但 / 另外连写 ⇒ 后半照拦
+      { text: "D95 已登记、hook 还没接线。" },
+      { text: "D95 已登记但 hook 还没接线。" },
+      { text: "D95 已登记 另外 hook 还没接线。" },
     ],
     neg: [
       { text: "那条还没落盘,已写进未覆盖栏。" },
@@ -409,6 +466,14 @@ export const RULE_C = {
       //   ③ 收到分句后它单独露出、照提示——C 不阻断,取「逗号连写的真缺件不被已登记吃掉」一侧
       { text: "收尾闸只剩 CW 一项,是超时的已登记债(D95)。" },
       { text: "组 G 没有做完:分支还停在 d3567e1,我已经把它叫醒接着做。\n\n条件1:达成\n条件2:未达成(组 G 在跑)" },   // ④ 进度已入条件账
+      // 批 276 BP-8:提及型引文(前有提及标记 / 后接「这句」)仍抹
+      { text: "文档原话是「hook 还没接线」,那是旧版本的说法,现在已经接上。" },
+      { text: "标题叫「迁移脚本还没做完」的那张旧单子已经关了。" },
+      // 批 276 BP-6:「已登记」与缺件同一分句(没有切点)仍遮
+      { text: "hook 还没接线的那条已登记(D172)。" },
+      // 批 276b BP-8:「已登记」紧跟顿号 / 但 起头 ⇒ 回指前一分句,一起遮
+      { text: "hook 还没接线、已登记(D172)。" },
+      { text: "hook 还没接线但已登记(D172)。" },
     ],
   },
 };
@@ -1814,6 +1879,8 @@ export const RULE_X = {
  *
  *  口径只此一份:`eFacts` 与 `RULE_E2` 原先各抄了一遍同样的字面量,是漂移预备役。 */
 export function maskQuoted(s) {
+  // 批 276 停止出口①:本批两次改动(ASCII 引号不跨行 / 奇数引号行不配对)连续三轮复核各出新的诚实误拦与漏放(规则层红队 r3 BP-1、BP-8),
+  //   整段退回 fd83576;跨行抹除这个老洞登记为让出面 D175⑨。
   // 红队 182 BP-6 附:『』(内层引号,本仓正文里与「」混用)原不在集合 ⇒ 引闸拦词『别外审』不被剥。
   return String(s || "").replace(/「[^」]*」|『[^』]*』|«[^»]*»|“[^”]*”|"[^"]*"/g,
     (m) => m.replace(/[^\n]/g, " "));
@@ -1911,6 +1978,8 @@ function eFacts(ctx) {
   //   BP-8 ② 须有派发动词在前(发 / 下 / 送 + ≤12 字 + 指令 / 消息…):「闸的拦截消息让它把出路词抄进了正文」是名词致使者,照拦;
   //   BP-7 ③ 句首(行首 / 。！？后)可不带副词;**逗号 / 冒号后须带「已 / 再 / 又 / 先 / 刚」**——
   //         「pushDefault 没设,让它把代码推到了 origin」的前分句是致使事件,照拦。
+  //  批 276 停止出口①:本批给 ②③ 加的「事后归因」判断(RETRO 损坏词)三轮复核各出新的诚实误拦(误拦猎手 FB-4、规则层红队 r3 BP-8),
+  //   整段退回 fd83576;「我下的指令让它把…弄错了」这类事后归因照放,登记为让出面 D175①。
   const unDirective = (line) => {
     let s = line.replace(/(想|希望)让(?=(它|他|她|我|你|对方))/g, "$1▯");
     if (dispatched) {
@@ -2222,6 +2291,20 @@ export const RULE_E0 = {
       { text: "我在等后台红队回件。\n\n你那边的问题已经答完。如果还想让我把排查步骤对到日志时刻上,把对话贴过来就行。" },
       { text: "已再发一次明确指令让它只回报告正文。回件后我核逐条状态与新发现,再关账。", mcp: "SendMessage" },
       { text: "grill 回件只回了一个「Complete」,已让它把报告正文重发;codex 轮询在跑。", mcp: "SendMessage" },
+      // 批 276 BP-11 反向钉:前瞻性派活(含中性完成态「重发了」)仍按派活涂
+      { text: "第三轮红队拿到的是旧 diff,我已补发消息让它以工作树为准。", mcp: "SendMessage" },
+      { text: "已让它把报告正文重发了。回件后我再核。", mcp: "SendMessage" },
+      // 批 276c(误拦猎手 FB-4)起的反向钉:零主语的清理指令回报不是归因——RETRO 退回后它们按原派活涂改放行,钉住不回退
+      { text: "已让它把 scratchpad 里的临时文件删掉了,回件后我再核。", mcp: "SendMessage" },
+      { text: "已让它把重复的那两段删掉了,正文其余不动。", mcp: "Agent" },
+      { text: "已让它把配置删掉了。", mcp: "Agent" },
+      // 带致使者的 ② 形派活句一律按派活涂(批 276 的 RETRO 事后归因判断已退回,残余见 D175①)
+      { text: "我发了指令让它把旧缓存删掉了,下一步重跑回放。", mcp: "SendMessage" },
+      { text: "我下的指令让它把旧文件覆盖掉了。", mcp: "SendMessage" },
+      // 批 276 maskQuoted:同一行内成对的 ASCII 引号仍算引文
+      { text: "对方原话:\"根因是缓存没刷新\"。我没有采信。" },
+      // 批 276b BP-5 反向钉:分句里有禁止 / 防范词 ⇒ 前瞻叮嘱,仍按派活涂
+      { text: "已补发消息让它别把旧文件覆盖了。", mcp: "SendMessage" },
       { text: "根因是路径写错。这是我的推断。" },
       // 真跑过跨模型 —— **动作面**,不是嘴上说
       { text: "根因是路径写错。", bash: "node ~/.claude/scripts/codex-run.mjs --task t.md" },
@@ -4365,16 +4448,21 @@ const RULE_P = {
     /** 本仓闸引擎(仓相对路径,锚定)。git 事实只用它;外发暂存树(clipboard/,gitignore)与 worktree 本就不在 diff 里。 */
     // 批 260(D160⑥):写入效果分析器(I / J / G / L 的判据实现)、自签误报盲审、解析依赖清单也是闸引擎——
     //   原先不在里面,改它们不被 P / start-gate 当成改闸引擎(收口轮红队 BP-16)
-    ENGINE_REL: /^scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay)\.mjs$|^scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|^scripts\/gate-deps\/package(?:-lock)?\.json$/i,
+    // 批 276(D171③):远端守卫 hook-remote-check 并入闸引擎面(五处同步:ENGINE_REL / ENGINE_PATHSPECS / ENGINE_PATH_RE /
+    //   GATE_ENGINE / hunterBound);只认 `scripts/hook-remote-check.mjs`,它的 `.selftest.mjs` 不算
+    // 批 276b(红队 BP-7):远端守卫的另两件——装 git 钩子的 `scripts/install-git-hooks.mjs` 与钩子本体 `scripts/git-hooks/*.mjs`——同样纳入
+    ENGINE_REL: /^scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check|install-git-hooks)\.mjs$|^scripts\/git-hooks\/[^/]*\.mjs$|^scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|^scripts\/gate-deps\/package(?:-lock)?\.json$/i,
     /** 与 ENGINE_REL 同一口径的 git pathspec(hook 取「上一次带闸改动的提交」时用;改一处必改另一处,自测钉着)。 */
-    ENGINE_PATHSPECS: ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", "scripts/fp-audit.mjs", "scripts/gate-replay.mjs", ":(glob)scripts/lib/gate-*.mjs",
+    ENGINE_PATHSPECS: ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", "scripts/fp-audit.mjs", "scripts/gate-replay.mjs", "scripts/hook-remote-check.mjs", "scripts/install-git-hooks.mjs", ":(glob)scripts/git-hooks/*.mjs", ":(glob)scripts/lib/gate-*.mjs",
       "scripts/lib/write-effects.mjs", "scripts/gate-deps/package.json", "scripts/gate-deps/package-lock.json"],
     /** 聚合项(readHeadFacts 范围超 CAP=60)缺 `count` 时的计数下限 = CAP+1(范围至少这么多笔)。 */
     AGG_MIN: 61,
     /** 语法回退面的闸引擎路径:锚定文件名结尾,裸名只在路径**开头**认(`cd scripts/lib` 之后的相对形)。
      *  派出方裁定(a27628dd):`clipboard/oss/public-repo/**` 与 `.claude/worktrees/**` 下的闸副本不算本仓闸引擎。 */
     // 批 260(红队 a700dedc (b)-10):第四处口径——git 事实取不到时的回退面,与 ENGINE_REL 同步纳入 D160⑥ 的三类文件
-    ENGINE_PATH_RE: /(?:^|\/)scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay)\.mjs$|(?:^|\/)scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|(?:^|\/)scripts\/gate-deps\/package(?:-lock)?\.json$|^(?:hook-stop-closure|hook-guard|fp-audit|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs$/i,
+    //   批 276c(误拦猎手 FB-5):`install-git-hooks.mjs` / `git-hooks/*.mjs` 是通用约定名,别的仓里同名文件不是本仓闸 ⇒
+    //   这两支只认**仓相对形**(本仓内的绝对路径在调用前已化成仓相对形),不认任意前缀、不认裸名
+    ENGINE_PATH_RE: /(?:^|\/)scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check)\.mjs$|^scripts\/(?:install-git-hooks\.mjs|git-hooks\/[^/]*\.mjs)$|(?:^|\/)scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|(?:^|\/)scripts\/gate-deps\/package(?:-lock)?\.json$|^(?:hook-stop-closure|hook-guard|fp-audit|hook-remote-check|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs$/i,
     WORKTREE_AREA: /(^|\/)\.claude\/worktrees\//i,
     /** root = hook 所在 checkout 根(ctx.hookCheckout):落在它下面的绝对路径先化成仓相对形再判区域——
      *  在 worktree 里开的会话,自己的闸文件路径本就含 `.claude/worktrees/`,不得当成别人的副本。 */
@@ -4818,10 +4906,13 @@ const RULE_P = {
     hunterBound(a) {
       const p = JSON.stringify((a && a.input) || {});
       // 批 260(红队 a700dedc BP-5):绑定词表与引擎面同源——D160⑥ 纳入的文件名、欠账号(D160 这类)也算绑定
-      return /hook-stop-closure|hook-guard|gate-[\w-]+\.mjs|write-effects|fp-audit|gate-deps|\.diff\b|规则 ?id|rule ids?|\bRULE_[A-Z0-9]+\b|批 ?\d{3}|\bD\d{3}\b/i.test(p);
+      // 批 276(D171③):远端守卫入引擎面后,点名它的红队也算绑定(它的 .selftest 不算)
+      //   批 276b(BP-7):装钩子脚本与钩子目录同样算绑定
+      return /hook-stop-closure|hook-guard|hook-remote-check(?!\.selftest)|install-git-hooks|git-hooks\/[\w.-]+\.mjs|gate-[\w-]+\.mjs|write-effects|fp-audit|gate-deps|\.diff\b|规则 ?id|rule ids?|\bRULE_[A-Z0-9]+\b|批 ?\d{3}|\bD\d{3}\b/i.test(p);
     },
     /** 旧整串正则(hook-start-gate 按名引用它判「本批碰没碰闸引擎」,口径与本条同源;P 自己改用上面三件)。 */
-    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard|fp-audit|gate-replay)\.mjs|scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs|scripts\/gate-deps\/package(?:-lock)?\.json|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|fp-audit|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier|replay))\.mjs\b/i,
+    //   批 276c(FB-5):通用名两支只认仓相对形(串首或空白 / 引号 / 等号之后的 `scripts/…`);hook-start-gate 先把本仓内的绝对路径化成相对形再判
+    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check)\.mjs|(?:^|[\s"'=])scripts\/(?:install-git-hooks\.mjs|git-hooks\/[\w.-]+\.mjs)|scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs|scripts\/gate-deps\/package(?:-lock)?\.json|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|fp-audit|hook-remote-check|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier|replay))\.mjs\b/i,
 
     /** 本批提交是否**带进了闸引擎改动**(D11 收紧的适用面)。
      *  · git 事实在 ⇒ **只认** `基点..HEAD` 上被带进的提交里有没有本仓闸引擎文件(派出方 a27628dd 口径①:
@@ -7162,7 +7253,10 @@ export const RULE_W = {
       const RE = /(?<!不要|不能|不许|不得|不可|别|避|请勿|勿)(别|不用|不必|不需要|无需|无须|毋须|免于?|不要|不做|跳过)\s*(再|进行)?\s*(外审|外部审查|四眼|battle|codex|审读|复核)\s*(了|吧|啦|的)?\s*(?=[,，。;;!！?？)\)\]\s]|$)/i;
       return RE.test(t);
     },
-    /** 充分核(2026-08-22 用户裁定):battle/codex 在场即充分;仅 grill 不充分。 */
+    /** 充分核:battle / codex / grill 任一在场即充分。
+     *  2026-08-22 原裁定「仅 grill 不充分」;**2026-09-16 用户改口**(ADR 0014,256-D6):「我觉得 grill 可以啊——那时候的说法是 codex 便宜 grill 贵;
+     *  但是现在看来未必如此」,10-10 再印证;法条与本判据到批 276 才同步(签单 clipboard/276-sign.md 第 5f 项,用户 2026-10-24「你推荐做额就去做吧」)。
+     *  函数名保留旧名(调用点与变异按名引用)。 */
     battleOrCodex(ctx) {
       const acts = [...(ctx.actions || [])], skills = [...(ctx.skills || [])];
       try { const w = ctx.window(); if (w) { acts.push(...(w.actions || [])); skills.push(...(w.skills || [])); } } catch { /* 空 */ }
@@ -7170,10 +7264,20 @@ export const RULE_W = {
       return acts.some((a) => {
         const n = String(a.name || "");
         if (/codex/i.test(n)) return true;
+        if (/^(Agent|Task)$/.test(n) && /^grill:/.test(String((a.input && (a.input.subagent_type || a.input.agentType)) || ""))) return true;
         return /^(Bash|PowerShell)$/.test(n) && /codex-run\.mjs/.test(String(a.input?.command || ""));
       });
     },
-    reviewedOne(ctx, names) {
+    /** 不算 grill 的充分性(battle / codex)。r6 BP-13:充分性只靠 grill 时,绑定须落在 grill 调用自身——
+     *  否则「不绑交付物的 grill 凑充分 + `_` 代理凑绑定」两头拼,交付物从没被外审过。 */
+    nonGrillSufficient(ctx) {
+      const acts = [...(ctx.actions || [])], skills = [...(ctx.skills || [])];
+      try { const w = ctx.window(); if (w) { acts.push(...(w.actions || [])); skills.push(...(w.skills || [])); } } catch { /* 空 */ }
+      if (skills.some((sk) => /battle/.test(String(sk)))) return true;
+      return acts.some((a) => /codex/i.test(String(a.name || "")) ||
+        (/^(Bash|PowerShell)$/.test(String(a.name || "")) && /codex-run\.mjs/.test(String(a.input?.command || ""))));
+    },
+    reviewedOne(ctx, names, opt = {}) {
       const acts = [];
       const grab = (c) => { for (const a of (c?.actions || [])) acts.push(a); };
       grab(ctx);
@@ -7195,7 +7299,9 @@ export const RULE_W = {
           //   按「判据与法条不一致的纠正」处理并在报告里明示,用户可随时驳回。
           const viaShell = /^(Bash|PowerShell)$/.test(nm) &&
             /codex-run\.mjs|CODEX_JOB=/.test(String((a.input && a.input.command) || ""));
-          const isReviewer = (/^(Agent|Task)$/.test(nm) && /^(grill:|_)/.test(String((a.input && (a.input.subagent_type || a.input.agentType)) || ""))) || /codex/i.test(nm) || viaShell;
+          const sub = String((a.input && (a.input.subagent_type || a.input.agentType)) || "");
+          const isReviewer = opt.grillOnly ? (/^(Agent|Task)$/.test(nm) && /^grill:/.test(sub))
+            : (/^(Agent|Task)$/.test(nm) && /^(grill:|_)/.test(sub)) || /codex/i.test(nm) || viaShell;
           return isReviewer && (JSON.stringify(a.input || {}).includes(n) || JSON.stringify(a.input || {}).includes(stem));
         });
       });
@@ -7211,15 +7317,15 @@ export const RULE_W = {
     //   只免交付物支,不免支②(生产内容写入的外审是 W′ 修正案另签的)。
     const names = H.userExempt(ctx) ? [] : H.deliverablesOf(ctx);
     if (names.length) {
-      // 2026-08-22 用户裁定:充分性=battle/codex 在场;绑定=某外审入参提及文件名(codex/grill 皆可作载体)。
-      if (!H.battleOrCodex(ctx)) out.push(`本批交付物外审不充分(仅 grill 或全无——须 battle/codex 在场):${names.slice(0, 4).join(", ")}`);
-      else if (!H.reviewedOne(ctx, names)) out.push(`本批交付物审读未绑定文件名:${names.slice(0, 4).join(", ")}`);
+      // 充分性 = battle / codex / grill 任一在场(ADR 0014);绑定 = 某外审入参提及文件名(codex / grill 皆可作载体)。
+      if (!H.battleOrCodex(ctx)) out.push(`本批交付物外审不充分(须 battle / codex / grill 任一在场):${names.slice(0, 4).join(", ")}`);
+      else if (!H.reviewedOne(ctx, names, { grillOnly: !H.nonGrillSufficient(ctx) })) out.push(`本批交付物审读未绑定文件名:${names.slice(0, 4).join(", ")}`);
     }
     // 支② 内容批(W′ 修正案,2026-08-22 亲签):动作面出现生产内容写入 ⇒ 三选一外审
     //   (battle skill / codex / grill 类子代理)。语义=把 ai-note 内建的 battle 步
     //   从「希望跑了」变成「没跑就拦」。CEILING:只证外审被发起,不证意见被采纳。
     if (H.contentWrote(ctx) && !H.battleOrCodex(ctx)) {
-      out.push("本批有生产内容写入(write-node/prod 管线),缺 battle/codex 外审(仅 grill 不充分——用户裁定)");
+      out.push("本批有生产内容写入(write-node/prod 管线),缺外审(battle / codex / grill 任一,ADR 0014)");
     }
     return out;
   },
@@ -7435,11 +7541,7 @@ export const RULE_W = {
       { text: "审过了。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
         write: "clipboard/mapgen/tdd/README.md",
         agent: { type: "general-purpose", prompt: "读一下 clipboard/mapgen/tdd/README.md" } },
-      // **仅 grill(哪怕绑定了)⇒ 拦**——用户裁定「仅有 grill 的需加上 battle」的正面证人
-      { text: "只派了 grill,收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
-        write: "clipboard/gate-playbook.md",
-        agent: { type: "grill:recon", prompt: "审读 clipboard/gate-playbook.md" } },
-      // grill 但入参没绑交付物 ⇒ 拦(空跑刷不过)
+      // grill 但入参没绑交付物 ⇒ 拦(空跑刷不过;ADR 0014 之后 grill 算充分,绑定照旧要)
       { text: "派了 grill。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
         write: "clipboard/gate-playbook.md",
         agent: { type: "grill:testing", prompt: "随便看看仓库" } },
@@ -7567,8 +7669,18 @@ export const RULE_W = {
         text: "收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
         batchGoal: { armedAt: "2026-10-10T08:00:00Z", conditions: ["甲"] },
         prior: [{ text: "写报告", write: "clipboard/258-report.md", at: "2026-10-10T09:00:00Z" }] },
+      // 批 276 红队 r6 BP-13:充分性只靠一个不绑交付物的 grill,绑定靠 `_` 代理 ⇒ 交付物没被外审过,照拦
+      { name: "276 r6 BP-13:grill 不绑 + `_` 代理绑 ⇒ 拦", text: "审过了,收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+        write: "clipboard/gate-playbook.md", agent: { type: "grill:testing", prompt: "随便看看仓库" },
+        prior: [{ agent: { type: "_rule-placement-judge", prompt: "看看 clipboard/gate-playbook.md 该落哪层" } }] },
     ],
     neg: [
+      // 批 276(ADR 0014 同步):只派了 grill、入参绑定了交付物 ⇒ 放;生产内容写入 + grill ⇒ 放
+      { name: "276 ADR 0014:仅 grill 且绑定交付物 ⇒ 充分", text: "只派了 grill,收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+        write: "clipboard/gate-playbook.md", agent: { type: "grill:recon", prompt: "审读 clipboard/gate-playbook.md" } },
+      { name: "276 ADR 0014:生产内容写入 + grill 外审 ⇒ 充分", text: "注写完,grill 审过,收工。",
+        bash: ["node scripts/write-node.mjs --preview payload.json", "node --no-warnings scripts/batch-goal.mjs --clear"],
+        agent: { type: "grill:testing", prompt: "审 payload.json 里的注" } },
       // 批 258 W-a(判据过宽,真误报):上一批写的交付物落在 400 条窗口里、时刻早于本批 armedAt ⇒ 不算本批交付物
       { name: "258 W-a:上一批的交付物在窗口里、早于本批武装 ⇒ 不算",
         text: "收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
@@ -7802,7 +7914,11 @@ export const RULE_V = {
   //   条件对照里「呈签单…已落盘,四段全文已给你看过」与「V 项已处理…核对结果写在呈签单开头」两类,都没在本轮摊新事。
   //   红队 a47d383e(批 273 收口)BP-5:往**已有**单子里加项同样是摊事(本仓比新起一张更常见)——「补进 / 列进 / 放进 / 加进 / 写进」呈签单;
   //   待办口另认无人称 / 第三人称的等签:「待签 / 等签 / 签了再 / 需用户…签 / 请过目」(只认这几个短句式,不判语义)。
-  _NEW: /(?<![这那同每])(?:一张|一份)呈签单|呈签单(?:写|拟|整理|起草)(?:出来|好)|(?:整理|写|做|拟|汇总|归并?)成(?:一张|一份)?呈签单|整理进(?:一张|一份)?呈签单|(?:补|列|放|加|写|并)进了?(?:一张|一份)?呈签单|呈签单[^。！？!?\n]{0,30}(?:已更新|新增|加了|补了)/,
+  //   批 276(BP-15,核查代理 rules-probe):加项动词补「记 / 挂 / 收 / 塞 / 录 / 归 + 进 / 入」「记到 / 挂到 / 挂上」「登记(进 / 入 / 到)」「纳入」,
+  //   以及既有六字的「入」形(补入 / 列入 / 写入…);「写在 / 记在呈签单里」是回指已有内容(样本:撤回理由写在呈签单里),不收。
+  //   批 276b(红队 BP-6):「到」形对全部加项动词开放(放到 / 加到 / 补到…),补双字动词「补充 / 新增」;
+  //   唯独「收到呈签单」不收——那是「收到了一份单子」的意思;「在」形照旧排除。
+  _NEW: /(?<![这那同每])(?:一张|一份)呈签单|呈签单(?:写|拟|整理|起草)(?:出来|好)|(?:整理|写|做|拟|汇总|归并?)成(?:一张|一份)?呈签单|整理进(?:一张|一份)?呈签单|(?:补|列|放|加|写|并|记|挂|收|塞|录|归|补充|新增)(?:进|入)了?(?:一张|一份)?呈签单|(?:补|列|放|加|写|并|记|挂|塞|录|归|补充|新增)到了?(?:一张|一份)?呈签单|挂上了?(?:一张|一份)?呈签单|(?:补充|新增)(?:了|一项|一条)?(?:一张|一份)?呈签单|登记(?:进|入|到)?了?(?:一张|一份)?呈签单|纳入了?(?:一张|一份)?呈签单|呈签单[^。！？!?\n]{0,30}(?:已更新|新增|加了|补了)/,
   _CALL: /需你裁|呈签(?!单)|请亲签|待你亲签|需要你亲签/,
   _ASK: /⏸|等[^。！？!?\n]{0,8}你|需你|由你|要你|摊给你|呈给你|挂在你|给你签|(?<!不用|不必|无需|无须|不需)你来?(?:签|裁|定|点头|拍板|确认)(?![的过])|待签|等签|签了再|需用户[^。！？!?\n]{0,6}签|请过目/,
   _ASK_LOOSE: /⏸|等[^。！？!?\n]{0,8}你|需你|由你|要你|摊给你|呈给你|挂在你|给你签|你来?(?:签|裁|定|点头|拍板|确认)/,
@@ -8010,6 +8126,16 @@ export const RULE_V = {
       { name: "273 收口:列进呈签单 + 需用户亲签", text: "D121 已列进呈签单,需用户亲签后再动。" },
       { name: "273 收口:放进呈签单等签", text: "这两项我拿不准,放进呈签单等签。" },
       { name: "273 收口:呈签单已更新新增一项 + 请过目", text: "呈签单 `clipboard/273-sign.md` 已更新,新增 D122(改守卫语义),请过目。" },
+      // 批 276 BP-15:加项动词「记进 / 挂进 / 收进 / 登记到 / 纳入」,无待办口也算呼签
+      { name: "276 BP-15:记进呈签单", text: "删除锁定 worktree 属不可逆,已记进呈签单第 3 项。" },
+      { name: "276 BP-15:挂进呈签单", text: "D121 改守卫语义,已挂进呈签单。" },
+      { name: "276 BP-15:收进呈签单", text: "这两项我拿不准,收进呈签单了。" },
+      { name: "276 BP-15:登记到呈签单", text: "删 worktree 属不可逆,登记到呈签单第 3 项。" },
+      { name: "276 BP-15:纳入呈签单", text: "D122 已纳入呈签单。" },
+      // 批 276b BP-6:「到」形全开、双字动词
+      { name: "276b BP-6:放到呈签单", text: "这两项我拿不准,放到呈签单第 4 项了。" },
+      { name: "276b BP-6:补充进呈签单", text: "D123 改守卫语义,已补充进呈签单。" },
+      { name: "276b BP-6:新增到呈签单", text: "删 worktree 属不可逆,新增到呈签单。" },
     ],
     neg: [
       // 批 253b BP-11:「否,不是纠错」、④ 理由换到下一行、锚写「免签核过:」
@@ -8037,11 +8163,20 @@ export const RULE_V = {
         text: "四之二已经按 202b 呈签单原文落进 `lawmaking.md`(甲乙丙丁),里面记了复议结论以及你的原话。`verify-laws` PASS。机器触发层还没建,到期没建成就回报你。\n**下一步**:单独提交 → 推送 → 探针 → 关 203。" },
       { name: "273 续:回指「那一份呈签单」不是起单",
         text: "四之二已按那一份呈签单原文落笔,`verify-laws` PASS。\n**下一步**:单独提交 → 推送。" },
+      // 批 276 BP-15 反向钉:「记在 / 写在呈签单里」是回指已有内容,不是加项
+      { name: "276 BP-15 反向:核对结果记在呈签单开头", text: "V 项已处理,核对结果记在呈签单开头。\n**下一步**:提交。" },
+      { name: "276b BP-6 反向:收到呈签单是收件不是加项", text: "已收到呈签单的回签,四项都签了。\n**下一步**:按签字落笔。" },
       { name: "273 样本形态:完成条件对照(引号里的「你定」不算待办口)",
         text: "- **条件 1:达成。** 呈签单 `202-auto-deploy-sign.md` 在;新条文 21 行,都曾逐字给你看过。\n- 随做:第 2 项按你的「你定」撤回,撤回理由写在呈签单里。\n还不 `--clear`:正在等 codex 和第五轮红队复核。\n**下一步**:处置发现 → 单独提交 → 推送。" },
     ],
   },
 };
+
+// 批 276b(红队 BP-2 / BP-4):O 的 Sources 类标签段与引用式定义——依据词入口、段首判定、退回分支三处同源。
+//   标签后 ≤20 字说明 / 括注再接冒号(「参考资料(检索结果):」「参考链接如下:」);不带冒号时标签须独占一行。
+const O_SRC_WORD = "(?:(?:Sources?|References?)\\b|来源|参考(?:资料|文献|链接)?|引用)";
+const O_SRC_LABEL = `[ \\t]*(?:#{1,6}[ \\t]*)?(?:\\*\\*)?[ \\t]*${O_SRC_WORD}(?:[^\\n:：]{0,20}?[ \\t]*(?:\\*\\*)?[ \\t]*[:：]|[ \\t]*(?:\\*\\*)?[ \\t]*(?=\\n|$))`;
+const O_REFDEF = "[ \\t]*\\[[^\\]\\n]{1,40}\\]:[ \\t]*<?https?:\\/\\/";
 
 /** O(提示):外部引文未过取页核实(D55 结清,2026-08-27)。
  *
@@ -8097,7 +8232,11 @@ export const RULE_O = {
   //   必带 `url`,读不到 url 的 WebFetch 只出现在夹具(`mcp: "WebFetch"`),按旧口径视作通配;
   //   ⑤`false && curl <url>` 这类蓄意形态不防(用户裁定:蓄意规避不计)。
   _URL_RE: /https?:\/\/[A-Za-z0-9\-._~:/?#@!$&*+,;=%]+/g,
-  _CUE_RE: /出处|原文|逐字|引自|依据[:：]|见\s*https?:\/\//,
+  // 批 276b(红队 BP-2 / BP-4):Sources / References / 来源 / 参考 / 引用 **标签段**与行首引用式定义 `[n]: url` 也是依据词——
+  //   只附 Sources 列表的回答原先整条 O 不响(语料实见 25 块)。标签后允许 ≤20 字说明 / 括注再接冒号(「参考资料(检索结果):」「参考链接如下:」)。
+  //   无冒号时标签须独占一行(「Source code is here」不算)。三处同源:_SRC_RE(段首)/ _CUE_RE / 退回分支,见 O_SRC_LABEL。
+  _SRC_RE: new RegExp(`^${O_SRC_LABEL}`, "i"),
+  _CUE_RE: new RegExp(`出处|原文|逐字|引自|依据[:：]|见\\s*https?:\\/\\/|(?:^|\\n)${O_SRC_LABEL}|(?:^|\\n)${O_REFDEF}`, "i"),
   _DEVNULL_RE: /^(?:\/dev\/null|nul:?|\$null)$/i,
   // 短旗标里**吃值**的字母。curl 与 wget **不合并**:同一个字母两边含义不同
   //   (`-o` 在 curl 是输出文件、在 wget 是**日志**文件;`-O` 在 wget 才是输出文件)。
@@ -8149,7 +8288,18 @@ export const RULE_O = {
     const paras = t.split(/\n\s*\n/);
     const isCue = paras.map((p) => RULE_O._CUE_RE.test(p));
     const inCue = paras.filter((p, i) => isCue[i]).flatMap(RULE_O._urls);
-    let pick = inCue;
+    const LOCAL = /^https?:\/\/(?:localhost|127(?:\.\d+){3}|0\.0\.0\.0|\[::1\]|10(?:\.\d+){3}|192\.168(?:\.\d+){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d+){2})(?::\d+)?(?:[/?#]|$)/i;
+    // 批 276b(红队 BP-3):引用式定义与 Sources 标签段(标签段无网址时连同下一段)**不论依据段有没有网址都并入**
+    //   ——「正文里有一处 出处:url,文末另附 Sources 列表」时,后者原先被 inCue 非空整个跳过。
+    //   自动链接 `<url>`(引文块行除外)同样始终并入:语料量过(rules-probe/corpus-auto.mjs,含依据词的块里)多认 0 块,
+    //   第一轮那 13 块有意放行的非引文不受影响。
+    const refDefs = opt.noRef ? [] : [...t.matchAll(/^[ \t]*\[[^\]\n]{1,40}\]:[ \t]*<?(https?:\/\/[^\s>]+)/gm)].flatMap((m) => RULE_O._urls(m[1]));
+    const srcParas = opt.noRef ? [] : paras.flatMap((p, i) => (RULE_O._SRC_RE.test(p)
+      ? [...RULE_O._urls(p), ...(!RULE_O._urls(p).length ? RULE_O._urls(paras[i + 1] || "") : [])] : []));
+    // 引文块(`>` 起头的行)里的自动链接是被引的那段原文自带的(语料 某会话:494:引 README 的「评价以 <https://example.org> 实测为准」),不收
+    const auto = opt.noRef ? [] : t.split("\n").filter((l) => !/^\s*>/.test(l))
+      .flatMap((l) => [...l.matchAll(/<(https?:\/\/[^>\s]+)>/g)].map((m) => m[1])).flatMap((u) => RULE_O._urls(u));
+    let pick = [...inCue, ...[...refDefs, ...srcParas, ...auto].filter((u) => !LOCAL.test(u))];
     if (!inCue.length) {
       if (opt.oldFallback) pick = RULE_O._urls(t);
       else {
@@ -8158,9 +8308,12 @@ export const RULE_O = {
         //   前一段是引文块(以 > 起头)时再往前看一段(「网址 / > 原文 / 以上是原文」三段式)
         const prev = opt.noPrev ? [] : paras.flatMap((p, i) => ((isCue[i + 1] || (isCue[i + 2] && /^\s*>/.test(paras[i + 1] || ""))) ? RULE_O._urls(p) : []));
         const md = opt.noMd ? [] : [...t.matchAll(/\]\(\s*<?(https?:\/\/[^)\s>]+)/g)].flatMap((m) => RULE_O._urls(m[1]));
-        // 本机 / 内网地址不可能是外部引文(样本 2 的 127.0.0.1 恰在依据段前一段)——只在退回分支里剔
-        const LOCAL = /^https?:\/\/(?:localhost|127(?:\.\d+){3}|0\.0\.0\.0|\[::1\]|10(?:\.\d+){3}|192\.168(?:\.\d+){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d+){2})(?::\d+)?(?:[/?#]|$)/i;
-        pick = [...next, ...prev, ...md].filter((u) => !LOCAL.test(u));
+        // 批 276(BP-16,核查代理 rules-probe):检索结果的另三种引文排版也是结构位置——
+        //   ① 引用式定义 `[1]: url`(行首);② `<url>` 自动链接;③ 以「Sources / References / 来源 / 参考(资料|文献|链接)/ 引用」
+        //   开头的段(标签独占一段时连同下一段)。授权链接 / 自开 PR / 资源清单这些裸网址不带这三种排版,仍不收。
+        //   (批 276b 起三支的计算挪到上面、始终并入;此处照旧一并收。)
+        // 本机 / 内网地址不可能是外部引文(样本 2 的 127.0.0.1 恰在依据段前一段)——只在退回分支里剔(LOCAL 定义见上)
+        pick = [...next, ...prev, ...md, ...auto, ...refDefs, ...srcParas].filter((u) => !LOCAL.test(u));
       }
     }
     return [...new Set(pick.map(RULE_O._clean))];
@@ -8344,7 +8497,7 @@ export const RULE_O = {
     //   现改为真调 `toolPresent()`,与 L 项同一条口径。
     // `forPos`:样例只取 `https://x.test/a` 一个网址,而 pos[15..17] 引的是**两个**网址
     //   ——逐网址口径下,取一个当然清不掉另一个。缩小适用面写在明处,不是悄悄只测第一条。
-    { forPos: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 19, 20, 21, 22],
+    { forPos: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],   // 23–27:批 276 BP-16;28–31:批 276b BP-2/4
       say: toolPresent("scripts/fetch-quote-check.mjs")
         ? "真取页核实**那一个网址**:node --no-warnings scripts/fetch-quote-check.mjs <url> \"引文\""
         : "真取页核实——**本仓没装取页核实件**(`scripts/fetch-quote-check.mjs` 不在)," +
@@ -8357,7 +8510,7 @@ export const RULE_O = {
     //   批 253:夹具造的 WebFetch 不带 url ⇒ 此样例走通配分支(天花板④);按网址配对由「取了别的网址」正例钉。
     { say: "或用 **WebFetch** 亲自取**同一网址**(注意:**WebSearch 不算**——搜索给的是摘要不是页面)",
       sample: { mcp: "WebFetch" } },
-    { forPos: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 19, 20, 21, 22],
+    { forPos: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],   // 23–27:批 276 BP-16;28–31:批 276b BP-2/4
       say: "或用 curl 真取**同一网址**的页面内容(`curl -sL <url>`;只取响应头 `-I`(含 `-sIL` 这类组合)、" +
         "输出丢进空设备、下游只 `wc`/`Select-Object StatusCode` 都不算)",
       sample: { bash: "curl -sL https://x.test/a | grep -c 某句" } },
@@ -8422,9 +8575,11 @@ export const RULE_O = {
       detect: (ctx) => RULE_O._detect(ctx, { noMd: true }) }) },
     { name: "退回分支不认依据段前一段的网址(红队 BP-9)", apply: (r) => ({ ...r,
       detect: (ctx) => RULE_O._detect(ctx, { noPrev: true }) }) },
+    { name: "退回分支不认引用式定义 / 自动链接 / Sources 段(批 276 BP-16)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_O._detect(ctx, { noRef: true }) }) },
   ],
   cases: {
-    // ⚠️ pos 的**下标被 escapes 的 forPos 引用**:0–14、19–20 只引一个网址(样例取得动),
+    // ⚠️ pos 的**下标被 escapes 的 forPos 引用**:0–14、19–31 只引一个网址(样例取得动),
     //   15–17 引两个网址(逐网址口径下样例天然清不掉)。往中间插用例要同步改 forPos。
     pos: [
       { text: "出处:https://x.test/a 里写着那句话。" },                                       // 0
@@ -8467,6 +8622,20 @@ export const RULE_O = {
       { text: "Claude Code changelog:https://x.test/a\n\n原文写的是「Hooks now receive cwd」,所以 cwd 字段可用。" }, // 21
       //   网址 / 引文块 / 「以上是原文」三段式 ⇒ 仍拦
       { text: "官方文档 https://x.test/a 第三节。\n\n> PreToolUse hooks can deny.\n\n以上是原文。" }, // 22
+      // ── 批 276 BP-16:退回分支认回引用式定义 / 自动链接 / Sources 段 ────────────────
+      { text: "两条承重断言都逐字核过原文[1]。\n\n另外顺手修了一处措辞。\n\n[1]: https://x.test/a" },          // 23
+      { text: "两条承重断言都逐字核过原文。\n\n另外顺手修了一处措辞。\n\n见 <https://x.test/a>" },              // 24
+      { text: "两条承重断言都逐字核过原文。\n\n其余三条是本地 changelog 证的。\n\n下一步:提交。\n\nSources:\n- https://x.test/a" }, // 25
+      { text: "两条承重断言都逐字核过原文。\n\n其余是本地证的。\n\n下一步:提交。\n\n## 参考资料\n\n- https://x.test/a" }, // 26
+      //   pos 19 带「Sources:」标签后也被 Sources 段一支认出 ⇒ 「不认 markdown 链接」变异需一条不带标签的 md 链接证人
+      { text: "两条承重断言都逐字核过原文。\n\n另外顺手修了一处措辞。\n\n详见 [A 页](https://x.test/a)" },             // 27
+      // ── 批 276b BP-2 / BP-4:只附 Sources 列表 / 引用式定义的回答,依据词入口也认 ────────────
+      { text: "Claude Code 2.1 起 hooks 会收到 cwd 字段,可以直接用。\n\nSources:\n- https://x.test/a" },                // 28
+      { text: "hooks 会收到 cwd 字段[1],可以直接用。\n\n[1]: https://x.test/a" },                                         // 29
+      { text: "hooks 会收到 cwd 字段。\n\n参考资料(检索结果):\n- https://x.test/a" },                                       // 30
+      { text: "hooks 会收到 cwd 字段。\n\n参考链接如下:\n\n- https://x.test/a" },                                           // 31
+      //   BP-3:正文依据段已有一个取过的网址,文末 Sources 另列一个没取的 ⇒ 后者照报(两个网址,不进 forPos)
+      { text: "出处:https://x.test/a 第三节。\n\nSources:\n\n- https://x.test/b", bash: "curl -sL https://x.test/a" },    // 32
     ],
     neg: [
       // 真取过页
@@ -8504,6 +8673,10 @@ export const RULE_O = {
       { name: "273 样本3:自己刚开的 PR 网址",
         text: "第二批已经推上去,开成了 PR #11:https://github.test/o/r/pull/11 。\n\n这批包括:\n\n" +
           "- 新增任务状态表,每一条都要能在用户原话里找到出处。\n- 本机测试全绿。\n\n后台在等 CI。" },
+      // 批 276 BP-16 反向钉:资源清单(指针)不是 Sources 段;正文里给用户点的裸授权链接仍不收
+      { name: "276 BP-16 反向:资源清单的指针", text: "草稿正文逐字给你看过。\n\n下一步:提交。\n\n## 资源清单\n\n- https://x.test/a" },
+      { name: "276b BP-4 反向:不带冒号的「Source …」须独占一行才算标签", text: "Source code is here, see the repo.\n- https://x.test/a" },
+      { name: "276 BP-16 反向:引文块里原文自带的自动链接", text: "README 首段的措辞我逐字对过。\n\n改动后的那段:\n\n> 请勿据代码推断线上能力。\n> 评价以 <https://x.test/a> 实测为准。\n\n我只改了措辞。" },
       // 只是给了个地址,没当依据用
       { text: "仓库在 https://example.test/repo,回头看。" },
       { text: "今天没有引任何外部页面。" },
@@ -9224,5 +9397,288 @@ const RULE_AD = {
   },
 };
 
+/** MF:写「以后都这样做」的 memory,那条 memory 自己必须带一行执行面(批 276,D179;v3)。
+ *  立法动机(记忆规则普查 `clipboard/276-memory-rule-audit.md`):52 条「以后都这样做」类 memory 规则里 34 条没有任何机器判据;
+ *  根因在入口——宪法允许把口头持久指令落进 memory,而追问「触发层在哪」的 J 只认 AGENTS.md / docs/laws,I / L / K0 还豁免 memory 写入
+ *  ⇒ 用户说「以后都这样」时没有任何闸问执行面在哪。本批当日三次实撞(D176 / D177 / D178,都由用户指出),用户:「那我还能说啥?」;
+ *  2026-10-24 签单 `clipboard/276-sign.md` 第 2 项签为阻断(「你推荐做额就去做吧」,276-D4)。
+ *  **v3 契约**(两轮复核后的重设计——停止出口①:v1 / v2 从「全轮回复里找有没有交代」,收紧误拦、放宽漏放,
+ *  r5 语料实测 v2 的「顺带提到路径即算」与「⏸ 即算」放掉 33 次 feedback 写入里的 24 次):
+ *    **交代只认写在那条 memory 自己正文里的一行 `执行面:<值>`**;回复里说的、顺带提到的路径、⏸ 都不算。
+ *    值认:仓内文件路径(scripts/ docs/ .claude/ AGENTS.md、绝对路径与 ~ 亦可;memory 目录与 MEMORY.md 不算)、规则 id(「M 项」/ RULE_X)、
+ *    `npm run <脚本>`、D 号(欠账表里登记了候选闸);或 `不可机械化:<理由>`。写「无 / 暂无」须后跟 D 号。
+ *    读法:Stop 时**读盘上那条 memory 的全文**(既有笔记只追加一句时,原有的执行面行照认——误拦猎手 r5 FB-12);读不到退回本次写入正文。
+ *  触发:写了 `type: feedback` 或 `type: user` 的 memory(项目 memory 或 dotfiles-claude 全局 memory;索引 MEMORY.md 除外)。
+ *    不再按措辞词表触发(r5 误拦猎手 FB-1 / FB-8 / FB-9:「必须 / 每次 / always」在纯事实型 project memory 里常见)。
+ *  天花板:① 规则写在 project / reference 类正文里的不触发(普查实见 11 条,D179 残余);② 经 Bash 写 memory 不认;
+ *    ③ 只证那一行在,不证它指的东西真在查这条规则(写一行假执行面即可绕过,属故意伪造)。
+ *  失效条件:连续 20 批零命中 ⇒ 复议;「不可机械化」占命中 >80% ⇒ 它成了仪式,复议。 */
+const RULE_MF = {
+  id: "MF",
+  blocking: true,   // 2026-10-24 用户签(签单第 2 项,276-D4)
+  law: "docs/gate-debts.md#在账欠账",
+  requires: [],
+  escapes: [
+    { say: "在那条 memory 正文里加一行「执行面:」+ 执行它的文件路径 / 收尾闸里真实存在的规则 id(「<id> 项」)/ `npm run` 脚本或 `/插件:命令` / 登记了候选闸的 D 号(正文别处已提到的路径要挪进这一行才算)",
+      sample: { text: "已存。", write: "C:/Users/u/.claude/projects/example-project/memory/esc1.md",
+        written: "---\nname: esc1\nmetadata:\n  type: feedback\n---\n回复先给结论。\n执行面:scripts/lib/gate-rules.mjs" } },
+    { say: "确实做不成机器判据 ⇒ 在那条 memory 正文里写「不可机械化:」+ 理由",
+      sample: { text: "已存。", write: "C:/Users/u/.claude/projects/example-project/memory/esc2.md",
+        written: "---\nname: esc2\nmetadata:\n  type: feedback\n---\n说话别绕。\n不可机械化:这条要判语气,无动作面可查。" } },
+  ],
+  //   r6 BP-7:agent 持久记忆目录(.claude/agent-memory*/<名>/)同管
+  _MEM: /(^|\/)(?:\.claude\/projects\/[^/]+\/memory|dotfiles-claude\/memory|\.claude\/agent-memory[^/]*)\/(?:[^/]+\/)*[^/]+\.md$/i,
+  //   索引只认 memory 根(或 agent-memory 的 <名>/)下那一份;子目录里叫 Memory.md 的照管(r6 BP-7)
+  _INDEX: /(?:^|\/)(?:memory|agent-memory[^/]*\/[^/]+)\/MEMORY\.md$/i,
+  /** frontmatter 里的 type 值(只认文件开头 --- 段;容 `type : x` 与全角冒号——r6 BP-8 / 误拦 r6 FB-3:正文里复述「type: feedback」不算)。 */
+  fmType(s) {
+    const fm = String(s || "").replace(/^\s+/, "").match(/^﻿?---\r?\n([\s\S]*?)\r?\n---/);
+    const t = fm && fm[1].match(/^\s*type\s*[:：]\s*["']?([\w-]+)/m);
+    return t ? t[1].toLowerCase() : null;
+  },
+  //   误拦 r6 FB-2:user 类多是关于用户的事实,只有带持久指令措辞时才算规则
+  _USER_CUE: /以后|每次|一律|必须|总是|永远|不要|别再|务必|always|never/i,
+  // 执行面行:取标签后到行尾的值判
+  faceOk(body) {
+    const ids = new Set(RULES.map((r) => r.id));   // 调用时 RULES 已定义(r6 BP-3:规则 id 须真实存在)
+    for (const line of String(body || "").split(/\r?\n/)) {
+      const m = line.match(/(?:执行面|触发层)\s*(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*(.+)$/);
+      if (!m) continue;
+      const v = m[1].replace(/[`*「」"]/g, "").replace(/\\/g, "/").trim();
+      // D 号:容后缀字母(D105c,误拦 r6 FB-4);回声 D178 / D179(拦截消息自己点名的号)不算(r6 BP-1)
+      const hasD = /\bD\d{2,4}[a-z]?\b/.test(v.replace(/\bD17[89]\b/g, ""));
+      // 如实说没有 ⇒ 须附 D 号(r5 BP-3);否定词在值的任意处都认(r6 BP-2:「目前没有,候选是 scripts/…」「无机器闸」)
+      if (/^(?:无|暂无|没有|尚无|还没有?|目前没有|未有|待定|n\/?a)(?=$|[\s,，。;；:：(（])/i.test(v) || /无机器(?:闸|判据|检查)|没有机器|尚无|还没有|目前没有|暂无|待定/.test(v)) {
+        if (hasD) return true;
+        continue;
+      }
+      const path = v.match(/(?:[A-Za-z]:\/|~\/|\.?\.?\/)?[\w.\-]+(?:\/[\w.\-]+)*\.(?:mjs|cjs|js|ts|tsx|ps1|py|md|json|ya?ml)\b/);
+      // 路径须带目录或是 AGENTS.md / CLAUDE.md:裸文件名多半是这条笔记自己(r5 BP-3「先记在 r3.md」);
+      //   裸脚本名在本仓 scripts/ 或 scripts/lib/ 下真有同名文件才认(误拦 r6 FB-4 / r6 BP-25)
+      const bareScript = (n) => { try { return fs.existsSync(`scripts/${n}`) || fs.existsSync(`scripts/lib/${n}`); } catch { return false; } };
+      if (path && (/\//.test(path[0]) || /^(?:AGENTS|CLAUDE)\.md$/i.test(path[0]) || (/\.(?:mjs|cjs|js|ps1)$/i.test(path[0]) && bareScript(path[0]))) &&
+        !/(^|\/)(?:memory\/|MEMORY\.md$)/i.test(path[0]) && !RULE_MF._MEM.test(path[0])) return true;
+      const idHit = [...v.matchAll(/\b([A-Z][A-Z0-9]{0,2})\s*项|\bRULE_([A-Z0-9]+)\b|(?:收尾闸|规则)\s*([A-Z][A-Z0-9]{0,2})\b/g)].some((x) => ids.has(x[1] || x[2] || x[3]));
+      if (idHit || /npm run [\w:.-]+|(?:^|\s)\/[a-z][\w-]*:[\w-]+/.test(v) || hasD) return true;
+    }
+    // 不可机械化:只认行首标签(r6 BP-5:正文讨论这种格式不算);理由 ≥2 字(误拦 r6 FB-5「判语义」)
+    return String(body || "").split(/\r?\n/).some((l) => /^\s*(?:[-*]\s+)?(?:\*\*)?不可机械化(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*\S.+/.test(l));
+  },
+  detect: (ctx, V = {}) => {
+    const H = RULE_MF;
+    const norm = (p) => String(p || "").replace(/\\/g, "/").replace(/\(经 Bash\)$/, "");
+    const acts = (ctx.actions || []).filter((a) => /^(Write|Edit|MultiEdit|NotebookEdit)$/.test(a.name));
+    const bodyOf = (a) => String(a.input?.content ?? a.input?.new_string ?? a.input?.new_source ?? "") +
+      (Array.isArray(a.input?.edits) ? "\n" + a.input.edits.map((e) => String(e?.new_string ?? "")).join("\n") : "");
+    const byPath = new Map();
+    for (const a of acts) {
+      const p = norm(a.input?.file_path);
+      if (!H._MEM.test(p) || H._INDEX.test(p)) continue;   // 索引除外(r5 BP-10 / FB-7)
+      byPath.set(p, (byPath.get(p) || "") + "\n" + bodyOf(a));
+    }
+    const hits = [];
+    for (const [p, written] of byPath) {
+      let disk = null;
+      if (!V.noDisk) { try { disk = fs.readFileSync(p, "utf8"); } catch { disk = null; } }
+      const body = disk ?? written;
+      if (!V.anyType) {
+        const ty = H.fmType(body) ?? H.fmType(written);
+        if (ty !== "feedback" && ty !== "user") continue;
+        if (ty === "user" && !H._USER_CUE.test(body.replace(/^\s+/, "").replace(/^﻿?---\r?\n[\s\S]*?\r?\n---/, ""))) continue;
+      }
+      if (!V.noEscapes && H.faceOk(body)) continue;
+      hits.push(p);
+    }
+    return hits.slice(0, 3);
+  },
+  exempts: [],
+  message: (hits) =>
+    `**写了「以后都这样做」的 memory(${hits.join("、")}),它自己没带执行面**(D179:memory 正文只有执行方想起来读才生效,` +
+    `普查 52 条里 34 条没有机器判据)。\n${renderEscapes(RULE_MF.escapes)}\n` +
+    `      只认写在**那条 memory 正文里**的一行;回复里说的不算。天花板:project / reference 类正文里的规则不触发;经 Bash 写 memory 不认;只证那一行在。`,
+  mutations: [
+    { name: "去掉出路(带了执行面也照拦)", apply: (r) => ({ ...r, detect: (ctx) => RULE_MF.detect(ctx, { noEscapes: true }) }) },
+    { name: "不看 type(写任何 memory 都拦)", apply: (r) => ({ ...r, detect: (ctx) => RULE_MF.detect(ctx, { anyType: true }) }) },
+  ],
+  cases: {
+    pos: [
+      { name: "MF:写 feedback memory,正文没执行面", text: "记下了,以后都这样做。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/reply-style.md", written: "---\nname: reply-style\nmetadata:\n  type: feedback\n---\n回复先给结论。" },
+      { name: "MF:全局 memory 同样管", text: "已存进全局记忆。",
+        write: "E:/dotfiles-claude/memory/x-rule.md", written: "---\nname: x\nmetadata:\n  type: feedback\n---\n先查 ADR 再动手。" },
+      { name: "MF v3:回复里说了执行面不算(只认笔记正文)", text: "已存。执行面:scripts/lib/gate-rules.mjs:8668(ND 项)。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/reply-style2.md", written: "---\nname: reply-style2\nmetadata:\n  type: feedback\n---\n回复先给结论。" },
+      { name: "MF r5 BP-1:正文顺带提到路径不算(不在执行面行)", text: "记下了。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/r.md", written: "---\nname: r\nmetadata:\n  type: feedback\n---\n以后改 AGENTS.md 前先跑一遍核对。" },
+      { name: "MF r5 BP-2:⏸ 不算", text: "记下了。⏸ 需要你确认:这批要不要顺手部署?",
+        write: "C:/Users/u/.claude/projects/example-project/memory/r2.md", written: "---\nname: r2\nmetadata:\n  type: feedback\n---\n回复先给结论。" },
+      { name: "MF r5 BP-3:执行面写「暂无」不附 D 号不算", text: "记下了。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/r3.md", written: "---\nname: r3\nmetadata:\n  type: feedback\n---\n回复先给结论。\n执行面:暂无,先记在 r3.md" },
+      { name: "MF r5 BP-7:user 类同样管", text: "记下了。",
+        write: "E:/dotfiles-claude/memory/u.md", written: "---\nname: u\nmetadata:\n  type: user\n---\n以后回复先给结论,结论放第一行。" },
+      { name: "MF r6 BP-1:执行面只写回声 D179 不算", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/c1.md", written: "---\nname: c1\nmetadata:\n  type: feedback\n---\n回复先给结论。\n执行面:D179(普查待办)" },
+      { name: "MF r6 BP-2:「目前没有」+ 候选路径不算", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/c2.md", written: "---\nname: c2\nmetadata:\n  type: feedback\n---\n回复先给结论。\n执行面:目前没有,候选是在 scripts/lib/gate-rules.mjs 里加一项" },
+      { name: "MF r6 BP-2:法条路径但自认无机器闸不算", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/c2b.md", written: "---\nname: c2b\nmetadata:\n  type: feedback\n---\n分支推 private 后保留。\n执行面:docs/laws/collab.md(法条;无机器闸,收尾时靠这条 memory 想起)" },
+      { name: "MF r6 BP-3:不存在的规则 id 不算", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/c5.md", written: "---\nname: c5\nmetadata:\n  type: feedback\n---\n回复先给结论。\n执行面:ZQ 项" },
+      { name: "MF r6 BP-5:正文讨论「不可机械化」格式不算", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/c6.md", written: "---\nname: c6\nmetadata:\n  type: feedback\n---\n判不了的规则要写「不可机械化:附理由」再交用户裁。" },
+      { name: "MF r6 BP-7:agent-memory 目录同管", text: "已存。",
+        write: "/repo/.claude/agent-memory/rev/notes.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n回复先给结论。" },
+      { name: "MF r6 BP-8:type 冒号前带空格", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/c7.md", written: "---\nname: x\nmetadata:\n  type : feedback\n---\n回复先给结论。" },
+      { name: "MF r5 BP-8:type 值带引号", text: "改好了。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/me.md", written: "---\nname: me\nmetadata:\n  type: \"feedback\"\n---\n先跑自测。" },
+    ],
+    neg: [
+      { name: "MF:正文带执行面路径", text: "已存。",
+        write: "E:/dotfiles-claude/memory/z.md", written: "---\nname: z\nmetadata:\n  type: feedback\n---\n先查 ADR。\n执行面:scripts/batch-goal.mjs" },
+      { name: "MF FB-7:memory 模板的加粗标签", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/x.md", written: "---\nname: x\nmetadata:\n  type: feedback\n---\n先查 ADR。\n\n**执行面:** scripts/batch-goal.mjs:487\n" },
+      { name: "MF FB-1:迁进法条、执行面指法典", text: "两条工艺迁进 collab.md「四之二」。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/workload.md", written: "---\nname: workload\nmetadata:\n  type: feedback\n---\n规则正文见法典。\n执行面:docs/laws/collab.md「四之二」" },
+      { name: "MF r5 FB-10:绝对路径 / .ts", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/wh.md", written: "---\nname: wh\nmetadata:\n  type: feedback\n---\n起子进程一律带 windowsHide。\n执行面:/repo/scripts/check-windows-hide.mjs" },
+      { name: "MF r5 FB-11:规则 id 当执行面", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/rb.md", written: "---\nname: rb\nmetadata:\n  type: feedback\n---\n写完必须逐路径回读。\n执行面:收尾闸 M 项" },
+      { name: "MF:执行面写「无」但附了 D 号", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/d.md", written: "---\nname: d\nmetadata:\n  type: feedback\n---\n先查 ADR。\n执行面:无,候选闸见 D180" },
+      { name: "MF:声明不可机械化", text: "已存。",
+        write: "E:/dotfiles-claude/memory/v.md", written: "---\nname: v\nmetadata:\n  type: feedback\n---\n说话别绕。\n不可机械化:这条要判语气,无动作面可查。" },
+      { name: "MF r5 FB-1/FB-8:project 类事实(含「必须 / 每次」)不管", text: "记下了工具事实。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/headroom.md", written: "---\nname: headroom\nmetadata:\n  type: project\n---\n改完环境变量必须重开会话才生效;verify-prod 每次跑约 40 秒。" },
+      { name: "MF r5 FB-7:只改索引 MEMORY.md 不管", text: "清了一条过期索引。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/MEMORY.md", written: "- [b](b.md) — type: feedback,写批一律走管线" },
+      { name: "MF 误拦 r6 FB-2:user 类纯事实不管", text: "记下了。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/u-fact.md", written: "---\nname: n\nmetadata:\n  type: user\n---\n用户在读本科,数学专业,2026-09 开学。" },
+      { name: "MF 误拦 r6 FB-3:project 类正文复述 type: feedback 不管", text: "记下了项目事实。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/mf-fact.md", written: "---\nname: n\nmetadata:\n  type: project\n---\n批 276 起 MF 项上线:写 type: feedback 或 type: user 的 memory 须在正文带一行执行面。" },
+      { name: "MF 误拦 r6 FB-4:D 号带后缀字母", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/d105c.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n只读代理别跑写形命令。\n执行面:hook-guard(D105c)" },
+      { name: "MF 误拦 r6 FB-5:不可机械化三字理由", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/nm.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n说话别绕。\n不可机械化:判语义" },
+      { name: "MF r6 BP-25:插件命令 / 不带「项」的规则名", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/pc.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n关账前跑一致性检查。\n执行面:/nlpm:check 关账;收尾闸 MF" },
+    ],
+  },
+};
+
+/** SE:自查出错必附「闸怎么拦」(批 276,D178)。
+ *  规则正文原住 memory `self-caught-error-propose-gate-fix`(用户 2026-09-04:「以后如果你自己发现自己锅了能不能主动想闸怎么修这个?」),
+ *  从未闸化;本批用户问「我记得有一个闸就是这种东西错了必须自动做成闸?为什么这次没弹出来」——检索面见 D178。
+ *  判据:本轮正文(剥引文后)出现认错措辞,而本轮既没往本仓 docs/gate-debts.md 新登记 D 号行、也没写「闸怎么拦:」+ 规则 id / D 号 / 不可机械化 ⇒ 提示。
+ *  只提示不阻断:认错措辞是措辞锚,误触面宽(复述别人的错、讨论历史),阻断会逼人少说实话。
+ *  批 276 红队 r4:BP-5 召回约 23%(「我」与动词之间插宾语就漏)⇒ 允许同一分句内 ≤12 字的插入并补「搞反 / 漏掉 / 失误 / 错了」;
+ *    BP-6 出路过宽(碰一下欠账表、「闸怎么拦:回头再想」即过)⇒ 收紧;BP-16「假读数」裸词、「不是我的锅」⇒ 要求主语、排除否定。
+ *  天花板:换个说法认错仍会漏;只证「登记了 / 指了一个规则」,不证候选闸写得对。
+ *  失效条件:20 批零命中 ⇒ 复议;命中后登记率 <50% ⇒ 升阻断(D178)。 */
+const RULE_SE = {
+  id: "SE",
+  blocking: false,
+  law: "docs/gate-debts.md#在账欠账",
+  requires: [],
+  escapes: [
+    { say: "补一节「闸怎么拦」并往本仓 docs/gate-debts.md 新登记 D 号行:错型归族 / 候选闸(机械判据)/ 仪器 / 失效条件",
+      sample: { write: "/repo/docs/gate-debts.md", written: "| D180 | 错型 … 候选闸 … | 276 | ≤280 | … | … |" } },
+    { say: "就地写 ⟪闸怎么拦:⟫ + 已有规则 id(如「X 项」)/ D 号 / 「不可机械化」及理由", sample: { text: "闸怎么拦:已有 E2 项管这一形,不另立。" } },
+  ],
+  //   r5 BP-12:「我」与动词之间的插入不许含假设 / 否定 / 疑问 / 防范词,主语不认「我们」
+  //   r6 BP-9:原排除表把「发现 / 觉得 / 确认 / 核对」也排了 ⇒「我发现自己读错了」漏;这几个词改由 detect 里的评他人判(见 _OTHER)
+  //   误拦 r6 FB-10:防范句「以免 / 防止 / 怕 / 确保 / 不再 / 不(不小心除外)」排除
+  _PAT: /(?<!假如|如果|要是|万一|免得|担心|以免|防止|怕|确保)我(?!们)(?:上一轮|刚才|刚刚|之前|前面|当时)?(?:(?!假如|如果|要是|不是|没|不会|不再|不(?!小心)|有没有|免得|担心|以免|防止|怕|确保|让)[^，,。！!？?；;\n]){0,12}?(?:说错|判错|读错|算错|搞错|弄错|写错|看错|报早|核错|拼错|搞反|弄反|漏掉|失误|错了)|(?<!不|并非|并不)(?:是|属)我的(?:锅|错)|我锅了|(?:我|我的|这是|那是)[^，,。\n]{0,6}假读数|红队是对的,我错了|我得出了反的结论|推翻了我(?:初版|上一轮|之前)/,
+  // 本仓 docs/gate-debts.md(clipboard 暂存树里的副本不算)
+  _DEBTS: (p) => /(^|\/)docs\/gate-debts\.md$/i.test(p) && !/(^|\/)clipboard\//i.test(p),
+  //   插入段里有「发现 / 觉得 / 确认…」且主语换成了别人(codex / 子代理 / 他…)而没回到「自己」⇒ 评他人,不算(原 r5 BP-12 的反例)
+  _OTHER: /codex|子代理|红队|猎手|对方|用户|上游|他|她|它|[A-Za-z]{3,}/,
+  /** 逐个候选判,返回第一个算数的认错句;都不算 ⇒ null。 */
+  firstAdmission(t) {
+    const H = RULE_SE;
+    for (const m of t.matchAll(new RegExp(H._PAT.source, "g"))) {
+      const s0 = Math.max(t.lastIndexOf("。", m.index), t.lastIndexOf("\n", m.index), t.lastIndexOf("!", m.index), t.lastIndexOf("?", m.index),
+        t.lastIndexOf("！", m.index), t.lastIndexOf("？", m.index)) + 1;
+      const pre = t.slice(s0, m.index);
+      const endRel = t.slice(m.index).search(/[。\n!?！？]/);
+      const sent = t.slice(s0, endRel < 0 ? t.length : m.index + endRel);
+      if (/如果|要是|万一|假如|倘若/.test(pre)) continue;                      // 误拦 r6 FB-8:同句前面有条件词,隔多远都算假设
+      if (/(?:回报|原话|回件|写道|说)\s*[:：]/.test(pre)) continue;            // 误拦 r6 FB-11:冒号转述别人的话
+      if (/发现|觉得|认为|判定|确认|核对/.test(m[0]) && !/自己|我(?!们)/.test(m[0].slice(1)) && H._OTHER.test(m[0])) continue;
+      if (/\bD\d{2,4}[a-z]?\b/.test(sent.replace(/\bD17[89]\b/g, ""))) continue;   // 误拦 r6 FB-9:同句已点名 D 号 = 复述已登记的错
+      return m[0];
+    }
+    return null;
+  },
+  detect: (ctx, V = {}) => {
+    const H = RULE_SE;
+    //   误拦 r6 FB-10:行内代码与代码围栏里复述判据词不算
+    const raw = String(ctx.text || "").replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
+    const t = V.noMask ? raw : maskQuoted(raw);
+    const hit = H.firstAdmission(t);
+    if (!hit) return [];
+    const m = [hit];
+    if (V.noEscapes) return [m[0]];
+    const norm = (p) => String(p || "").replace(/\\/g, "/");
+    const ids = (s) => new Set(String(s || "").match(/\bD\d{3}\b/g) || []);
+    const acts = (ctx.actions || []).filter((a) => /^(Write|Edit|MultiEdit|NotebookEdit)$/.test(a.name));
+    // 新登记 = 写入里出现了 old_string 里没有的 D 号(r5 BP-4:改既有行的状态不算新登记)
+    const newRow = (a) => {
+      const before = ids(a.input?.old_string ?? ""), after = String(a.input?.content ?? a.input?.new_string ?? "");
+      return [...(after.match(/\|\s*(D\d{3})\s*\|/g) || [])].map((x) => x.match(/D\d{3}/)[0]).some((d) => !before.has(d));
+    };
+    if (acts.some((a) => H._DEBTS(norm(a.input?.file_path)) && newRow(a))) return [];
+    if ((ctx.bashCmds || []).some((cmd, i) => { try { return bashWriteTargets(cmd, /docs\/gate-debts\.md/i, { dialect: ctx.bashDialects?.[i] }).some((x) => H._DEBTS(norm(x))); } catch { return false; } })) return [];
+    // 闸怎么拦:后跟规则 id / D 号 / 不可机械化+理由;回声 SE 自身与 D178 不算(r5 BP-6)
+    // r6 BP-11:推迟句(还没想好 / 回头 / 先…)里顺带的 id 不算;回声 D179 同剔;D 号容后缀字母(误拦 r6 FB-13)
+    //   逐处判,每处的值截到句末(一句推迟不连累同轮另一句真交代)
+    for (const g of t.matchAll(/闸怎么拦[:：]([^\n。]{0,80})/g)) {
+      const v = g[1].replace(/\bD17[89]\b|\bSE\s*项|\bRULE_SE\b/g, "");
+      if (!/还没想好|没想好|回头|以后再|稍后|待定|再说|^\s*先/.test(v) &&
+        /\bD\d{3}[a-z]?\b|\b[A-Z][A-Z0-9]{0,2}\s*项|RULE_[A-Z0-9]+|不可机械化\s*[:：,,]?\s*\S.{3,}/.test(v)) return [];
+    }
+    return [m[0]];
+  },
+  exempts: [],
+  message: (hits) =>
+    `**本轮认了一个错(「${hits[0]}」),却没写「闸怎么拦」**(用户 2026-09-04 要求:自己发现自己锅了要主动想闸怎么修;D178)。\n` +
+    `${renderEscapes(RULE_SE.escapes)}\n` +
+    `      天花板:措辞锚,换说法认错仍会漏;只证登记,不证候选闸写得对。`,
+  mutations: [
+    { name: "去掉两条出路(登记了也照提示)", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noEscapes: true }) }) },
+    { name: "不剥引文(引用别人的「我说错了」也提示)", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noMask: true }) }) },
+  ],
+  cases: {
+    pos: [
+      { name: "SE:认错没登记", text: "我上一轮说错了,那个文件其实没落盘。现在重写。" },
+      { name: "SE:我的假读数", text: "那是我的假读数,结论是反的,已重测。" },
+      { name: "SE:嘴上说回头补不算", text: "是我的锅,回头想想闸怎么拦。" },
+      { name: "SE r4 BP-5:我与动词之间插宾语", text: "batch-goal 那条是我路径搞错了,脚本在 /repo 下。现在重跑。" },
+      { name: "SE r4 BP-6:碰一下欠账表不算登记", text: "我上一轮说错了,那个文件没落盘。顺手把 D150 挪进已结清。", write: "/repo/docs/gate-debts.md", written: "~~D150~~ 已结清" },
+      { name: "SE r4 BP-6:「闸怎么拦:」后随便写不算", text: "是我的锅。闸怎么拦:回头再想。" },
+      { name: "SE r5 BP-6:回声 D178 / 引 SE 自身 / 不可机械化不写理由都不算", text: "是我的锅。闸怎么拦:D178。另:SE 项。不可机械化。" },
+      { name: "SE r6 BP-9:我发现自己读错了", text: "我发现自己读错了,那条结论不成立,已重测。" },
+      { name: "SE r6 BP-9:我觉得对的那个数其实算错了", text: "我觉得对的那个数其实算错了,重算。" },
+      { name: "SE r6 BP-11:推迟句里顺带规则 id 不算", text: "是我的锅。闸怎么拦:还没想好,先把 M 项自测跑了。" },
+      { name: "SE r6 BP-11:闸怎么拦只写回声 D179 不算", text: "是我的锅。闸怎么拦:归 D179 一起处置。" },
+      { name: "SE:我不小心写错了", text: "我不小心写错了路径,已改。" },
+    ],
+    neg: [
+      { name: "SE:同轮新登记了 D 号行", text: "我上一轮说错了,已登记 D180。", write: "/repo/docs/gate-debts.md", written: "| D180 | 错型 … | 276 | ≤280 |" },
+      { name: "SE:就地写了闸怎么拦 + 规则 id", text: "我刚才读错了。闸怎么拦:已有 X 项管落盘断言,这次是它没覆盖的读法,登进 X 的残余。" },
+      { name: "SE:引用别人的认错不算", text: "子代理原话是「我上一轮说错了」,它已自己更正。" },
+      { name: "SE:没认错", text: "跑完了,全绿。" },
+      { name: "SE r4 BP-16:否认不算认错", text: "这不是我的锅,是上游接口变了。" },
+      { name: "SE r4 BP-16:讲教训时提到假读数(无主语)", text: "先把口径弄对,口径错了改出来的判据是照着假读数改的。" },
+      { name: "SE r5 BP-12:假设句 / 否定 / 评别人", text: "假如我算错了,结论会反过来,所以先核一遍。我核对了两遍,我没有算错。我发现 codex 漏掉了一节。" },
+      { name: "SE 误拦 r6 FB-8:同句远端条件词", text: "如果重载之后还是整段显示,那就是我判断错了画法这一层。要是还没有,就是我写错了,告诉我。" },
+      { name: "SE 误拦 r6 FB-9:复述已登记的旧错", text: "D38 前一批已撤销(我读错了退出码)。" },
+      { name: "SE 误拦 r6 FB-10:写闸描述 / 防范句 / 行内代码", text: "我补了一条反例防止 SE 漏掉「我们」主语的形态。我逐条回读,以免我漏掉哪一条。我确保不漏掉任何一个调用点。SE 的 _PAT 现在认 `我…漏掉` 这类措辞。" },
+      { name: "SE 误拦 r6 FB-11:冒号转述子代理", text: "子代理回报:我漏掉了 MultiEdit 那一支,已补。" },
+      { name: "SE 误拦 r6 FB-13:闸怎么拦后写 D105c", text: "是我的锅。闸怎么拦:hook-guard 的 D105c 已管这一形。" },
+    ],
+  },
+};
+
 export const RULES = [RULE_O, RULE_V, RULE_W, RULE_Q, RULE_D, RULE_G, RULE_B, RULE_C, RULE_H, RULE_F, RULE_L, RULE_N, RULE_I, RULE_J, RULE_M,
-  RULE_E0, RULE_E1, RULE_E2, RULE_K, RULE_K0, RULE_S, RULE_T, RULE_U, RULE_P, RULE_ND, RULE_DP, RULE_X, RULE_AD];
+  RULE_E0, RULE_E1, RULE_E2, RULE_K, RULE_K0, RULE_S, RULE_T, RULE_U, RULE_P, RULE_ND, RULE_DP, RULE_X, RULE_AD, RULE_MF, RULE_SE];
