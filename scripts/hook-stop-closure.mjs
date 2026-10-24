@@ -3128,12 +3128,16 @@ function emit(findings, streak = 0, opts = {}) {
     try { seen = JSON.parse(fs.readFileSync(SEEN, "utf8")) || {}; } catch { seen = {}; }
     if (typeof seen !== "object" || Array.isArray(seen)) seen = {};   // 红队 r8 附三②:原始值会让下面赋值抛错,落进主 catch 又成空转
     const mine = new Set(Array.isArray(seen[_ledgerSid]) ? seen[_ledgerSid] : []);
-    //   红队 r8 BP-1:键原先只取「[id] 首行」,而 G / B / C / F / H 等的首行是固定标题、命中在第二行以后
-    //   ⇒ 首次提示后同规则的**新**命中整场静音。改为 id + 整条消息(即 D184 原写的「同一项同一命中串」)。
-    //   红队 r8 附三④:判据异常 / 缺通道类(UNKNOWN)每轮照报,不去重——否则「判据没跑成」与「无命中」从外面分不出来。
-    const key = (f) => `[${f.id}] ${String(f.msg)}`;
+    //   键 = **实际输出给模型的那一行**(brief:规则 id + 首行)。曾按红队 r8 BP-1 改成「id + 整条消息」(00fa9c0),
+    //   误拦猎手 r9 FB-1 实证那是回归:C / E1 / D / F 等首行是固定标题、命中在第二行,每轮引文不同 ⇒ 整条消息键每轮都新 ⇒
+    //   每轮重报、续一轮,而模型看到的仍是那一行一字不差的标题——D184 的空转原样回来,换来的「新命中」模型根本看不见
+    //   (全语料模拟:新键多输出 50 次,23 次落在续轮链上)。键与输出对齐:首行一样,模型拿不到新信息,重报只会续轮。
+    //   代价(已知,登记 D184):固定标题规则的后续新命中在同会话被静音——它们本来就只露首行,真要看见须让规则给出结构化命中身份(下一步设计复核)。
+    //   判据没跑成的照报:只认引擎包装行的固定前缀与 A 的两种未知消息,不扫规则正文 / 引文
+    //   (r9 FB-2:原正则扫整条消息,执行者正文里引到「UNKNOWN」就整批绕过去重,又成空转;codex dedup-r1 §2:A 的「状态未知」「自身出错」原先认不出)。
+    const key = brief;
     const cur = findings.map(key);
-    const unknown = findings.some((f) => /判据异常|UNKNOWN|^缺[::]/.test(String(f.msg)));
+    const unknown = findings.some((f) => /^\[(?:判据异常|必需通道缺席|消息渲染失败)|codex 账自身出错|状态未知/.test(String(f.msg).split("\n")[0]));
     if (!unknown && cur.every((l) => mine.has(l))) {
       if (sysParts.length) process.stdout.write(JSON.stringify({ systemMessage: sysParts.join("\n") }));
       return 0;

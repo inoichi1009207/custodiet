@@ -6782,8 +6782,10 @@ export const RULE_W = {
     // 批 276(codex 276-deliverables-audit 附 1):判据早已按 ADR 0014 认 grill 单独充分,这句出路还写着 08-22 的旧裁定——
     //   撞闸的人会收到与判据相反的指引。改成与判据一致:grill:* 单独即充分,但文件名须写在那个 grill 调用的入参里;
     //   `_*` 代理仍只作绑定载体(充分性须 battle / codex / grill 之一)。
-    { say: "**grill:* 子代理**:单独即充分(ADR 0014),但交付物文件名须写在**那个 grill 调用自己**的 prompt 里;" +
-        "`_*` 只读代理只作绑定载体,充分性仍须 battle / codex / grill 之一在场",
+    // r9 FB-4 / 红队 r9 BP-6:原后半句「`_*` 只作绑定载体,充分性仍须 battle / codex / grill 之一」许诺了判据不认的组合
+    //   (grill 不带名 + `_*` 带名 ⇒ 判据按 r6 BP-13 照拦)。改成与判据一致。
+    { say: "**grill:* 子代理**:单独即充分(ADR 0014),但交付物文件名须写在**那个 grill 调用自己**的入参里;" +
+        "`_*` 只读代理只在 battle / codex 在场时才可作绑定载体",
       forPos: 0, sample: { agent: { type: "grill:recon", prompt: "审读 clipboard/gate-playbook.md" } } },
   ],
   _w: {
