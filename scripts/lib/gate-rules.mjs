@@ -6779,10 +6779,12 @@ export const RULE_W = {
         "绑定须另有一个外审动作(codex 命令行 / agent prompt)把交付物名写进入参",
       forPos: 0, sample: { skill: "battle",
         agent: { type: "_source-verifier", prompt: "审读 clipboard/gate-playbook.md" } } },
-    { say: "只读子代理(grill:* 或 _*)**不是独立出路**——它只作绑定载体," +
-        "**充分性仍须 battle/codex 在场**(用户 2026-08-22 裁定:仅 grill 不充分)",
-      forPos: 0, sample: { agent: { type: "_source-verifier", prompt: "审读 clipboard/gate-playbook.md" },
-        bash: "node ~/.claude/scripts/codex-run.mjs --task clipboard/gate-playbook.md" } },
+    // 批 276(codex 276-deliverables-audit 附 1):判据早已按 ADR 0014 认 grill 单独充分,这句出路还写着 08-22 的旧裁定——
+    //   撞闸的人会收到与判据相反的指引。改成与判据一致:grill:* 单独即充分,但文件名须写在那个 grill 调用的入参里;
+    //   `_*` 代理仍只作绑定载体(充分性须 battle / codex / grill 之一)。
+    { say: "**grill:* 子代理**:单独即充分(ADR 0014),但交付物文件名须写在**那个 grill 调用自己**的 prompt 里;" +
+        "`_*` 只读代理只作绑定载体,充分性仍须 battle / codex / grill 之一在场",
+      forPos: 0, sample: { agent: { type: "grill:recon", prompt: "审读 clipboard/gate-playbook.md" } } },
   ],
   _w: {
     deliverablesOf(ctx) {
@@ -7349,7 +7351,8 @@ export const RULE_W = {
     //   (会话禁用 Agent 工具 ⇒ 判为无解),而 codex 通道一直开着。
     //   法条原文 `docs/laws/reporting.md:161-163`:「**battle/codex 在场即充分**;
     //   仅 grill 不充分,须补 battle……入参须提及交付物名(**codex prompt 或 agent prompt 皆可**)」。
-    `      出路(**法条 reporting.md#交付物四眼**;①② 二选一即充分,③ 只是载体):\n` +
+    //   ⚠️ 上面这段法条引文已被 ADR 0014 部分取代(reporting.md 5f 于批 276 同步:battle / codex / grill 任一即充分)。
+    `      出路(**法条 reporting.md#交付物四眼**;①②③ 任一即充分,③ 的文件名须写在 grill 调用自己身上):\n` +
     `${renderEscapes(RULE_W.escapes)}\n` +
     `      **任一通道都须在入参里带上交付物文件名**(codex prompt 或 agent prompt 皆可),回件处置后再收工。\n` +
     `      注:跨模型/联网两通道的**计数**并入 P 的跨批累计、本项不另计——这是计数归属,不是通道不可用。`,

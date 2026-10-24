@@ -3126,9 +3126,15 @@ function emit(findings, streak = 0, opts = {}) {
     const SEEN = ".claude/.gate-notice-seen.json";
     let seen = {};
     try { seen = JSON.parse(fs.readFileSync(SEEN, "utf8")) || {}; } catch { seen = {}; }
+    if (typeof seen !== "object" || Array.isArray(seen)) seen = {};   // 红队 r8 附三②:原始值会让下面赋值抛错,落进主 catch 又成空转
     const mine = new Set(Array.isArray(seen[_ledgerSid]) ? seen[_ledgerSid] : []);
-    const cur = findings.map(brief);
-    if (cur.every((l) => mine.has(l))) {
+    //   红队 r8 BP-1:键原先只取「[id] 首行」,而 G / B / C / F / H 等的首行是固定标题、命中在第二行以后
+    //   ⇒ 首次提示后同规则的**新**命中整场静音。改为 id + 整条消息(即 D184 原写的「同一项同一命中串」)。
+    //   红队 r8 附三④:判据异常 / 缺通道类(UNKNOWN)每轮照报,不去重——否则「判据没跑成」与「无命中」从外面分不出来。
+    const key = (f) => `[${f.id}] ${String(f.msg)}`;
+    const cur = findings.map(key);
+    const unknown = findings.some((f) => /判据异常|UNKNOWN|^缺[::]/.test(String(f.msg)));
+    if (!unknown && cur.every((l) => mine.has(l))) {
       if (sysParts.length) process.stdout.write(JSON.stringify({ systemMessage: sysParts.join("\n") }));
       return 0;
     }
