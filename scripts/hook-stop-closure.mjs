@@ -2597,16 +2597,27 @@ export function run(transcriptPath, ctx = {}) {
     cx = codexLedger(cxEntries, { ...(Array.isArray(ctx.bgTasks) ? { bgTasks: ctx.bgTasks } : {}), ...(codexEnv || {}),
       turnStart: Math.max(0, cxEntries.length - turn.length) });
   }
-  catch (e) { cx = { open: [], unknown: [`codex 账自身出错(${safeErrMsg(e).slice(0, 60)})`] }; }
+  // 账自身抛错 ⇒ 提示 + 结构标记 `unknown`(批 277)。红队 BP-1:原先只是提示,经去重后第二轮起无声;
+  //   曾改成 UNKNOWN 阻断,误拦猎手 FB-1 实证那会连从没发过 codex 的会话也每轮拦、执行者无出口(只剩环境变量 / 6 拦 1 降循环)
+  //   ⇒ 不阻断;`unknown` 让去重静音时每轮经 systemMessage 投给人看(判据坏了,该修的是人,模型修不了)。
+  //   原生后台任务(a.open)不依赖这本账,照常阻断。
+  catch (e) { cx = { open: [], unknown: [], broken: `codex 账自身出错(${safeErrMsg(e).slice(0, 60)})` }; }
 
   const findings = [];
-  if (a.open.length || cx.open.length) {
+  if (cx.broken && !a.open.length) {
     findings.push({
-      id: "A", block: true,
+      id: "A", block: false, unknown: true,
+      msg: `[判据异常,codex 委派账本轮**未能判定**] ${cx.broken} —— 有没有未读的 codex 回件判不了;发过委派的照实写明未知。`,
+    });
+  } else if (a.open.length || cx.open.length) {
+    findings.push({
+      // 账坏并进这条阻断时也带 unknown:被 STOP_CLOSURE_BLOCK_A=0 降级进去重后,仍每轮经 systemMessage 投给人(批 277 误拦猎手附节二①)
+      id: "A", block: true, ...(cx.broken ? { unknown: true } : {}),
       msg: [
         a.open.length ? `后台/委派任务未闭环:${a.open.join(", ")} —— 发起了但没有取回动作(poll 或读结果)。` : "",
         cx.open.length ? `codex 委派未闭环:${cx.open.join(";")}` : "",
         cx.unknown.length ? `(另有状态未知,提示不阻断:${cx.unknown.join(";")})` : "",
+        cx.broken ? `(另:${cx.broken},codex 委派账本轮未能判定)` : "",
       ].filter(Boolean).join("\n    "),
     });
   } else if (cx.unknown.length) {
@@ -3133,12 +3144,18 @@ function emit(findings, streak = 0, opts = {}) {
     //   每轮重报、续一轮,而模型看到的仍是那一行一字不差的标题——D184 的空转原样回来,换来的「新命中」模型根本看不见
     //   (全语料模拟:新键多输出 50 次,23 次落在续轮链上)。键与输出对齐:首行一样,模型拿不到新信息,重报只会续轮。
     //   代价(已知,登记 D184):固定标题规则的后续新命中在同会话被静音——它们本来就只露首行,真要看见须让规则给出结构化命中身份(下一步设计复核)。
-    //   判据没跑成的照报:只认引擎包装行的固定前缀与 A 的两种未知消息,不扫规则正文 / 引文
-    //   (r9 FB-2:原正则扫整条消息,执行者正文里引到「UNKNOWN」就整批绕过去重,又成空转;codex dedup-r1 §2:A 的「状态未知」「自身出错」原先认不出)。
+    //   不设「判据没跑成照报」旁路(批 277,按 reporting.md 停止出口①退回最简):旁路试过两版,每版都在识别正则上出新洞
+    //   (f196bee 后两支未锚定、不限 A ⇒ AD 首行引到「状态未知」即整批绕过去重,空转复现;A 等回件时每次 poll 照报;持续性异常每轮照报)。
+    //   「本项本轮没判成」认结构标记 `f.unknown`(引擎三种包装行 + A 的账抛错),不认文本。这类行被去重时**不续轮,但每轮照样经
+    //   systemMessage 投给人看**(批 277 红队 BP-3 / BP-4:判据持续坏、或阻断被开关降级时,每轮都是新的「没判」,静音就成了无声失效;
+    //   给模型重报又是空转,而它本来也修不了判据)。引擎里阻断项的判据异常是 block:true,有阻断项时根本不进这里;
+    //   A 的账抛错单独出现时是 block:false + unknown(进这里),并进原生任务阻断时那条阻断也带 unknown;
+    //   被 STOP_CLOSURE_BLOCK_<X>=0 降级的阻断项会进这里,带 unknown 的由下面这条 systemMessage 兜住。
     const key = brief;
     const cur = findings.map(key);
-    const unknown = findings.some((f) => /^\[(?:判据异常|必需通道缺席|消息渲染失败)|codex 账自身出错|状态未知/.test(String(f.msg).split("\n")[0]));
-    if (!unknown && cur.every((l) => mine.has(l))) {
+    if (cur.every((l) => mine.has(l))) {
+      const unk = findings.filter((f) => f.unknown).map(brief);
+      if (unk.length) sysParts.push(`收尾闸本轮有 ${unk.length} 项未能判定(提示本会话已给过模型,不再续轮):\n${unk.join("\n")}`);
       if (sysParts.length) process.stdout.write(JSON.stringify({ systemMessage: sysParts.join("\n") }));
       return 0;
     }
@@ -3860,6 +3877,16 @@ function selfTest() {
     const to = call("Bash", { command: `${launchCmd} --wait-ms 560000` }, "Exit code 143\nCommand timed out after 2m 0s", true);
     cx("BP-8 超时被杀 ⇒ 占位入账(离线未知、提示)", aOf([userSay("审"), ...to, say("超时了,收工")], { codexEnv: {} }), "A");
     cx("BP-8 超时被杀、反查到 done ⇒ A 阻断", aOf([userSay("审"), ...to, say("超时了,收工")], { codexEnv: findEnv("done") }), "A!");
+    // 批 277 红队 BP-1 / 误拦猎手 FB-1:账自身抛错 ⇒ 提示 + unknown 标记(不阻断:零 codex 会话也会撞,执行者无出口)
+    const boomEnv = { ...env0, now, jobState: () => { throw new Error("boom"); } };
+    cx("277 FB-1 codex 账抛错 ⇒ A 只提示", aOf([userSay("审"), ...launchBg(), say("收工")], { codexEnv: boomEnv }), "A");
+    { const e = [userSay("审"), ...launchBg(), say("收工")];
+      const f = run(null, { entries: e, turn: lastTurn(e), text: "x", codexEnv: boomEnv }).find((x) => x.id === "A");
+      cx("277 BP-1 codex 账抛错 ⇒ 带 unknown 标记(去重时转 systemMessage)", !!(f && f.unknown), true);
+      const e2 = [userSay("审"), ...launchBg(), say("收工")];
+      const g = run(null, { entries: e2, turn: lastTurn(e2), text: "x", codexEnv: boomEnv,
+        bgTasks: [{ id: "bk277", status: "completed", description: "build" }] }).find((x) => x.id === "A");
+      cx("277 附节二① 原生任务阻断 + 账抛错 ⇒ 阻断且带 unknown", g ? `${g.block}/${!!g.unknown}` : "-", "true/true"); }
     cx("BP-8 对照:参数错误不是发起", codexLedger([...call("Bash", { command: launchCmd }, "任务文件不存在:clipboard/codex/t.md", true)], {}).jobs.length, 0);
     // BP-9 / BP2-2 / BP3-2 / BP3-6 / CX-5 / BP3-3:子代理边界——自己发车就自己读;运行中也阻断;不设按次数放行
     cx("BP-9 子代理边界:自己发了没读 ⇒ 阻断", sub([...launchDone()], doneEnv), 1);

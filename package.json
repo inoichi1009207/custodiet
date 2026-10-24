@@ -1,6 +1,6 @@
 {
   "name": "custodiet",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "description": "Machine-checkable accountability gates for Claude Code agents — catches \"done\" that never happened.",
   "type": "module",
   "license": "MIT",

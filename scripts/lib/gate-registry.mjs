@@ -154,6 +154,8 @@ export function runRules(rules, ctx) {
       findings.push({
         id: r.id,
         block: typeof r.blocking === "function" ? true : !!r.blocking,
+        // unknown:结构标记「本项本轮没判成」,供收尾闸去重用(D184,批 277 红队 BP-3)——别从消息文本反推
+        unknown: true,
         msg: `[必需通道缺席,该项本轮**未能判定**] 缺:${missing.join(", ")}\n` +
              `      ${r.blocking ? "本项是阻断项 ⇒ 按 **UNKNOWN 阻断**处理:没有输入不等于没有欠账。" : "本项非阻断,记为提示。"}\n` +
              `      调用方须显式供值(可以是 null = 「查过了,没有」),**不供**与**供 null 是两件事**。`,
@@ -179,6 +181,7 @@ export function runRules(rules, ctx) {
         // 条件阻断项在 UNKNOWN 路径上**一律按阻断算**,不去问那个条件函数:
         // 判据都没跑成,凭什么信「本轮不该阻断」这个判断能跑成。fail-closed 只有一个方向。
         block: typeof r.blocking === "function" ? true : !!r.blocking,
+        unknown: true,
         msg: `[判据异常,该项本轮**未能判定**] ${e.message}\n` +
              `      ${r.blocking ? "本项是阻断项 ⇒ 按 **UNKNOWN 阻断**处理:判据没跑成不等于没命中。" : "本项非阻断,记为提示。"}`,
       });
@@ -204,13 +207,15 @@ export function runRules(rules, ctx) {
     //   落到接缝的 catch ⇒ **15 条全体退回旧实现**。
     //   这与上面那个 catch 自己写的「单条判据抛错**不让整闸陪葬**」是同一个承诺,
     //   而 message 那一半从未兑现——**隔离只做了一半**。
-    let msg;
+    let msg, renderFailed = false;
     try { msg = r.message(hits, ctx); }
     catch (e) {
-      msg = `[消息渲染失败,判据本身已命中] ${e.message}\n` +
-            `      命中 ${hits.length} 处。**不得读作「未命中」**——判据成立,只是消息渲染坏了。`;
+      renderFailed = true;
+      // 命中数放首行:收尾闸去重按首行判,数放第二行时新命中会被当成「见过」静音(D184,批 277 红队 BP-2)
+      msg = `[消息渲染失败,判据本身已命中 ${hits.length} 处] ${e.message}\n` +
+            `      **不得读作「未命中」**——判据成立,只是消息渲染坏了。`;
     }
-    findings.push({ id: r.id, block: isBlocking(r, ctx), msg });
+    findings.push({ id: r.id, block: isBlocking(r, ctx), msg, ...(renderFailed ? { unknown: true } : {}) });
   }
   return findings;
 }
