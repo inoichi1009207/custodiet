@@ -3116,6 +3116,29 @@ function emit(findings, streak = 0, opts = {}) {
   // 提示项只留首行——多行说明是给「第一次撞到」的人看的,重复刷屏反而淹没结论;
   // 阻断项保留全文,因为那几行写的是**出路**,是收到即可执行的东西。
   const brief = (f) => `  [${f.id}] ${String(f.msg).split("\n")[0]}`;
+  // D184(批 276,用户 2026-10-24:「这玩意成死循环了啊,就算不阻断也依然会一直撞」):
+  //   非阻断提示每输出一次,模型就续一轮;同一条提示每轮重报 ⇒ 等后台任务时成了停不下来的空转(本会话 AD 连撞十余轮)。
+  //   ⇒ **本轮无阻断项**时,本会话已经提示过的同一行(规则 id + 首行原文)不再输出;只要出现新的一行就整批照报。
+  //   阻断项不去重(它们本来就要求处理);systemMessage(批次提醒等)不续轮,照常投递。
+  //   台账在 gitignore 面 `.claude/.gate-notice-seen.json`,按会话号分桶,只留最近 20 个会话;写不了 ⇒ 下轮照报(宁吵)。
+  //   失效条件:Claude Code 不再因 Stop 的非阻断反馈续轮 ⇒ 撤掉去重。
+  if (live && !blocking.length && _ledgerSid && process.env.STOP_CLOSURE_NOTICE_DEDUP !== "0") {
+    const SEEN = ".claude/.gate-notice-seen.json";
+    let seen = {};
+    try { seen = JSON.parse(fs.readFileSync(SEEN, "utf8")) || {}; } catch { seen = {}; }
+    const mine = new Set(Array.isArray(seen[_ledgerSid]) ? seen[_ledgerSid] : []);
+    const cur = findings.map(brief);
+    if (cur.every((l) => mine.has(l))) {
+      if (sysParts.length) process.stdout.write(JSON.stringify({ systemMessage: sysParts.join("\n") }));
+      return 0;
+    }
+    for (const l of cur) mine.add(l);
+    delete seen[_ledgerSid];
+    seen[_ledgerSid] = [...mine].slice(-200);
+    const keys = Object.keys(seen);
+    for (const k of keys.slice(0, Math.max(0, keys.length - 20))) delete seen[k];
+    try { fs.writeFileSync(SEEN, JSON.stringify(seen)); } catch { /* 写不了 ⇒ 下轮照报 */ }
+  }
   const lines = findings.map(brief).join("\n");
   const notice =
     `收尾闭环闸命中 ${findings.length} 项:\n${lines}\n` +
@@ -5416,7 +5439,8 @@ if (hookInput.hook_event_name === "SubagentStop") {
       //   ≥10 次命中且 fp 台账零条 —— 有了这个分母才谈得上升档;
       //   在那之前升档等于拿一个没量过误报率的判据去拦人。
       //   · `MF`(批 276 红队 r6 BP-6):触发与出路只吃本轮写入与那份 memory 的盘上全文,在子代理边界上语义完整
-      //     ⇒ **接入**(否则把「存一条 memory」派给子代理写即绕过);SE 吃的是认错措辞,子代理的自述不是执行方本人,不接。
+      //     ⇒ **接入**。注意本通道整体是**提示**不阻断(见下「升阻断的判据」):接入只让「派子代理写 memory」不再静默,
+      //     并没有把它堵成阻断(误拦猎手 r7 附二①纠正);SE 吃的是认错措辞,子代理的自述不是执行方本人,不接。
       const only = new Set(["I", "M", "L", "B", "MF"]);
       const subFindings = runRules(RULES.filter((r) => only.has(r.id)), sCtx);
       hitIds = subFindings.map((f) => f.id);

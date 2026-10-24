@@ -173,7 +173,8 @@ const G_CHECK = {
     //   r5 BP-8:只认用 node 真跑它,`git add … hook-remote-check.selftest.mjs` / `cat` 这个文件不算
     //   r6 BP-15:node 须是该段命令首词、自测文件须是脚本参数(`node --check …selftest.mjs` / `grep node …` 不算);
     //   误拦 r6 FB-14:容 `\` 续行
-    const ran = (c) => !!c && c.ranBash(/--self-test|gate:self-test|gate:accept|gate-migrate-check|(?:^|[;&|(])\s*node(?:\s+(?:--(?!check\b|eval\b|print\b)[\w-]+(?:=\S+)?|\\\r?\n))*\s+[^\s|;&-][^\s|;&]*hook-remote-check\.selftest\.mjs/);
+    //   codex 276-r6-fix-audit 附 1:认 `node.exe`、独立 `--`、`cd scripts && node hook-remote-check.selftest.mjs`(裸 basename)
+    const ran = (c) => !!c && c.ranBash(/--self-test|gate:self-test|gate:accept|gate-migrate-check|(?:^|[;&|(\n])\s*node(?:\.exe)?(?:\s+(?:--(?:(?!check\b|eval\b|print\b)[\w-]+(?:=\S+)?)?|\\\r?\n))*\s+(?!-)[^\s|;&]*hook-remote-check\.selftest\.mjs/);
     if (!touchedGate || ran(ctx) || ran(win)) return null;
     return "④ 关账义务:本轮提交触及闸机件,而本轮∪批窗口没有自测/验收动作(--self-test 或 gate:accept)";
   },
@@ -252,6 +253,14 @@ export const RULE_G = {
         tracked: ["scripts/hook-remote-check.mjs"], bash: "node --no-warnings \\\n  scripts/hook-remote-check.selftest.mjs" },
       { name: "276:cd 后 && node 跑推送防线自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
         tracked: ["scripts/hook-remote-check.mjs"], bash: "cd /repo && node --no-warnings scripts/hook-remote-check.selftest.mjs" },
+      { name: "276 误拦 r7 FB-6:多行命令第二行跑推送防线自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "git diff --stat\nnode --no-warnings scripts/hook-remote-check.selftest.mjs" },
+      { name: "276 codex r6-fix 附 1:node.exe 跑自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "node.exe scripts/hook-remote-check.selftest.mjs" },
+      { name: "276 codex r6-fix 附 1:独立 -- 后跑自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "node -- scripts/hook-remote-check.selftest.mjs" },
+      { name: "276 codex r6-fix 附 1:cd scripts 后裸文件名跑自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "cd scripts && node hook-remote-check.selftest.mjs" },
       // 新建载体但**没提交** ⇒ 不追(杀「去掉 didCommit 前置闸」)
       { text: "写了个新零件,还没提交。", write: "scripts/zzz-new-widget.mjs" },
       // 普通提交轮:不触造物面/register/闸机件 ⇒ 一个字的仪式文本都不要求(v1 的 21 次噪声消失)
@@ -9437,7 +9446,7 @@ const RULE_MF = {
     return t ? t[1].toLowerCase() : null;
   },
   //   误拦 r6 FB-2:user 类多是关于用户的事实,只有带持久指令措辞时才算规则
-  _USER_CUE: /以后|每次|一律|必须|总是|永远|不要|别再|务必|always|never/i,
+  _USER_CUE: /以后|每次|一律|必须|总是|永远|默认|不要|别再|务必|always|never|by default/i,   // 「默认」:codex 276-r6-fix-audit 附 2
   // 执行面行:取标签后到行尾的值判
   faceOk(body) {
     const ids = new Set(RULES.map((r) => r.id));   // 调用时 RULES 已定义(r6 BP-3:规则 id 须真实存在)
@@ -9445,10 +9454,13 @@ const RULE_MF = {
       const m = line.match(/(?:执行面|触发层)\s*(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*(.+)$/);
       if (!m) continue;
       const v = m[1].replace(/[`*「」"]/g, "").replace(/\\/g, "/").trim();
+      if (/^不可机械化\s*[:：]\s*\S.+/.test(v)) return true;   // 误拦 r7 FB-2:「执行面:不可机械化:理由」
       // D 号:容后缀字母(D105c,误拦 r6 FB-4);回声 D178 / D179(拦截消息自己点名的号)不算(r6 BP-1)
       const hasD = /\bD\d{2,4}[a-z]?\b/.test(v.replace(/\bD17[89]\b/g, ""));
       // 如实说没有 ⇒ 须附 D 号(r5 BP-3);否定词在值的任意处都认(r6 BP-2:「目前没有,候选是 scripts/…」「无机器闸」)
-      if (/^(?:无|暂无|没有|尚无|还没有?|目前没有|未有|待定|n\/?a)(?=$|[\s,，。;；:：(（])/i.test(v) || /无机器(?:闸|判据|检查)|没有机器|尚无|还没有|目前没有|暂无|待定/.test(v)) {
+      //   codex 276-r6-fix-audit §1:否定词只认值开头,或明说「没有执行者」的短语——「scripts/x.mjs(此脚本暂无副作用)」不算没有
+      if (/^(?:无|暂无|没有|尚无|还没有?|目前没有|未有|待定|n\/?a)(?=$|[\s,，。;；:：(（])/i.test(v) ||
+        /无机器(?:闸|判据|检查)|没有机器|(?:暂无|尚无|目前没有|还没有|没有)(?:执行面|执行者|机器|闸|判据|检查)/.test(v)) {
         if (hasD) return true;
         continue;
       }
@@ -9462,7 +9474,9 @@ const RULE_MF = {
       if (idHit || /npm run [\w:.-]+|(?:^|\s)\/[a-z][\w-]*:[\w-]+/.test(v) || hasD) return true;
     }
     // 不可机械化:只认行首标签(r6 BP-5:正文讨论这种格式不算);理由 ≥2 字(误拦 r6 FB-5「判语义」)
-    return String(body || "").split(/\r?\n/).some((l) => /^\s*(?:[-*]\s+)?(?:\*\*)?不可机械化(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*\S.+/.test(l));
+    //   误拦 r7 FB-2:编号列表 / 引用块前缀、行首加粗小标题(「**How to apply:** 不可机械化:…」)同等对待
+    return String(body || "").split(/\r?\n/).some((l) =>
+      /^\s*(?:[-*>]\s+|\d+[.)]\s+)?(?:\*\*[^*\n]{1,20}\*\*\s*)?(?:\*\*)?不可机械化(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*\S.+/.test(l));
   },
   detect: (ctx, V = {}) => {
     const H = RULE_MF;
@@ -9516,6 +9530,8 @@ const RULE_MF = {
         write: "C:/Users/u/.claude/projects/example-project/memory/r3.md", written: "---\nname: r3\nmetadata:\n  type: feedback\n---\n回复先给结论。\n执行面:暂无,先记在 r3.md" },
       { name: "MF r5 BP-7:user 类同样管", text: "记下了。",
         write: "E:/dotfiles-claude/memory/u.md", written: "---\nname: u\nmetadata:\n  type: user\n---\n以后回复先给结论,结论放第一行。" },
+      { name: "MF codex r6-fix 附 2:user 类「默认…」是指令", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/u-def.md", written: "---\nname: n\nmetadata:\n  type: user\n---\n默认用中文回复。" },
       { name: "MF r6 BP-1:执行面只写回声 D179 不算", text: "已存。",
         write: "C:/Users/u/.claude/projects/example-project/memory/c1.md", written: "---\nname: c1\nmetadata:\n  type: feedback\n---\n回复先给结论。\n执行面:D179(普查待办)" },
       { name: "MF r6 BP-2:「目前没有」+ 候选路径不算", text: "已存。",
@@ -9552,6 +9568,14 @@ const RULE_MF = {
         write: "C:/Users/u/.claude/projects/example-project/memory/headroom.md", written: "---\nname: headroom\nmetadata:\n  type: project\n---\n改完环境变量必须重开会话才生效;verify-prod 每次跑约 40 秒。" },
       { name: "MF r5 FB-7:只改索引 MEMORY.md 不管", text: "清了一条过期索引。",
         write: "C:/Users/u/.claude/projects/example-project/memory/MEMORY.md", written: "- [b](b.md) — type: feedback,写批一律走管线" },
+      { name: "MF codex r6-fix §1:执行面旁注里的「暂无副作用」不算没有执行面", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/r6a.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n先跑自测。\n执行面:scripts/lib/gate-rules.mjs(此脚本暂无副作用)" },
+      { name: "MF 误拦 r7 FB-1:真实 id + 覆盖范围限定语", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/r7a.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n自查出错必附闸怎么拦。\n执行面:收尾闸 SE 项(提示级,尚无阻断;升阻断待定)" },
+      { name: "MF 误拦 r7 FB-2:执行面行里写不可机械化", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/r7b.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n说话别绕。\n执行面:不可机械化:要判语气" },
+      { name: "MF 误拦 r7 FB-2:加粗小标题后写不可机械化", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/r7c.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n说话别绕。\n**How to apply:** 不可机械化:要判语气" },
       { name: "MF 误拦 r6 FB-2:user 类纯事实不管", text: "记下了。",
         write: "C:/Users/u/.claude/projects/example-project/memory/u-fact.md", written: "---\nname: n\nmetadata:\n  type: user\n---\n用户在读本科,数学专业,2026-09 开学。" },
       { name: "MF 误拦 r6 FB-3:project 类正文复述 type: feedback 不管", text: "记下了项目事实。",
@@ -9604,8 +9628,12 @@ const RULE_SE = {
       const sent = t.slice(s0, endRel < 0 ? t.length : m.index + endRel);
       if (/如果|要是|万一|假如|倘若/.test(pre)) continue;                      // 误拦 r6 FB-8:同句前面有条件词,隔多远都算假设
       if (/(?:回报|原话|回件|写道|说)\s*[:：]/.test(pre)) continue;            // 误拦 r6 FB-11:冒号转述别人的话
-      if (/发现|觉得|认为|判定|确认|核对/.test(m[0]) && !/自己|我(?!们)/.test(m[0].slice(1)) && H._OTHER.test(m[0])) continue;
-      if (/\bD\d{2,4}[a-z]?\b/.test(sent.replace(/\bD17[89]\b/g, ""))) continue;   // 误拦 r6 FB-9:同句已点名 D 号 = 复述已登记的错
+      //   误拦 r7 FB-7:「评他人」看整句(「我发现文件里漏掉了一节,是上游生成器的问题」),「回到自己」仍只看匹配段
+      if (/发现|觉得|认为|判定|确认|核对/.test(m[0]) && !/自己|我(?!们)/.test(m[0].slice(1)) && H._OTHER.test(sent)) continue;
+      // 误拦 r6 FB-9:同句点名 D 号且带登记语境 = 复述已登记的错;
+      //   只有 D 号不算(codex 276-r6-fix-audit §2:「我说错了,D150 那条的状态写反了」里 D150 是被说错的对象)
+      const sentD = sent.replace(/\bD17[89]\b/g, "");
+      if (/\bD\d{2,4}[a-z]?\b/.test(sentD) && /登记|登进|记为|记账|已撤销|已结清|已修|在册|见\s*D\d/.test(sentD)) continue;
       return m[0];
     }
     return null;
@@ -9634,8 +9662,10 @@ const RULE_SE = {
     //   逐处判,每处的值截到句末(一句推迟不连累同轮另一句真交代)
     for (const g of t.matchAll(/闸怎么拦[:：]([^\n。]{0,80})/g)) {
       const v = g[1].replace(/\bD17[89]\b|\bSE\s*项|\bRULE_SE\b/g, "");
-      if (!/还没想好|没想好|回头|以后再|稍后|待定|再说|^\s*先/.test(v) &&
-        /\bD\d{3}[a-z]?\b|\b[A-Z][A-Z0-9]{0,2}\s*项|RULE_[A-Z0-9]+|不可机械化\s*[:：,,]?\s*\S.{3,}/.test(v)) return [];
+      //   误拦 r7 FB-9:推迟词只在它出现在第一个交代(id / D 号 / 不可机械化)之前才作废;「先前」不是推迟
+      const okRe = /\bD\d{3}[a-z]?\b|\b[A-Z][A-Z0-9]{0,2}\s*项|RULE_[A-Z0-9]+|不可机械化\s*[:：,,]?\s*\S.{3,}/;
+      const ok = v.search(okRe), late = v.search(/还没想好|没想好|回头|以后再|稍后|待定|再说|^\s*先(?!前)/);
+      if (ok >= 0 && (late < 0 || late > ok)) return [];
     }
     return [m[0]];
   },
@@ -9662,6 +9692,7 @@ const RULE_SE = {
       { name: "SE r6 BP-11:推迟句里顺带规则 id 不算", text: "是我的锅。闸怎么拦:还没想好,先把 M 项自测跑了。" },
       { name: "SE r6 BP-11:闸怎么拦只写回声 D179 不算", text: "是我的锅。闸怎么拦:归 D179 一起处置。" },
       { name: "SE:我不小心写错了", text: "我不小心写错了路径,已改。" },
+      { name: "SE codex r6-fix §2:同句 D 号是被说错的对象,不是登记", text: "我说错了,D150 那条的状态写反了。" },
     ],
     neg: [
       { name: "SE:同轮新登记了 D 号行", text: "我上一轮说错了,已登记 D180。", write: "/repo/docs/gate-debts.md", written: "| D180 | 错型 … | 276 | ≤280 |" },
@@ -9676,6 +9707,9 @@ const RULE_SE = {
       { name: "SE 误拦 r6 FB-10:写闸描述 / 防范句 / 行内代码", text: "我补了一条反例防止 SE 漏掉「我们」主语的形态。我逐条回读,以免我漏掉哪一条。我确保不漏掉任何一个调用点。SE 的 _PAT 现在认 `我…漏掉` 这类措辞。" },
       { name: "SE 误拦 r6 FB-11:冒号转述子代理", text: "子代理回报:我漏掉了 MultiEdit 那一支,已补。" },
       { name: "SE 误拦 r6 FB-13:闸怎么拦后写 D105c", text: "是我的锅。闸怎么拦:hook-guard 的 D105c 已管这一形。" },
+      { name: "SE 误拦 r7 FB-7:同句后半点名别人的错", text: "我发现文件里漏掉了一节,是上游生成器的问题。" },
+      { name: "SE 误拦 r7 FB-9:已给 id + 附带后续计划", text: "是我的锅。闸怎么拦:E2 项已管,稍后补一条反例。" },
+      { name: "SE 误拦 r7 FB-9:「先前」不是推迟", text: "是我的锅。闸怎么拦:先前已有 E2 项管这一形,不另立。" },
     ],
   },
 };

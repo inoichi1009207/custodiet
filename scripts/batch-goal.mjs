@@ -43,7 +43,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { ledgerAppend } from "./lib/ledger-chain.mjs";
 import { quoteUntrusted } from "./lib/gate-ctx.mjs";
-import { isLoadBearing } from "./lib/gate-carriers.mjs";
+import { isCarrierPath, CARRIER_SURFACE } from "./lib/gate-carriers.mjs";
 const JOURNAL = path.join(".claude", ".batch-goal.jsonl");
 // 盲审日志(fpAudit / fpAuditLast 用)。须在顶部定义:--clear / --arm 分支在文件中段执行并 exit,
 //   定义在函数旁边时落在暂时性死区,发车与读结论都会失败(codex 259-final-r1 附节 1 实测)
@@ -493,13 +493,15 @@ export function loadBearingTouched(baseCommit, git = gitRun) {
   let r; try { r = git(["diff", "--name-only", "--no-renames", "-z", baseCommit, "HEAD"]); } catch (e) { return { unknown: true, why: e.message }; }
   if (!r || r.status !== 0) return { unknown: true, why: String(r?.stderr || "git diff 失败").trim() || "git diff 失败" };
   const paths = String(r.stdout || "").split("\0").map((x) => x.trim().replace(/\\/g, "/")).filter(Boolean)
-    //   红队 r6 BP-20:手抄表只是子集(漏 package.json / verify-laws / perm-match…)⇒ 并上 P 的判据面 isLoadBearing,不再另抄
-    .filter((p) => (LOAD_BEARING_PATH.test(p) || isLoadBearing(p)) && !/\.(?:selftest|test|spec)\.[cm]?[jt]s$/i.test(p));
+    //   红队 r6 BP-20:手抄表只是子集(漏 package.json / verify-laws / perm-match…)⇒ 并上 P 实际用的判据面,不再另抄;
+    //   codex 276-r6-fix-audit 附 3:用 isCarrierPath(CARRIER_SURFACE, …)(排除暂存 / 依赖 / 构建区),不用裸 isLoadBearing
+    .filter((p) => (LOAD_BEARING_PATH.test(p) || isCarrierPath(CARRIER_SURFACE, p)) && !/\.(?:selftest|test|spec)\.[cm]?[jt]s$/i.test(p));
   return { paths };
 }
 
 /** --no-decision 的理由是不是照抄了拒清消息里的模板(红队 r6 BP-23:「决定在批 N」/「<为什么…>」原样贴回)。 */
-export const isTemplateReason = (t) => /批\s*N\b|<[^>]*>/.test(String(t || ""));
+//   误拦 r7 FB-5:只认消息给过的模板原串,不认任意尖括号(「只改 <details> 折叠块」「Map<string, Node>」是真理由)
+export const isTemplateReason = (t) => /批\s*N\b|<为什么本批没有决定>|<那一批的真实批号>|<一句话>|<理由>/.test(String(t || ""));
 
 /** --clear 的检查。io 可注入:{git, readDiary():string|null(不存在=null), adrNames():string[]}。 */
 export function obligationCheck(goal, io = {}) {
@@ -798,6 +800,8 @@ function selfTest() {
     t("D177:声明过 --no-decision ⇒ 不核", obligationCheck({ ...g0, noDecision: { text: "只修笔误" } }, { git: names(["scripts/hook-guard.mjs"]) }).noDecisionTouched, []);
     t("D177 r6 BP-23:照抄消息模板的理由不算声明", obligationCheck({ ...g0, noDecision: { text: "合并带入,决定在批 N" } }, { git: names(["scripts/hook-guard.mjs"]) }).noDecisionTouched.length, 1);
     t("D177 r6 BP-20:手抄表外的承重件(package.json / verify-laws / perm-match)也核", obligationCheck(g0, { git: names(["package.json", "scripts/verify-laws.mjs", "scripts/lib/perm-match.mjs"]) }).noDecisionTouched.length, 3);
+    t("D177 误拦 r7 FB-5:理由里的尖括号字面量不算模板", isTemplateReason("只改 <details> 折叠块的笔误") || isTemplateReason("修 Map<string, Node> 的注释"), false);
+    t("D177 codex r6-fix 附 3:构建区 build/package.json 不算承重面", obligationCheck(g0, { git: names(["build/package.json"]) }).noDecisionTouched, []);
     t("D177:登记了决定 ⇒ 走 ADR 覆盖,不走本格", obligationCheck({ ...g0, decisions: dec }, { git: () => ({ status: 0, stdout: "" }) }).noDecisionTouched, []);
     t("D177:没基点 ⇒ 跳过并提示", (() => { const o = obligationCheck({ batch: "276" }, { git: names(["scripts/hook-guard.mjs"]) }); return [o.noDecisionTouched.length, o.notes.length]; })(), [0, 1]);
     t("D177:git 判不了 ⇒ unknown", !!obligationCheck(g0, { git: () => ({ status: 128, stdout: "" }) }).unknown, true);
