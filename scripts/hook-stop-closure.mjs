@@ -2285,6 +2285,42 @@ let _ledgerSid;
 /** P 的跨批持久账(2026-08-22 亲签)。读不到/坏 ⇒ null(首跑语义,宽限计 0)。
  *  为什么不怕坏账读成 null:方向是**少收一轮税**,而下一次真提交会重新开始累计;
  *  比反向(坏账读成天文数字 ⇒ 永久拦死)便宜得多。 */
+/** 批 281:盘上这批是不是**别的会话**武装的。
+ *  ① armedBy(--arm 时的 CLAUDE_CODE_SESSION_ID)就是本会话 ⇒ 本会话的;
+ *  ② 否则看本会话转录里有没有跑过 `batch-goal … --arm <该批号>`:跑过 ⇒ 本会话的(红队 281 BP-1:武装命令可前缀伪造会话号;
+ *     BP-2:同号重武装要能认领回来);没跑过 ⇒ 外来——**armedBy 缺(旧批 / 用户终端 / codex 武装)也算外来**(误拦猎手 281 FB-1:
+ *     上线前武装的 280 没有 armedBy,照旧连拦别的会话)。
+ *  CEILING(漏放方向,用户 10-27「漏放的影响看起来比误拦小很多」):/clear 后会话号与转录都换了,原先自己武装的批变外来、S 不再拦它。
+ *  判不了(会话号缺 / 抛错)⇒ false(按本会话的批算,偏严)。 */
+export function isForeignBatch(g, sid, entries) {
+  try {
+    if (!g || !g.batch || typeof sid !== "string" || !sid) return false;
+    if (typeof g.armedBy === "string" && g.armedBy === sid) return false;
+    const re = new RegExp(`batch-goal\\.mjs[^\\n]*--arm[\\s=]+["']?${String(g.batch || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`);
+    const armedHere = (Array.isArray(entries) ? entries : []).some((e) => e && e.type === "assistant" && Array.isArray(e.message?.content) &&
+      e.message.content.some((c) => c && c.type === "tool_use" && /^(Bash|PowerShell)$/.test(String(c.name)) && re.test(String(c.input?.command || ""))));
+    return !armedHere;
+  } catch { return false; }
+}
+
+/** 批 281(D184 FB-2):阻断轮随附的提示按会话去重——返回本轮还该随附的提示(没见过的 + 带 unknown 的),并把本轮全部提示记为见过。
+ *  台账与非阻断轮的去重同一份(`.claude/.gate-notice-seen.json`,按会话分桶,留最近 20 个会话);读写失败 ⇒ 原样全列(宁吵)。 */
+export function dedupNotices(file, sid, notices, keyOf) {
+  if (!notices.length) return notices;
+  let seen = {};
+  try { seen = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { seen = {}; }
+  if (typeof seen !== "object" || Array.isArray(seen)) seen = {};
+  const mine = new Set(Array.isArray(seen[sid]) ? seen[sid] : []);
+  const out = notices.filter((f) => f.unknown || !mine.has(keyOf(f)));
+  for (const f of notices) mine.add(keyOf(f));
+  delete seen[sid];
+  seen[sid] = [...mine].slice(-200);
+  const keys = Object.keys(seen);
+  for (const k of keys.slice(0, Math.max(0, keys.length - 20))) delete seen[k];
+  try { fs.writeFileSync(file, JSON.stringify(seen)); } catch { return notices; }
+  return out;
+}
+
 function readPLedger() {
   // 自测隔离(2026-08-26 实撞):readBatchGoal 有这道阀而本函数没有——真实 P 账爬满 5 笔当天,
   // 夹具世界被磁盘真账污染,G 的用例凭空多出 P 命中(「测出来的东西取决于磁盘上碰巧有什么」,
@@ -2783,8 +2819,11 @@ export function run(transcriptPath, ctx = {}) {
         batchEverArmed: ctx.batchGoal !== undefined || !ctx.live || process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : batchEverArmedHere(),
         // 批 258:实时路径给批状态补 `turnBatchStart`(本轮开始时正开着的那一批的起点;W 按它切交付物)
         batchGoal: ctx.batchGoal !== undefined ? ctx.batchGoal : (() => {
-          const g = readBatchGoal();
-          if (!g || typeof g !== "object") return g;
+          const g0 = readBatchGoal();
+          if (!g0 || typeof g0 !== "object") return g0;
+          // 批 281:`--arm` 记了武装者会话号(armedBy)且与本会话不同 ⇒ 标 foreign(S 不再拿别的会话的批拦本会话);
+          //   旧批没有 armedBy ⇒ 不标(照旧算本会话的,偏严)
+          const g = isForeignBatch(g0, ctx.sessionId, _allEntriesCache) ? { ...g0, foreign: true } : g0;
           try {
             const ts = (Array.isArray(turn) ? turn : []).map((e) => Date.parse(String((e && e.timestamp) || ""))).filter(Number.isFinite);
             const rows = fs.readFileSync(".claude/.batch-goal.jsonl", "utf8").trim().split("\n");
@@ -3210,7 +3249,11 @@ function emit(findings, streak = 0, opts = {}) {
     // ⚠️ 提示项必须**一起**输出。原实现只把 blocking 放进 reason 就 return,
     //   于是「只要有一项阻断,八个提示项就全被吞掉」——2026-08-19 实测:
     //   A/B/C/D/E1/F/G/H 全会话零显示,不是没命中,是命中了没机会说话。
-    const notices = findings.filter((f) => !blocking.includes(f));
+    // 批 281(D184 FB-2):随阻断一起显示的提示也记为见过、且见过的不再随附(结构标记 unknown 的照列)——
+    //   原来阻断轮不碰见过台账 ⇒ 同一条提示(如 AD)每个阻断轮都挂在消息尾、阻断解除后又按「新提示」再续一轮
+    const notices = (live && _ledgerSid && process.env.STOP_CLOSURE_NOTICE_DEDUP !== "0")
+      ? dedupNotices(".claude/.gate-notice-seen.json", _ledgerSid, findings.filter((f) => !blocking.includes(f)), brief)
+      : findings.filter((f) => !blocking.includes(f));
     process.stdout.write(JSON.stringify(withWarn({
       decision: "block",
       reason: `收尾闸阻断 ${blocking.length} 项:\n` +
@@ -4796,6 +4839,34 @@ function selfTest() {
           const E_ = ([t, c]) => ({ type: "assistant", timestamp: iso(t), message: { content: c } });
           const cW = buildCtx([[T, [bash("git commit -am x")]]].map(E_), { pLedger: { carriers: 0 }, headFacts: () => ({ ...engF(T + 1e3), engineAnchorAt: iso(T - 40000e3) }), priorEntries: [[T - 36000e3, [hunter, fbHunter]]].map(E_) });
           hp("279 红队 BP-1:陈旧猎手 + 本批新提交 ⇒ 不记", JSON.stringify(P_.huntedShas(cW)), "[]");
+        }
+        // 批 281:外来批判定(isForeignBatch)
+        {
+          const arm = (cmd) => ({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: cmd } }] } });
+          const g = { batch: "280", armedBy: "other-session-1234" };
+          hp("281:armedBy 是别的会话、本会话没武装过 ⇒ 外来", isForeignBatch(g, "me-session-5678", [arm("git status")]), true);
+          hp("281 红队 BP-1:本会话转录里跑过 --arm 280(哪怕前缀伪造会话号)⇒ 不算外来",
+            isForeignBatch(g, "me-session-5678", [arm("CLAUDE_CODE_SESSION_ID=other-session-1234 node scripts/batch-goal.mjs --arm 280 --cond x")]), false);
+          hp("281:武装过的是 2800 不是 280 ⇒ 仍算外来", isForeignBatch(g, "me-session-5678", [arm("node scripts/batch-goal.mjs --arm 2800 --cond x")]), true);
+          hp("281 误拦猎手 FB-1:旧批没有 armedBy、本会话没武装过 ⇒ 外来", isForeignBatch({ batch: "280" }, "me-session-5678", [arm("git status")]), true);
+          hp("281:旧批没有 armedBy、本会话武装过 ⇒ 本会话的", isForeignBatch({ batch: "280" }, "me-session-5678", [arm("node scripts/batch-goal.mjs --arm 280 --cond x")]), false);
+          hp("281:会话号缺 ⇒ 按本会话的批算", isForeignBatch({ batch: "280", armedBy: "x-session-0000" }, "", []), false);
+          hp("281:armedBy 就是本会话 ⇒ 不算外来", isForeignBatch({ batch: "280", armedBy: "me-session-5678" }, "me-session-5678", []), false);
+        }
+        // 批 281(D184 FB-2):阻断轮随附提示的去重
+        {
+          const df = path.join(os.tmpdir(), `notice-dedup-selftest-${process.pid}.json`);
+          try { fs.unlinkSync(df); } catch { /* 无 */ }
+          const kf = (f) => `[${f.id}] ${f.msg}`;
+          const n1 = dedupNotices(df, "s1", [{ id: "AD", msg: "决定清单为空" }], kf);
+          const n2 = dedupNotices(df, "s1", [{ id: "AD", msg: "决定清单为空" }, { id: "E1", msg: "新提示" }], kf);
+          const n3 = dedupNotices(df, "s1", [{ id: "A", msg: "账坏", unknown: true }, { id: "A", msg: "账坏", unknown: true }], kf);
+          const n4 = dedupNotices(df, "s2", [{ id: "AD", msg: "决定清单为空" }], kf);
+          hp("281 FB-2:阻断轮首次随附提示照列", n1.map((f) => f.id).join(","), "AD");
+          hp("281 FB-2:同会话再次随附的旧提示不列、新提示照列", n2.map((f) => f.id).join(","), "E1");
+          hp("281 FB-2:带 unknown 的照列", n3.length, 2);
+          hp("281 FB-2:别的会话不受影响", n4.map((f) => f.id).join(","), "AD");
+          try { fs.unlinkSync(df); } catch { /* 无 */ }
         }
         // 批 279「修闸 tag」:记账判据(lib/gate-touch.mjs touchWhy / readTouched;零件注入,避免循环导入)
         {

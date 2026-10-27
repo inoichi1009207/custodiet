@@ -1193,7 +1193,8 @@ if (argv.includes("--arm")) {
     for (const o of lostO) console.error(`  成果 ${o.o}: ${String(o.text || "").slice(0, 80)}`);
     if (!lostD.length && !lostO.length) console.error("  (清单形状异常,未能列出)");
   }
-  journal("arm", { batch, conditions: conds, checks, shell: "bash", overwrote: cur?.batch ?? null, baseCommit, ...(argv.includes("--force") ? { forced: true } : {}) });   // forced:批 278(误拦猎手附节二 6)
+  journal("arm", { batch, conditions: conds, checks, shell: "bash", overwrote: cur?.batch ?? null, baseCommit, ...(argv.includes("--force") ? { forced: true } : {}),
+    ...(typeof process.env.CLAUDE_CODE_SESSION_ID === "string" && /^[\w-]{8,80}$/.test(process.env.CLAUDE_CODE_SESSION_ID) ? { armedBy: process.env.CLAUDE_CODE_SESSION_ID } : {}) });   // forced:批 278(误拦猎手附节二 6);armedBy:批 281(与状态文件同一校验,误拦猎手 281 附节二 ①)
   // ⚠️ `armedAt` 是 2026-08-20 加的:开工面闸要判「**本批**跑过哪几条通道」,
   //   而状态文件此前**不记武装时刻**,于是那个窗口起点取不到 ⇒ 闸只能闭嘴。
   //   台账 .jsonl 里有时间,但让读者去 join 两份文件是把简单的事做复杂了。
@@ -1202,7 +1203,11 @@ if (argv.includes("--arm")) {
   // 批 258(codex 258-cond2-r1 断言 3):同号未结清的重放保留原 armedAt——它是「本批从何时起」,W 按它切交付物、
   //   P 按它切凭证池;重放刷新它会把本批更早的写入切到批外(本批未审的交付物被放行)。换批或结清后重开才取新时刻。
   const armedAt = sameOpen && typeof cur.armedAt === "string" && cur.armedAt ? cur.armedAt : new Date().toISOString();
-  try { atomicWrite({ batch, conditions: conds, checks, shell: "bash", armedAt, baseCommit, ...kept, ...carry }, seenVersion); }
+  // 批 281:记武装者会话号(Claude Code 给子进程的 CLAUDE_CODE_SESSION_ID);收尾闸据此把别的会话武装的批标 foreign,
+  //   S 不再拿它拦本会话。同号重放保留原武装者;取不到 ⇒ 不记(收尾闸按本会话的批算,偏严)
+  const sidEnv = typeof process.env.CLAUDE_CODE_SESSION_ID === "string" && /^[\w-]{8,80}$/.test(process.env.CLAUDE_CODE_SESSION_ID) ? process.env.CLAUDE_CODE_SESSION_ID : null;
+  const armedBy = sameOpen && typeof cur.armedBy === "string" && cur.armedBy ? cur.armedBy : sidEnv;
+  try { atomicWrite({ batch, conditions: conds, checks, shell: "bash", armedAt, baseCommit, ...(armedBy ? { armedBy } : {}), ...kept, ...carry }, seenVersion); }
   catch (e) { console.error(e.message); process.exit(2); }
   console.log(`已武装批 ${batch} 的 ${conds.length} 条完成条件${checks.length ? `(其中 ${checks.length} 条带可执行判据,--clear 时经 bash 跑)` : ""};收尾时须逐条写「条件N:达成/未达成/不适用」`);
   for (const c of checks) console.log(`  条件${c.i + 1} ⇐ $ ${c.cmd}${c.expect !== undefined ? `  期待含「${c.expect}」` : ""}${c.expectRe !== undefined ? `  期待匹配 /${c.expectRe}/` : ""}`);

@@ -3778,7 +3778,10 @@ const RULE_S = {
     //   「零推进」取动作面:本轮既没写文件、没提交、也没委派出去。
     //   这一条**不问我用了什么词、也不问我标没标**,信号来自磁盘台账与动作面,
     //   都不在被审那一方手里——原来的两条入口(措辞白名单 / ⏸ 标记)恰恰都在。
-    const bg = ctx.batchGoal;
+    // 批 281:别的会话武装的批(foreign)不是本会话的活——当作没有批(不拿它要求本会话结清 / 标 ⏸;S 的措辞面入口照旧)。
+    //   用户 10-27「漏放的影响看起来比误拦小很多」;当日 S 拿别的会话的 277 / 280 连拦六七轮。
+    //   CEILING:armedBy 取 --arm 时的 CLAUDE_CODE_SESSION_ID,旧批没有 ⇒ 照旧算本会话的。
+    const bg = ctx.batchGoal && ctx.batchGoal.foreign ? null : ctx.batchGoal;
     // 「非 C」用 `settledConditions`(已减掉自判「未达成」的),不用原始 confirmed ——
     //   否则写一句「条件2:未达成」就把自己算成跑完了。见 settledConditions 头注(D85)。
     // ⚠️ D67④ 结清(2026-08-27):**C 态改认动作面**。
@@ -3938,6 +3941,9 @@ const RULE_S = {
       sample: { text: "⏸ 需要你确认：属「不可逆」类，翻 public 撤不回来。" } },
   ],
   mutations: [
+    // 批 281:不看 foreign(别的会话武装的批照样拦本会话)——被 neg「281:别的会话武装的批」杀
+    { name: "不看 foreign(别的会话的批照拦)", apply: (r) => ({ ...r, detect: (ctx) =>
+      RULE_S.detect(ctx.batchGoal && ctx.batchGoal.foreign ? Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx, { batchGoal: { ...ctx.batchGoal, foreign: false } }) : ctx) }) },
     // 分支①:只看有没有问句,不看标记 ⇒ 标了 ⏸ 的合法停工也被拦
     { name: "不认 ⏸ 标记", apply: (r) => ({ ...r, detect: (ctx) =>
       (matchAny(ctx.text, PAT.handoff).length ? ["推回给用户"] : []) }) },
@@ -4030,6 +4036,10 @@ const RULE_S = {
         batchGoal: { armedAt: "2026-10-10T08:00:00Z", conditions: ["A"] } })),
     ],
     neg: [
+      // 批 281:别的会话武装的批(foreign)不拿来拦本会话——与 pos「A 态:零推进就收尾」只差 foreign
+      { name: "281:别的会话武装的批 ⇒ 不要求本会话结清 / 标 ⏸",
+        text: "这批还剩两条没办。我先看看情况。",
+        batchGoal: { armedAt: "2026-08-26T00:00:00Z", conditions: ["甲", "乙"], foreign: true } },
       // D99 回归钉(2026-09-06;fp 台账 2026-09-05T05:17Z 那笔的实况措辞):
       //   零动作、英文写出下一步(动词+宾语)⇒ A 态痕迹成立,放行。**样本不含中文动词**。
       { name: "D99:英文说出下一步(零动作)",

@@ -512,6 +512,9 @@ export function buildCtx(entries, extra = {}) {
       /** 批 258:本轮开始时正开着的那一批的起点(hook 从台账算;W 切交付物取较早者)。 */
       turnBatchStart: typeof g.turnBatchStart === "string" ? g.turnBatchStart : null,
       cleared: g.cleared === true,
+      /** 批 281:这批是**别的会话**武装的(`--arm` 时记了 armedBy,与本会话 id 不同;hook 实时路径判)。
+       *  用户 10-27「漏放的影响看起来比误拦小很多」+ 当日 S 拿别的会话的 277 / 280 连拦本会话六七轮。S 见到它不再要求结清。 */
+      foreign: g.foreign === true,
       /** batch-goal 拒清留痕(判据未过 / 判据被改):有它且未结清 ⇒ 本批的 `--clear` 没成,ranClear 不得为真。 */
       clearRefusedAt: typeof g.clearRefusedAt === "string" ? g.clearRefusedAt : null,
       // 中和在**进 ctx 时**做,不指望每个调用方记得——那是「靠人记得」,今天已证不可靠
