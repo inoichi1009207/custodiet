@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.7 — 2026-10-27
+
+修闸 tag 判据改准(0.9.6 发出后两个猎手又审了一轮):
+- 命令里的目录跟踪:子 shell `( cd X && … )` 出括号即回到原目录;`popd` / `Pop-Location` 回到 push 之前;PowerShell 的 `Set-Location` / `sl` / `Push-Location` 都认。
+- 在 `.claude/worktrees/` 下切 HEAD(子代理在自己的 worktree 里)不算本会话碰闸;合回主树那一步的 merge 照算。
+- 只丢弃自己改动的 git 不算碰闸:`reset` / `reset HEAD <文件>` / `reset .`、不带别的提交的 `checkout <文件|.>`、`checkout HEAD -- .`、不带 `--source` 的 `restore`。
+- 带起点开分支(`checkout -b X <起点>`、`switch -c X <起点>`)、`git -C <闸目录>` 下的相对路径、整目录带回旧版闸(`checkout <ref> -- scripts/lib`)、git 别名与未知子命令、前面带 `npx` / `&` / `env` 的 codex,都算碰闸。
+- 作用在别的仓的 git(相对路径、`~`、`-C`)不算;同一条命令里只要有一段提交落在本仓,提交邻近兜底就照算。
+- 本包仍不带记账钩子,P 在本包里的行为与 0.9.5 相同;以上只在装了记账钩子的仓里生效。
+
 ## 0.9.6 — 2026-10-27
 
 主题:**P 只对「碰过闸」的会话要两个猎手;MF 不再拦改错别字;SE 允许说「这个错不值得立闸」**。

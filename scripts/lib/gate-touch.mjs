@@ -87,13 +87,15 @@ export function gitSegWhy(g, dir, underRoot, isEngine) {
     case "checkout": {
       if (flags.some((f) => /^-[bB]$|^--orphan$/.test(f))) return pos.length >= 2 ? why : null;   // codex 279-r2 附 1:带起点才记
       const { refs, ps } = split();
-      if (ps.length) return refs.length && anyCovers(ps) ? why : null;   // 路径模式:无引用 = 从暂存区还原(丢弃自己的改动),不记
+      // 路径模式:无引用 / 引用是 HEAD = 从暂存区或 HEAD 还原(丢弃自己的改动),不记(末笔附节二 4)
+      if (ps.length) return refs.some((r) => !/^HEAD$/i.test(r)) && anyCovers(ps) ? why : null;
       return refs.length ? why : null;                                    // checkout <ref>:切 HEAD
     }
     case "reset": {
       if (flags.some((f) => /^--(?:hard|keep|merge)$/.test(f))) return why;
       const { refs, ps } = split();
-      if (ps.length) return anyCovers(ps) ? why : null;                   // 路径模式(只动暂存区):碰到闸路径才记
+      // 路径模式(只动暂存区):引用是 HEAD 或没给 = 撤暂存,不记(末笔附节二 4:`reset .`);从别的提交重置闸路径才记
+      if (ps.length) return refs.some((r) => !/^HEAD$/i.test(r)) && anyCovers(ps) ? why : null;
       // 余下只有引用:`reset` / `reset HEAD` 是撤暂存(误拦猎手收窄版 FB-1);别的引用(HEAD~1、sha、分支名)⇒ 移 HEAD,记
       return refs.some((r) => !/^HEAD$/i.test(r)) ? why : null;
     }
@@ -120,7 +122,13 @@ export function engineUnder(root, engineRel, resolve = null) {
 export function rootUnder(root, resolve = null) {
   const norm = (x) => (resolve ? resolve(null, x) : String(x || "").replace(/\\/g, "/"));
   const r = norm(root).replace(/\/+$/, "").toLowerCase();
-  return (p) => { const s = norm(p).replace(/\/+$/, "").toLowerCase(); return !!r && (s === r || s.startsWith(r + "/")); };
+  //   `.claude/worktrees/` 下是别的 checkout(子代理 worktree):在那里切 HEAD 不动主树 P 范围,按仓外算(批 279 末笔 FB-1);
+  //   合回主树那一步的 merge 照记
+  return (p) => {
+    const s = norm(p).replace(/\/+$/, "").toLowerCase();
+    if (!r || !(s === r || s.startsWith(r + "/"))) return false;
+    return !/^\.claude\/worktrees(?:\/|$)/.test(s.slice(r.length + 1));
+  };
 }
 
 /** 这次工具调用算不算碰闸;算 ⇒ 返回理由串,不算 ⇒ null。deps 注入解析零件(本模块不拖规则引擎)。 */
@@ -263,6 +271,15 @@ export function selfTest(deps0, os, log = console.log) {
   t("codex r2 附 1:checkout -b 新分支 <起点> ⇒ 记", call("Bash", { command: "git checkout -b new other-branch" }), "git-checkout");
   t("codex r2 附 1:switch -c 新分支 <起点> ⇒ 记", call("Bash", { command: "git switch -c new other-branch" }), "git-switch");
   t("codex r2 附 3:-C 闸目录 restore --source 闸文件 ⇒ 记", call("Bash", { command: "git -C /repo/scripts/lib restore --source HEAD~1 gate-touch.mjs" }), "git-restore");
+  // 末笔误拦猎手 FB-1 / FB-2、附节二 1
+  t("末笔 FB-1:worktree 里 checkout -B 到基点 ⇒ 不记", call("Bash", { command: "git checkout -B b 668dc6f" }, { cwd: "/repo/.claude/worktrees/agent-x" }), null);
+  t("末笔 FB-1:cd 进 worktree 再 switch -c ⇒ 不记", call("Bash", { command: "cd /repo/.claude/worktrees/agent-x && git switch -c w master" }), null);
+  t("末笔 FB-1 对照:主树 merge worktree 分支 ⇒ 记", call("Bash", { command: "git merge worktree-agent-x" }), "git-merge");
+  t("末笔附节二 1:子 shell cd 他仓后回本仓 pull ⇒ 记", call("Bash", { command: "(cd E:/cbot && git pull) && git pull" }), "git-pull");
+  t("末笔附节二 1:Push/Pop-Location 后本仓 pull ⇒ 记", call("PowerShell", { command: "Push-Location E:/cbot; git pull; Pop-Location; git pull" }), "git-pull");
+  t("末笔附节二 4:git reset . ⇒ 不记", call("Bash", { command: "git reset ." }), null);
+  t("末笔附节二 4:git checkout HEAD -- . ⇒ 不记", call("Bash", { command: "git checkout HEAD -- ." }), null);
+  t("末笔 FB-2:子 shell cd 他仓后本仓写闸 ⇒ 记", call("Bash", { command: "(cd E:/cbot && git pull); echo x >> scripts/lib/gate-rules.mjs" }), "cmd-write");
   t("Read ⇒ 不记", call("Read", { file_path: "/repo/scripts/lib/gate-rules.mjs" }), null);
   t("解析抛错 ⇒ 记", touchWhy({ tool_name: "Bash", tool_input: { command: "x" } }, { ...deps, writeTargets: () => { throw new Error("boom"); } }), "parse-failed");
   const f = path.join(os.tmpdir(), `gate-touch-selftest-${process.pid}.jsonl`);

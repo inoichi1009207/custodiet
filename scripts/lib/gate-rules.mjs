@@ -4571,13 +4571,23 @@ const RULE_P = {
       const H = RULE_P._p, out = [];
       const ps = d === "ps";
       let cwd = null;
+      const sub = [], dirs = [];   // 子 shell 进入时的目录栈;pushd / Push-Location 的目录栈
       for (const seg of segments(ps ? String(cmd || "") : H.stripHeredoc(cmd), ps)) {
-        // 批 279 误拦猎手收窄版 FB-3 / FB-4:认 PowerShell 的 Set-Location / sl / Push-Location / chdir;段首 `(` / `{`(子 shell / 大括号组)先剥;
-        //   引号路径允许空格。子 shell 的 cd 不回退(偏严:之后同调用的段按那个目录判,多数是仓外 ⇒ 少记,见 CEILING)
-        const s0 = String(seg).replace(/^(?:\(\s*|\{\s+)+/, "");
-        const m = /^(?:cd|pushd|chdir|Set-Location|sl|Push-Location)\s+(?:-[LP]\s+|-(?:Literal)?Path\s+)?(?:"([^"]+)"|'([^']+)'|([^"'\s;&|)]+))\s*\)?\s*$/i.exec(s0);
-        if (m) { cwd = H.resolve(cwd, m[1] || m[2] || m[3]); continue; }
-        out.push({ seg, cwd });
+        // 批 279 误拦猎手收窄版 FB-3 / FB-4:认 PowerShell 的 Set-Location / sl / Push-Location / chdir;段首 `(` 是子 shell、`{` 是大括号组;
+        //   引号路径允许空格。末笔 FB-2:子 shell 里的 cd 出括号即回退,popd / Pop-Location 回到 push 前的目录(原不回退 ⇒ 之后本仓写入被拼成他仓路径)
+        const raw = String(seg);
+        const opens = (/^(?:\(\s*|\{\s+)+/.exec(raw) || [""])[0].split("(").length - 1;
+        for (let k = 0; k < opens; k++) sub.push(cwd);
+        const s0 = raw.replace(/^(?:\(\s*|\{\s+)+/, "");
+        const closes = (/\)+\s*$/.exec(s0) || [""])[0].replace(/\s/g, "").length;
+        const m = /^(pushd|Push-Location|cd|chdir|Set-Location|sl)\s+(?:-[LP]\s+|-(?:Literal)?Path\s+)?(?:"([^"]+)"|'([^']+)'|([^"'\s;&|)]+))\s*\)*\s*$/i.exec(s0);
+        if (m) {
+          if (/^(?:pushd|Push-Location)$/i.test(m[1])) dirs.push(cwd);
+          cwd = H.resolve(cwd, m[2] || m[3] || m[4]);
+        } else if (/^(?:popd|Pop-Location)\s*\)*\s*$/i.test(s0)) {
+          cwd = dirs.length ? dirs.pop() : cwd;
+        } else out.push({ seg, cwd });
+        for (let k = 0; k < closes && sub.length; k++) cwd = sub.pop();
       }
       return out;
     },
@@ -5002,7 +5012,9 @@ const RULE_P = {
       const rootP = root || (f && f.root) || null;
       const rootR = rootP ? H.resolve(null, rootP).replace(/\/+$/, "").toLowerCase() : null;
       const absP = (p) => { const s = String(p || "").replace(/\\/g, "/"); return /^([A-Za-z]:)?\//.test(s) || s.startsWith("~") || !rootP ? s : `${rootP}/${s}`; };
-      const under = (p) => { if (!rootR) return true; const s0 = absP(p); if (/^~|^\$/.test(s0)) return false; const s = H.resolve(null, s0).toLowerCase(); return s === rootR || s.startsWith(rootR + "/"); };
+      // `.claude/worktrees/` 下是别的 checkout,按仓外算(批 279 末笔 FB-1;与 gate-touch rootUnder 同口径)
+      const under = (p) => { if (!rootR) return true; const s0 = absP(p); if (/^~|^\$/.test(s0)) return false; const s = H.resolve(null, s0).toLowerCase();
+        return (s === rootR || s.startsWith(rootR + "/")) && !/^\.claude\/worktrees(?:\/|$)/.test(s.slice(rootR.length + 1)); };
       const eng = (p) => (rootR ? under(p) && H.isEnginePath(H.resolve(null, absP(p)), rootP) : H.isEnginePath(p, root));
       const commitAts = [];
       for (const a of acts) {
@@ -5011,20 +5023,21 @@ const RULE_P = {
         if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(name) && typeof fp === "string" && eng(fp)) return true;
         if (/^(Bash|PowerShell)$/.test(name) && typeof inp.command === "string") {
           const d = H.dOf(a);
-          let outsideCommit = false;
+          let insideCommit = false;   // 本条命令里有没有落在本仓(或作用目录未知)的提交段
           try {
             if (H.writeTargets(inp.command, eng, d).length || H.gitPathArgs(inp.command, d).some(eng)) return true;
             // 合并类 git:与 hook 侧同一判据(lib/gate-touch.mjs gitSegWhy;误拦猎手 279 终版 FB-3 / FB-4 / 附节二 3)
             for (const { seg, cwd } of H.walk(inp.command, d)) {
               const g = gitArgs(String(seg).trim().replace(/^(?:\(\s*|\{\s+)+/, "").replace(/^(?:\w+=\S*\s+)+/, ""));
               const where = g && g.cdir ? (cwd && !/^([A-Za-z]:)?\//.test(String(g.cdir)) ? `${cwd}/${g.cdir}` : g.cdir) : cwd;
-              if (g && g.sub === "commit" && where && !under(where)) outsideCommit = true;
+              if (g && g.sub === "commit" && (!where || under(where))) insideCommit = true;
               if (gitSegWhy(g, cwd, under, eng)) return true;
             }
           } catch { return true; }   // 解析失败 ⇒ 按碰过算(偏严)
           // ③ 只认整树提交(git add -A / . / commit -a):共用 checkout 时它会把同目录里别人没提交的闸改动一起带走,算碰过是对的;
-          //   定向提交的路径已由上面 gitPathArgs 判过(误拦猎手 279 终版 FB-5);提交落在别的仓不算(收窄版 FB-6)
-          if (!outsideCommit && Number.isFinite(a.at) && H.hasCommit(inp.command, d) && (() => { try { return gitWholeCommit(inp.command); } catch { return true; } })()) commitAts.push(a.at);
+          //   定向提交的路径已由上面 gitPathArgs 判过(误拦猎手 279 终版 FB-5);提交**全部**落在别的仓才不算(收窄版 FB-6;
+          //   批 279 末笔内存探针:`cd 别仓 && commit; cd 本仓 && add -A && commit` 原因前半段整条跳过)
+          if (insideCommit && Number.isFinite(a.at) && H.hasCommit(inp.command, d) && (() => { try { return gitWholeCommit(inp.command); } catch { return true; } })()) commitAts.push(a.at);
         }
       }
       if (f && commitAts.length) {
@@ -5607,6 +5620,10 @@ const RULE_P = {
         text: "提交。", pLedger: { carriers: 0 }, gateTouched: false,
         bash: ["git add -A && git commit -m x"], at: "2026-10-26T02:00:00Z",
         prior: [{ text: "改判据", write: "/repo/scripts/lib/gate-rules.mjs" }],
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:00:30Z" }] } },
+      { name: "279 末笔探针:先在别的仓提交、再回本仓整树提交,30 秒后落改闸提交 ⇒ 照要猎手",
+        text: "提交。", pLedger: { carriers: 0 }, gateTouched: false,
+        bash: ["cd E:/cbot && git commit -am a; cd /repo && git add -A && git commit -m b"], at: "2026-10-26T02:00:00Z",
         headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:00:30Z" }] } },
       { name: "279 修闸 tag:账说没有、本轮提交后 30 秒落了改闸提交(脚本写的闸)⇒ 照要猎手",
         text: "提交。", pLedger: { carriers: 0 }, gateTouched: false,
@@ -6279,6 +6296,11 @@ const RULE_P = {
         text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
         bash: ["git -C E:/cbot add scripts/lib/gate-rules.mjs"], at: "2026-10-26T01:30:00Z",
         headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
+      // 末笔误拦猎手 FB-2:子 shell cd 他仓后本仓写 AGENTS.md、只提交 docs ⇒ 不算他仓承重写入
+      { name: "279 末笔 FB-2:子 shell cd 他仓后本仓写 AGENTS.md、只提交 docs ⇒ 不触发",
+        text: "做完了。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        bash: ["(cd E:/cbot && git pull); echo x >> AGENTS.md; git add docs/a.md && git commit -m a"], at: "2026-10-26T02:00:00Z",
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["docs/a.md"], at: "2026-10-26T02:00:05Z" }] } },
       // 误拦猎手 279 终版 FB-3:只读 git 动作不算碰闸
       { name: "279 FB-3:只跑 git stash list / restore --staged ⇒ 不要猎手",
         text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
