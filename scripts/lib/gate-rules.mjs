@@ -3780,7 +3780,8 @@ const RULE_S = {
     //   都不在被审那一方手里——原来的两条入口(措辞白名单 / ⏸ 标记)恰恰都在。
     // 批 281:别的会话武装的批(foreign)不是本会话的活——当作没有批(不拿它要求本会话结清 / 标 ⏸;S 的措辞面入口照旧)。
     //   用户 10-27「漏放的影响看起来比误拦小很多」;当日 S 拿别的会话的 277 / 280 连拦六七轮。
-    //   CEILING:armedBy 取 --arm 时的 CLAUDE_CODE_SESSION_ID,旧批没有 ⇒ 照旧算本会话的。
+    //   判法见 hook-stop-closure.mjs isForeignBatch:旧批没有 armedBy、本会话转录里也没武装过 ⇒ 外来。
+    //   CEILING(漏放方向,有意接受):换了会话号(如 /clear)后自己原先武装的批变外来;经脚本 / 变量间接跑的 --arm 转录里认不出。
     const bg = ctx.batchGoal && ctx.batchGoal.foreign ? null : ctx.batchGoal;
     // 「非 C」用 `settledConditions`(已减掉自判「未达成」的),不用原始 confirmed ——
     //   否则写一句「条件2:未达成」就把自己算成跑完了。见 settledConditions 头注(D85)。

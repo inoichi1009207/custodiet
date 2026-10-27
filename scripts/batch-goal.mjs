@@ -1204,7 +1204,8 @@ if (argv.includes("--arm")) {
   //   P 按它切凭证池;重放刷新它会把本批更早的写入切到批外(本批未审的交付物被放行)。换批或结清后重开才取新时刻。
   const armedAt = sameOpen && typeof cur.armedAt === "string" && cur.armedAt ? cur.armedAt : new Date().toISOString();
   // 批 281:记武装者会话号(Claude Code 给子进程的 CLAUDE_CODE_SESSION_ID);收尾闸据此把别的会话武装的批标 foreign,
-  //   S 不再拿它拦本会话。同号重放保留原武装者;取不到 ⇒ 不记(收尾闸按本会话的批算,偏严)
+  //   S 不再拿它拦本会话。同号重放时状态文件保留原武装者(台账行记本次武装者);取不到 ⇒ 不记,
+  //   这时收尾闸看本会话转录里有没有武装过该批号(没有 ⇒ 外来,判法见 hook-stop-closure.mjs isForeignBatch)
   const sidEnv = typeof process.env.CLAUDE_CODE_SESSION_ID === "string" && /^[\w-]{8,80}$/.test(process.env.CLAUDE_CODE_SESSION_ID) ? process.env.CLAUDE_CODE_SESSION_ID : null;
   const armedBy = sameOpen && typeof cur.armedBy === "string" && cur.armedBy ? cur.armedBy : sidEnv;
   try { atomicWrite({ batch, conditions: conds, checks, shell: "bash", armedAt, baseCommit, ...(armedBy ? { armedBy } : {}), ...kept, ...carry }, seenVersion); }

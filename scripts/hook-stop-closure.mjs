@@ -2821,8 +2821,8 @@ export function run(transcriptPath, ctx = {}) {
         batchGoal: ctx.batchGoal !== undefined ? ctx.batchGoal : (() => {
           const g0 = readBatchGoal();
           if (!g0 || typeof g0 !== "object") return g0;
-          // 批 281:`--arm` 记了武装者会话号(armedBy)且与本会话不同 ⇒ 标 foreign(S 不再拿别的会话的批拦本会话);
-          //   旧批没有 armedBy ⇒ 不标(照旧算本会话的,偏严)
+          // 批 281:这批不是本会话武装的 ⇒ 标 foreign(S 不再拿别的会话的批拦本会话);判法唯一实现在 isForeignBatch
+          //   (armedBy 等于本会话 / 本会话转录里武装过该批号 ⇒ 本会话的;否则外来,旧批没有 armedBy 亦然)
           const g = isForeignBatch(g0, ctx.sessionId, _allEntriesCache) ? { ...g0, foreign: true } : g0;
           try {
             const ts = (Array.isArray(turn) ? turn : []).map((e) => Date.parse(String((e && e.timestamp) || ""))).filter(Number.isFinite);
