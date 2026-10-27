@@ -564,7 +564,9 @@ export function buildCtx(entries, extra = {}) {
       : (extra.pLedger && typeof extra.pLedger === "object"
         ? { carriers: Number.isFinite(+extra.pLedger.carriers) ? Math.max(0, Math.floor(+extra.pLedger.carriers)) : 0,
             // 聚合项的去重键是范围 `agg:<基点sha>..<HEAD sha>`(codex 257-p-agg-r1 断言 2),与普通提交 sha 同表
-            shas: Array.isArray(extra.pLedger.shas) ? extra.pLedger.shas.filter((s) => typeof s === "string" && /^(agg:[0-9a-f]{40,64}\.\.)?[0-9a-f]{40,64}$/i.test(s)).slice(-400) : [] }
+            shas: Array.isArray(extra.pLedger.shas) ? extra.pLedger.shas.filter((s) => typeof s === "string" && /^(agg:[0-9a-f]{40,64}\.\.)?[0-9a-f]{40,64}$/i.test(s)).slice(-400) : [],
+            // 批 278(D173③):两猎手覆盖过的改闸提交 sha(只收普通 sha,不收聚合键);缺/坏 ⇒ 空数组(不认任何 ⇒ 照旧要猎手,偏严)
+            hunted: Array.isArray(extra.pLedger.hunted) ? extra.pLedger.hunted.filter((s) => typeof s === "string" && /^[0-9a-f]{40,64}$/i.test(s)).slice(-400) : [] }
         : null),
     bgTasks: Array.isArray(extra.bgTasks) ? extra.bgTasks : null,
     /** 部署欠账事实(DP 项,2026-09-12 批 202):`{lastPushTs, pushRef, lastProbeTs}`,由 hook 经

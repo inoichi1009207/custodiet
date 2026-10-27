@@ -368,6 +368,21 @@ export function decisionNo(id) {
 }
 
 /** 台账里该批号已用过的最大 D 号(登记行与撤回行都算,批 256b BP-2)。台账不存在 ⇒ 0;读不了 ⇒ 抛(调用方拒登记)。 */
+/** 批 278(D173①):这个批号是否已在台账里**结清过**(按去前导零、不分大小写比,同 maxDecisionNoInJournal)。
+ *  实撞:两个会话共用本仓台账,会话乙 `--arm 277` 时会话甲的 277 已结清 ⇒ 台账里两笔不同条件的 277,
+ *  lanes 等读者按批号显示,把乙那笔未结清的 277 当成甲已结清的批「还挂着」。台账读不了 ⇒ 抛(调用方 fail-closed 拒武装)。 */
+export function batchClearedBefore(batch, file = JOURNAL) {
+  let raw;
+  try { raw = fs.readFileSync(file, "utf8"); }
+  catch (e) { if (e?.code === "ENOENT") return false; throw new Error(`台账读不了(${e?.code || e?.message}):${file}`); }
+  const nb = (x) => String(x ?? "").replace(/^0+(?=\d)/, "").toLowerCase();
+  for (const l of raw.split("\n")) {
+    let o; try { o = JSON.parse(l); } catch { continue; }
+    if (o && o.action === "clear" && nb(o.batch) === nb(batch)) return true;
+  }
+  return false;
+}
+
 export function maxDecisionNoInJournal(batch, file = JOURNAL) {
   let raw;
   try { raw = fs.readFileSync(file, "utf8"); }
@@ -890,11 +905,21 @@ function selfTest() {
     cli("--arm", "304", "--cond", "乙", "--force"); const a3 = st().armedAt;
     return [typeof a1 === "string" && a1 === a2, a3 !== a1];
   }), [true, true]);
+  // 批 278(D173①):批号结清过 ⇒ 不带 --force 拒复用(台账多会话共用,另一会话 --arm 277 时 277 已结清过)
+  t("集成 278 D173①:结清过的批号再武装 ⇒ 拒(exit 2、状态不变);换号放行;--force 放行", sandbox(({ cli, st }) => {
+    cli("--arm", "305", "--cond", "甲"); cli("--no-decision", "自测"); cli("--clear");
+    const r = cli("--arm", "305", "--cond", "乙");
+    const refused = [r.status, /已结清过/.test(r.stderr), st().cleared === true];
+    const ok = cli("--arm", "305b", "--cond", "乙").status;
+    cli("--no-decision", "自测"); cli("--clear");
+    const forced = cli("--arm", "305", "--cond", "丙", "--force").status;
+    return [...refused, ok, forced];
+  }), [2, true, true, 0, 0]);
   t("集成 BP-2:同号结清后重开 ⇒ 编号接着 D2、旧日记行与旧 ADR 不抵、补新的才结清", sandbox(({ tmp, cli, w, commit, st }) => {
     cli("--arm", "302", "--cond", "甲"); cli("--decision", "第一次"); cli("--outcome", "成果一");
     w("docs/adr/0009-a.md", "# 0009\n- 决定编号:302-D1\n"); fs.appendFileSync(path.join(tmp, "docs/product-diary.md"), "| d | 批 302:成果一 | y | e |\n"); commit("first");
     const c1 = cli("--clear").status;
-    cli("--arm", "302", "--cond", "乙"); cli("--decision", "第二次"); cli("--outcome", "成果二");
+    cli("--arm", "302", "--cond", "乙", "--force"); cli("--decision", "第二次"); cli("--outcome", "成果二");   // 批 278:结清过的号重开须 --force
     const id2 = st().decisions?.[0]?.id;
     const r2 = cli("--clear");
     const refused = [r2.status, /缺:302-D2/.test(r2.stderr), /diary-missing/.test(r2.stderr)];
@@ -1140,6 +1165,17 @@ if (argv.includes("--arm")) {
     console.error(`  确需覆盖(会丢失当前条件,但可从 .claude/.batch-goal.jsonl 翻回):加 --force`);
     process.exit(2);
   }
+  // 批 278(D173①):批号在台账里已结清过 ⇒ 拒绝复用(换个号,如加字母后缀),除非 --force。
+  //   同号未结清的重放不受影响(那是同一批);结清后用同号重开要 --force,台账照记。
+  if (!(cur && !cur.cleared && cur.batch === batch) && !argv.includes("--force")) {
+    let used = false;
+    try { used = batchClearedBefore(batch); } catch (e) { console.error(`拒绝武装:${e.message}`); process.exit(2); }
+    if (used) {
+      console.error(`拒绝:批号 ${batch} 在台账里已结清过——本仓台账多会话共用,复用批号会让两笔不同条件的批同号(lanes 等按批号显示的读者会混)。`);
+      console.error(`  换一个没用过的号(如 ${batch}b,或下一个数字);确是同一批要重开就加 --force(记入台账)。`);
+      process.exit(2);
+    }
+  }
   // 批 256:同号未结清的重武装(含同号 --force)保留基点与决定/成果清单;换批或结清后重开才取新基点。
   //   旧批没有基点 ⇒ 保持 null 不补记(补记的 HEAD 比真基点晚,会误拦,见 headCommit 上方头注 ①)。
   const sameOpen = !!(cur && !cur.cleared && cur.batch === batch);
@@ -1157,7 +1193,7 @@ if (argv.includes("--arm")) {
     for (const o of lostO) console.error(`  成果 ${o.o}: ${String(o.text || "").slice(0, 80)}`);
     if (!lostD.length && !lostO.length) console.error("  (清单形状异常,未能列出)");
   }
-  journal("arm", { batch, conditions: conds, checks, shell: "bash", overwrote: cur?.batch ?? null, baseCommit });
+  journal("arm", { batch, conditions: conds, checks, shell: "bash", overwrote: cur?.batch ?? null, baseCommit, ...(argv.includes("--force") ? { forced: true } : {}) });   // forced:批 278(误拦猎手附节二 6)
   // ⚠️ `armedAt` 是 2026-08-20 加的:开工面闸要判「**本批**跑过哪几条通道」,
   //   而状态文件此前**不记武装时刻**,于是那个窗口起点取不到 ⇒ 闸只能闭嘴。
   //   台账 .jsonl 里有时间,但让读者去 join 两份文件是把简单的事做复杂了。

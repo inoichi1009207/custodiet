@@ -32,7 +32,10 @@ export const RULE_Q = {
   blocking: true,
   law: "AGENTS.md#执行共识",
   detect: (ctx) => {
-    const defer = /留给下次|留到下(次|批)|下一批(再|做)|下次(再)?(做|办|处理)|后续(再)?(做|办|处理)|改天|以后再|另立(一)?批|留待/;
+    // 批 278(误拦猎手 某会话 FB-2):「朋友在 PR 里写了留待审阅」——「留待」后接外部流程的状态词(审阅/审核/评审/合并/review)
+    //   是在转述别人那件事的状态,不是我推迟自己的活 ⇒ 不算。红队 278 BP-4 否掉了另一条修法(realBlock 加「由你定」:
+    //   「剩下的 bug 改天再修,怎么修由你定」也会放行)。代价:真有人写「这件留待审阅」推自己的活会漏报——那句话本身不通。
+    const defer = /留给下次|留到下(次|批)|下一批(再|做)|下次(再)?(做|办|处理)|后续(再)?(做|办|处理)|改天|以后再|另立(一)?批|留待(?!\s*(他人|对方|上游|维护者)?\s*(审阅|审核|评审|合并|review))/i;
     const realBlock = /缺凭据|凭据(未|没)|站点不可达|不可达|需亲签|归你签|归用户|待你签|配额(已)?耗尽|只有用户能触发|不可逆/;
     // ⚠️ **引号内的内容不算我在推面出批**(2026-08-20 实撞，窄例外③ 自签)。
     //   实撞形态：Q 报「命中：留给下次」，而我那一轮唯一出现这四个字的地方，
@@ -73,6 +76,9 @@ export const RULE_Q = {
       // ⚠️ **引号里含推迟词、正文里真推迟** ⇒ 仍须拦。
       //   这是「剥引号」那个修法的**控制组**:没它的话,把推迟句包进引号就能绕闸。
       { text: "闸说「留给下次」不算理由。所以这条我下一批再做。" },
+      // 红队 278 BP-4 控制组:推活面缀「由你定」不是阻断理由
+      { text: "剩下的 bug 改天再修,具体怎么修由你定。" },
+      { text: "这件留待下批再做。" },   // 「留待」不接外部流程状态词 ⇒ 照拦
     ],
     neg: [
       // ⚠️ **引用闸自己的报告不算推面出批**(2026-08-20 实撞)。
@@ -81,6 +87,9 @@ export const RULE_Q = {
       { text: "Q 报命中「留给下次」——但我上一条消息里没有这四个字。" },
       { text: "这件留给下次——它改的是授权边界,需亲签,归你签。" },
       { text: "今天把三条规则迁完了,验收全过。" },   // 中性:既无推迟也无阻断理由
+      // 批 278 FB-2:转述第三方 PR 状态,决定权归用户
+      { text: "朋友在 PR 里写了留待审阅,合不合由你们定。" },
+      { text: "朋友在 PR 里写了留待 review,合不合由你们定。" },   // 误拦猎手 278 FB-5:中英文之间留空格
     ],
   },
 };
@@ -4501,6 +4510,34 @@ const RULE_P = {
     //   原样装入 / 升级的发布件,不是本仓改闸 ⇒ 不进 D11 的红队要求(用户 10-19:「红队要么设置成可选,要么就把红队体系完善了」;
     //   新仓装闸那次提交必撞 D11,而审原样拷入的发布件没有意义)。内容有一处不一致、删除或改名 ⇒ 照旧要红队。
     gitEngineCommits(f) { const H = RULE_P._p; return f.commits.filter((c) => !c.vendoredEngine && H.touches(c, (p) => H.ENGINE_REL.test(p))); },
+    // 批 278(D173③ / 误拦猎手 某会话 FB-1):P 按仓计账,别的会话已审过的改闸提交落进本会话范围也要本会话再起两个猎手
+    //   (某会话 → 某会话 → 某会话 三次同形)。修法 = 按 sha 认账:某会话 P 在闸引擎面结清时,把两猎手覆盖到的改闸提交
+    //   记进共用 P 账的 `hunted`(`huntedShas`),别的会话的 D11 判定不再算这些提交。**不按作者 / 会话排除**——那会给合并别人
+    //   闸改动的会话开出漏放口;认的是「这笔提交有过两猎手」这件事本身。聚合项(范围超 CAP)不记、不认。
+    //   CEILING:`hunted` 在 gitignore 面,能写盘的人可预填(与 `shas` 同族,属故意伪造);「覆盖到」按时刻判,见 huntedShas。
+    gitEngineUnhunted(f, ctx) {
+      const H = RULE_P._p;
+      const hunted = new Set(((ctx && ctx.pLedger && ctx.pLedger.hunted) || []).map((s) => String(s).toLowerCase()));
+      return H.gitEngineCommits(f).filter((c) => c.aggregated || !c.sha || !hunted.has(String(c.sha).toLowerCase()));
+    },
+    /** 本次 Stop 时,哪些改闸提交算两猎手覆盖到了(hook 每次 live Stop 经 settleP 落账,不要求 P 无命中;纯函数)。
+     *  覆盖 = 两猎手都在 hunterPool 里,且该提交**不晚于两者中较早那次的最后一次派单**——误拦猎手的 `--base` 已校验早于
+     *  范围里第一笔改闸提交(fbBaseOk),派单晚于该提交 ⇒ 那次回放的范围含它。
+     *  红队 278 BP-1/BP-2 撤掉了「本会话提交命令后 300 秒内也算」那一支:它只比时刻、不比与猎手的先后,
+     *  「泛泛起一次猎手 → 再提交猎手没见过的改闸改动」或「上一批的陈旧猎手 + 本批新提交」都会被永久记账。
+     *  代价(残余,D173③):「红队 → 按回件修闸 → 提交」的修闸提交本会话照常抵账,但不记进 hunted,别的会话范围里仍要审它。
+     *  CEILING:提交时刻取 git committer date(可回填,属故意伪造);红队 prompt 只验绑定某个闸文件、不验哪笔提交(hunterBound 老口径);
+     *  账按 checkout 各存一份(.claude/ 在 gitignore 面)⇒ worktree 会话记的账主树读不到(误拦猎手 278 FB-4);两会话 Stop 并发读改写可丢账(FB-3,同 shas)。 */
+    huntedShas(ctx) {
+      const H = RULE_P._p, f = H.facts(ctx);
+      if (!f || !H.gateEngineTouched(ctx) || !H.hunterMet(ctx)) return [];
+      const pool = H.hunterPool(ctx);
+      const lastAt = (pred) => pool.reduce((m, a) => { let ok = false; try { ok = pred(a); } catch { ok = false; } return ok && Number.isFinite(a.at) ? Math.max(m, a.at) : m; }, -Infinity);
+      const cover = Math.min(lastAt(H.isBoundHunter), lastAt((a) => H.isBoundFalseBlockHunter(a, ctx)));
+      return H.gitEngineUnhunted(f, ctx)
+        .filter((c) => !c.aggregated && typeof c.sha === "string" && /^[0-9a-f]{40,64}$/i.test(c.sha) && Number.isFinite(c.at) && c.at <= cover)
+        .map((c) => c.sha.toLowerCase());
+    },
 
     // ── 命令语法零件(回退与补充;唯一实现)──────────────────────────────────────
     stripHeredoc(cmd) { return String(cmd || "").replace(/<<-?\s*(['"]?)(\w+)\1[\s\S]*?^\s*\2\s*$/gm, " "); },
@@ -4934,7 +4971,7 @@ const RULE_P = {
       if (!ctx || typeof ctx !== "object") return false;
       if (H._engMemo.has(ctx)) return H._engMemo.get(ctx);
       const f = H.facts(ctx);
-      const v = f ? H.gitEngineCommits(f).length > 0 : H.engineBySyntax(ctx);
+      const v = f ? H.gitEngineUnhunted(f, ctx).length > 0 : H.engineBySyntax(ctx);
       H._engMemo.set(ctx, v);
       return v;
     },
@@ -5311,7 +5348,8 @@ const RULE_P = {
       const who = miss.length === 2 ? "两个都要起——`_gate-bypass-hunter`(找漏放)与 `_gate-false-block-hunter`(找误拦,跑 scripts/gate-replay.mjs 回放)"
         : miss[0] === "_gate-bypass-hunter" ? "缺红队 `_gate-bypass-hunter`(找漏放);误拦猎手那格已有"
         : "缺误拦猎手 `_gate-false-block-hunter`(找误拦,跑 scripts/gate-replay.mjs 回放;已起过但 `--base` 不合格也算缺);红队那格已有";
-      return `**闸引擎面提交,红队 / 误拦猎手未跑齐**(D11,独立于「每 ${h0.every} 次武装一次」的宽限;本批累计 ${h0.commits} 次承重提交,另两通道仍在宽限内)。\n` +
+      return `**闸引擎面提交,红队 / 误拦猎手未跑齐**(D11,独立于「每 ${h0.every} 次武装一次」的宽限;本仓 P 账累计 ${h0.commits} 次承重提交——账跨会话共用,含别的会话的提交;另两通道仍在宽限内)。\n` +
+        `      范围 = 本会话上次 P 结清以来进仓的提交(不分哪个会话提交的);别的会话已按两猎手审过的改闸提交按 sha 认账、不再要你审。\n` +
         `      处置:${who},` +
         `prompt 里带上本批闸文件名 / 规则 id / diff 文件(空 prompt 不算,上一批的调用不抵账);误拦猎手派单里**只写一个** \`--base <sha>\`(只认 --base 参数,说明文字里的 base: 不算;写了多个不同的 --base——哪怕是「别用 --base HEAD」的提醒——也不认),sha 要早于 P 范围(本会话上次 P 结清以来)里第一笔改闸提交(不能填 HEAD,也不能填那一笔及之后的提交——那样回放恒为零新增;有疑问就填开工前的提交 sha)。回件处置后再提交或关账。grill 在此格**不充分**。`;
     }
@@ -5337,6 +5375,9 @@ const RULE_P = {
   mutations: [
     // ── 红队 a27628dd 轮的新分支各钉一条(swapP:临时换掉 _p 里的零件,跑完还原)────────────────────
     { name: "git 事实不接(恒回退语法判据:merge/cherry-pick 合回看不见)", apply: swapP({ facts: () => () => null }) },
+    // 批 278(D173③):按 sha 认账的两向——不认 hunted(误拦复发)/ 任何 sha 都认(漏放)
+    { name: "D173③ 不认 hunted(别的会话审过的改闸提交照要猎手)", apply: swapP({ gitEngineUnhunted: () => (f) => RULE_P._p.gitEngineCommits(f) }) },
+    { name: "D173③ hunted 非空即全认(不比 sha)", apply: swapP({ gitEngineUnhunted: (orig) => (f, ctx) => (ctx && ctx.pLedger && (ctx.pLedger.hunted || []).length ? [] : orig(f, ctx)) }) },
     // codex 266-r4 §一 b:base 校验的修前形态(误拦猎手只要绑定闸文件就算在场,不看 base)
     { name: "误拦猎手 base 校验恒过(修前形态,批 266 之前)", apply: swapP({ fbBaseOk: () => () => true }) },
     { name: "误拦猎手 base 不剔否定、任一合格即认(codex 266-r3 §1 的修前形态)", apply: swapP({ fbBases: () => (a) => { const p = String(JSON.stringify((a && a.input) || {})); const out = []; const re = /--base[\s=]+([\w./~^@{}+:-]+)/g; let m; while ((m = re.exec(p))) out.push(m[1]); return out.length ? [out.find((b) => RULE_P._p.fbBaseOk(b, null) && /^[0-9a-f]{7,}$/i.test(b)) || out[0]] : []; } }) },
@@ -5496,6 +5537,11 @@ const RULE_P = {
   cases: {
     // 正例 = **四种已知文本伪造形态**各一条(全部必须照拦)+ 一条写入面伪造。
     pos: [
+      // 批 278(D173③)控制组:hunted 记的是别的 sha ⇒ 照要猎手(钉「hunted 非空即全认」变异)
+      { name: "278 D173③:hunted 里没有本范围的改闸提交 ⇒ 仍欠猎手",
+        text: "设计稿写好了。", pLedger: { carriers: 0, hunted: ["f".repeat(40)] },
+        bash: ["git add -A docs/design.md && git commit -m x"],
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
       // ⚠️ D92 回归钉:**跨轮**形态——承重写入在前几轮,本轮只 `git add -A && git commit`。
       //   旧 `triggered` 只看**本轮**写入与提交命令的参数面,这形态下**两者都空**
       //   ⇒ P 从不触发。实撞:另一条会话 120 轮里「同轮既写又提交」= 0,
@@ -6135,6 +6181,11 @@ const RULE_P = {
         diffFacts: { root: "/repo", files: [{ path: "scripts/lib/ledger-chain.test.mjs", status: "M", readable: true }] } },
     ],
     neg: [
+      // 批 278(D173③ / 误拦猎手 某会话 FB-1):范围里的改闸提交是别的会话的、共用 P 账 `hunted` 记过它两猎手已审 ⇒ 不再要本会话起猎手
+      { name: "278 D173③:范围里的改闸提交已按 sha 记进 hunted ⇒ 放行",
+        text: "设计稿写好了。", pLedger: { carriers: 0, hunted: ["e".repeat(40)] },
+        bash: ["git add -A docs/design.md && git commit -m x"],
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
       { name: "266:闸引擎提交,红队与误拦猎手都在且都绑定闸文件 ⇒ 放行",
         text: "两个都跑过了,提交。", pLedger: { carriers: 0 },
         bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],

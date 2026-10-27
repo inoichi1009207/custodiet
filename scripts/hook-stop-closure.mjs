@@ -47,7 +47,7 @@
 //       手动自测: node --no-warnings scripts/hook-stop-closure.mjs --self-test
 //                 node --no-warnings scripts/hook-stop-closure.mjs --dry-run <transcript.jsonl>
 // 退出码: 0=放行(可能带提示)  2=阻断
-//       临时解除: STOP_CLOSURE_BLOCK_{A|E|I|J|K}=0
+//       临时解除: STOP_CLOSURE_BLOCK_<键>=0,键的全集以下文 BLOCK_ENV 为准(P 无逃生口)
 //
 // 输出契约: 命中时向 stderr 打印人类可读清单;阻断时同时向 stdout 打印 JSON
 //          {"decision":"block","reason":"..."} —— Stop hook 的阻断形态。
@@ -75,7 +75,7 @@ import crypto from "node:crypto";
 // 同批撤回的还有一条编造的解释:「F/H/C 是单条件所以全漏」——单条件比双条件**更容易**命中,
 // 全漏的真实原因是模式没匹配上那些句子,与条件数量无关。
 //
-// 临时解除:STOP_CLOSURE_BLOCK_{A|E|I|J}=0
+// 临时解除:STOP_CLOSURE_BLOCK_<键>=0(键的全集见 BLOCK_ENV)
 const BLOCK_ON_R = process.env.STOP_CLOSURE_BLOCK_R !== "0";
 // ⚠️ `Q` 是 2026-08-20 补的(grill:architecture 5.3)。它在引擎里 `blocking: true`,
 //   却不在 `BLOCK_OFF` 表里 ⇒ `BLOCK_OFF["Q"] ?? true` 恒为 true
@@ -2293,13 +2293,13 @@ function readPLedger() {
   try {
     const j = JSON.parse(fs.readFileSync(".claude/.p-ledger.json", "utf8"));
     return { carriers: Number.isFinite(+j.carriers) ? Math.max(0, Math.floor(+j.carriers)) : 0,
-      shas: Array.isArray(j.shas) ? j.shas : [] };
+      shas: Array.isArray(j.shas) ? j.shas : [], hunted: Array.isArray(j.hunted) ? j.hunted : [] };
   } catch { return null; }
 }
 
 /** P 的收尾结算(唯一实现;live 路径落盘、自测直接喂):计账 + 基点推进。纯函数,不读写盘。
  *  返回 `{ ledger, advance, head }`:
- *    · ledger = 要写的账 `{carriers, shas}`,null = 不动账。三通道齐(动作面)⇒ 清零;否则累加 `tally(eCtx).n`
+ *    · ledger = 要写的账 `{carriers, shas, hunted}`(hunted:批 278 D173③,见 huntedShas),null = 不动账。三通道齐(动作面)⇒ 清零;否则累加 `tally(eCtx).n`
  *      (红队 a2a9f58b BP-1:与 detect 同一份取值——git 事实在 ⇒ 范围内带承重改动、未记过 sha 的提交数;
  *       原来这里是命令语法计数,`git add -A` / merge 合回计 0 ⇒ 宽限账永不涨)。`shas` 累积已计提交(封顶 400),去重用;
  *    · advance = 推进基点:**只在 git 事实非 null 且 P 无命中**时(BP-2:事实取不到时回退面沉默 ≠ 结清,推进会让之前欠的蒸发);
@@ -2316,7 +2316,12 @@ export function settleP(P, eCtx, eFindings) {
   const allThree = P.channelsMet(eCtx).every(Boolean);
   const next = allThree ? 0 : prior + t.n;
   const shas = [...new Set([...priorShas, ...t.shas])].slice(-400);
-  const ledger = (next !== prior || allThree || shas.length !== priorShas.length) ? { carriers: next, shas } : null;
+  // 批 278(D173③):两猎手覆盖到的改闸提交按 sha 记进共用账,别的会话的 D11 判定按 sha 认(判据唯一实现 `huntedShas`)
+  const priorHunted = (eCtx.pLedger && Array.isArray(eCtx.pLedger.hunted)) ? eCtx.pLedger.hunted : [];
+  let newHunted = [];
+  try { newHunted = typeof P.huntedShas === "function" ? P.huntedShas(eCtx) : []; } catch { newHunted = []; }
+  const hunted = [...new Set([...priorHunted, ...newHunted])].slice(-400);
+  const ledger = (next !== prior || allThree || shas.length !== priorShas.length || hunted.length !== priorHunted.length) ? { carriers: next, shas, hunted } : null;
   const f = P.facts(eCtx);
   const advance = !!f && !eFindings.some((x) => x && x.id === "P");
   return { ledger, advance, head: f && typeof f.head === "string" ? f.head : null };
@@ -4709,7 +4714,7 @@ function selfTest() {
           { pLedger: ledger, ...(facts === undefined ? {} : { headFacts: () => facts }) });
         const law3 = { root: "/repo", head: HD, commits: [S1, S2, S3].map((sha) => ({ sha, files: ["docs/laws/collab.md"] })) };
         const s1 = settleP(P_, sc({ facts: law3 }), []);
-        hp("settleP BP-1:git add -A 带进 3 笔法典提交 ⇒ 账 +3(原命令语法计 0)、记下 sha", JSON.stringify(s1.ledger), JSON.stringify({ carriers: 3, shas: [S1, S2, S3] }));
+        hp("settleP BP-1:git add -A 带进 3 笔法典提交 ⇒ 账 +3(原命令语法计 0)、记下 sha", JSON.stringify(s1.ledger), JSON.stringify({ carriers: 3, shas: [S1, S2, S3], hunted: [] }));
         hp("settleP BP-6:推进到读事实那一刻的 HEAD", `${s1.advance}:${s1.head}`, `true:${HD}`);
         const s2 = settleP(P_, sc({ ledger: { carriers: 3, shas: [S1, S2, S3] }, facts: law3 }), [{ id: "P" }]);
         hp("settleP 去重:同一批提交再出现(P 欠着、基点没动)⇒ 账不动", s2.ledger, null);
@@ -4721,7 +4726,7 @@ function selfTest() {
         const all3 = [{ type: "tool_use", name: "Bash", input: { command: "node ~/.claude/scripts/codex-run.mjs --task t.md" } },
           { type: "tool_use", name: "Agent", input: { subagent_type: "grill:testing" } }, { type: "tool_use", name: "WebSearch", input: { query: "先例" } }];
         hp("settleP:三通道齐 ⇒ 清零(sha 照记)", JSON.stringify(settleP(P_, sc({ ledger: { carriers: 4 }, facts: law3, extra: all3 }), []).ledger),
-          JSON.stringify({ carriers: 0, shas: [S1, S2, S3] }));
+          JSON.stringify({ carriers: 0, shas: [S1, S2, S3], hunted: [] }));
         // 红队 a9af71da BP-1:基点后 61 笔(readHeadFacts 走聚合)⇒ 事实不再 null;合回带进闸改动
         //   ① 三通道齐(闸引擎面的独立视角 = 绑定红队)且 P 无命中 ⇒ advance=true(原 facts=null ⇒ 永不推进,G2)
         //   ② 无红队 ⇒ P 命中、不推进
@@ -4754,6 +4759,30 @@ function selfTest() {
         const st2 = settleP(P_, c2, h2.length ? [{ id: "P" }] : []);
         hp("settleP a9af71da BP-1:聚合项带闸改动、无红队(只有 grill)⇒ P 命中(欠独立视角)、不推进、账按 count 计 61",
           `${h2.map((h) => /独立视角/.test(h.ch) ? "hunter" : "other").join(",")}:${st2.advance}:${st2.ledger && st2.ledger.carriers}`, "hunter:false:61");
+        // 批 278(D173③ / 误拦猎手 某会话 FB-1):两猎手覆盖到的改闸提交按 sha 记进共用账,别的会话按 sha 认
+        {
+          const S4 = "4".repeat(40), T = Date.parse("2026-10-26T02:00:00Z"), iso = (t) => new Date(t).toISOString();
+          const engF = (at) => ({ root: "/repo", head: S4, commits: [{ sha: S4, at: iso(at), files: ["scripts/lib/gate-rules.mjs"] }] });
+          const hc = (facts, ledger, rows) => buildCtx(rows.map(([t, c]) => ({ type: "assistant", timestamp: iso(t), message: { content: c } })),
+            { pLedger: ledger, headFacts: () => facts });
+          const bash = (command) => ({ type: "tool_use", name: "Bash", input: { command } });
+          const cA = hc(engF(T - 3600e3), { carriers: 0 }, [[T, [hunter, fbHunter]]]);
+          hp("278 D173③:两猎手晚于改闸提交 ⇒ 结清时记进 hunted", JSON.stringify(settleP(P_, cA, []).ledger.hunted), JSON.stringify([S4]));
+          const cB = hc(engF(T + 60e3), { carriers: 0 }, [[T, [hunter, fbHunter]]]);
+          hp("278 D173③:改闸提交晚于两猎手、也不是本会话提交的 ⇒ 不记(别的会话在猎手之后落的提交)", JSON.stringify(P_.huntedShas(cB)), "[]");
+          const cC = hc(engF(T + 60e3), { carriers: 0 }, [[T, [hunter, fbHunter]], [T + 50e3, [bash("git add -A && git commit -m fix")]]]);
+          // 红队 278 BP-1:「本会话提交命令后 300 秒内」那支已撤——猎手之后提交的改闸改动,猎手没见过,不记(代价:修闸提交不记,残余 D173③)
+          hp("278 BP-1:红队 → 再提交猎手没见过的改闸改动(本会话提交)⇒ 不记", JSON.stringify(P_.huntedShas(cC)), "[]");
+          // 红队 278 BP-2:上一批的陈旧猎手(无切点 ⇒ 整窗入池)+ 本批新提交 ⇒ 不记
+          const cE = hc(engF(T), { carriers: 0 }, [[T - 36000e3, [hunter, fbHunter]], [T, [bash("git commit -m x")]]]);
+          hp("278 BP-2:陈旧猎手在窗口里、改闸提交晚于它 ⇒ 不记", JSON.stringify(P_.huntedShas(cE)), "[]");
+          const cD = hc(engF(T - 3600e3), { carriers: 0 }, [[T, [hunter]]]);
+          hp("278 D173③:只有红队、缺误拦猎手 ⇒ 不记", JSON.stringify(P_.huntedShas(cD)), "[]");
+          const read = (hunted) => PR.detect(hc(engF(T - 86400e3), { carriers: 0, hunted }, [[T, [bash("git add -A && git commit -m x")]]]))
+            .map((h) => /独立视角/.test(h.ch) ? "hunter" : "other").join(",");
+          hp("278 D173③:账上 hunted 有该 sha ⇒ 别的会话不再要猎手", read([S4]), "");
+          hp("278 D173③:账上 hunted 是别的 sha ⇒ 照要猎手", read(["5".repeat(40)]), "hunter");
+        }
       }
       // ENGINE_PATHSPECS 与 ENGINE_REL 同一口径(改一处必改另一处)
       const _Pp = RULES.find((r) => r.id === "P")._p;
