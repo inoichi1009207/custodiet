@@ -2296,9 +2296,15 @@ export function isForeignBatch(g, sid, entries) {
   try {
     if (!g || !g.batch || typeof sid !== "string" || !sid) return false;
     if (typeof g.armedBy === "string" && g.armedBy === sid) return false;
-    const re = new RegExp(`batch-goal\\.mjs[^\\n]*--arm[\\s=]+["']?${String(g.batch || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`);
+    // 红队 281 终版 BP-2 / BP-3:先把 `\` / `` ` `` 续行接回一行,脚本名不分大小写(Windows 文件名不分大小写)
+    const re = new RegExp(`batch-goal\\.mjs[^\\n]*--arm[\\s=]+["']?${String(g.batch || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`, "i");
+    const join = (s) => String(s || "").replace(/[\\`]\r?\n/g, " ");
+    // codex 281-r1 断言 2:只认**命令头真是 node … batch-goal.mjs** 的那一段——`echo '… --arm 281'` 这类只打印、没执行的不算认领
+    //   (误认方向会让 S 拿别人的批拦本会话;按段切走 gate-cmd segments 唯一实现,命令头前允许 env 赋值与 cd 等前缀段)
+    const HEAD = /^(?:\w+=\S*\s+)*(?:&\s*)?["']?node(?:\.exe)?["']?\s+(?:--\S+\s+)*\S*batch-goal\.mjs\b/i;
+    const ranArm = (cmd, ps) => { try { return segments(join(cmd), ps).some((s) => HEAD.test(String(s).trim().replace(/^(?:\(\s*|\{\s+)+/, "")) && re.test(s)); } catch { return re.test(join(cmd)); } };
     const armedHere = (Array.isArray(entries) ? entries : []).some((e) => e && e.type === "assistant" && Array.isArray(e.message?.content) &&
-      e.message.content.some((c) => c && c.type === "tool_use" && /^(Bash|PowerShell)$/.test(String(c.name)) && re.test(String(c.input?.command || ""))));
+      e.message.content.some((c) => c && c.type === "tool_use" && /^(Bash|PowerShell)$/.test(String(c.name)) && ranArm(c.input?.command, String(c.name) === "PowerShell")));
     return !armedHere;
   } catch { return false; }
 }
@@ -2823,7 +2829,9 @@ export function run(transcriptPath, ctx = {}) {
           if (!g0 || typeof g0 !== "object") return g0;
           // 批 281:这批不是本会话武装的 ⇒ 标 foreign(S 不再拿别的会话的批拦本会话);判法唯一实现在 isForeignBatch
           //   (armedBy 等于本会话 / 本会话转录里武装过该批号 ⇒ 本会话的;否则外来,旧批没有 armedBy 亦然)
-          const g = isForeignBatch(g0, ctx.sessionId, _allEntriesCache) ? { ...g0, foreign: true } : g0;
+          // 红队 281 终版 BP-1:盘上状态文件里手写的 foreign 一律不认,外来标记只由 isForeignBatch 打
+          const { foreign: _diskForeign, ...gClean } = g0;
+          const g = isForeignBatch(gClean, ctx.sessionId, _allEntriesCache) ? { ...gClean, foreign: true } : gClean;
           try {
             const ts = (Array.isArray(turn) ? turn : []).map((e) => Date.parse(String((e && e.timestamp) || ""))).filter(Number.isFinite);
             const rows = fs.readFileSync(".claude/.batch-goal.jsonl", "utf8").trim().split("\n");
@@ -4850,6 +4858,13 @@ function selfTest() {
           hp("281:武装过的是 2800 不是 280 ⇒ 仍算外来", isForeignBatch(g, "me-session-5678", [arm("node scripts/batch-goal.mjs --arm 2800 --cond x")]), true);
           hp("281 误拦猎手 FB-1:旧批没有 armedBy、本会话没武装过 ⇒ 外来", isForeignBatch({ batch: "280" }, "me-session-5678", [arm("git status")]), true);
           hp("281:旧批没有 armedBy、本会话武装过 ⇒ 本会话的", isForeignBatch({ batch: "280" }, "me-session-5678", [arm("node scripts/batch-goal.mjs --arm 280 --cond x")]), false);
+          hp("281 红队终版 BP-2:续行把 --arm 放到下一行 ⇒ 仍认本会话武装过",
+            isForeignBatch(g, "me-session-5678", [arm("CLAUDE_CODE_SESSION_ID=fakefake-0001 node scripts/batch-goal.mjs \\\n  --arm 280 --cond x")]), false);
+          hp("281 红队终版 BP-3:脚本名大写 ⇒ 仍认本会话武装过",
+            isForeignBatch(g, "me-session-5678", [arm("CLAUDE_CODE_SESSION_ID=fakefake-0001 node scripts/Batch-Goal.mjs --arm 280 --cond x")]), false);
+          hp("281 codex r1 断言 2:只是 echo 打印武装命令 ⇒ 不算本会话武装过", isForeignBatch(g, "me-session-5678", [arm("echo 'node scripts/batch-goal.mjs --arm 280 --cond x'")]), true);
+          hp("281 误拦猎手终版 FB-1:grep 查谁武装的 ⇒ 不算本会话武装过", isForeignBatch(g, "me-session-5678", [arm("grep -n \"batch-goal.mjs --arm 280\" .claude/.batch-goal.jsonl")]), true);
+          hp("281:cd 后再跑武装 ⇒ 认", isForeignBatch(g, "me-session-5678", [arm("cd /repo && node --no-warnings scripts/batch-goal.mjs --arm 280 --cond x")]), false);
           hp("281:会话号缺 ⇒ 按本会话的批算", isForeignBatch({ batch: "280", armedBy: "x-session-0000" }, "", []), false);
           hp("281:armedBy 就是本会话 ⇒ 不算外来", isForeignBatch({ batch: "280", armedBy: "me-session-5678" }, "me-session-5678", []), false);
         }
