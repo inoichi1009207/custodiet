@@ -2485,7 +2485,7 @@ import { RULES, ranClear as ranClearRule, maskQuoted, BG_RUNNING_STATUS } from "
 // `validateRules` 是 2026-08-20 才接进**生产路径**的 —— 此前它只在 `gate:accept` 里跑,
 // 于是 INV-1..4 对真跑的闸完全不生效(grill:recon 查出,`grep -c` = 0)。
 import { runRules, validateRules } from "./lib/gate-registry.mjs";
-import { buildCtx, isBlockedStop, blockedStopIds, isStopFeedbackLine } from "./lib/gate-ctx.mjs";
+import { buildCtx, isBlockedStop, blockedStopIds, isStopFeedbackLine, gitArgs as gitArgsT } from "./lib/gate-ctx.mjs";
 import { segments, stripQuoted, quoteScan } from "./lib/gate-cmd.mjs";   // 批 257:A 项 codex 账的命令切段(引号外才切,唯一实现)
 // DP 的部署欠账事实源(2026-09-12 批 202)。**动态导入、缺件静默退场**:本文件随公开树 custodiet 分发,
 //   那边未必带 debt-facts.mjs;缺件时注入 undefined,DP 退回命令解析判法(与判活探针三件同一缺件纪律)。
@@ -2502,6 +2502,7 @@ const _codexRunForSelfTest = process.argv.includes("--self-test")
   ? await import("./codex-run.mjs").catch(() => null) : null;
 // D1/批 102:两份台账的追加改走行级 hash 链(完整性告警;担保边界见 ledger-chain 头注)
 import { ledgerAppend, verifyFile as ledgerVerify } from "./lib/ledger-chain.mjs";
+import { readTouched, selfTest as touchSelfTest } from "./lib/gate-touch.mjs";   // 批 279「修闸 tag」
 
 /** 反推「闸机件」清单:凡**改了它就可能改变闸的行为**的文件。
  *
@@ -2794,6 +2795,11 @@ export function run(transcriptPath, ctx = {}) {
         // P 的跨批持久计账(2026-08-22 亲签「改吧」):同 batchGoal 的注入纪律——
         //   hook 读一次、规则纯函数;账文件在 gitignore 面;夹具经 ctx.pLedger 精确控制。
         pLedger: ctx.pLedger !== undefined ? ctx.pLedger : readPLedger(),
+        // 批 279「修闸 tag」:只在实时路径读(离线回放读到的是今天的账,套到历史轮上是错配 ⇒ undefined ⇒ P 保持旧判法)
+        gateTouched: ctx.gateTouched !== undefined ? ctx.gateTouched
+          //   账路径按本脚本位置算绝对路径(红队 279 终版附注 4:chdir 失败时相对路径会读到别处 ⇒ ENOENT ⇒ 误判「没碰过」)
+          //   不认改道变量(红队 279 复审 BP-2;自测与回放走注入的 ctx.gateTouched)
+          : (ctx.live && process.env.STOP_CLOSURE_SELFTEST !== "1" ? readTouched(fileURLToPath(new URL("../.claude/.gate-touch.jsonl", import.meta.url)), ctx.sessionId) : undefined),
         // DP 的部署欠账事实(2026-09-12 批 202):同一注入纪律——hook 读一次、规则纯函数。
         //   **只在实时路径读**:离线回放读到的是「现在」的 reflog,套到历史轮上是错配 ⇒ 保持 undefined,DP 退回解析判法。
         debtFacts: ctx.debtFacts !== undefined ? ctx.debtFacts : (ctx.live ? readDebtFacts(process.cwd()) : undefined),
@@ -4782,6 +4788,43 @@ function selfTest() {
             .map((h) => /独立视角/.test(h.ch) ? "hunter" : "other").join(",");
           hp("278 D173③:账上 hunted 有该 sha ⇒ 别的会话不再要猎手", read([S4]), "");
           hp("278 D173③:账上 hunted 是别的 sha ⇒ 照要猎手", read(["5".repeat(40)]), "hunter");
+          // 批 279:试过的「修闸提交也记」支已撤(红队 279 BP-1~4,停止出口①);钉住退回形——有切点 + 本会话提交 + 文件点名的修闸提交仍不记
+          const engA = (at, file = "scripts/lib/gate-rules.mjs") => ({ ...engF(at), engineAnchorAt: iso(T - 7200e3), commits: [{ sha: S4, at: iso(at), files: [file] }] });
+          const fixRows = [[T, [hunter, fbHunter]], [T + 50e3, [bash("git add -A && git commit -m fix")]]];
+          hp("279 退回:猎手之后的修闸提交(即使有切点、本会话提交、文件点名)⇒ 不记", JSON.stringify(P_.huntedShas(hc(engA(T + 60e3), { carriers: 0 }, fixRows))), "[]");
+          // 红队 279 BP-1:陈旧猎手在窗口里 + 更早的 engineAnchorAt + 本批新提交 ⇒ 不记
+          const E_ = ([t, c]) => ({ type: "assistant", timestamp: iso(t), message: { content: c } });
+          const cW = buildCtx([[T, [bash("git commit -am x")]]].map(E_), { pLedger: { carriers: 0 }, headFacts: () => ({ ...engF(T + 1e3), engineAnchorAt: iso(T - 40000e3) }), priorEntries: [[T - 36000e3, [hunter, fbHunter]]].map(E_) });
+          hp("279 红队 BP-1:陈旧猎手 + 本批新提交 ⇒ 不记", JSON.stringify(P_.huntedShas(cW)), "[]");
+        }
+        // 批 279「修闸 tag」:记账判据(lib/gate-touch.mjs touchWhy / readTouched;零件注入,避免循环导入)
+        {
+          const Pt = RULES.find((x) => x.id === "P")._p;
+          const r = touchSelfTest({ segments, gitArgs: gitArgsT, walk: (cmd, d) => Pt.walk(cmd, d), writeTargets: (cmd, d) => Pt.writeTargets(cmd, () => true, d), engineRel: Pt.ENGINE_REL, resolve: Pt.resolve }, os,
+            (l) => { if (/^FAIL/.test(l)) console.log("  gate-touch " + l); });
+          hp(`279 gate-touch 记账判据 ${r.pass + r.fail} 条全过`, r.fail, 0);
+        }
+        // 批 279(交接单 20261027 第一节):MF 碰即补 ⇒ 小改的 Edit 不查(smallEdit;首版按指令词个数判,被红队 279 BP-6/7 打穿后收窄)
+        {
+          const MF = RULES.find((r) => r.id === "MF");
+          const mp = "C:/Users/u/.claude/projects/example-project/memory/no-such-279.md";
+          const ed = (o, n) => buildCtx([{ type: "assistant", message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: mp, old_string: o, new_string: n } }] } }], {});
+          const fm = "---\nname: n\nmetadata:\n  type: feedback\n---\n";
+          hp("279 MF:改旧 feedback memory 的日期 ⇒ 不拦", MF.detect(ed(fm + "2026-09-04 用户要求", fm + "2026-09-05 用户要求")).length, 0);
+          hp("279 MF:改错别字 ⇒ 不拦", MF.detect(ed(fm + "回复先给结伦。", fm + "回复先给结论。")).length, 0);
+          hp("279 MF:Edit 新增「以后一律」⇒ 照拦", MF.detect(ed(fm + "回复先给结论。", fm + "回复先给结论。以后一律先跑自测。")).length, 1);
+          hp("279 MF:Edit 新增「禁止」类规则句 ⇒ 照拦", MF.detect(ed(fm + "回复先给结论。", fm + "回复先给结论。\n禁止在正文写出处。")).length, 1);
+          hp("279 红队 BP-6:同数替换换掉规则 ⇒ 照拦", MF.detect(ed(fm + "以后回复先给结论。", fm + "以后改闸提交都不跑红队。")).length, 1);
+          hp("279 红队 BP-7:无指令词的规则句(长)⇒ 照拦", MF.detect(ed(fm + "回复先给结论。", fm + "回复先给结论。\n提交后回读远端,推完部署。")).length, 1);
+          hp("279 红队 BP-6:小改里换指令词「必须」→「不必」⇒ 照拦", MF.detect(ed(fm + "提交前必须跑自测。", fm + "提交前不必跑自测。")).length, 1);
+          hp("279 误拦猎手 FB-3:补一个漏字 ⇒ 不拦", MF.detect(ed(fm + "回复先给论。", fm + "回复先给结论。")).length, 0);
+          hp("279 误拦猎手 FB-3:英文 commonly 不算 only ⇒ 不拦", MF.detect(ed(fm + "it is comonly seen.", fm + "it is commonly seen.")).length, 0);
+          hp("279 误拦猎手 FB-3:纯插入一句(>2 字)⇒ 照拦", MF.detect(ed(fm + "回复先给结论。", fm + "回复先给结论。提交后回读")).length, 1);
+          // 误拦猎手 279 FB-5:同轮另一笔小改补了执行面行 ⇒ 判执行面时取全部写入
+          const ed2 = buildCtx([{ type: "assistant", message: { content: [
+            { type: "tool_use", name: "Edit", input: { file_path: mp, old_string: fm + "回复先给结论。", new_string: fm + "回复先给结论。以后一律先跑自测。" } },
+            { type: "tool_use", name: "Edit", input: { file_path: mp, old_string: "执行面:暂无", new_string: "执行面:M 项" } }] } }], {});
+          hp("279 误拦猎手 FB-5:同轮两笔 Edit,另一笔补了执行面行 ⇒ 不拦", MF.detect(ed2).length, 0);
         }
       }
       // ENGINE_PATHSPECS 与 ENGINE_REL 同一口径(改一处必改另一处)

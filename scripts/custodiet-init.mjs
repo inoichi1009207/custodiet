@@ -45,6 +45,8 @@ const FILES = [
   // 同理:gate-rules.mjs 顶部 import 它(I / J / G / L 的写入效果分析)。解析依赖 tree-sitter 由 gate-deps 清单另装;
   //   没装时它报「解析器缺席」,规则退回旧判法,不崩。
   "scripts/lib/write-effects.mjs",
+  // 0.9.6:gate-rules.mjs / hook-stop-closure.mjs 顶部 import 它(P 的「修闸 tag」判据)。本包不带记账钩子 ⇒ 账不存在 ⇒ 按「碰过」算,P 行为同前。
+  "scripts/lib/gate-touch.mjs",
   "scripts/gate-deps/package.json",
   "scripts/gate-deps/package-lock.json",
   // 自签误报的 codex 盲审;batch-goal --clear 在场才后台发车。它经 scripts/codex-run.mjs 调本机 codex CLI(只读沙箱);

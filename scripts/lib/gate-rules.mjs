@@ -14,6 +14,7 @@ import { classifyDiffTier, coversWrites } from "./gate-difftier.mjs";
 import { quoteUntrusted, gitArgs, isCommitSeg } from "./gate-ctx.mjs";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import { gitSegWhy } from "./gate-touch.mjs";   // 批 279「修闸 tag」:合并类 git 判据唯一实现(hook 侧记账与 P 侧兜底同用)
 
 /** 那个件在本仓在不在?**消息里凡是让人去跑某个脚本的,都要先问这一句。**
  *
@@ -4534,6 +4535,10 @@ const RULE_P = {
       const pool = H.hunterPool(ctx);
       const lastAt = (pred) => pool.reduce((m, a) => { let ok = false; try { ok = pred(a); } catch { ok = false; } return ok && Number.isFinite(a.at) ? Math.max(m, a.at) : m; }, -Infinity);
       const cover = Math.min(lastAt(H.isBoundHunter), lastAt((a) => H.isBoundFalseBlockHunter(a, ctx)));
+      // 批 279 试过补「猎手 → 修 → 本会话提交」那一支(切点 + 提交命令后 300 秒 + 文件名在派单里出现),红队 279 打出 5 条漏放:
+      //   切点在本仓恒有限(BP-1)、派单里「别看 X」也算点名(BP-2,即 257 撤掉的 namedCover)、按时刻邻近认「本会话提交」
+      //   会吞别的会话 / 失败的提交(BP-3)、basename 撞名(BP-4)。278 + 279 两轮同一子系统连出新形态 ⇒ 停止出口①:退回本最简形,
+      //   「本会话提交」须按 sha 认(转录里拿不到提交命令产出的 sha),归设计复核(D173③)。
       return H.gitEngineUnhunted(f, ctx)
         .filter((c) => !c.aggregated && typeof c.sha === "string" && /^[0-9a-f]{40,64}$/i.test(c.sha) && Number.isFinite(c.at) && c.at <= cover)
         .map((c) => c.sha.toLowerCase());
@@ -4567,8 +4572,11 @@ const RULE_P = {
       const ps = d === "ps";
       let cwd = null;
       for (const seg of segments(ps ? String(cmd || "") : H.stripHeredoc(cmd), ps)) {
-        const m = /^(?:cd|pushd)\s+(?:-[LP]\s+)?(["']?)([^"'\s;&|]+)\1\s*$/.exec(seg);
-        if (m) { cwd = H.resolve(cwd, m[2]); continue; }
+        // 批 279 误拦猎手收窄版 FB-3 / FB-4:认 PowerShell 的 Set-Location / sl / Push-Location / chdir;段首 `(` / `{`(子 shell / 大括号组)先剥;
+        //   引号路径允许空格。子 shell 的 cd 不回退(偏严:之后同调用的段按那个目录判,多数是仓外 ⇒ 少记,见 CEILING)
+        const s0 = String(seg).replace(/^(?:\(\s*|\{\s+)+/, "");
+        const m = /^(?:cd|pushd|chdir|Set-Location|sl|Push-Location)\s+(?:-[LP]\s+|-(?:Literal)?Path\s+)?(?:"([^"]+)"|'([^']+)'|([^"'\s;&|)]+))\s*\)?\s*$/i.exec(s0);
+        if (m) { cwd = H.resolve(cwd, m[1] || m[2] || m[3]); continue; }
         out.push({ seg, cwd });
       }
       return out;
@@ -4971,9 +4979,58 @@ const RULE_P = {
       if (!ctx || typeof ctx !== "object") return false;
       if (H._engMemo.has(ctx)) return H._engMemo.get(ctx);
       const f = H.facts(ctx);
-      const v = f ? H.gitEngineUnhunted(f, ctx).length > 0 : H.engineBySyntax(ctx);
+      // 批 279(用户 10-27「修闸 tag」):git 事实面上,范围里的改闸提交只在**本会话碰过闸**时才算本批的(selfTouched)
+      const v = f ? H.gitEngineUnhunted(f, ctx).length > 0 && H.selfTouched(ctx, f) : H.engineBySyntax(ctx);
       H._engMemo.set(ctx, v);
       return v;
+    },
+    /** 批 279:本会话碰过闸没有(「修闸 tag」;用户 2026-10-27 方案,判据与理由见 scripts/lib/gate-touch.mjs 头注)。并集,任一成立即真:
+     *  ① `ctx.gateTouched` 不是 false——hook 侧读 `.claude/.gate-touch.jsonl`(PreToolUse 按动作记,含子代理);
+     *     undefined(通道没接:夹具 / 回放)⇒ 真(保持旧判法);null(账读不了)⇒ 真(偏严);
+     *  ② 窗口 ∪ 本轮里看得见的闸写入(Edit / Write / 命令写目标)或带进别处改动的 git 子命令(钩子账写丢时的兜底);
+     *  ③ 本会话有**整树**提交命令(git add -A / . / commit -a),而范围里某笔改闸提交的时刻落在它之后 −2–300 秒
+     *     (钩子视野外的写:本会话跑的脚本写闸后整树提交;共用 checkout 时整树提交也会带走同目录里别人没提交的闸改动)。
+     *  残余(登记 D173):tag 一打上整个会话有效(误拦猎手 279 终版 FB-6);被拒 / 用户否掉的命令也已记(PreToolUse 先于权限,FB-2);
+     *  脚本在子进程里写闸并自己提交两头都看不见(红队 279 复审 BP-1,PF 提示让执行者自己认领)。 */
+    selfTouched(ctx, f) {
+      const H = RULE_P._p;
+      if (!ctx || ctx.gateTouched !== false) return true;
+      const w = H.win(ctx), root = ctx.hookCheckout || null;
+      const acts = [...((w && Array.isArray(w.actions)) ? w.actions : []), ...(Array.isArray(ctx.actions) ? ctx.actions : [])];
+      // 作用仓与闸路径都按仓根判(误拦猎手收窄版 FB-5、codex 279-r2 附 2):相对路径先拼到仓根(会话 cwd 按仓根近似),
+      //   仓外绝对路径不算;取不到仓根 ⇒ 退回原后缀判法(偏严)
+      const rootP = root || (f && f.root) || null;
+      const rootR = rootP ? H.resolve(null, rootP).replace(/\/+$/, "").toLowerCase() : null;
+      const absP = (p) => { const s = String(p || "").replace(/\\/g, "/"); return /^([A-Za-z]:)?\//.test(s) || s.startsWith("~") || !rootP ? s : `${rootP}/${s}`; };
+      const under = (p) => { if (!rootR) return true; const s0 = absP(p); if (/^~|^\$/.test(s0)) return false; const s = H.resolve(null, s0).toLowerCase(); return s === rootR || s.startsWith(rootR + "/"); };
+      const eng = (p) => (rootR ? under(p) && H.isEnginePath(H.resolve(null, absP(p)), rootP) : H.isEnginePath(p, root));
+      const commitAts = [];
+      for (const a of acts) {
+        const name = String((a && a.name) || ""), inp = (a && a.input) || {};
+        const fp = inp.file_path || inp.notebook_path;
+        if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(name) && typeof fp === "string" && eng(fp)) return true;
+        if (/^(Bash|PowerShell)$/.test(name) && typeof inp.command === "string") {
+          const d = H.dOf(a);
+          let outsideCommit = false;
+          try {
+            if (H.writeTargets(inp.command, eng, d).length || H.gitPathArgs(inp.command, d).some(eng)) return true;
+            // 合并类 git:与 hook 侧同一判据(lib/gate-touch.mjs gitSegWhy;误拦猎手 279 终版 FB-3 / FB-4 / 附节二 3)
+            for (const { seg, cwd } of H.walk(inp.command, d)) {
+              const g = gitArgs(String(seg).trim().replace(/^(?:\(\s*|\{\s+)+/, "").replace(/^(?:\w+=\S*\s+)+/, ""));
+              const where = g && g.cdir ? (cwd && !/^([A-Za-z]:)?\//.test(String(g.cdir)) ? `${cwd}/${g.cdir}` : g.cdir) : cwd;
+              if (g && g.sub === "commit" && where && !under(where)) outsideCommit = true;
+              if (gitSegWhy(g, cwd, under, eng)) return true;
+            }
+          } catch { return true; }   // 解析失败 ⇒ 按碰过算(偏严)
+          // ③ 只认整树提交(git add -A / . / commit -a):共用 checkout 时它会把同目录里别人没提交的闸改动一起带走,算碰过是对的;
+          //   定向提交的路径已由上面 gitPathArgs 判过(误拦猎手 279 终版 FB-5);提交落在别的仓不算(收窄版 FB-6)
+          if (!outsideCommit && Number.isFinite(a.at) && H.hasCommit(inp.command, d) && (() => { try { return gitWholeCommit(inp.command); } catch { return true; } })()) commitAts.push(a.at);
+        }
+      }
+      if (f && commitAts.length) {
+        for (const c of H.gitEngineCommits(f)) if (Number.isFinite(c.at) && commitAts.some((t) => c.at >= t - 2000 && c.at <= t + 300000)) return true;
+      }
+      return false;
     },
     engineBySyntax(ctx) {
       const H = RULE_P._p, w = H.win(ctx), root = ctx.hookCheckout || null;
@@ -5349,7 +5406,8 @@ const RULE_P = {
         : miss[0] === "_gate-bypass-hunter" ? "缺红队 `_gate-bypass-hunter`(找漏放);误拦猎手那格已有"
         : "缺误拦猎手 `_gate-false-block-hunter`(找误拦,跑 scripts/gate-replay.mjs 回放;已起过但 `--base` 不合格也算缺);红队那格已有";
       return `**闸引擎面提交,红队 / 误拦猎手未跑齐**(D11,独立于「每 ${h0.every} 次武装一次」的宽限;本仓 P 账累计 ${h0.commits} 次承重提交——账跨会话共用,含别的会话的提交;另两通道仍在宽限内)。\n` +
-        `      范围 = 本会话上次 P 结清以来进仓的提交(不分哪个会话提交的);别的会话已按两猎手审过的改闸提交按 sha 认账、不再要你审。\n` +
+        `      本项只对**本会话碰过闸**的会话响(修闸 tag:写过闸文件 / 合并类 git / 可写 codex,含子代理;账 .claude/.gate-touch.jsonl,按本会话 sid 查 why 字段)。\n` +
+      `      别的会话已按两猎手审过的改闸提交按 sha 认账、不再要你审;tag 若是误记(只读命令被记上)⇒ 照实记 --fp P。\n` +
         `      处置:${who},` +
         `prompt 里带上本批闸文件名 / 规则 id / diff 文件(空 prompt 不算,上一批的调用不抵账);误拦猎手派单里**只写一个** \`--base <sha>\`(只认 --base 参数,说明文字里的 base: 不算;写了多个不同的 --base——哪怕是「别用 --base HEAD」的提醒——也不认),sha 要早于 P 范围(本会话上次 P 结清以来)里第一笔改闸提交(不能填 HEAD,也不能填那一笔及之后的提交——那样回放恒为零新增;有疑问就填开工前的提交 sha)。回件处置后再提交或关账。grill 在此格**不充分**。`;
     }
@@ -5375,6 +5433,9 @@ const RULE_P = {
   mutations: [
     // ── 红队 a27628dd 轮的新分支各钉一条(swapP:临时换掉 _p 里的零件,跑完还原)────────────────────
     { name: "git 事实不接(恒回退语法判据:merge/cherry-pick 合回看不见)", apply: swapP({ facts: () => () => null }) },
+    // 批 279「修闸 tag」两向:恒算碰过(误拦复发)/ 只看账、不看窗口与提交邻近兜底(漏放)
+    { name: "279 修闸 tag 恒真(本会话没碰闸也要猎手)", apply: swapP({ selfTouched: () => () => true }) },
+    { name: "279 修闸 tag 只看账(钩子账写丢 / 脚本写闸时放过)", apply: swapP({ selfTouched: () => (ctx) => !ctx || ctx.gateTouched !== false }) },
     // 批 278(D173③):按 sha 认账的两向——不认 hunted(误拦复发)/ 任何 sha 都认(漏放)
     { name: "D173③ 不认 hunted(别的会话审过的改闸提交照要猎手)", apply: swapP({ gitEngineUnhunted: () => (f) => RULE_P._p.gitEngineCommits(f) }) },
     { name: "D173③ hunted 非空即全认(不比 sha)", apply: swapP({ gitEngineUnhunted: (orig) => (f, ctx) => (ctx && ctx.pLedger && (ctx.pLedger.hunted || []).length ? [] : orig(f, ctx)) }) },
@@ -5537,6 +5598,20 @@ const RULE_P = {
   cases: {
     // 正例 = **四种已知文本伪造形态**各一条(全部必须照拦)+ 一条写入面伪造。
     pos: [
+      // 批 279「修闸 tag」控制组:账里有 tag / 账说没有但窗口里看得见闸写入 / 提交命令后 300 秒内落的改闸提交 ⇒ 照要猎手
+      { name: "279 修闸 tag:账里有本会话 ⇒ 照要猎手",
+        text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: true,
+        bash: ["git add -A docs/design.md && git commit -m x"], at: "2026-10-26T02:00:00Z",
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
+      { name: "279 修闸 tag:账说没有、但前几轮改过闸文件(钩子账写丢)⇒ 照要猎手",
+        text: "提交。", pLedger: { carriers: 0 }, gateTouched: false,
+        bash: ["git add -A && git commit -m x"], at: "2026-10-26T02:00:00Z",
+        prior: [{ text: "改判据", write: "/repo/scripts/lib/gate-rules.mjs" }],
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:00:30Z" }] } },
+      { name: "279 修闸 tag:账说没有、本轮提交后 30 秒落了改闸提交(脚本写的闸)⇒ 照要猎手",
+        text: "提交。", pLedger: { carriers: 0 }, gateTouched: false,
+        bash: ["node tools/regen.mjs && git add -A && git commit -m x"], at: "2026-10-26T02:00:00Z",
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:00:30Z" }] } },
       // 批 278(D173③)控制组:hunted 记的是别的 sha ⇒ 照要猎手(钉「hunted 非空即全认」变异)
       { name: "278 D173③:hunted 里没有本范围的改闸提交 ⇒ 仍欠猎手",
         text: "设计稿写好了。", pLedger: { carriers: 0, hunted: ["f".repeat(40)] },
@@ -6181,6 +6256,34 @@ const RULE_P = {
         diffFacts: { root: "/repo", files: [{ path: "scripts/lib/ledger-chain.test.mjs", status: "M", readable: true }] } },
     ],
     neg: [
+      // 批 279(用户 10-27「修闸 tag」):范围里有别的会话的改闸提交,本会话没 tag、窗口里也没碰闸 ⇒ 不要猎手
+      { name: "279 修闸 tag:本会话没碰闸(账里无 tag)⇒ 范围里别的会话的改闸提交不要猎手",
+        text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
+        bash: ["git add -A docs/design.md && git commit -m x"], at: "2026-10-26T02:00:00Z",
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
+      // 误拦猎手 279 终版 FB-5:本会话定向提交 docs,3 分钟后别的会话落改闸提交 ⇒ 不算本会话碰过(③ 只认整树提交)
+      { name: "279 FB-5:定向提交 docs 后别的会话落改闸提交 ⇒ 不要猎手",
+        text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
+        bash: ["git add docs/a.md && git commit -m a"], at: "2026-10-26T02:00:00Z",
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:03:00Z" }] } },
+      // 误拦猎手收窄版 FB-5 / FB-6、codex 279-r2 附 2:作用在别的仓的 git(相对路径、整树提交、同名闸文件路径)不算本会话碰闸
+      { name: "279 收窄版 FB-5:git -C ../cbot pull ⇒ 不要猎手",
+        text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
+        bash: ["git -C ../cbot pull"], at: "2026-10-26T01:30:00Z",
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
+      { name: "279 收窄版 FB-6:别的仓整树提交,300 秒内本仓落别人的改闸提交 ⇒ 不要猎手",
+        text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
+        bash: ["git -C E:/cbot commit -am x"], at: "2026-10-26T02:00:00Z",
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:00:30Z" }] } },
+      { name: "279 codex r2 附 2:git -C 别的仓 add 同名闸文件 ⇒ 不要猎手",
+        text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
+        bash: ["git -C E:/cbot add scripts/lib/gate-rules.mjs"], at: "2026-10-26T01:30:00Z",
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
+      // 误拦猎手 279 终版 FB-3:只读 git 动作不算碰闸
+      { name: "279 FB-3:只跑 git stash list / restore --staged ⇒ 不要猎手",
+        text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
+        bash: ["git stash list && git restore --staged docs/a.md"], at: "2026-10-26T01:30:00Z",
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:03:00Z" }] } },
       // 批 278(D173③ / 误拦猎手 某会话 FB-1):范围里的改闸提交是别的会话的、共用 P 账 `hunted` 记过它两猎手已审 ⇒ 不再要本会话起猎手
       { name: "278 D173③:范围里的改闸提交已按 sha 记进 hunted ⇒ 放行",
         text: "设计稿写好了。", pLedger: { carriers: 0, hunted: ["e".repeat(40)] },
@@ -9503,6 +9606,8 @@ const RULE_MF = {
   },
   //   误拦 r6 FB-2:user 类多是关于用户的事实,只有带持久指令措辞时才算规则
   _USER_CUE: /以后|每次|一律|必须|总是|永远|默认|不要|别再|务必|always|never|by default/i,   // 「默认」:codex 276-r6-fix-audit 附 2
+  //   批 279:小改的改动段里不许出现的指令措辞(宽:含单字「不 / 要 / 应 / 别 / 只 / 先 / 再」,误伤只是多查一次)
+  _RULE_CUE: /以后|今后|每次|一律|必须|总是|永远|默认|禁止|务必|不|要|应|别|只|须|先|再|\b(?:always|never|must|should|only|don'?t|do not|by default)\b/i,   // 英文按整词(误拦猎手 279 FB-3:commonly 里的 only)
   // 执行面行:取标签后到行尾的值判
   faceOk(body) {
     const ids = new Set(RULES.map((r) => r.id));   // 调用时 RULES 已定义(r6 BP-3:规则 id 须真实存在)
@@ -9541,11 +9646,39 @@ const RULE_MF = {
     const bodyOf = (a) => String(a.input?.content ?? a.input?.new_string ?? a.input?.new_source ?? "") +
       (Array.isArray(a.input?.edits) ? "\n" + a.input.edits.map((e) => String(e?.new_string ?? "")).join("\n") : "");
     const byPath = new Map();
+    // 批 279(交接单 20261027 第一节「碰即补」):feedback/user 类 43 份里 40 份没有执行面行,碰任何一份、改一个字都拦
+    //   (含「日期写错了改一下」)。改为:**小改**的 Edit 不查——每一对 old/new 去掉公共前后缀后,两边改动段都 ≤ 24 字、
+    //   且两边改动段里都没有指令措辞(_RULE_CUE,含「不 / 要 / 应 / 别」这类单字)。其余 Edit 与一切 Write 照旧查。
+    //   首版按「新串指令词比旧串多」判,红队 279 BP-6(同数替换换掉规则)/ BP-7(无指令词的规则句)/ BP-10(史料里的「先…再」误拦)
+    //   ⇒ 换成这个更窄的口径:只放改错别字、改日期、改编号这一类。CEILING:≤24 字、不含指令词的改动改变规则含义(如改一个路径)会漏。
+    const MID = 24;
+    const smallEdit = (e) => {
+      const o = e?.old_string, n = e?.new_string;
+      if (typeof o !== "string" || typeof n !== "string") return false;   // 夹具形 / 异常调用 ⇒ 当新内容查
+      let i = 0; while (i < o.length && i < n.length && o[i] === n[i]) i++;
+      let j = 0; while (j < o.length - i && j < n.length - i && o[o.length - 1 - j] === n[n.length - 1 - j]) j++;
+      const om = o.slice(i, o.length - j), nm = n.slice(i, n.length - j);
+      // 只放「替换」:改动段里带句末标点 / 换行 = 写了新句子,照查(红队 279 BP-7);纯插入只放 ≤2 字的补字(误拦猎手 279 FB-3「给论→给结论」)
+      if (om.length > MID || nm.length > MID || /[。！？!?;；\n]/.test(nm)) return false;
+      if (!om.length && nm.length > 2) return false;
+      // 指令词:两边改动段的指令词多重集合相同才放(误拦猎手 279 FB-3「在次→再次」类仍拦——单字「再」进了新串;「必须→不必」照拦,红队 BP-6)
+      const bag = (s) => (s.match(new RegExp(H._RULE_CUE.source, "gi")) || []).map((x) => x.toLowerCase()).sort().join("|");
+      return bag(om) === bag(nm);
+    };
+    const addsRule = (a) => {
+      if (a.name !== "Edit" && a.name !== "MultiEdit") return true;
+      const pairs = a.name === "MultiEdit" && Array.isArray(a.input?.edits) ? a.input.edits : [a.input || {}];
+      return !pairs.length || pairs.some((e) => !smallEdit(e));
+    };
+    // 误拦猎手 279 FB-5:小改只决定「要不要查这份」;判执行面时取本轮对该路径的**全部**写入(同轮另一笔小改补的执行面行照认)
+    const allWritten = new Map(), pick = new Set();
     for (const a of acts) {
       const p = norm(a.input?.file_path);
       if (!H._MEM.test(p) || H._INDEX.test(p)) continue;   // 索引除外(r5 BP-10 / FB-7)
-      byPath.set(p, (byPath.get(p) || "") + "\n" + bodyOf(a));
+      allWritten.set(p, (allWritten.get(p) || "") + "\n" + bodyOf(a));
+      if (addsRule(a)) pick.add(p);
     }
+    for (const p of pick) byPath.set(p, allWritten.get(p));
     const hits = [];
     for (const [p, written] of byPath) {
       let disk = null;
@@ -9569,6 +9702,7 @@ const RULE_MF = {
   mutations: [
     { name: "去掉出路(带了执行面也照拦)", apply: (r) => ({ ...r, detect: (ctx) => RULE_MF.detect(ctx, { noEscapes: true }) }) },
     { name: "不看 type(写任何 memory 都拦)", apply: (r) => ({ ...r, detect: (ctx) => RULE_MF.detect(ctx, { anyType: true }) }) },
+    // 批 279「小改的 Edit 不查」(smallEdit)钉在 hook 自测「279 MF」那组 hp 用例上:夹具键造不出带 old_string 的 Edit,变异在这里杀不死
   ],
   cases: {
     pos: [
@@ -9664,6 +9798,10 @@ const RULE_SE = {
     { say: "补一节「闸怎么拦」并往本仓 docs/gate-debts.md 新登记 D 号行:错型归族 / 候选闸(机械判据)/ 仪器 / 失效条件",
       sample: { write: "/repo/docs/gate-debts.md", written: "| D180 | 错型 … 候选闸 … | 276 | ≤280 | … | … |" } },
     { say: "就地写 ⟪闸怎么拦:⟫ + 已有规则 id(如「X 项」)/ D 号 / 「不可机械化」及理由", sample: { text: "闸怎么拦:已有 E2 项管这一形,不另立。" } },
+    // 批 279(用户 10-27「SE 过犹不及」):错小、当轮已改、没进产物的,说一句不值得即可,不必现场设计闸
+    { say: "错的量级小(当轮已改正、没进产物 / 没据此推翻别人)⇒ 写 ⟪闸怎么拦:不立闸:⟫ + 理由", sample: { text: "我刚才写错了路径。闸怎么拦:不立闸:当轮自己发现并改掉,没进任何产物。" },
+      // 重型错(假读数 / 据此提交)本就不认这条出口 ⇒ 不对那两个正例自证(pos[1]「我的假读数」、pos[13] 红队 279 BP-8)
+      forPos: [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17] },
   ],
   //   r5 BP-12:「我」与动词之间的插入不许含假设 / 否定 / 疑问 / 防范词,主语不认「我们」
   //   r6 BP-9:原排除表把「发现 / 觉得 / 确认 / 核对」也排了 ⇒「我发现自己读错了」漏;这几个词改由 detect 里的评他人判(见 _OTHER)
@@ -9719,8 +9857,22 @@ const RULE_SE = {
     for (const g of t.matchAll(/闸怎么拦[:：]([^\n。]{0,80})/g)) {
       const v = g[1].replace(/\bD17[89]\b|\bSE\s*项|\bRULE_SE\b/g, "");
       //   误拦 r7 FB-9:推迟词只在它出现在第一个交代(id / D 号 / 不可机械化)之前才作废;「先前」不是推迟
+      // 批 279(交接单 20261027 第二追加节,用户 10-27:「SE 有点过犹不及……这个东西再给他去立个闸有点没必要」):
+      //   错的量级不进判据 ⇒ 小错也被逼着现场设计一道闸,成本压在认错上。加一条出口「不立闸:<理由>」(量级小、当轮已改正、
+      //   没进产物等),理由至少 4 字;只是让「不值得」能说出口,不再逼出低价值候选闸。
+      //   红队 279 BP-8 / BP-9:「不立闸」必写全「闸」、后跟冒号、理由 ≥4 个非空白字;理由里有推迟词就作废(不看先后);
+      //   认的是重型错(假读数 / 推翻了别人 / 据此提交)时不认这个出口
       const okRe = /\bD\d{3}[a-z]?\b|\b[A-Z][A-Z0-9]{0,2}\s*项|RULE_[A-Z0-9]+|不可机械化\s*[:：,,]?\s*\S.{3,}/;
-      const ok = v.search(okRe), late = v.search(/还没想好|没想好|回头|以后再|稍后|待定|再说|^\s*先(?!前)/);
+      const DEFER = /还没想好|没想好|回头|以后再|稍后|待定|再说|懒得|^\s*先(?!前)/;
+      //   误拦猎手 279 FB-7:同义写法「没必要立闸 / 不另立闸」也认,冒号或逗号都行(「不立闸怎么行」没有标点,仍不算)
+      const nl = /(?:不立闸|不值得立闸|没必要立闸|不必立闸|不另立闸)\s*[:：,，]\s*(.*)$/.exec(v);
+      //   误拦猎手 279 FB-6:重型错只在**认错那一句**与「闸怎么拦」的值里找,且排除否定(「也没据此提交」);
+      //   原来扫整轮,收尾状态句「批 279 已提交」就让出口失效
+      const HEAVY = /(?<!没|未|并未|也没|没有)(?:假读数|推翻了|据此(?:提交|推送|发布|裁决)|已提交|已发布)/;
+      const admSent = t.split(/[。！？!?\n]/).find((s) => s.includes(hit)) || hit;
+      const heavy = HEAVY.test(admSent) || HEAVY.test(v);
+      if (nl && !heavy && nl[1].replace(/\s/g, "").length >= 4 && !DEFER.test(nl[1])) return [];
+      const ok = v.search(okRe), late = v.search(DEFER);
       if (ok >= 0 && (late < 0 || late > ok)) return [];
     }
     return [m[0]];
@@ -9748,6 +9900,11 @@ const RULE_SE = {
       { name: "SE r6 BP-11:推迟句里顺带规则 id 不算", text: "是我的锅。闸怎么拦:还没想好,先把 M 项自测跑了。" },
       { name: "SE r6 BP-11:闸怎么拦只写回声 D179 不算", text: "是我的锅。闸怎么拦:归 D179 一起处置。" },
       { name: "SE:我不小心写错了", text: "我不小心写错了路径,已改。" },
+      { name: "SE 279:「不立闸」不写理由不算", text: "我写错了路径。闸怎么拦:不立闸。" },
+      { name: "SE 红队 279 BP-8:重型错不认「不立闸」", text: "那是我的假读数,结论是反的,已据此提交。闸怎么拦:不立闸:当轮已经改掉了。" },
+      { name: "SE 红队 279 BP-9:「不值得立刻」是推迟", text: "是我的锅。闸怎么拦:不值得立刻处理,回头再说。" },
+      { name: "SE 红队 279 BP-9:「不立闸」理由本身是推迟", text: "我读错了日志。闸怎么拦:不立闸:回头再说吧。" },
+      { name: "SE 红队 279 附节三 4:理由不足 4 字", text: "我写错了路径。闸怎么拦:不立闸:没必要" },
       { name: "SE codex r6-fix §2:同句 D 号是被说错的对象,不是登记", text: "我说错了,D150 那条的状态写反了。" },
     ],
     neg: [
@@ -9766,9 +9923,59 @@ const RULE_SE = {
       { name: "SE 误拦 r7 FB-7:同句后半点名别人的错", text: "我发现文件里漏掉了一节,是上游生成器的问题。" },
       { name: "SE 误拦 r7 FB-9:已给 id + 附带后续计划", text: "是我的锅。闸怎么拦:E2 项已管,稍后补一条反例。" },
       { name: "SE 误拦 r7 FB-9:「先前」不是推迟", text: "是我的锅。闸怎么拦:先前已有 E2 项管这一形,不另立。" },
+      { name: "SE 279:小错写「不立闸」+ 理由", text: "我刚才写错了路径。闸怎么拦:不立闸:当轮自己发现并改掉,没进任何产物。" },
+      { name: "SE 误拦猎手 279 FB-6:同轮收尾写「已提交」不废「不立闸」出口", text: "批 279 已提交并推 private。另:我刚才写错了一处路径。闸怎么拦:不立闸:当轮自己发现并改掉,没进任何产物。" },
+      { name: "SE 误拦猎手 279 FB-7:用户原话「没必要立闸」+ 理由", text: "我刚才写错了路径。闸怎么拦:没必要立闸:当轮已改、没进产物。" },
+    ],
+  },
+};
+
+/** PF:范围里有别的会话带进来的改闸提交,本会话没碰闸 ⇒ 只提示(批 279;用户 2026-10-27 签「B+A」+「修闸 tag」)。
+ *  这是 P 的 D11 放下的那一半:P 只在本会话有「修闸 tag」时才要求两个猎手(RULE_P._p.selfTouched),没有 tag 的会话
+ *  原来会被别的会话的改闸提交连拦(交接单 20261027 追加节:5 轮),现在只看到本提示。
+ *  提示里给 B:并行写的会话各开自己的 worktree(宪法恒定条款①),各自 HEAD 互不干扰,问题从源头消失。
+ *  判据:git 事实在、范围里有未按 sha 认账的改闸提交、本会话没碰闸(与 P 同一取值,不另写)。
+ *  天花板:同 selfTouched——钩子视野外又不在提交邻近窗口里的闸写入会被当成别人的。失效条件:20 批零命中 ⇒ 复议。 */
+const RULE_PF = {
+  id: "PF",
+  blocking: false,
+  law: "AGENTS.md#恒定条款",
+  requires: [],
+  detect: (ctx) => {
+    const P = RULE_P._p, f = P.facts(ctx);
+    if (!f || ctx.gateTouched !== false) return [];
+    const foreign = P.gitEngineUnhunted(f, ctx);
+    if (!foreign.length || P.selfTouched(ctx, f)) return [];
+    return [foreign.map((c) => String(c.sha || "?").slice(0, 7)).join(" ")];
+  },
+  exempts: [],
+  message: (hits) =>
+    `范围里有改闸提交(${hits[0]}),但本会话的动作里看不到碰闸 ⇒ P 不要求本会话起猎手。\n` +
+    `      **若是你自己经脚本 / 子进程改的闸**(钩子看不见那一类),照规矩仍要两个猎手——这一形闸判不出(红队 279 复审 BP-1),靠你认领。\n` +
+    `      若是别的会话的:两个会话共用一个 checkout 时,别人的提交会落进你的 HEAD;并行写请各开自己的 worktree(宪法恒定条款①)。`,
+  mutations: [
+    { name: "不看本会话碰没碰闸(碰过闸也提示)", apply: (r) => ({ ...r, detect: (ctx) => {
+      const P = RULE_P._p, f = P.facts(ctx);
+      return f && ctx.gateTouched === false && P.gitEngineUnhunted(f, ctx).length ? ["x"] : [];
+    } }) },
+    { name: "不看范围里有没有改闸提交", apply: (r) => ({ ...r, detect: (ctx) => (RULE_P._p.facts(ctx) && ctx.gateTouched === false && !RULE_P._p.selfTouched(ctx, RULE_P._p.facts(ctx)) ? ["x"] : []) }) },
+  ],
+  cases: {
+    pos: [
+      { name: "PF:别的会话的改闸提交、本会话没碰闸 ⇒ 提示", text: "导入完了。", gateTouched: false,
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
+    ],
+    neg: [
+      { name: "PF:本会话改过闸文件 ⇒ 不提示(归 P)", text: "提交。", gateTouched: false,
+        prior: [{ text: "改判据", write: "/repo/scripts/lib/gate-rules.mjs" }],
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
+      { name: "PF:范围里没有改闸提交 ⇒ 不提示", text: "导入完了。", gateTouched: false,
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["docs/x.md"], at: "2026-10-25T02:14:00Z" }] } },
+      { name: "PF:通道没接 ⇒ 不提示", text: "导入完了。",
+        headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
     ],
   },
 };
 
 export const RULES = [RULE_O, RULE_V, RULE_W, RULE_Q, RULE_D, RULE_G, RULE_B, RULE_C, RULE_H, RULE_F, RULE_L, RULE_N, RULE_I, RULE_J, RULE_M,
-  RULE_E0, RULE_E1, RULE_E2, RULE_K, RULE_K0, RULE_S, RULE_T, RULE_U, RULE_P, RULE_ND, RULE_DP, RULE_X, RULE_AD, RULE_MF, RULE_SE];
+  RULE_E0, RULE_E1, RULE_E2, RULE_K, RULE_K0, RULE_S, RULE_T, RULE_U, RULE_P, RULE_ND, RULE_DP, RULE_X, RULE_AD, RULE_MF, RULE_SE, RULE_PF];

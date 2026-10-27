@@ -568,6 +568,9 @@ export function buildCtx(entries, extra = {}) {
             // 批 278(D173③):两猎手覆盖过的改闸提交 sha(只收普通 sha,不收聚合键);缺/坏 ⇒ 空数组(不认任何 ⇒ 照旧要猎手,偏严)
             hunted: Array.isArray(extra.pLedger.hunted) ? extra.pLedger.hunted.filter((s) => typeof s === "string" && /^[0-9a-f]{40,64}$/i.test(s)).slice(-400) : [] }
         : null),
+    /** 批 279:本会话「修闸 tag」(PreToolUse 按动作记的 `.claude/.gate-touch.jsonl`,见 lib/gate-touch.mjs)。
+     *  三态:undefined=通道没接(夹具 / 回放 ⇒ P 保持旧判法);true / false=账里有 / 没有本会话;null=账读不了(P 按碰过算)。 */
+    gateTouched: extra.gateTouched === undefined ? undefined : (extra.gateTouched === true || extra.gateTouched === false ? extra.gateTouched : null),
     bgTasks: Array.isArray(extra.bgTasks) ? extra.bgTasks : null,
     /** 部署欠账事实(DP 项,2026-09-12 批 202):`{lastPushTs, pushRef, lastProbeTs}`,由 hook 经
      *  `lib/debt-facts.mjs` 读一次注入(reflog 最后一次 `update by push` vs 欠账探针标记)。三态同 pLedger:

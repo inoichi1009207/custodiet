@@ -12,7 +12,7 @@
 //   · 语料 = 本项目转录目录(~/.claude/projects/<项目名>/*.jsonl,不含子代理转录)+ `--corpus <目录>` 追加的;
 //     每个主线 assistant 的 end_turn 是一个回合,截该处之前最多 `--tail` 条条目当转录前缀。
 //   · 抽样:全部回合按 `--seed` 洗牌后取前 `--max` 个(缺省 1500;按 mtime 排序会只取到写规则的那个会话 = 拿训练集测,见 hook run() 头注)。
-//   · 产出:一屏摘要(阻断回合改前 / 改后、新增 / 解除、按规则分、前 10 条新增样例)+ 全量 JSON(`--out`,缺省 .claude/.gate-replay/last.json)。
+//   · 产出:一屏摘要(阻断回合改前 / 改后、新增 / 解除、按规则分、前 10 条新增样例)+ 全量 JSON(`--out`,缺省 .claude/.gate-replay/run-<时刻>-<pid>.json,另抄 last.json)。
 //
 // 用法:node --no-warnings scripts/gate-replay.mjs [--base <rev> | --base=<rev>] [--corpus <目录>]... [--max N] [--seed S] [--tail N] [--out 文件]
 //       node --no-warnings scripts/gate-replay.mjs --self-test
@@ -31,6 +31,11 @@
 //     回放恒为空,只能靠读 diff(误拦猎手回件 a48b3bca 附节二⑤)。
 //   · 语料含正在写的会话转录:两次运行之间可用回合数会变,洗牌后入样的回合就换一批;只有语料不动时种子才可复现(同上附节二③)。
 //   · 不写真台账:run() 不传 live,台账 / 心跳 / journal 的落盘都在 live 门后(hook-stop-closure.mjs)。
+//   · **MF 在 detect 里直接读此刻盘面**上那条 memory 的全文(D179):回放历史回合时读到的是今天的文件内容,不是当时的;
+//     那条 memory 后来补了执行面行 ⇒ 历史回合也判成不拦。MF 的回放读数只反映「今天的 memory 盘面」。
+//   · **「修闸 tag」零覆盖**(批 279):回放里 `gateTouched` 恒为 undefined ⇒ P 的 selfTouched 恒真 ⇒ 修闸 tag 与 PF 一条都回放不到,
+//     只能靠读 diff、hook 自测与内存探针(误拦猎手 279 终版附节二 4)。
+//   · 输出:缺省写 `.claude/.gate-replay/run-<时刻>-<pid>.json` 并抄一份到 last.json;并发时 last.json 只留最后写的那次,以摘要里「全量:」那行的路径为准(批 279)。
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -131,7 +136,8 @@ function materializeBase(rev) {
 }
 
 async function main(argv) {
-  const opt = { base: "HEAD", corpus: [], max: 1500, seed: 20261019, tail: 4000, out: path.join(ROOT, ".claude", ".gate-replay", "last.json") };
+  // 批 279(274 追加节「并发回放互相覆盖」):缺省输出按进程分开,两个猎手同时跑不再互相盖掉;跑完另抄一份到 last.json(并发时它取最后写的那次)
+  const opt = { base: "HEAD", corpus: [], max: 1500, seed: 20261019, tail: 4000, out: path.join(ROOT, ".claude", ".gate-replay", `run-${Date.now()}-${process.pid}.json`), outDefault: true };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i], v = argv[i + 1];
     if (k.startsWith("--base=")) { opt.base = k.slice("--base=".length); continue; }   // codex 266-r7 §1:与 P 认的写法对齐
@@ -140,7 +146,7 @@ async function main(argv) {
     else if (k === "--max") { opt.max = Number(v); i++; }
     else if (k === "--seed") { opt.seed = Number(v); i++; }
     else if (k === "--tail") { opt.tail = Number(v); i++; }
-    else if (k === "--out") { opt.out = path.resolve(v); i++; }
+    else if (k === "--out") { opt.out = path.resolve(v); opt.outDefault = false; i++; }
     else { console.error(`未知参数 ${k}`); return 2; }
   }
   if (!(opt.max > 0) || !Number.isFinite(opt.seed) || !(opt.tail > 0)) { console.error("--max / --tail 须为正数,--seed 须为数"); return 2; }
@@ -189,6 +195,7 @@ async function main(argv) {
   fs.writeFileSync(opt.out, JSON.stringify({ base: base.sha, after: "worktree", worktree, seed: opt.seed, max: opt.max, tail: opt.tail, corpus: dirs,
     turnsAvailable: all.length, evidenceShared: evShared, ...r, rows: undefined, added: r.added, removed: r.removed, changed: r.changed, errored,
     picked: jobs.map((j) => `${j.file}#${j.idx}`) }, null, 1));   // 全路径:多语料目录有同名转录时也能唯一反查(codex 266-r2 表)
+  if (opt.outDefault) { try { fs.copyFileSync(opt.out, path.join(path.dirname(opt.out), "last.json")); } catch { /* 抄不成不影响本次结果文件 */ } }
   const rules = Object.entries(r.newBlocksByRule).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join(" ") || "无";
   console.log(`gate-replay base=${base.sha.slice(0, 8)} → 工作树:回放 ${r.turns} 回合(可用 ${all.length};语料 ${files.length} 份转录;种子 ${opt.seed};${Math.round((Date.now() - t0) / 1000)} 秒)`);
   console.log(`  阻断回合:改前 ${r.blockedBefore} / 改后 ${r.blockedAfter};新增 ${r.added.length}、解除 ${r.removed.length}、规则变了 ${r.changed.length};出错 ${r.errors}`);
