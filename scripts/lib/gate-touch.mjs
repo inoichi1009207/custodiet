@@ -131,6 +131,34 @@ export function rootUnder(root, resolve = null) {
   };
 }
 
+/** codex 调用段(启动器已剥)里 codex 自己的工作目录参数(`-C` / `--cd` / `--cwd`,空格或 `=` 给值),只看参数区、取最后一个;没有 ⇒ null。
+ *  参数区 = 命令头(codex / node …codex-run.mjs)之后、第一个非选项且非子命令词、也不是已知带值选项之值的词(prompt)之前。
+ *  认不出的带值选项后面那个值会被当成 prompt 起点 ⇒ 提前收手、更可能返回 null(记 tag,偏严)。 */
+const CODEX_DIR_OPT = /^(?:-C|--cd|--cwd)$/;
+const CODEX_VALUE_OPT = /^(?:-s|--sandbox|-m|--model|-c|--config|-p|--profile|-i|--image|-a|--ask-for-approval|-o|--output-last-message|--output-schema|--add-dir|--color|--task|--effort|--timeout|--model-reasoning-effort|--job|--out|--output)$/;
+const CODEX_SUBCMD = /^(?:exec|e|resume|review|apply|login|logout|mcp|proto|completion|debug|cloud|sandbox|help)$/;
+export function codexDirArg(seg) {
+  const toks = String(seg || "").match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+  let i = 0;
+  if (/^["']?(?:\S*[\\/])?codex(?:\.exe|\.cmd|\.ps1)?["']?$/i.test(toks[0] || "")) i = 1;
+  else { const k = toks.findIndex((x) => /codex-run\.mjs["']?$/i.test(x)); if (k < 0) return null; i = k + 1; }
+  const unq = (x) => String(x).replace(/^["']|["']$/g, "");
+  let dir = null, sawPos = false;
+  for (; i < toks.length; i++) {
+    const x = toks[i];
+    if (/^-/.test(x)) {
+      const eq = x.indexOf("=");
+      const name = eq > 0 ? x.slice(0, eq) : x;
+      if (CODEX_DIR_OPT.test(name)) { if (eq > 0) dir = unq(x.slice(eq + 1)); else if (i + 1 < toks.length) dir = unq(toks[++i]); }
+      else if (eq < 0 && CODEX_VALUE_OPT.test(name)) i++;
+      continue;
+    }
+    if (!sawPos && CODEX_SUBCMD.test(x)) { sawPos = true; continue; }
+    break;   // prompt 串起点:其后的 -C 是 prompt 正文
+  }
+  return dir;
+}
+
 /** 这次工具调用算不算碰闸;算 ⇒ 返回理由串,不算 ⇒ null。deps 注入解析零件(本模块不拖规则引擎)。 */
 export function touchWhy(input, deps) {
   const tool = String(input?.tool_name || "");
@@ -165,7 +193,16 @@ export function touchWhy(input, deps) {
       const LAUNCH = /^(?:(?:npx|bunx|env|&|call|exec|command|nohup|time|start|pnpm\s+(?:dlx|exec)|npm\s+exec|yarn\s+dlx)\s+(?:-\S+\s+)*)*/i;
       const s2 = s.replace(LAUNCH, "");
       if (/^["']?(?:\S*[\\/])?codex(?:\.exe|\.cmd|\.ps1)?["']?\s/i.test(s2) || /^node(?:\.exe)?\s+(?:--\S+\s+)*\S*codex-run\.mjs\b/i.test(s2)) {
-        if (/(?:^|\s)(?:--sandbox[\s=]+(?:workspace-write|danger-full-access)|--full-auto|--yolo|--dangerously-bypass\S*)/.test(s)) return "codex-writable";
+        // 批 285(D173 ③ 残余 FB-7,误拦):显式把 codex 的工作目录指到别的仓(裸 codex `-C` / `--cd`,codex-run `--cwd`)⇒ 不记;
+        //   不带目录参数、或目录在本仓根下的照记。代价(漏放侧,接受):可写沙箱的笼子在本机没关住(往 ../ 写成功),
+        //   指向别仓的 codex 仍可能写到本仓闸文件——出现一次即重开。
+        // 批 285 第二轮复核(红队第 2 份 BP-3):目录参数只认 codex 自己的参数区(第一个非选项的 prompt 串之前),多次给出取最后一个
+        //   (与常见 CLI 解析一致)——原在整段里找第一个,prompt 里引了「git -C E:/cbot」就当成指向别仓不记 tag,
+        //   `--cwd E:/cbot --cwd /repo` 取了前一个。只会让「指向别仓」更难成立 ⇒ 多记 tag 的方向(偏严,同 ⑤)。
+        const cdir = codexDirArg(s2);
+        //   目录是变量 / 命令替换(`$PWD`、`$(pwd)`)解析不出 ⇒ 当本仓照记
+        const elsewhere = cdir && !/\$/.test(cdir) && !underRoot(segCwd && !/^([A-Za-z]:)?[\\/]|^~|^\$/.test(cdir) ? `${String(segCwd).replace(/\\/g, "/").replace(/\/+$/, "")}/${cdir}` : cdir);
+        if (!elsewhere && /(?:^|\s)(?:--sandbox[\s=]+(?:workspace-write|danger-full-access)|--full-auto|--yolo|--dangerously-bypass\S*)/.test(s)) return "codex-writable";
       }
       // 写目标是变量 / 命令替换展开(解析不出路径)且本段出现闸相关字样 ⇒ 按碰过记(偏严;红队 279 复审 BP-1)
       if (/(?:>>?|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|Set-Content|Out-File|Add-Content)\s*[^|;&\n]*\$[({\w]/.test(s) && /scripts|gate|hook/i.test(s)) return "dynamic-target";
@@ -224,6 +261,17 @@ export function selfTest(deps0, os, log = console.log) {
   t("codex 可写沙箱 ⇒ 记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --sandbox workspace-write" }), "codex-writable");
   t("codex 只读 ⇒ 不记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md" }), null);
   t("红队复审 BP-1:裸 codex exec 可写沙箱 ⇒ 记", call("Bash", { command: "codex exec --sandbox workspace-write \"fix it\"" }), "codex-writable");
+  // 批 285(D173 FB-7):codex 工作目录显式指到别的仓 ⇒ 不记;指本仓 / 相对 / 变量 ⇒ 照记
+  t("285 FB-7:codex-run --cwd 别的仓 + 可写 ⇒ 不记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd E:/cbot --sandbox workspace-write" }), null);
+  t("285 FB-7:裸 codex -C 别的仓 + 可写 ⇒ 不记", call("Bash", { command: "codex exec -C E:/cbot --sandbox workspace-write \"fix it\"" }), null);
+  t("285 FB-7:裸 codex --cd=别的仓 + 可写 ⇒ 不记", call("Bash", { command: "codex exec --cd=\"E:/other repo\" --sandbox workspace-write x" }), null);
+  t("285 FB-7 反向:--cwd 本仓子目录 + 可写 ⇒ 记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd /repo/scripts --sandbox workspace-write" }), "codex-writable");
+  t("285 FB-7 反向:--cwd 相对路径(落在本仓)+ 可写 ⇒ 记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd . --sandbox workspace-write" }), "codex-writable");
+  t("285 FB-7 反向:--cwd 变量 + 可写 ⇒ 记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd $PWD --sandbox workspace-write" }), "codex-writable");
+  // 批 285 第二轮复核(红队第 2 份 BP-3):目录参数只认 codex 参数区、取最后一个
+  t("285 二轮 BP-3:prompt 里引了 git -C 别的仓 ⇒ 照记", call("Bash", { command: "codex exec --sandbox workspace-write \"先跑 git -C E:/cbot status 再修\"" }), "codex-writable");
+  t("285 二轮 BP-3:--cwd 写两次取最后一个(本仓)⇒ 照记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd E:/cbot --cwd /repo --sandbox workspace-write" }), "codex-writable");
+  t("285 二轮 BP-3 对照:--cwd 写两次、最后一个是别的仓 ⇒ 不记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd /repo --cwd E:/cbot --sandbox workspace-write" }), null);
   t("红队复审 BP-1:命令替换写目标 + 闸字样 ⇒ 记", call("Bash", { command: "printf x >> $(printf scripts/lib/gate-rules.mjs)" }), "dynamic-target");
   t("变量写目标但与闸无关 ⇒ 不记", call("Bash", { command: "echo x > $TMPDIR/out.txt" }), null);
   // 误拦猎手 279 终版 FB-1 / FB-3 / FB-4

@@ -184,7 +184,9 @@ const G_CHECK = {
     //   r6 BP-15:node 须是该段命令首词、自测文件须是脚本参数(`node --check …selftest.mjs` / `grep node …` 不算);
     //   误拦 r6 FB-14:容 `\` 续行
     //   codex 276-r6-fix-audit 附 1:认 `node.exe`、独立 `--`、`cd scripts && node hook-remote-check.selftest.mjs`(裸 basename)
-    const ran = (c) => !!c && c.ranBash(/--self-test|gate:self-test|gate:accept|gate-migrate-check|(?:^|[;&|(\n])\s*node(?:\.exe)?(?:\s+(?:--(?:(?!check\b|eval\b|print\b)[\w-]+(?:=\S+)?)?|\\\r?\n))*\s+(?!-)[^\s|;&]*hook-remote-check\.selftest\.mjs/);
+    //   批 285(D179 误拦 r7 FB-6 余,只提示项):段首的环境变量赋值(`FOO=1 node …`)、`timeout 300 node …`、
+    //   带值的预加载旗(`node -r x …` / `--require x` / `--import x` / `--loader x`)同样算真跑;仍须在段首(echo 里的不算)。
+    const ran = (c) => !!c && c.ranBash(/--self-test|gate:self-test|gate:accept|gate-migrate-check|(?:^|[;&|(\n])\s*(?:\w+=\S*\s+|timeout\s+(?:-\S+\s+)*\d+[smhd]?\s+)*node(?:\.exe)?(?:\s+(?:(?:-r|--require|--import|--loader|--experimental-loader)\s+(?!-)\S+|--(?:(?!check\b|eval\b|print\b)[\w-]+(?:=\S+)?)?|\\\r?\n))*\s+(?!-)[^\s|;&]*hook-remote-check\.selftest\.mjs/);
     if (!touchedGate || ran(ctx) || ran(win)) return null;
     return "④ 关账义务:本轮提交触及闸机件,而本轮∪批窗口没有自测/验收动作(--self-test 或 gate:accept)";
   },
@@ -256,6 +258,9 @@ export const RULE_G = {
         tracked: ["scripts/hook-remote-check.mjs"], bash: "node --check scripts/hook-remote-check.selftest.mjs" },
       { name: "276 r6 BP-15:grep node 自测文件不算", text: "改好了,提交。", commit: true, write: "scripts/hook-remote-check.mjs",
         tracked: ["scripts/hook-remote-check.mjs"], bash: "grep -n node scripts/hook-remote-check.selftest.mjs" },
+      // 批 285 反向钉:前缀放宽只认段首,echo 里的不算
+      { name: "285 FB-6 余 反向:echo 里的 timeout … node 自测不算", text: "改好了,提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "echo timeout 300 node scripts/hook-remote-check.selftest.mjs" },
     ],
     neg: [
       // 批 276 误拦 r6 FB-14:续行写法真跑了推送防线自测 ⇒ 放行;cd 之后跑也放
@@ -271,6 +276,13 @@ export const RULE_G = {
         tracked: ["scripts/hook-remote-check.mjs"], bash: "node -- scripts/hook-remote-check.selftest.mjs" },
       { name: "276 codex r6-fix 附 1:cd scripts 后裸文件名跑自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
         tracked: ["scripts/hook-remote-check.mjs"], bash: "cd scripts && node hook-remote-check.selftest.mjs" },
+      // 批 285(D179 误拦 r7 FB-6 余)
+      { name: "285 FB-6 余:段首环境变量赋值后跑自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "FOO=1 node --no-warnings scripts/hook-remote-check.selftest.mjs" },
+      { name: "285 FB-6 余:timeout 300 node 跑自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "timeout 300 node scripts/hook-remote-check.selftest.mjs" },
+      { name: "285 FB-6 余:node -r x 跑自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
+        tracked: ["scripts/hook-remote-check.mjs"], bash: "node -r ./instrument.js scripts/hook-remote-check.selftest.mjs" },
       // 新建载体但**没提交** ⇒ 不追(杀「去掉 didCommit 前置闸」)
       { text: "写了个新零件,还没提交。", write: "scripts/zzz-new-widget.mjs" },
       // 普通提交轮:不触造物面/register/闸机件 ⇒ 一个字的仪式文本都不要求(v1 的 21 次噪声消失)
@@ -377,7 +389,9 @@ export const RULE_B = {
 //   或引文后紧跟「这句 / 那句 / 这段 / 字样 / 的说法」才抹——那才是「引文=提及不是使用」的本意(批 273 立这刀的样本
 //   「…:「覆盖到但断言弱的行比没覆盖的更险」这句不在那一页上」后接「这句」,照抹)。BP-1 的转述动词(报 / 说 / 指出…)仍优先保留。
 //   残余:没有提及标记的纯引用(「页面上写的:「X 没覆盖」」以外的写法,如裸「「X 没覆盖」不成立」)照拦——C 不阻断,取多拦一侧。
-const C_MENTION_BEFORE = /(?:原话|原文|原句|写着|写的是|写道|标题|题为|名为|叫做?|称为|所谓|字样|条件\s*\d+)(?:是|为)?\s*[:：]?\s*$/;
+// 批 285(D175 ③,只提示项):「撞「不在白名单」」——撞上的是闸 / 工具给出的那句话,是提及不是本仓缺件陈述;提及标记补「撞(上 / 到 / 了)」。
+//   代价(漏放侧,接受):「撞「hook 还没接线」」若真在说自己的缺件,不再提示。
+const C_MENTION_BEFORE = /(?:原话|原文|原句|写着|写的是|写道|标题|题为|名为|叫做?|称为|所谓|字样|条件\s*\d+|撞(?:上|到|了)?)(?:是|为)?\s*[:：]?\s*$/;
 const C_MENTION_AFTER = /^\s*(?:这一?句|那一?句|这段话?|那段话?|这行字?|这条(?:话|说法)|一句|字样|的(?:说法|原话|字样|原文)|这个(?:标签|说法|词))/;
 // 批 276(BP-6):③ 的分句切点补顿号与转折 / 递进连接词——「D95 已登记、hook 还没接线」「D95 已登记但 hook 还没接线」
 //   的后半是另一件缺件,不得被前半的「已登记」吃掉。连接词表只收**独立成词**时几乎必是分句界的几个。
@@ -387,6 +401,9 @@ const C3_RE = new RegExp(`${C3_CLAUSE}{0,200}已登记${C3_CLAUSE}{0,200}`, "g")
 //   ——「hook 还没接线、已登记(D172)」「hook 还没接线但已登记(D172)」⇒ 前一分句连同本分句一起遮。
 //   方向只此一种:「D95 已登记、hook 还没接线」(已登记在前、缺件在后)不受影响,照提示。逗号连写照旧不回指(BP-2 口径)。
 const C3_BACK_RE = new RegExp(`${C3_CLAUSE}{0,200}(?:、|但是?)\\s*(?:也|均|都|现)?已登记${C3_CLAUSE}{0,200}`, "g");
+// 批 285(D175 r3 BP-11):「那个 hook 已登记但还没接线」——「但」后不换主语、直接接否定 = 同一件事的状态句(已入账),整句遮。
+//   「D95 已登记但 hook 还没接线」(但后另起主语)不受影响,照提示(276 BP-6 口径)。代价(漏放侧,接受):同主语的「已登记但还没修」不再提示。
+const C3_SAME_RE = new RegExp(`${C3_CLAUSE}{0,200}已登记\\s*(?:但是?|不过)\\s*(?:还|尚|仍)?(?:没有?|未)[^。！？!?;；，,：:|、\\n]{0,200}`, "g");
 const defectText = (ctx) => {
   const raw = String(ctx.text || "");
   const keepQuote = /(?:报|说|指出|发现|提到|反映)\s*[:：]?\s*$/;
@@ -409,6 +426,7 @@ const defectText = (ctx) => {
   const blank = (s) => " ".repeat(s.length);                          // 等长保行:回显仍取原文同号行
   return kept.split("\n").map((l) => {
     // 误拦猎手 ae8ef771 附节二②:无句读长行上不限长的两侧量词是平方级(20 万字 33 秒,超 Stop 30 秒)⇒ 两侧各限 200
+    l = l.replace(C3_SAME_RE, (s) => (/(?:不是|并非|没有?|未|非)\s*已登记/.test(s) ? s : blank(s)));   // ③″ 同主语状态句(批 285 D175 r3 BP-11)
     l = l.replace(C3_BACK_RE, (s) => (/(?:不是|并非|没有?|未|非)\s*已登记/.test(s) ? s : blank(s)));   // ③′ 回指前一分句(批 276b BP-8)
     l = l.replace(C3_RE, (s) => (/(?:不是|并非|没有?|未|非)\s*已登记/.test(s) ? s : blank(s)));   // ③ 同分句(批 276 BP-6:切点含 、/但/另外…)
     if (!notes.length) return l;
@@ -421,14 +439,31 @@ export const RULE_C = {
   id: "C",
   blocking: false,
   law: "AGENTS.md#恒定条款",
-  detect: (ctx) => {
-    const hits = matchAny(defectText(ctx), PAT.defect, ctx.text);
+  detect: (ctx, opt = {}) => {
+    const all = matchAny(defectText(ctx), PAT.defect, ctx.text);
+    // 批 285(D152 d-C,误拦):写在 ⏸ 段里的缺件是**摊给用户裁**的那件事本身(宪法唯一通用等待标识),
+    //   不是「陈述了缺陷却没处置」——外部只读会话 10-11 实撞「⏸ 需要你确认:hook 还没接线…」照报。
+    //   只免 ⏸ 所在段落(空行为界;⏸ 段只有一行标题时连下一段)里的命中行,段外缺件照报(cases.pos 钉着)。
+    //   代价(漏放面,按用户取舍接受):⏸ 段里顺手夹一句与所问无关的缺件不再提示;C 本就不阻断,出现一次真实漏放损失即重开。
+    const hits = opt.noPauseSeg ? all : RULE_C._dropPauseSeg(all, ctx.text);
     if (!hits.length) return [];
     if (ctx.writes.length) return [];                                  // 动手处置了
     // 登记面:写进未覆盖栏 / 落进 clipboard/prompts / 事件流。只看**我说的**与**我写的**,
     // 不看工具输出(旧实现用 rawText,于是闸自己上一轮消息里的「未覆盖」就能豁免它)。
     if (/未覆盖/.test(ctx.text) || ctx.wroteAny(/clipboard[/\\]prompts|constraint-events\.jsonl/)) return [];
     return hits;
+  },
+  /** 命中行(matchAny 的形状:行 trim 后截 120)落在 ⏸ 段里的剔掉。 */
+  _dropPauseSeg: (hits, text) => {
+    const paras = String(text || "").split(/\n[ \t]*\n/);
+    const inPause = new Set();
+    paras.forEach((p, i) => {
+      if (!p.includes("⏸")) return;
+      const segs = [p];
+      if (p.trim().split("\n").length === 1 && paras[i + 1]) segs.push(paras[i + 1]);
+      for (const s of segs) for (const ln of s.split("\n")) inPause.add(ln.trim().slice(0, 120));
+    });
+    return inPause.size ? hits.filter((h) => !inPause.has(h)) : hits;
   },
   exempts: [],
   message: (hits) =>
@@ -440,6 +475,8 @@ export const RULE_C = {
       if (!hits.length || ctx.writes.length) return [];
       return hits;
     } }) },
+    // 批 285(D152 d-C):真退回——⏸ 段里的缺件照报(证人 = neg「285 D152 d-C」两条)
+    { name: "285 退回:⏸ 段里的缺件不免", apply: (r) => ({ ...r, detect: (ctx) => RULE_C.detect(ctx, { noPauseSeg: true }) }) },
     // 另一分支:去掉「本轮动手改了即算处置」⇒ 真去修的回合也会被报
     { name: "去掉写动作即处置", apply: (r) => ({ ...r, detect: (ctx) => {
       const hits = matchAny(ctx.text, PAT.defect);
@@ -473,6 +510,9 @@ export const RULE_C = {
       { text: "D95 已登记、hook 还没接线。" },
       { text: "D95 已登记但 hook 还没接线。" },
       { text: "D95 已登记 另外 hook 还没接线。" },
+      // 批 285(D152 d-C)贴边:⏸ 段外的缺件照报(只免 ⏸ 所在段)
+      { name: "285 D152 d-C 贴边:缺件在 ⏸ 段之前的另一段 ⇒ 照报",
+        text: "迁移脚本的回滚分支还没做完,先不管。\n\n另外顺手改了措辞。\n\n⏸ 需要你确认:要不要现在发布?" },
     ],
     neg: [
       { text: "那条还没落盘,已写进未覆盖栏。" },
@@ -493,6 +533,12 @@ export const RULE_C = {
       // 批 276b BP-8:「已登记」紧跟顿号 / 但 起头 ⇒ 回指前一分句,一起遮
       { text: "hook 还没接线、已登记(D172)。" },
       { text: "hook 还没接线但已登记(D172)。" },
+      // 批 285(D152 d-C,误拦):⏸ 段里摊给用户裁的缺件就是待裁事项本身(10-11 外部会话实撞原形)
+      { name: "285 D152 d-C:⏸ 同行写缺件", text: "⏸ 需要你确认:hook 还没接线,要不要现在接?" },
+      { name: "285 D152 d-C:⏸ 标题独占一行,缺件在下一段列表", text: "改完了。\n\n⏸ 需要你确认\n\n- hook 还没接线,接它要动 settings.json(需你签)" },
+      // 批 285(D175):同主语状态句 / 撞上的闸消息是提及
+      { name: "285 D175 r3 BP-11:已登记但还没接线(同一件事)", text: "那个 hook 已登记但还没接线。" },
+      { name: "285 D175 ③:撞「…」是提及闸消息", text: "这一轮撞「不在白名单」,换了写法。" },
     ],
   },
 };
@@ -818,6 +864,11 @@ export const RULE_L = {
       //   「不在 HEAD 的新增里」;isNew 判既有,唯一命中理由是 Write 工具形态。「新建只认 isNew」的证人
       { text: "先看有啥再造,分两次提交了。", bash: "ls scripts/", write: "/repo/scripts/new-tool.mjs",
         tracked: ["scripts/new-tool.mjs"], prior: [{ text: "x" }] },
+      // 批 285(D136②):夹具补了 justAdded 通道后的原形——HEAD 最近一次新增提交里是别的文件(第二次提交只带了别的新件),
+      //   新件已追踪 ⇒ isNew 判既有,唯一命中理由仍是 Write 工具形态。「新建只认 isNew」的第二个证人(这回注入面与生产同形)
+      { name: "285 D136②:同轮造件分两次提交(justAdded 注入,新件不在其中)", text: "先看有啥再造,分两次提交了。",
+        bash: "ls scripts/", write: "/repo/scripts/new-tool.mjs",
+        tracked: ["scripts/new-tool.mjs", "scripts/other-new.mjs"], justAdded: ["scripts/other-new.mjs"], prior: [{ text: "x" }] },
       // 同上,Bash heredoc 造件
       { text: "造好了。", bash: ["ls scripts/", "cat > scripts/new-tool.mjs <<'EOF'\nconsole.log(1)\nEOF"],
         tracked: ["scripts/new-tool.mjs"], prior: [{ text: "x" }] },
@@ -922,6 +973,29 @@ const CARRIER_RE = CREATION_SURFACE;
 // 批 259(红队 a391d46c BP-5):锚到路径边界、不分大小写(NTFS)——`/tmp/AGENTS.md.bak`、`docs/laws/x.md.orig` 不是法条。
 //   不用 `$`:退回旧判法时它还要在整段命令文本里找(`sed -i … AGENTS.md 2>/dev/null`)
 const LAW_RE = /(?:^|[\\/\s'"`=(])(?:AGENTS\.md|docs[\\/]laws[\\/][\w-]+\.md)(?![\w.-])/i;
+// 批 285(D159⑪ 误拦):LAW_RE 不锚仓根 ⇒ `cp a /tmp/AGENTS.md`、往 scratchpad(…/AppData/Local/Temp/…)放一份宪法草稿 / 副本
+//   被 J 判「改宪法」。临时目录里的同名文件不是任何仓的法条 ⇒ J 的路径谓词剔掉**以临时目录开头**的路径(仅此一处收窄)。
+//   **不做**分诊草图里「别的盘一律不算」那半:`isCarrierPath` 注明 D93「限定本仓」已撤销(跨仓承重件照看),
+//   别仓的 AGENTS.md 算不算 J 面是定位取舍,不在本批自签面内(登记 deferred)。
+//   代价:有人把真宪法放在临时目录里改,J 不响——临时目录不被任何会话加载为宪法,构不成「改法」。
+//   失效条件:J 反例「285 D159:cp 到 /tmp」「285 D159:写 scratchpad 草稿」或正例「285 D159 对照:别盘仓根的 AGENTS.md 照拦」翻红。
+// 批 285 第二轮复核(误拦猎手第 1 份 FB-1):`cp AGENTS.md ~/AppData/Local/Temp/x/AGENTS.md` 被判改法——家目录写成 `~/` / `$HOME/` / `${HOME}/`
+//   的临时目录原不认。现认这三种家目录写法后接 `AppData/Local/Temp/`(只认临时目录那一支,裸 `~/` 下的别处不算临时)。
+//   代价(漏放侧,接受):同上「临时目录里的同名文件不是法条」。V.noHomeTemp 只给变异用。
+const TEMP_AREA = /^(?:\/(?:var\/)?tmp\/|[A-Za-z]:\/(?:Windows\/Temp|Users\/[^/]+\/AppData\/Local\/Temp)\/|\/[A-Za-z]\/(?:Windows\/Temp|Users\/[^/]+\/AppData\/Local\/Temp)\/|(?:~|\$HOME|\$\{HOME\})\/AppData\/Local\/Temp\/)/i;
+const TEMP_AREA_NOHOME = /^(?:\/(?:var\/)?tmp\/|[A-Za-z]:\/(?:Windows\/Temp|Users\/[^/]+\/AppData\/Local\/Temp)\/|\/[A-Za-z]\/(?:Windows\/Temp|Users\/[^/]+\/AppData\/Local\/Temp)\/)/i;
+// 批 285 第二轮复核(派出方追加,红队第 1 份):判临时目录前先消 `.` / `..` 段(复用 P 的唯一路径归一 RULE_P._p.resolve)——
+//   原按字面前缀判,`E:/Windows/Temp/../../test/AGENTS.md`、`/tmp/../test/AGENTS.md` 以临时目录开头、实际落在仓里,J 不响(漏放)。
+//   归一只会让路径**离开**临时目录前缀(相对路径归一后仍是相对,不会变成临时目录)⇒ 只多拦伪装形,不多拦诚实写法。
+//   调用时 RULE_P 已定义(本谓词只在 detect 里求值)。V.noDotNorm 只给变异用。
+const lawPathPred = ({ noHome = false, noDot = false } = {}) => ({ test: (s) => {
+  if (!LAW_RE.test(s)) return false;
+  const flat = String(s).replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+  let p = flat;
+  if (!noDot) { try { p = RULE_P._p.resolve(null, flat); } catch { p = flat; } }   // `/c/Users/…` 会归成 `c:/Users/…`,TEMP_AREA 两形都认
+  return !(noHome ? TEMP_AREA_NOHOME : TEMP_AREA).test(p);
+} });
+const LAW_PATH = lawPathPred();
 
 /** touched 的判据(批 258 I-c;复核红队三轮后按停止出口①收口,不再补):
  *  ① 先问引号感知的 `bashWriteTargets`(会递归解子壳)——**不设进门词表**:一轮那张词表比解析器窄,
@@ -1029,6 +1103,9 @@ export const RULE_I = {
   id: "I",
   blocking: true,
   law: "docs/laws/collab.md#五之二、造物两约束",
+  // 批 285(D157③):判据最后一次改动的时刻 = 7de7678(批 260,touched 换写入效果分析的收口;`git log -L` 量 RULE_I 段所得)。
+  //   `--fp-report` 的误报率表只数此刻之后的报警与自签(此前 17 笔自签全部早于 10-10)。**改 I 的判据时同步改这里**;忘了改 ⇒ 窗口偏宽,退回全量口径。
+  criteriaSince: "2026-10-12T02:28:08+08:00",
   // 出路即数据(批 117)。判据**只看动作**:本地任一层 + 联网,两半都要(批 253 起不再要求文字)。
   escapes: [
     { say: "**先用一句话写出你要解决的问题,拿它当搜索键**(不是拿「你打算写的实现」当键)" +
@@ -1098,6 +1175,9 @@ export const RULE_I = {
     `      ② ~/.claude/plugins/known_marketplaces.json 里**已在册未装**的市场\n` +
     `      ③ 本项目已有的封装(.claude/commands|skills)——绕过封装直调底层=丢掉封装里的纪律\n` +
     `      ④ 联网搜同类实现(WebSearch/WebFetch 或 gh search)——现成件常在仓外,本地三层查不到\n` +
+    // 批 285 D114:法条 collab.md 五之二① 的本地扫描是四层(补了「本机 PATH 已装二进制 + 运行时/语言标准库」),
+    //   消息原只列三层 ⇒ 人读法条得四层、读闸提示得三层。只补消息,detect 不动(判据不看这一层,同 D17 裁定)。
+    `      另:法条的本地扫描还有一层「本机 PATH 已装二进制 + 运行时/语言标准库」(collab.md 五之二①)——判据不看这层,扫描义务照旧在\n` +
     `      (memory 笔记 .claude/projects/*/memory/*.md 不算工具载体,不在本项辖区)\n` +
     `      ⚠️ **搜索的键必须是「你要解决的问题」,不是「你打算写的实现」**。\n` +
     `      2026-08-20 实撞:造 shell 词法器时我搜的是 shell|quote|shlex|token|词法,报「无命中」。\n` +
@@ -1185,10 +1265,20 @@ export const RULE_I = {
       { name: "259 红队二轮(b):curl -o 下载成新脚本 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "curl -o scripts/new-tool.mjs https://example.com/x" },
       { name: "259 红队二轮(b):git -C 下的 mv 新名 ⇒ 命中", text: "改名。", tracked: ["scripts/x.mjs", "scripts/old.mjs"], bash: "git -C scripts mv old.mjs new-tool.mjs" },
       { name: "259 收口轮 BP-3:从别的分支 checkout 拣回新脚本 ⇒ 命中", text: "从分支拿回脚本。", tracked: ["scripts/x.mjs"], bash: "git checkout agent-branch -- scripts/new-tool.mjs" },
+      // 批 285 D160③ 对照:从别的版本拣(--source)仍会新建,照算
+      { name: "285 D160③ 对照:git restore --source=别的分支 拣回新脚本 ⇒ 命中", text: "从分支拿回脚本。", tracked: ["scripts/x.mjs"], bash: "git restore --source=agent-branch scripts/new-tool.mjs" },
+      // 批 285 第二轮复核(派出方追加,红队第 1 份):--source 的缩写与短选项捆绑同样是「从别处拣回」
+      { name: "285 二轮 红队 1:git restore --sour=别的分支 拣回新脚本 ⇒ 命中", text: "从分支拿回脚本。", tracked: ["scripts/x.mjs"], bash: "git restore --sour=agent-branch scripts/new-tool.mjs" },
+      { name: "285 二轮 红队 1:git restore -Wsagent-branch 拣回新脚本 ⇒ 命中", text: "从分支拿回脚本。", tracked: ["scripts/x.mjs"], bash: "git restore -Wsagent-branch scripts/new-tool.mjs" },
       // 批 260(D160①):heredoc 起头那行后接管道 / && 的写命令,原先解析成功却效果为空
       { name: "260 D160①:cat heredoc 管道给 bash 新建脚本 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' | bash\ncp a scripts/new-tool.mjs\nEOF" },
     ],
     neg: [
+      // 批 285 D160③(误拦):从索引 / HEAD 还原 = 丢弃改动,造不出新载体;原 op=write 走 isNew,文件恰在最近新增提交里(justAdded)即判新建。
+      //   夹具不注入 justAdded,以「不在追踪集」形态代证:还原效果不再进新建判(旧实现在这三条上命中)
+      { name: "285 D160③:git restore 丢弃改动不算新建", text: "丢弃改动。", tracked: ["scripts/x.mjs"], bash: "git restore scripts/new-tool.mjs" },
+      { name: "285 D160③:git checkout HEAD -- 丢弃改动不算新建", text: "丢弃改动。", tracked: ["scripts/x.mjs"], bash: "git checkout HEAD -- scripts/new-tool.mjs" },
+      { name: "285 D160③:git checkout -- 丢弃改动不算新建", text: "丢弃改动。", tracked: ["scripts/x.mjs"], bash: "git checkout -- scripts/new-tool.mjs" },
       // 复核红队二轮 BP-6:读 / 检索命令带 2>&1、引号里有写词 ⇒ 不是写入(D148 复活形)
       { name: "258 复核二轮 BP-6:D148 载荷 + 2>&1 不算新建", text: "喂一段测试载荷。", tracked: ["scripts/x.mjs"],
         bash: "echo '{\"command\":\"cat > .claude/skills/x/SKILL.md\"}' | node scripts/hook-guard.mjs 2>&1" },
@@ -1303,8 +1393,8 @@ export const RULE_J = {
   // ⚠️ 声明写进**法条正文**同样算数(ctx.written),不只认对话——
   //   对话是易失的,法条才是权威载体。旧实现只扫 assistant 文本,于是
   //   「写进文件了但没在对话里复述」被判违规(2026-08-19 实撞)。
-  detect: (ctx) => {
-    const laws = touched(ctx, LAW_RE, false);
+  detect: (ctx, V = {}) => {
+    const laws = touched(ctx, V.anyDir ? LAW_RE : (V.noHomeTemp || V.noDotNorm) ? lawPathPred({ noHome: !!V.noHomeTemp, noDot: !!V.noDotNorm }) : LAW_PATH, false);   // 批 285 D159:临时目录里的同名文件不算法条(见 TEMP_AREA)
     if (!laws.length) return [];
     if (matchAny(ctx.text, PAT.triggerLayer).length) return [];
     if (matchAny(ctx.written, PAT.triggerLayer).length) return [];
@@ -1325,10 +1415,15 @@ export const RULE_J = {
   mutations: [
     // 分支①:只认对话不认写入 ⇒ 「写进法条正文」的反例会被误报(旧实现的那个 bug)
     { name: "只扫对话不扫写入正文", apply: (r) => ({ ...r, detect: (ctx) => {
-      const laws = touched(ctx, LAW_RE, false);
+      const laws = touched(ctx, LAW_PATH, false);
       if (!laws.length) return [];
       return matchAny(ctx.text, PAT.triggerLayer).length ? [] : laws.slice(0, 4);
     } }) },
+    // 批 285 D159⑪:临时目录剔除的变异证人——退回不分目录的 LAW_RE ⇒ 「cp 到 /tmp」反例必须翻红
+    { name: "不剔临时目录(/tmp、scratchpad 里的同名文件也算法条)", apply: (r) => ({ ...r, detect: (ctx) => RULE_J.detect(ctx, { anyDir: true }) }) },
+    // 批 285 第二轮复核:两处修法各留一条退回(证人 = neg「285 二轮 FB-1」/ pos「285 二轮 红队 1:」)
+    { name: "285 二轮退回:家目录写法(~/、$HOME/)的临时目录不认", apply: (r) => ({ ...r, detect: (ctx) => RULE_J.detect(ctx, { noHomeTemp: true }) }) },
+    { name: "285 二轮退回:判临时目录前不消 ./.. 段", apply: (r) => ({ ...r, detect: (ctx) => RULE_J.detect(ctx, { noDotNorm: true }) }) },
     // 分支②:去掉法典路径限定 ⇒ 任何写动作都会被当成立法
     { name: "去掉法典路径限定", apply: (r) => ({ ...r, detect: (ctx) => {
       if (!ctx.writes.length) return [];
@@ -1377,8 +1472,36 @@ export const RULE_J = {
         bash: "node -e \"require('fs').renameSync('AGENTS.md','backup.md')\"" },
       // 批 260(D160①)
       { name: "260 D160①:heredoc 管道给 tee 写宪法 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' | tee AGENTS.md\nx\nEOF" },
-      { name: "260 D160①:heredoc 后 && cp 写宪法 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' && cp /tmp/x AGENTS.md\nx\nEOF" }],
+      { name: "260 D160①:heredoc 后 && cp 写宪法 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' && cp /tmp/x AGENTS.md\nx\nEOF" },
+      // 批 285 D159 对照:临时目录剔除不外溢到别盘 / 别仓(D93 撤销后跨仓照看);读调用剔除不吞掉同一路径的真写
+      { name: "285 D160③ 对照:git restore 还原宪法 J 照算(op=restore 只对问新建的调用方让路)", text: "还原了宪法。", tracked: ["scripts/x.mjs"], bash: "git restore AGENTS.md" },
+      { name: "285 D159 对照:别盘仓根的 AGENTS.md 照拦", text: "改了宪法。", tracked: ["scripts/x.mjs"], bash: "cp a /other/AGENTS.md" },
+      { name: "285 D159 对照:读后写回同一插值路径照拦", text: "改了宪法。", tracked: ["scripts/x.mjs"],
+        bash: "node -e 'const fs=require(\"fs\"); const s=fs.readFileSync(`${process.cwd()}/AGENTS.md`,\"utf8\"); fs.writeFileSync(`${process.cwd()}/AGENTS.md`, s+\"x\")'" },
+      { name: "285 D159 对照:open 读后 open(…,'w') 写回宪法照拦", text: "改了宪法。", tracked: ["scripts/x.mjs"],
+        bash: "python -c \"t=open('AGENTS.md').read(); open('AGENTS.md','w').write(t+'x')\"" },
+      { name: "285 D159 对照:open(插值, 'w') 不算读调用", text: "改了宪法。", tracked: ["scripts/x.mjs"],
+        bash: "python -c \"t=1; open(f'{root}/AGENTS.md', 'w').write(str(t))\"" },
+      // 批 285 第二轮复核(派出方追加,红队第 1 份):以临时目录起头、经 .. 落回仓里的宪法 ⇒ 照拦
+      { name: "285 二轮 红队 1:Edit E:/Windows/Temp/../../test/AGENTS.md ⇒ 拦", text: "改了宪法。", write: "E:/Windows/Temp/../../test/AGENTS.md" },
+      { name: "285 二轮 红队 1:Edit /tmp/../test/AGENTS.md ⇒ 拦", text: "改了宪法。", write: "/tmp/../test/AGENTS.md" }],
     neg: [
+      // 批 285 D159⑪(误拦):LAW_RE 不锚仓根,临时目录里的副本 / 草稿被判改宪法
+      { name: "285 D159:cp 宪法副本到 /tmp 不算改法", text: "备份了一份。", tracked: ["scripts/x.mjs"], bash: "cp AGENTS.md /tmp/AGENTS.md" },
+      // 批 285 第二轮复核(误拦猎手第 1 份 FB-1):家目录写法的临时目录
+      { name: "285 二轮 FB-1:cp 宪法副本到 ~/AppData/Local/Temp 不算改法", text: "备份了一份。", tracked: ["scripts/x.mjs"],
+        bash: "cp AGENTS.md ~/AppData/Local/Temp/x/AGENTS.md" },
+      { name: "285 D159:写 scratchpad 里的宪法草稿不算改法", text: "起草了。",
+        write: "C:/Users/someone/AppData/Local/Temp/claude/example-project/sess/scratchpad/AGENTS.md" },
+      // 批 285 D159⑩(误拦):读调用实参里的路径被当写落点候选
+      { name: "285 D159:node 读宪法(插值路径)写 clipboard 不算改法", text: "导出了。", tracked: ["scripts/x.mjs"],
+        bash: "node -e 'const fs=require(\"fs\"); const s=fs.readFileSync(`${process.cwd()}/AGENTS.md`,\"utf8\"); fs.writeFileSync(out, s)'" },
+      { name: "285 D159:node 读法典(字面路径)写变量落点不算改法", text: "导出了。", tracked: ["scripts/x.mjs"],
+        bash: "node -e 'const fs=require(\"fs\"); fs.writeFileSync(out, fs.readFileSync(\"docs/laws/collab.md\",\"utf8\"))'" },
+      { name: "285 D159:python open(宪法).read() 写变量落点不算改法", text: "导出了。", tracked: ["scripts/x.mjs"],
+        bash: "python -c \"t=open('AGENTS.md').read(); open(out,'w').write(t)\"" },
+      { name: "285 D159:python Path(插值).read_text() 写变量落点不算改法", text: "导出了。", tracked: ["scripts/x.mjs"],
+        bash: "python -c \"from pathlib import Path; t=Path(f'{root}/AGENTS.md').read_text(); Path(out).write_text(t)\"" },
       { name: "259 红队 BP-13:touch -r 的参考文件不是目标", text: "改了时间戳。", tracked: ["scripts/x.mjs"], bash: "touch -r AGENTS.md /tmp/x" },
       // 批 259 红队(a391d46c)BP-3~6:提到不等于写、只动暂存区、备份文件、检索词恰好叫 cp
       { name: "259 红队二轮 BP-3:替换文本里提到 AGENTS.md 不算改宪法", text: "改了闸自测。", tracked: ["scripts/x.mjs", "scripts/lib/gate-difftier.mjs"],
@@ -1495,7 +1618,7 @@ function mNeutralizeProgramRedirs(rawCmd) {
   return out.join("");
 }
 /** 该命令里 t 是否「写后被 rm」:最后一个写 t 的段之后,有一段以 rm 开头且操作数逐字等于 t。 */
-function mRemovedAfterWrite(rawCmd, t) {
+function mRemovedAfterWrite(rawCmd, t, V = {}) {
   const segs = segments(stripHeredoc(String(rawCmd)));
   const norm = (x) => x.replace(/\\/g, "/").replace(/^["'`]|["'`]$/g, "").replace(/^\.\//, "");
   const want = norm(t);
@@ -1505,7 +1628,27 @@ function mRemovedAfterWrite(rawCmd, t) {
   // 只认 `printf` / `echo` 段的重定向:它们吐的是字面量,不存在「替换没命中、内容静默不变」。
   //   `writeFileSync(p, s.replace(a,b))` 写变异体再 rm 掉的探针**不放**——replace 没命中时变异体与原件一字不差,
   //   正是本条要逮的失败形(全语料 diff 逮到 11 条这种,收窄前曾被一并放掉)。
-  if (!/^(?:printf|echo)\s[^]*>/.test(stripQuoted(segs[lastWrite].replace(/^(?:\w+=\S*\s+)+/, "")))) return false;   // 引号外的 `>` 才是重定向
+  // 批 285(D171⑪ M 那半,误拦):PowerShell 同形 `Set-Content -Path b1.json -Value '{}'; curl …; Remove-Item b1.json` 原照拦
+  //   (只认 printf / echo + rm)。现再认一种写段:段首 `Set-Content`、值是引号字面量、引号外没有 `(` `$` 反引号
+  //   (排除 `-Value (Get-Content a) -replace …` / `-Value $x` 这类可能「替换没命中、内容静默不变」的形)、且不是管道下游
+  //   (`… -replace … | Set-Content` 同理不认)。删除段再认 `Remove-Item` / `ri` / `del`。
+  //   刻意不认 `Out-File`:它的内容只经管道来,分不出上游是不是字面量 ⇒ 照拦(维持现状,不新增误拦也不新开漏放)。
+  //   为什么只认同一条命令(D171④ 要求补注释):两条命令之间可能隔着别的工具调用 / 上一条失败,
+  //   rm 那条单独执行时看不出它删的是不是这次写的那份;同一条命令里次序与连接符都在文本上(见下方 joinerBefore)。
+  const s = stripHeredoc(String(rawCmd));
+  let from = 0;
+  const joinerBefore = segs.map((seg) => { const at = s.indexOf(seg, from); const j = at < 0 ? "" : s.slice(from, at); if (at >= 0) from = at + seg.length; return j; });
+  const wHead = segs[lastWrite].replace(/^(?:\w+=\S*\s+)+/, ""), wBare = stripQuoted(wHead);
+  const echoForm = /^(?:printf|echo)\s[^]*>/.test(wBare);   // 引号外的 `>` 才是重定向
+  // 批 285 第二轮复核(红队第 3 份 BP-1 诚实那一半):`-Value "$((Get-Content a.mjs -Raw) -replace 'x','y')"` 的子表达式住在**双引号**里,
+  //   PowerShell 双引号会插值,而 wBare 剥了引号内容看不见它 ⇒ 被当成引号字面量放行(正是「replace 没命中、内容静默不变」那一形)。
+  //   现在不剥双引号插值的原段上再判:双引号串里有 `$(` ⇒ 不算字面量。只认 `$(`,`"…$x…"` 这类不动(派出方口径)。
+  //   只少放 ⇒ 只会多拦这一形。V.noDqSub 只给变异用。`del` 与 `-WhatIf` 两形不修(故意伪造,已接受)。
+  //   批 285 第三轮(误拦猎手第二轮 FB-4)撤回:它把「写完即删的临时请求体」(`-Value "ts=$(Get-Date -Format o)"` → curl → Remove-Item)也拦了;
+  //   按用户「误拦比漏放贵」退回原判(双引号里的 $( 仍当字面量),红队第 3 份 BP-1 诚实那一半改记接受的漏放。V.dqSub 只给变异用(开 = 新判)
+  const dqSub = !!V.dqSub && /"(?:[^"`]|`.)*\$\(/.test(wHead.replace(/'[^']*'/g, " "));
+  const psForm = /^Set-Content\s/i.test(wBare) && !/[($`]/.test(wBare) && !dqSub && /['"]/.test(wHead) && !/\|\s*$/.test(joinerBefore[lastWrite] || "");
+  if (!echoForm && !psForm) return false;
   // writeTargets 的重定向抽取会把 `b1.json` 截成 `b1.js`(扩展名分支顺序;它另有消费者,本批不动)。
   //   故认写段里**逐字出现**、以目标开头且只多出字母数字的那个 token 为真名;`b1.json.bak` 多出了点,不认。
   const names = new Set([want]);
@@ -1514,10 +1657,7 @@ function mRemovedAfterWrite(rawCmd, t) {
     if (x.startsWith(want) && /^[A-Za-z0-9]*$/.test(x.slice(want.length))) names.add(x);
   }
   // 红队 a47d383e(批 273 收口)BP-11:`… || rm -f X` 只在前段失败时才删——成功路径上文件留下 ⇒ 不算写后删除;
-  //   只认前面连接符是 `;` / `&&` / 换行的 rm 段。连接符从原串里按段位置取(segments 不带连接符)。
-  const s = stripHeredoc(String(rawCmd));
-  let from = 0;
-  const joinerBefore = segs.map((seg) => { const at = s.indexOf(seg, from); const j = at < 0 ? "" : s.slice(from, at); if (at >= 0) from = at + seg.length; return j; });
+  //   只认前面连接符是 `;` / `&&` / 换行的 rm 段。连接符从原串里按段位置取(segments 不带连接符;joinerBefore 已在上方算好)。
   // codex 273-r1:`&& rm` 在前一步失败时同样不执行(「构建失败、配置文件还在」)⇒ 只认 `;` / 换行前接的 rm,
   //   或紧跟在写段之后的 `&& rm`(写成功才轮到它,那时文件确实被删)。
   return segs.slice(lastWrite + 1).some((seg, k) => {
@@ -1525,7 +1665,7 @@ function mRemovedAfterWrite(rawCmd, t) {
     if (/\|\|\s*$/.test(j)) return false;
     if (/&&\s*$/.test(j) && k > 0) return false;
     const toks = seg.replace(/^(?:\w+=\S*\s+)+/, "").split(/\s+/);
-    return toks[0] === "rm" && toks.slice(1).filter((x) => !x.startsWith("-")).map(norm).some((x) => names.has(x));
+    return /^(?:rm|Remove-Item|ri|del)$/i.test(toks[0] || "") && toks.slice(1).filter((x) => !x.startsWith("-")).map(norm).some((x) => names.has(x));
   });
 }
 
@@ -1533,7 +1673,7 @@ export const RULE_M = {
   id: "M",
   blocking: true,
   law: "docs/laws/reporting.md#「完成」靠核对不靠断言",
-  detect: (ctx) => {
+  detect: (ctx, V = {}) => {
     const targets = [];
     for (const cmd of ctx.bashCmds) {
       // M-2:原实现见到 `--self-test` 就 `continue` **整条命令** ⇒
@@ -1545,7 +1685,7 @@ export const RULE_M = {
       for (const t of writeTargets(cmd)) {
         if (fixtureCtx && /^(scripts|docs)\/(foo|bar|x|a|b)\./.test(t)) continue;   // 明显的示例名
         if (!realRedir.has(t)) continue;                                           // 批 273 ②:解释器字符串里的 `>`
-        if (mRemovedAfterWrite(cmd, t)) continue;                                  // 批 273 ③:写后同命令 rm
+        if (mRemovedAfterWrite(cmd, t, V)) continue;                               // 批 273 ③:写后同命令 rm
         targets.push(t);
       }
     }
@@ -1629,6 +1769,8 @@ export const RULE_M = {
       return uniq.filter((p) => !ctx.reads.some((x) => x.endsWith(p.split("/").pop())) &&
         !readCmds.some((c) => c.includes(p.split("/").pop())));
     } }) },
+    // 批 285 第二轮复核(红队第 3 份 BP-1):证人 = pos「285 二轮 红队 3 BP-1」
+    { name: "285 三轮:开启双引号 $( 新判(会误拦临时请求体)", apply: (r) => ({ ...r, detect: (ctx) => RULE_M.detect(ctx, { dqSub: true }) }) },
     { name: "只比 basename(M-7 回归)", apply: (r) => ({ ...r, detect: (ctx) => {
       const uniq = [...new Set(ctx.bashCmds.flatMap(writeTargets))].filter((p) => !/\/(tmp|temp)\//i.test(p));
       const all = [...ctx.reads, ...ctx.bashCmds].join(" ").replace(/\\/g, "/");
@@ -1671,8 +1813,20 @@ export const RULE_M = {
       { name: "273 收口:解释器输出 | sh ⇒ 仍拦", text: "改完了。", bash: `node -e "console.log('echo x > docs/real.md')" | sh` },
       { name: "273 收口:失败才 || rm ⇒ 成功路径文件留下,仍拦", text: "改完了。", bash: `printf '{}' > config/app.json && node build.mjs || rm -f config/app.json` },
       { name: "273 codex r1:中间步骤 && rm,构建失败则不删 ⇒ 仍拦", text: "构建失败,配置文件还在;本轮先结束。", bash: `printf '{}' > config/app.json && node build.mjs && rm -f config/app.json` },
+      // 批 285(D171⑪ M 那半)放宽后的边界:值不是引号字面量 / 管道下游 / Out-File ⇒ 仍拦
+      { name: "285 D171 边界:Set-Content -Value (Get-Content …) -replace 再 Remove-Item ⇒ 仍拦", text: "变异体转红了。",
+        bash: `Set-Content -Path scripts/mut.mjs -Value ((Get-Content scripts/a.mjs -Raw) -replace 'x','y'); node scripts/mut.mjs --self-test; Remove-Item scripts/mut.mjs` },
+      { name: "285 D171 边界:… -replace … | Set-Content 再 Remove-Item ⇒ 仍拦", text: "变异体转红了。",
+        bash: `(Get-Content scripts/a.mjs -Raw) -replace 'x','y' | Set-Content scripts/mut.mjs; node scripts/mut.mjs --self-test; Remove-Item scripts/mut.mjs` },
+      { name: "285 D171 边界:Set-Content -Value $x 再 Remove-Item ⇒ 仍拦", text: "写了请求体。",
+        bash: `Set-Content -Path b1.json -Value $body; curl.exe --data-binary "@b1.json" http://127.0.0.1:1/; Remove-Item b1.json` },
     ],
     neg: [
+      // 批 285 第三轮:双引号 $( 的新判撤回(误拦猎手第二轮 FB-4)——写完即删的临时请求体不拦;红队第 3 份 BP-1 那形随之记为接受的漏放
+      { name: "285 三轮 FB-4:临时请求体 -Value \"ts=$(Get-Date)\" → curl → Remove-Item ⇒ 不拦", text: "发了一个请求。",
+        bash: `Set-Content -Path b1.json -Value "ts=$(Get-Date -Format o)"; curl.exe --data-binary "@b1.json" http://127.0.0.1:1/; Remove-Item b1.json` },
+      { name: "285 三轮 接受的漏放:Set-Content -Value \"$(… -replace …)\" 再 Remove-Item ⇒ 不拦", text: "变异体转红了。",
+        bash: `Set-Content -Path scripts/mut.mjs -Value "$((Get-Content scripts/a.mjs -Raw) -replace 'x','y')"; node scripts/mut.mjs --self-test; Remove-Item scripts/mut.mjs` },
       // 真回读(Bash 面)
       { text: "改完并回读。", bash: `node -e "fs.writeFileSync('docs/real.md','x')" && grep -c x docs/real.md` },
       // 批 258 M-b:按字节 / 逐行比对的读法也是回读
@@ -1703,6 +1857,11 @@ export const RULE_M = {
         bash: `node -e " const RE=/x/g; for(const cmd of ['echo x > a/config.json','echo x > a/view.tsx']){ console.log(cmd.split('> ')[1]); }"` },
       { name: "273 ③:写请求体、curl 用完、同命令 rm 掉", text: "冒烟通过。",
         bash: `cd /d/app && printf '{"u":"demo"}' > b1.json; printf '{"t":"x"}' > b2.json; curl -s -X POST http://127.0.0.1:8766/api/register --data-binary @b1.json; curl -s --data-binary @b2.json http://127.0.0.1:8766/api/x | head -c 200; rm -f c.txt b1.json b2.json smoke.db` },
+      // 批 285(D171⑪ M 那半,误拦猎手 a2a474c0):PowerShell 同形(Set-Content 引号字面量 + 用完同命令 Remove-Item)放行
+      { name: "285 D171:PS Set-Content 写请求体、curl 用完、同命令 Remove-Item", text: "冒烟通过。",
+        bash: `Set-Content -Path b1.json -Value '{"u":"demo"}'; curl.exe -s --data-binary "@b1.json" http://127.0.0.1:8766/api/register; Remove-Item -Force b1.json` },
+      { name: "285 D171:PS 位置参数 Set-Content + del", text: "冒烟通过。",
+        bash: `Set-Content b1.json '{}'; Invoke-RestMethod -InFile b1.json http://127.0.0.1:1/; del b1.json` },
     ],
   },
 };
@@ -1992,19 +2151,31 @@ function eFacts(ctx) {
   //   与 crossChecked 认动作面同一口径。前面有名词性致使者的(「缓存过期让它…」「这让它…」)一律不涂。
   //  天花板:措辞锚,判不出语义;「已让它把缓存清空了」这类零主语自述的结果句会被放行。
   //  失效条件:fp 台账出现「真断言因本涂改被放行」一次 ⇒ 回收 ②③(只留 ①)。
-  const dispatched = (ctx.toolNames || []).some((n) => /^(SendMessage|Agent|Task)$/.test(String(n)));
+  //  批 285(D171⑪ E0 那半,误拦猎手 a2a474c0,c9112e2 同样命中):派发动作表再认 Skill / Workflow(再派发也是派发)。
+  const dispatched = (ctx.toolNames || []).some((n) => /^(SendMessage|Agent|Task|Skill|Workflow)$/.test(String(n)));
   //  红队 a47d383e(批 273 收口):
   //   BP-8 ② 须有派发动词在前(发 / 下 / 送 + ≤12 字 + 指令 / 消息…):「闸的拦截消息让它把出路词抄进了正文」是名词致使者,照拦;
   //   BP-7 ③ 句首(行首 / 。！？后)可不带副词;**逗号 / 冒号后须带「已 / 再 / 又 / 先 / 刚」**——
   //         「pushDefault 没设,让它把代码推到了 origin」的前分句是致使事件,照拦。
   //  批 276 停止出口①:本批给 ②③ 加的「事后归因」判断(RETRO 损坏词)三轮复核各出新的诚实误拦(误拦猎手 FB-4、规则层红队 r3 BP-8),
   //   整段退回 fd83576;「我下的指令让它把…弄错了」这类事后归因照放,登记为让出面 D175①。
+  //  批 285(D171⑪ E0 那半)再放四形,各带结构锚(都只涂「让」字,同行别的因果形态照拦):
+  //   ④ 疑问提议:「要不要 / 需不需要 / 是否(需)要 / 用不用 + 让 + 人称」——问句提议,不是断言(同 ① 不要求动作面);
+  //   ⑤ 逗号隔开的指令义:「发…指令,让它…」——② 的致使者与「让」之间多一个逗号;
+  //   ⑥ 显式主语「我」:分句起头的「我 + (已/再/又/先/刚/也)* + 让它把」——③ 的零主语换成显式「我」;
+  //   ⑦ 无「把」的请求动词:③⑥ 的位置上「让它」后紧跟 (重新/再/只/先/又)* + 发 / 重发 / 补发 / 回报 / 回件 / 汇报 / 回(不接 滚到退归落升)/ 重跑 / 重做。
+  //   ⑤⑥⑦ 须本轮真有派发动作(dispatched)。「重启服务后,已让它恢复正常」(无把、动词不在请求表)照拦。
+  //   代价(漏放,按用户「误拦比漏放贵」接受):「我已让它把缓存清空了」这类显式主语的结果句、「又让它重发了一份坏数据」
+  //   这类请求动词带出的结果句被放行,与 ③ 的既有天花板同族。
+  const REQ_AFTER = "(?:把|(?:重新|再|只|先|又)*(?:重发|补发|发(?![生现作热酵散])|回报|回件|汇报|回(?![滚到退归落升])|重跑|重做))";
   const unDirective = (line) => {
-    let s = line.replace(/(想|希望)让(?=(它|他|她|我|你|对方))/g, "$1▯");
+    let s = line.replace(/(想|希望)让(?=(它|他|她|我|你|对方))/g, "$1▯")
+      .replace(/(要不要|需不需要|是否需?要|用不用)让(?=(它|他|她|我|你|对方))/g, "$1▯");
     if (dispatched) {
-      s = s.replace(/((?:发|下|送)了?[^，,。\n]{0,12}(?:指令|消息|要求|提示))让(?=(它|他|她|对方))/g, "$1▯")
-        .replace(/(^|[。！!？?])(\s*)((?:已经?|再|又|先|刚|也)*)让(?=(它|他|她|对方)把)/g, "$1$2$3▯")
-        .replace(/([，,；;：:\s])((?:已经?|再|又|先|刚)+)让(?=(它|他|她|对方)把)/g, "$1$2▯");
+      s = s.replace(/((?:发|下|送)了?[^，,。\n]{0,12}(?:指令|消息|要求|提示))([，,]\s*)?让(?=(它|他|她|对方))/g, (_m, a, c) => `${a}${c || ""}▯`)
+        .replace(new RegExp(`(^|[。！!？?])(\\s*)((?:已经?|再|又|先|刚|也)*)让(?=(它|他|她|对方)${REQ_AFTER})`, "g"), "$1$2$3▯")
+        .replace(new RegExp(`([，,；;：:\\s])((?:已经?|再|又|先|刚)+)让(?=(它|他|她|对方)${REQ_AFTER})`, "g"), "$1$2▯")
+        .replace(new RegExp(`(^|[。！!？?，,；;：:\\s])(\\s*)我((?:已经?|再|又|先|刚|也)*)让(?=(它|他|她|对方)${REQ_AFTER})`, "g"), "$1$2我$3▯");
     }
     return s;
   };
@@ -2304,6 +2475,12 @@ export const RULE_E0 = {
       { text: "pushDefault 没设,让它把代码推到了 origin。", mcp: "Agent" },
       { text: "路径正则少了一个斜杠,让它把 $TEMP 也当成了改动文件。", mcp: "SendMessage" },
       { text: "闸的拦截消息让它把出路词抄进了正文。", mcp: "Agent" },
+      // 批 285(D171⑪)放宽后的边界钉:贴着新四形、仍须拦
+      { name: "285 D171 边界:「可以让它」是能力断言不是问句提议", text: "这个改动可以让它快两倍。" },
+      { name: "285 D171 边界:显式主语「我」但请求动词表外(恢复)", text: "我已让它恢复正常。", mcp: "SendMessage" },
+      { name: "285 D171 边界:「让它发生」不是请求动词「发」", text: "我又让它发生了回退。", mcp: "SendMessage" },
+      { name: "285 D171 边界:「我的改动让它」名词性致使者", text: "我的改动让它把旧缓存当成了新数据。", mcp: "SendMessage" },
+      { name: "285 D171 边界:显式主语形无派发动作", text: "我已让它把报告正文重发。" },
     ],
     neg: [
       // ── 批 273 盲审 3/3 拦错的三种形态(使令义「让」,不是因果)──────────────
@@ -2315,6 +2492,13 @@ export const RULE_E0 = {
       { text: "已让它把报告正文重发了。回件后我再核。", mcp: "SendMessage" },
       // 批 276c(误拦猎手 FB-4)起的反向钉:零主语的清理指令回报不是归因——RETRO 退回后它们按原派活涂改放行,钉住不回退
       { text: "已让它把 scratchpad 里的临时文件删掉了,回件后我再核。", mcp: "SendMessage" },
+      // 批 285(D171⑪,误拦猎手 a2a474c0 列的四形 + 派发换成 Skill / Workflow)
+      { name: "285 D171:显式主语「我已让它把…重发」", text: "grill 只回了 Complete,我已让它把报告正文重发。", mcp: "SendMessage" },
+      { name: "285 D171:无「把」的请求「我又让它重新发一遍」", text: "回件是空的,我又让它重新发一遍。", mcp: "SendMessage" },
+      { name: "285 D171:疑问提议「要不要让我把…」", text: "要不要让我把排查步骤对到日志时刻上?" },
+      { name: "285 D171:逗号隔开「指令,让它只回…」", text: "已再发一次指令,让它只回报告正文。", mcp: "SendMessage" },
+      { name: "285 D171:派发是 Skill", text: "已让它把报告正文重发。回件后我再核。", mcp: "Skill" },
+      { name: "285 D171:派发是 Workflow", text: "已让它把报告正文重发。回件后我再核。", mcp: "Workflow" },
       { text: "已让它把重复的那两段删掉了,正文其余不动。", mcp: "Agent" },
       { text: "已让它把配置删掉了。", mcp: "Agent" },
       // 带致使者的 ② 形派活句一律按派活涂(批 276 的 RETRO 事后归因判断已退回,残余见 D175①)
@@ -2360,18 +2544,23 @@ export const RULE_E1 = {
   id: "E1",
   blocking: false,
   law: "docs/laws/reporting.md#未被机器直证的因果断言过独立复核",
-  detect: (ctx) => {
+  detect: (ctx, V = {}) => {
     const f = eFacts(ctx);
     if (!f.hits.length || f.hedged) return [];
     // E0 与 E1 互斥:E0 管「两半都没做」,E1 管「做了形、缺独立性」
     if (f.crossChecked) return [];
     if (!f.shaped) return [];          // 形也没过 ⇒ 归 E0,不归本项
+    // 批 285(D117,误拦;本项只提示):探针跑了、正文又就地声明了**肯定的**机械判据(写法同 E2 出路②,否定前瞻同口径)⇒
+    //   断言已被机器直证,不再要独立复核(全局规范 3.1「纯机器判据不必走」)。codex 2026-10-17 盲审判过一笔「拦错了」(三版判据读数)。
+    //   接受的漏放:声明写了但探针与断言无关时不提示(同 D72 的整轮布尔天花板)
+    if (!V.noD117 && /机械判据\s*[:：]\s*(?!无|没有|不可|未)\S/.test(ctx.text)) return [];
     return f.hits;
   },
   exempts: [],
   message: (hits) =>
     `因果断言已过形、未过**独立性**那一半(跨模型复核 codex 或 battle):\n    · ${hits.slice(0, 3).join("\n    · ")}`,
   mutations: [
+    { name: "285 D117 退回:就地声明了机械判据也照提示", apply: (r) => ({ ...r, detect: (ctx) => RULE_E1.detect(ctx, { noD117: true }) }) },
     { name: "与 E0 不再互斥(形没过也报 E1)", apply: (r) => ({ ...r, detect: (ctx) => {
       const f = eFacts(ctx);
       if (!f.hits.length || f.hedged || f.crossChecked) return [];
@@ -2387,6 +2576,8 @@ export const RULE_E1 = {
     pos: [
       // 跑了探针(形过了)但没跑跨模型
       { text: "根因是路径写错。", bash: "node --no-warnings scripts/verify-laws.mjs" },
+      // 批 285 D117 对照:声明的是「机械判据:无」⇒ 照提示(否定前瞻)
+      { name: "285 D117 对照:机械判据:无 ⇒ 照提示", text: "根因是路径写错。机械判据:无。", bash: "node --no-warnings scripts/verify-laws.mjs" },
     ],
     neg: [
       // 两半都做了
@@ -2395,6 +2586,9 @@ export const RULE_E1 = {
       // 形没过 ⇒ 归 E0 不归 E1
       { text: "根因是路径写错，整闸因此失效。" },
       { text: "今天没有下任何因果断言。" },
+      // 批 285 D117:探针跑了 + 就地声明肯定的机械判据 ⇒ 不再要跨模型
+      { name: "285 D117:探针直证并就地声明 ⇒ 不提示", text: "根因是路径写错。机械判据:已跑 verify-laws,退出码 0 直证。",
+        bash: "node --no-warnings scripts/verify-laws.mjs" },
     ],
   },
 };
@@ -2413,7 +2607,7 @@ export const RULE_E1 = {
 //     现在直接读 `actions[].input.command`,顺序也来自 `actions` 的天然次序。
 //
 // 考虑过但**不修**的两条,连同理由一起登记(免得下次有人当漏网):
-//  ④ 编号形态只认阿拉伯数字,`条件一`/`条件①` 不算数。**不放宽**——放宽的方向是
+//  ④ 【批 285 D135 已作废,见 confirmedConditions 下方注】编号形态只认阿拉伯数字,`条件一`/`条件①` 不算数。**不放宽**——放宽的方向是
 //     让 K **更容易被满足**(命中更少),那是 fail-open 那一侧。一道阻断闸的召回
 //     只能往严了调;真要放宽得先有证据说明我确实在用那些写法。
 //  ⑤ 只扫对话 `ctx.text`,不扫 `ctx.written`。同理由:把「写进文件的逐条对照」算数
@@ -2422,12 +2616,44 @@ export const RULE_E1 = {
 
 /** 从对话里取出「已给出裁决」的条件编号。冒号**必须含全角 U+FF1A**——
  *  同型 bug 在 E2 上 2026-08-19 上午修过,K 这处当天下午才被逐字节验出。 */
-function confirmedConditions(text) {
+// 批 285 第二轮复核(误拦猎手第 2 份 FB-1,阻断级老误拦):「条件N」与裁决词之间只认「空白 + 冒号 + 空白」⇒ Markdown 写法
+//   (`条件 1:**达成**`、`条件 1(欠账清零):达成`、`- 条件 1 —— 达成`、`| 条件 1 | 达成 |`、`条件 1:✅ 达成`、`**条件 1**:达成`、`条件（一）:达成`)
+//   的诚实逐条对照全不算,K0 关账照拦。现编号可加括号;编号与分隔符之间容许加粗 `**`、一个括注;分隔符认冒号 / 破折号 / 表格竖线;
+//   分隔符与裁决词之间容许加粗、竖线、✅ 等勾选符号与空白。K / K0 / S 经 confirmedConditions / unmetConditions 共用 COND_SEP_SRC。
+//   「条件 1 的达成标准是…」这类(编号后接普通汉字)不是裁决,仍不算(pos 反向钉)。
+//   代价(漏放方向,接受):更多写法能满足逐条对照;失效条件:出现一次真实漏放损失即重开。V.oldSep 只给变异用(退回只认冒号)。
+// 批 285 第三轮(红队第二轮 BP-3):裁决词后接「标准 / 判据 / 条件 / 与否 / 的」是在复述标准,不是裁决(「| 条件 1 | 达成标准:欠账清零 |」)
+//   收口误拦猎手 FB-1:单字排除把「条件 2:未达成的部分已登记」「达成的,探针全绿」这类真裁决也挡掉(关账提交被拦)⇒ 只排除复述标准的组合
+const COND_VERDICT_END = "(?!(?:的)?(?:标准|判据|条件|要求|口径)|与否)";
+const COND_SEP_SRC = "(?:\\*\\*|__)?\\s*(?:[(（][^)）\\n]{0,40}[)）])?\\s*(?:\\*\\*|__)?\\s*(?:[:：]|——|—|--?|\\|)(?:\\s|\\*\\*|__|\\||[✅✔☑✓√❌⚠️\\uFE0F])*";
+const COND_NUM_WRAP = (src) => `[(（]?(${src})[)）]?`;
+function confirmedConditions(text, { arabicOnly = false, oldSep = false } = {}) {
   const done = new Set();
-  for (const m of String(text || "").matchAll(/条件\s*(\d+)\s*[:：]\s*(达成|未达成|已达成|不适用)/g)) {
-    done.add(Number(m[1]));
+  const re = arabicOnly ? /条件\s*(\d+)\s*[:：]\s*(达成|未达成|已达成|不适用)/g
+    : oldSep ? new RegExp(`条件\\s*(${COND_NUM_SRC})\\s*[:：]\\s*(达成|未达成|已达成|不适用)`, "g")
+    : new RegExp(`条件\\s*${COND_NUM_WRAP(COND_NUM_SRC)}\\s*${COND_SEP_SRC}(达成|未达成|已达成|不适用)${COND_VERDICT_END}`, "g");
+  for (const m of String(text || "").matchAll(re)) {
+    const n = condNum(m[1]);
+    if (n > 0) done.add(n);
   }
   return done;
+}
+// 批 285(D135 误拦半):上方④「编号只认阿拉伯数字、不放宽」作废——用户 2026-10-27 定「误拦比漏放贵」
+//   (memory false-block-costlier-than-leak)。诚实写「条件一:达成」「条件①:达成」「条件１:达成」的关账被 K0 拦
+//   (fp 报表 K0 盲审确认误拦 1 笔)。现中文数字(一…九十九)、圈码 ①…⑳、全角数字都归一成阿拉伯数字;
+//   K / K0 / S 经 confirmedConditions / unmetConditions 共用这一处。
+//   代价(漏放方向,接受):编号写法更宽 ⇒ 关账覆盖检查更容易被满足;失效条件:出现一次真实漏放损失即重开。
+const COND_NUM_SRC = "[0-9]+|[０-９]+|[一二三四五六七八九十]{1,3}|[①-⑳]";
+function condNum(s) {
+  const t = String(s || "");
+  if (/^[0-9]+$/.test(t)) return Number(t);
+  if (/^[０-９]+$/.test(t)) return Number(t.replace(/[０-９]/g, (c) => String(c.charCodeAt(0) - 0xFF10)));
+  if (/^[①-⑳]$/.test(t)) return t.charCodeAt(0) - 0x2460 + 1;
+  const D = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  const m = t.match(/^([一二三四五六七八九])?(十)?([一二三四五六七八九])?$/);
+  if (!m || (!m[1] && !m[2] && !m[3])) return 0;
+  if (!m[2]) return m[3] ? 0 : D[m[1]];              // 「一二」这类无十的多位不认
+  return (m[1] ? D[m[1]] : 1) * 10 + (m[3] ? D[m[3]] : 0);
 }
 
 /** 被裁成「**未达成**」的条件编号。与上面那个分开,是 2026-08-20 用户点破的洞:
@@ -2445,7 +2671,12 @@ function confirmedConditions(text) {
  *  代价不对称:多拦一轮=我多干一轮;漏放=批无限期挂着而没人再提。 */
 function unmetConditions(text) {
   const bad = new Set();
-  for (const m of String(text || "").matchAll(/条件\s*(\d+)\s*[:：]\s*未达成/g)) bad.add(Number(m[1]));
+  // 批 285(D135):编号口径与 confirmedConditions 同一份(COND_NUM_SRC / condNum)。
+  // 批 285 第二轮复核:分隔写法与 confirmedConditions 同一份(COND_SEP_SRC)——否则「条件 1:**未达成**」只进已对照、不进未达成(漏放)
+  for (const m of String(text || "").matchAll(new RegExp(`条件\\s*${COND_NUM_WRAP(COND_NUM_SRC)}\\s*${COND_SEP_SRC}未达成${COND_VERDICT_END}`, "g"))) {
+    const n = condNum(m[1]);
+    if (n > 0) bad.add(n);
+  }
   return bad;
 }
 
@@ -2513,13 +2744,18 @@ function batchDrifting(ctx) {
  *  返回 `[{op:"clear"} | {op:"arm", id}]`。 */
 // codex 253 合并复核:打印类段头(echo/printf/Write-Host…)同样不是执行。
 const BG_READ_HEAD = /^(?:cat|grep|egrep|fgrep|rg|sed|head|tail|less|more|wc|type|get-content|select-string|echo|printf|write-host|write-output)$/i;
+/** 段首(剥掉 `VAR=值` 前缀后)是读或打印命令 ⇒ 这一段不是在执行 batch-goal。
+ *  批 285(D126):从 batchGoalOps 抽出,与 ranClear 共用这一份口径(原来只有 batchGoalOps 用,ranClear 一条读命令排除都没有)。 */
+function bgSegIsRead(seg) {
+  const rest = String(seg).replace(/^\s*(?:\w+=(?:"[^"]*"|'[^']*'|\S*)\s+)*/, "");
+  const head = ((rest.match(/^\s*("[^"]*"|'[^']*'|\S+)/) || [])[1] || "").replace(/^["']|["']$/g, "");
+  return BG_READ_HEAD.test(head.replace(/^.*[\\/]/, ""));
+}
 function batchGoalOps(ctx) {
   const ops = [];
   for (const a of (ctx.actions || [])) for (const seg of segments(a.input?.command)) {
     if (typeof seg !== "string" || !seg.includes("batch-goal.mjs")) continue;
-    const rest = seg.replace(/^\s*(?:\w+=(?:"[^"]*"|'[^']*'|\S*)\s+)*/, "");
-    const head = ((rest.match(/^\s*("[^"]*"|'[^']*'|\S+)/) || [])[1] || "").replace(/^["']|["']$/g, "");
-    if (BG_READ_HEAD.test(head.replace(/^.*[\\/]/, ""))) continue;
+    if (bgSegIsRead(seg)) continue;
     const bare = stripQuoted(seg);
     if (/(^|\s)--clear(\s|$)/.test(bare)) ops.push({ op: "clear" });
     else if (/(^|\s)--arm(\s|$)/.test(bare)) {
@@ -2544,7 +2780,18 @@ function ranArm(ctx) {
  *  被判成「跑过 --clear」—— 我武装批次时把 `--clear` 写进了条件文本,当场把自己拦住。
  *  与本文件已登记的 L 项 `[^"]*`、M 项 `\S*` 是**同一族第四次**:
  *  **正则的作用域比我以为的宽**。剥掉引号串之后,参数面与文本面才真正分开。 */
-export function ranClear(ctx) {
+// 批 285(D126,误拦半):ranClear 只认**执行**——段首是读或打印命令(grep/rg/cat/sed/echo…,口径 = bgSegIsRead,
+//   与 batchGoalOps 同一份)的不算跑过结清。病:结清态下只读轮 `grep -n -- --clear scripts/batch-goal.mjs` 被当成关账轮,
+//   K0 覆盖检查对上一批要逐条对照、且因 ranClear 为真升阻断(分诊内存探针实跑复现)。
+//   ranClear 为真时触发的规则(K0 覆盖检查与阻断级、W、关账族)因此只会少响,不会多响。
+//   代价:结清态 + 本轮提交 + 只在读命令里提到 --clear 的轮次不再走关账覆盖检查,回到 K0 的常规判法
+//   (与那一轮不带这条 grep 时的结论一致)。
+//   **S 的 C 态豁免仍用宽口径 ranClearMention**(漏放半,按用户「误拦比漏放贵」接受):
+//   武装批里一行 `echo … batch-goal.mjs --clear` 仍能让 S 的批内判据跳过。失效条件:出现一次真实漏放损失即重开。
+export function ranClear(ctx) { return ranClearImpl(ctx, true); }
+/** 宽口径(批 285 前的 ranClear 原样):读 / 打印命令段里提到 --clear 也算。只给 S 的 C 态豁免用,见上。 */
+function ranClearMention(ctx) { return ranClearImpl(ctx, false); }
+function ranClearImpl(ctx, execOnly) {
   // ⚠️ **必须逐段判,不能整条判**(2026-08-20 codex 判出,三条复现全部实测复现):
   //   我造了 `segments()` 却**在生产代码里零调用**,只用了 `stripQuoted`,
   //   于是正则照样跨 `|` 和 `;` 拼接,P2 的原始反例**一条都没死**:
@@ -2589,6 +2836,8 @@ export function ranClear(ctx) {
       // 脚本名认**原串**:带引号的绝对路径(`node "/abs/…/batch-goal.mjs" --clear`)照样算数
       //   ——stripQuoted 会把它整个抹掉,这是既有致盲(Windows 上加引号是本能动作)。
       if (!seg.includes("batch-goal.mjs")) return false;
+      // 批 285(D126):读 / 打印命令段不是执行。
+      if (execOnly && bgSegIsRead(seg)) return false;
       // `--clear` 只认**去引号后**的:引号里的条件文本提到 --clear 不算数(用例④)。
       return hasClearTok(stripQuoted(seg));
     }));
@@ -3141,7 +3390,8 @@ const RULE_K0 = {
   requires: ["batchGoal"],
   // 判据取**最结构化的近似**:本轮动了工作面(写文件/提交)就该先有完成条件。
   // 纯问答、纯调查没有写动作 ⇒ 不触发,本项不会退化成仪式。
-  detect: (ctx) => {
+  // 第二参只给 mutations 注入变异开关(引擎只传 ctx,默认值即真判据;同 ND 的写法)。
+  detect: (ctx, V = {}) => {
     const g = ctx.batchGoal;
     const armed = g && !g.cleared && Array.isArray(g.conditions) && g.conditions.length > 0;
     if (armed) return [];                                  // 已武装 ⇒ 不归 K0(批 250 后 K 只管「结清没成」,做一半停下归 S)
@@ -3150,7 +3400,8 @@ const RULE_K0 = {
     //   ①分两轮关账——上一轮提交、本轮只 `--clear`、零对照:本轮无写无提交,第一个早退直接放行;
     //   ②本轮只改债表 + 提交 + 结清、零对照:簿记豁免先放行(D135 残余⑤)。
     //   覆盖检查只在「确实关掉一个带条件的批、且本轮非同轮武装」时生效;其余关账轮仍走下方原流程。
-    const clearing = (() => { try { return ranClear(ctx); } catch { return false; } })();
+    // 批 285(D126):V.looseClear 只给变异用(退回宽口径 ranClear),真判据恒为执行口径。
+    const clearing = (() => { try { return V.looseClear ? ranClearMention(ctx) : ranClear(ctx); } catch { return false; } })();
     // 批 253(红队 BP-11):同批号重武装(例如改判据时 `--arm 250 --force`,或一轮做完的小批)不算现造证据;
     //   只有本轮 --arm 了**别的**批号,才回落原判。
     //   批 253 二修:批号在原串上取再剥引号(红队 BP-7);本轮第一次 --arm 之前已经 --clear 过 ⇒ 「先零对照结清、再同号重开」,
@@ -3165,10 +3416,12 @@ const RULE_K0 = {
       return ["**关账证据取不到**(台账末行不是本批的 clear 行,或读不出)"];
     }
     if (clearing && g?.cleared && g.closedCount > 0 && !armedOther) {
-      const done = confirmedConditions(ctx.text);
+      // 批 285(D135):V.arabicOnly 只给变异用(退回只认阿拉伯数字编号)。
+      const cOpt = { arabicOnly: !!V.arabicOnly, oldSep: !!V.oldSep };
+      const done = confirmedConditions(ctx.text, cOpt);
       let win = null;
       try { win = ctx.window(); } catch { win = null; }
-      if (win) for (const n of confirmedConditions(win.text)) done.add(n);
+      if (win) for (const n of confirmedConditions(win.text, cOpt)) done.add(n);
       for (let i = 1; i <= g.closedCount; i++) {
         if (!done.has(i)) return [`关账但批 ${g.batch ?? "?"} 的 ${g.closedCount} 条完成条件未逐条对照(本轮与批窗口内缺条件${i})`];
       }
@@ -3278,6 +3531,13 @@ const RULE_K0 = {
     `      依据:当日多次「干着干着就宣布做完」,而从未在开工时定义过什么算完成。\n` +
     `      (官方 /goal 是内建 UI 命令、模型调不了——2026-08-19 实测,故由本仓等价物承担)`,
   mutations: [
+    // 批 285(D126):ranClear 退回宽口径(读 / 打印命令段里提到 --clear 也算关账轮)⇒ 结清态只读 grep 源码被拦。
+    //   证人 = neg「285 D126:结清态只读轮 grep batch-goal 源码」与 pos「285 D126:echo 里的 --clear 不顶关账覆盖」。
+    { name: "285 D126 退回:ranClear 认读 / 打印命令段", apply: (r) => ({ ...r, detect: (ctx) => RULE_K0.detect(ctx, { looseClear: true }) }) },
+    // 批 285(D135):编号退回只认阿拉伯数字 ⇒ 诚实写「条件一 / 条件①」的关账被拦。证人 = neg「285 D135」三条。
+    { name: "285 D135 退回:条件编号只认阿拉伯数字", apply: (r) => ({ ...r, detect: (ctx) => RULE_K0.detect(ctx, { arabicOnly: true }) }) },
+    // 批 285 第二轮复核(误拦猎手第 2 份 FB-1):证人 = neg「285 二轮 FB-1」七条
+    { name: "285 二轮退回:条件与裁决之间只认冒号(Markdown 写法不算)", apply: (r) => ({ ...r, detect: (ctx) => RULE_K0.detect(ctx, { oldSep: true }) }) },
     // 分支①:cleared 也算已武装 ⇒ 每批收尾之后整闸静默(旧实现的真 bug)
     { name: "已结清算作已武装", apply: (r) => ({ ...r, detect: (ctx) => {
       const g = ctx.batchGoal;
@@ -3563,8 +3823,55 @@ const RULE_K0 = {
       // 同轮先 arm 新批再结清:关账证据是现造的,不认(红队 BP-9:「关账分支去掉 !ranArm」的证人)。
       { text: "条件1: 达成。条件2: 达成。", bash: "node scripts/batch-goal.mjs --arm 250 --cond z\ngit commit -m x\nnode scripts/batch-goal.mjs --clear",
         batchGoal: { cleared: true, batch: "249", closedConditions: ["甲", "乙"] } },
+      // 批 285(D126):echo 打印的结清命令不是关账——结清态下又改又提交,照「已结清后又动工作面」拦
+      //   (与不带这条 echo 时的结论一致;宽口径下它被当关账轮、逐条裁决齐就放行)。
+      { name: "285 D126:echo 里的 --clear 不顶关账覆盖", expectBlock: true,
+        text: "条件1: 达成。条件2: 达成。(上一批的)现在接着改别的。", write: "scripts/x.mjs",
+        bash: "echo node scripts/batch-goal.mjs --clear\ngit commit -m x",
+        batchGoal: { cleared: true, batch: "072", closedConditions: ["甲", "乙"] } },
+      // 批 285(D135)反向钉:编号放宽不外溢——中文编号只裁了一条、缺条件二 ⇒ 关账照拦
+      { name: "285 D135 反向钉:条件一裁了、缺条件二 ⇒ 照拦", expectBlock: true,
+        text: "条件一:达成。关账。", bash: "node scripts/batch-goal.mjs --clear\ngit commit -m x",
+        batchGoal: { cleared: true, batch: "285", closedConditions: ["甲", "乙"] } },
+      // 批 285 第二轮复核(误拦猎手第 2 份 FB-1)反向钉:分隔写法放宽不外溢——编号后接普通汉字的说明句不是裁决
+      { name: "285 二轮 FB-1 反向钉:「条件 1 的达成标准是…」不算对照 ⇒ 照拦", expectBlock: true,
+        text: "条件 1 的达成标准是欠账清零。关账。", bash: "node scripts/batch-goal.mjs --clear\ngit commit -m x",
+        batchGoal: { cleared: true, batch: "285", closedConditions: ["甲"] } },
+      // 批 285 三轮(红队第二轮 BP-3):表格里复述「达成标准 / 不适用条件」「达成要求 / 达成口径」不是裁决 ⇒ 照拦
+      { name: "285 三轮 BP-3:表格复述达成标准不算对照 ⇒ 照拦", expectBlock: true,
+        text: "| 条件 1 | 达成标准:欠账清零 |\n| 条件 2 | 达成标准:探针绿 |\n| 条件 3 | 不适用条件:无 |\n关账。",
+        bash: "node scripts/batch-goal.mjs --clear\ngit commit -m x",
+        batchGoal: { cleared: true, batch: "285", closedConditions: ["甲", "乙", "丙"] } },
     ],
     neg: [
+      // 批 285 第二轮复核(误拦猎手第 2 份 FB-1,阻断级老误拦):Markdown 写法的逐条对照同样算数
+      ...["条件 1:**达成**", "条件 1(欠账清零):达成", "- 条件 1 —— 达成", "| 条件 1 | 达成 |", "条件 1:✅ 达成", "**条件 1**:达成", "条件（一）:达成"]
+        .map((w) => ({ name: `285 二轮 FB-1:${w}`, text: `${w}\n关账。`, bash: "node scripts/batch-goal.mjs --clear\ngit commit -m x",
+          batchGoal: { cleared: true, batch: "285", closedConditions: ["甲"] } })),
+      // 批 285 收口(误拦猎手 FB-1):裁决词后接「的 / 与」的真裁决照算
+      { name: "285 收口 FB-1:条件 2:未达成的部分已登记", text: "条件 1:达成。条件 2:未达成的部分已登记 D190。关账。",
+        bash: "git commit -m x\nnode scripts/batch-goal.mjs --clear", batchGoal: { cleared: true, batch: "285", closedConditions: ["甲", "乙"] } },
+      { name: "285 收口 FB-1:条件1:达成的,探针全绿", text: "条件1:达成的,探针全绿。关账。",
+        bash: "git commit -m x\nnode scripts/batch-goal.mjs --clear", batchGoal: { cleared: true, batch: "285", closedConditions: ["甲"] } },
+      // 批 285(D126 误拦半):结清态下只读轮 grep / rg batch-goal 源码里的 --clear ⇒ 不是关账轮,不追上一批的逐条对照
+      { name: "285 D126:结清态只读轮 grep batch-goal 源码", text: "看一下 --clear 的实现在哪。",
+        bash: "grep -n -- --clear scripts/batch-goal.mjs",
+        batchGoal: { cleared: true, batch: "285", closedConditions: ["甲", "乙"] } },
+      { name: "285 D126:结清态只读轮 rg 与 VAR= 前缀的 cat", text: "再看一眼。",
+        bash: ["rg -n -- --clear scripts/batch-goal.mjs", "LC_ALL=C cat scripts/batch-goal.mjs --clear"],
+        batchGoal: { cleared: true, batch: "285", closedConditions: ["甲", "乙"] } },
+      // 批 285(D135 误拦半):中文数字 / 圈码 / 全角数字编号的逐条对照同样算数
+      { name: "285 D135:条件一 / 条件二(中文数字)", text: "条件一:达成。条件二:不适用。关账。",
+        bash: "node scripts/batch-goal.mjs --clear\ngit commit -m x",
+        batchGoal: { cleared: true, batch: "285", closedConditions: ["甲", "乙"] } },
+      { name: "285 D135:条件① / 条件②(圈码)", text: "条件①:达成。条件②:达成。关账。",
+        bash: "node scripts/batch-goal.mjs --clear\ngit commit -m x",
+        batchGoal: { cleared: true, batch: "285", closedConditions: ["甲", "乙"] } },
+      { name: "285 D135:条件十(两位中文数字,裁决在上一轮)+ 全角数字", text: "关账。",
+        bash: "node scripts/batch-goal.mjs --clear\ngit commit -m x",
+        batchGoal: { cleared: true, batch: "285", closedConditions: ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"] },
+        prior: [{ text: "条件１:达成 条件２:达成 条件三:达成 条件四:达成 条件五:达成 条件六:达成 条件七:达成 条件八:达成 条件九:达成 条件十:达成" }] },
+
       // 纯问答,没动工作面
       { text: "这个字段是干嘛的?", batchGoal: null },
       // 批 265:从来没立过批的仓(实时注入 batchEverArmed:false),动了工作面也不追「先立批」——批是可选做法
@@ -3703,7 +4010,9 @@ const RULE_K0 = {
  *    改判为「引导词 + 任意动宾」。 */
 // 2026-09-06 当轮又撞一个未列动词(「回件到齐后我接着**判**」被拦,fp 已记)——这是 D87 写明的
 //   失效条件第三次触发;补「判|裁|派」止血,**方向问题**(措辞面 → 动作面)登记在 gate-debts D104 归用户裁。
-const SAID_NEXT_ZH = /(下一步|接下来|接着|继续|随后|然后)[^。\n]{0,24}(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删|候|等|盯|守|收|判|裁|派)/;
+// 批 285 第二轮复核(误拦猎手第 2 份 FB-2):动词表只此一份(SAID_NEXT_VERBS),同行写法与列表首项共用
+const SAID_NEXT_VERBS = "(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删|候|等|盯|守|收|判|裁|派)";
+const SAID_NEXT_ZH = new RegExp(`(下一步|接下来|接着|继续|随后|然后)[^。\n]{0,24}${SAID_NEXT_VERBS}`);
 // ⚠️ 首版英文支被 grill 复核判 CRITICAL(2026-09-06 当轮):引导词含裸 `then`/`will`/`going to`/`plan to`,
 //   动词表 50 个常用词,窗口不辨否定与时态 ⇒ 「The hook then runs the check and exits 0.」
 //   「I will not run the check until you confirm.」「I then ran the check」全算「说了下一步」——
@@ -3736,11 +4045,12 @@ function bgRunning(ctx) {
   if (prior && !(prior.actions || []).length) return false;   // 连续两窗零动作 ⇒ 不再算「等」
   return true;
 }
-function saidNextIn(text) {
+// 批 285(D155):第二参 `{ old258 }` 选批 258 的列表出路原式——D96 的「上一窗说过下一步」腿与 S 的变异用。
+function saidNextIn(text, { old258 = false, listVerbAtStart = false } = {}) {
   // 与 E0/E2/R 同一份剥引文实现(D71/D74),不用 gate-cmd 的 shell 引号版(会吃掉 I'll 的撇号);
   //   围栏代码块整块抹掉——粘贴闸拦词/命令样例不算「说了下一步」。
   const s = maskQuoted(String(text || "").replace(/```[\s\S]*?```/g, " "));
-  return SAID_NEXT_ZH.test(s) || SAID_NEXT_EN.test(s) || SAID_NEXT_LIST.test(s);
+  return SAID_NEXT_ZH.test(s) || SAID_NEXT_EN.test(s) || (old258 ? SAID_NEXT_LIST_258 : listVerbAtStart ? SAID_NEXT_LIST_AT_START : SAID_NEXT_LIST).test(s);
 }
 // 批 258 S-b(出路过窄,真误报):「下一步:」后换行接编号 / 项目符号列表,首项里有动作动词 ⇒ 同样算说了下一步。
 //   只许跨**一个**换行、且下一行须是列表项起头(数字加点 / 顿号 / 括号,或 - *),动词表照 D104 冻结、不补词。
@@ -3750,12 +4060,36 @@ function saidNextIn(text) {
 //   codex 258-cond2-r2:逐字排除完成体 / 否定躲不开多字动词(「已经核对过」「暂不检查」)⇒ 改结构判据:
 //   列表首项须**以动作动词开头**(可带「先 / 再 / 然后 / 接着 / 去」引导),且整项不含「了」「过」与「无需 / 没有 / 不再 / 不用 / 不必」。
 //   让出面(登记):首项以名词起头的计划(「迁移检查要跑」)不认;项内带「通过」的计划(「跑测试确认通过」)不认——同行写法 SAID_NEXT_ZH 照旧认。
-const SAID_NEXT_LIST = /(下一步|接下来|随后)[:：][ \t]*\r?\n[ \t]*(?:\d+[.、)）]|[-*])[ \t]*(?![^。\n]*?(?:了|过|无需|没有|不再|不用|不必))(?:先|再|然后|接着|去)?(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删|候|等|盯|守|收|判|裁|派)/;
+// 批 285(D155 误拦半;复核红队 258 cond2 BP-8,S 误报率 10.7%、35 笔盲审确认误拦):引导部分放宽到常见的 Markdown 写法——
+//   「**下一步**:」「**下一步:**」(加粗,冒号在粗体内外都认)、「## 下一步」标题(标题可不带冒号)、
+//   引导词加「然后」「下一步是 / 下一步计划」;列表序号加中文数字「一、」、圈码「①」、全角「１.」;
+//   引导行与列表之间容许**一个**空行(原 pos「下一步冒号后隔空行才是列表」翻为 neg——Markdown 标题后空一行是常态)。
+//   不动的:列表首项须以动作动词开头、整项不含「了 / 过 / 无需 / 没有 / 不再 / 不用 / 不必」(258 BP-3 与 codex r2 的完成体 / 否定反例照拦),
+//   列表标记后只许同一行,动词表照 D104 冻结;两个及以上空行仍不认。
+//   代价(漏放方向,接受):更多排版写法能满足 S 的 A 态出路;失效条件:出现一次真实漏放损失即重开。
+//   未修(登记):表格行起头的列表仍不认——表格单元格里「下一步」与动词的结构判据没有现成形态,拿不准会不会放过表头里的过去式。
+const SAID_NEXT_LEAD = "(?:#{1,6}[ \\t]*)?(?:\\*\\*|__)?(?:下一步(?:是|计划)?|接下来|随后|然后)(?:\\*\\*|__)?[ \\t]*";
+const SAID_NEXT_ITEM = "(?:\\d+[.、)）]|[０-９]+[.．、)）]|[一二三四五六七八九十]{1,3}[、.．]|[①-⑳]|[-*])";
+// 批 285 第二轮复核(误拦猎手第 2 份 FB-2):「**下一步**:\n1. 提交并推送」被拦——首项须**以**动词表里的字开头,「提交」不在表里,
+//   同行写法「下一步:提交并推送」却因 SAID_NEXT_ZH 容许动词前隔 ≤24 字而放行,两种排版判法不一。现首项与同行同一口径:
+//   动词表同一份(SAID_NEXT_VERBS,SAID_NEXT_ZH 也由它拼出),动词前容许 ≤24 个**非否定**字(前缀里不得有 不 / 别 / 未 / 勿 / 没 / 无 / 暂 / 已,
+//   「暂不检查」「已经核对过」照拦);整项不含「了 / 过 / 无需 / 没有 / 不再 / 不用 / 不必」的排除不变。
+//   代价(漏放方向,接受):首项以名词起头、后接动作字的写法(「全部跑完」)也算说了下一步;失效条件:出现一次真实漏放损失即重开。
+//   V.listVerbAtStart 只给变异用(退回首项须以动词开头)。
+const SAID_NEXT_LIST_HEAD =
+  // 冒号形(冒号可在粗体内:「**下一步:**」)或标题形(行首 # 起头,可不带冒号)
+  `(?:${SAID_NEXT_LEAD}[:：](?:\\*\\*|__)?|(?:^|\\n)[ \\t]*#{1,6}[ \\t]*(?:\\*\\*|__)?(?:下一步(?:是|计划)?|接下来|随后|然后)(?:\\*\\*|__)?[ \\t]*[:：]?(?:\\*\\*|__)?)` +
+  `[ \\t]*\\r?\\n(?:[ \\t]*\\r?\\n)?[ \\t]*${SAID_NEXT_ITEM}[ \\t]*(?![^。\\n]*?(?:了|过|无需|没有|不再|不用|不必))(?:先|再|然后|接着|去)?`;
+const SAID_NEXT_LIST = new RegExp(`${SAID_NEXT_LIST_HEAD}[^。\\n不别未勿没无暂已]{0,24}?${SAID_NEXT_VERBS}`);
+const SAID_NEXT_LIST_AT_START = new RegExp(`${SAID_NEXT_LIST_HEAD}${SAID_NEXT_VERBS}`);
+/** 批 258 原式(批 285 D155 前),只给 S 的变异「退回批 258 列表出路」用。 */
+const SAID_NEXT_LIST_258 = /(下一步|接下来|随后)[:：][ \t]*\r?\n[ \t]*(?:\d+[.、)）]|[-*])[ \t]*(?![^。\n]*?(?:了|过|无需|没有|不再|不用|不必))(?:先|再|然后|接着|去)?(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删|候|等|盯|守|收|判|裁|派)/;
 const RULE_S = {
   id: "S",
   blocking: true,          // 用户常设授权:「新增阻断项一律授权自动化」
   law: "AGENTS.md#执行共识",
-  detect: (ctx) => {
+  // 第二参只给 mutations 注入变异开关(引擎只传 ctx,默认值即真判据;同 ND 的写法)。
+  detect: (ctx, V = {}) => {
     // ⚠️ **剥引号**(2026-08-20 grill:error-handling §4.3,它跑代码复现了):
     //   把 S 自己的阻断消息原样引用一遍,就能**把 S 对本轮永久关掉**
     //   —— 它的消息里同时含 `⏸` 与「不可逆 / 需你亲签」,两段判据一起被满足。
@@ -3807,7 +4141,9 @@ const RULE_S = {
     //   **加一个更强的条件进 AND,不会让判据变强**,只会让它更容易被绕过的那一支胜出。
     //   ⇒ C 态**只认动作面**:真跑过 `batch-goal --clear` 才算跑完了。
     //   代价:先逐条对照、下一轮才关账的轮次会被拦一次,出路是 A 态那句「接下来关账」。
-    const ranClearNow = (() => { try { return ranClear(ctx); } catch { return false; } })();
+    // 批 285(D126):这里刻意用宽口径 ranClearMention(读 / 打印命令里提到 --clear 也算)——收窄会让 S 多响,
+    //   而本批只修误拦半;echo 抹掉 S 这一漏放按接受风险留着(见 ranClear 头注)。
+    const ranClearNow = (() => { try { return ranClearMention(ctx); } catch { return false; } })();
     if (bg && !bg.cleared && !ranClearNow && bg.conditionCount > 0) {          // 非 C(动作面)
       // ⚠️ 2026-08-27(D77 的**漏修半边**,出路自证逐正例跑之后逮到):
       //   理由面必须查**原文**,不查剥过引文的 `sTxt`——人会很自然地把分类名写引号里
@@ -3819,7 +4155,7 @@ const RULE_S = {
       // A 态的痕迹=「说出下一步」。⚠️ 2026-09-02(D97):此判据原先只在**第二分支**查,
       //   而第一分支(零动作)排在它前面 ⇒ 纯文本轮写了「接下来把剩下两条迁完」照样被拦,
       //   出路②在零动作轮**结构性不可达**(探针 T5 复现)。现提前计算、两个分支共用。
-      const saidNext = saidNextIn(ctx.text);
+      const saidNext = saidNextIn(ctx.text, { old258: !!V.old258, listVerbAtStart: !!V.listVerbAtStart });
       // 「继续跑」= **本轮有任何工具动作**,不是「写了文件」。
       //   首版把它编成 writes||commits||agents,实测三个候选四态全被误拦:
       //   「等 codex 回件」「只读了一堆文件」「发现条件错了」——前两个本来就是 A 且确实在跑
@@ -3841,7 +4177,9 @@ const RULE_S = {
       //   且 ⏸+三类理由(B 态)仍照常放行——等待用户是合法停工,本条只收「假装在跑」。
       const prior = typeof ctx.window === "function" ? ctx.window() : null;
       if (!marked && saidNext && !running && !(ctx.actions || []).length && prior &&
-          !(prior.actions || []).length && saidNextIn(prior.text)) {
+          // 批 285(D155):上一窗的「说过下一步」刻意仍用批 258 原式——新认的排版写法若也算进上一窗,
+          //   「上窗新写法 + 本窗旧写法、两窗零动作」会从放行变成 D96 阻断(多拦);本批只修误拦半,这一漏放按接受风险留着。
+          !(prior.actions || []).length && saidNextIn(prior.text, { old258: true })) {
         return ["上一窗已说过「接下来做 X」且零动作,本窗又零动作只靠「下一步」句——承诺连续未兑现,出路②失效(D96);要么真做一次,要么标 ⏸ 说明属哪一类合法停工"];
       }
       // ── D67③ 补齐(2026-08-27,批 117;用户当轮第三次逮到同一形态)────────────
@@ -3952,6 +4290,10 @@ const RULE_S = {
       sample: { text: "⏸ 需要你确认：属「不可逆」类，翻 public 撤不回来。" } },
   ],
   mutations: [
+    // 批 285(D155):列表出路退回批 258 原式 ⇒ 加粗 / 标题 / 中文与全角序号 / 隔一空行的诚实下一步被拦。证人 = neg「285 D155」各条。
+    { name: "285 D155 退回:列表出路只认批 258 原式", apply: (r) => ({ ...r, detect: (ctx) => RULE_S.detect(ctx, { old258: true }) }) },
+    // 批 285 第二轮复核(误拦猎手第 2 份 FB-2):证人 = neg「285 二轮 FB-2」
+    { name: "285 二轮退回:列表首项须以动词开头(与同行写法口径不一)", apply: (r) => ({ ...r, detect: (ctx) => RULE_S.detect(ctx, { listVerbAtStart: true }) }) },
     // 批 281:不看 foreign(别的会话武装的批照样拦本会话)——被 neg「281:别的会话武装的批」杀
     { name: "不看 foreign(别的会话的批照拦)", apply: (r) => ({ ...r, detect: (ctx) =>
       RULE_S.detect(ctx.batchGoal && ctx.batchGoal.foreign ? Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx, { batchGoal: { ...ctx.batchGoal, foreign: false } }) : ctx) }) },
@@ -4028,9 +4370,19 @@ const RULE_S = {
       { name: "D99 反向钉(codex):过去式与引用示例都不是下一步",
         text: "I will not run any commands. Back then we would run the checks manually. The phrase \"I will run the tests\" is only an example.",
         batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
-      // 批 258 S-b 反向钉:「下一步:」后隔空行才是列表 ⇒ 不算(只许跨一个换行进列表首项)
-      { name: "258 S-b 反:下一步冒号后隔空行才是列表",
-        text: "回件处置完了。\n\n下一步:\n\n1. 跑迁移检查",
+      // 批 258 S-b 反向钉(批 285 D155 改):原钉「隔一个空行」,现放宽到容许一个空行(该条翻入 neg);隔两个空行仍不认
+      { name: "285 D155 反向钉:下一步冒号后隔两个空行才是列表 ⇒ 不算", expectBlock: true,
+        text: "回件处置完了。\n\n下一步:\n\n\n1. 跑迁移检查",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      // 批 285(D155)反向钉:新认的排版写法不外溢——完成体 / 否定照拦(258 BP-3 与 codex r2 的教训)
+      { name: "285 D155 反向钉:加粗下一步 + 已做事项", expectBlock: true,
+        text: "**下一步**:\n1. 跑了迁移检查,全绿", read: "docs/x.md",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      { name: "285 D155 反向钉:标题下一步 + 无需再跑", expectBlock: true,
+        text: "处置完了。\n\n## 下一步\n\n- 无需再跑,本批到此", read: "docs/x.md",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      { name: "285 D155 反向钉:中文序号首项是否定", expectBlock: true,
+        text: "下一步:\n一、暂不检查任何内容。", read: "docs/x.md",
         batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
       // codex 258-cond2-r1 断言 2:列表标记后不许跨行;否定的「不做」不是下一步
       { name: "258 S-b 反:空列表项后隔行的过去式不是下一步", text: "下一步:\n-\n\n已核对。",
@@ -4059,6 +4411,24 @@ const RULE_S = {
       // 批 258 S-b:「下一步:」换行接编号列表,首项有动作动词 ⇒ 说了下一步
       { name: "258 S-b:下一步冒号后换行接编号列表",
         text: "这一轮的回件都处置完了。\n\n下一步:\n1. 跑迁移检查确认全绿\n2. 提交并推送",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
+      // 批 285(D155 误拦半;复核红队 258 cond2 BP-8 列的形态):诚实写出下一步的常见 Markdown 写法,首项以动作动词开头 ⇒ 放行。
+      //   每条都带 read 动作,走的是「做了活、没说下一步」那一支(零动作支另有 D96 的跨窗腿,不在本组)。
+      ...[
+        ["加粗引导词、冒号在外", "**下一步**:\n1. 跑迁移检查"],
+        ["加粗引导词、冒号在内", "**下一步:**\n1. 跑迁移检查"],
+        ["标题、无冒号、隔一空行", "回件处置完了。\n\n## 下一步\n\n1. 跑迁移检查"],
+        ["标题、无冒号、紧接列表", "### 下一步\n- 改判据再跑自测"],
+        ["中文序号「一、」", "下一步:\n一、跑迁移检查"],
+        ["圈码「①」", "下一步:\n① 跑迁移检查"],
+        ["全角序号「１.」", "下一步:\n１. 跑迁移检查"],
+        ["引导词「然后」", "然后:\n1. 跑迁移检查"],
+        ["引导词「下一步是」", "下一步是:\n1. 跑迁移检查"],
+        ["冒号后隔一空行(原 258 pos 翻入)", "回件处置完了。\n\n下一步:\n\n1. 跑迁移检查"],
+      ].map(([n, text]) => ({ name: `285 D155:${n}`, text, read: "docs/x.md",
+        batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } })),
+      // 批 285 第二轮复核(误拦猎手第 2 份 FB-2):首项动词前隔几个字(「提交并推送」)与同行写法同口径 ⇒ 放行
+      { name: "285 二轮 FB-2:**下一步**:列表首项「提交并推送」", text: "**下一步**:\n1. 提交并推送", read: "docs/x.md",
         batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
       // D104(a) 动作面(2026-09-06 用户裁「动作面吧」):后台任务在飞 + 零动作 + 一个字的下一步都没说 ⇒ 放行——
       //   这就是 2026-09-05 被 K 提示轮逼出的空回合的实况形态;**样本不含任何引导词/动词**,证的是动作面。
@@ -4141,10 +4511,69 @@ const RULE_T = {
   id: "T",
   blocking: true,          // 用户常设授权：「新增阻断项一律授权自动化」
   law: "AGENTS.md#执行共识",
-  detect: (ctx) => {
+  // 第二参只给 mutations 注入变异开关(引擎只传 ctx,默认值即真判据;同 ND 的写法)。
+  // 批 285(D139③ / D158⑤,误拦;只剔不加,不会多拦一句):两种「登记」不是处置声明——
+  //   ① 装机台账(INSTALLED.md / 装机台账 / tool-register / 工具台账)当处所或去向的「登记」:那是**已做完**的装机落账
+  //     (批 257 实撞「装机台账登记了新管的这批载体」被要失效期);只剔「台账名 + 登记」或「登记进 + 台账名」这几个字,句子其余照判。
+  //     欠账台账(gate-debts / 欠账表)不在表里——「这个洞登记进欠账表」正是 T 要管的登记。
+  //   ② 普查器(E:/dotfiles-claude/census.mjs)自己的输出格式:**行首**类别名「装了没登记 / 登记了已不在 / 登记了没装」后接空白或冒号,
+  //     以及类别名后紧跟计数(「登记了没装工具 1 条」)。批 259 撤掉的是**自由文本里猜**类别名;这里只认行首标签与「类别名 + 数字」两种格式,
+  //     裸写「这条只登记了没装上」「只登记了没装闸」照拦(cases.pos 钉着)。
+  //   代价(漏放面,按用户取舍接受):有人把缺陷「登记进 tool-register」或在行首以普查标签起句写真登记,T 不再响;出现一次真实漏放损失即重开。
+  _LEDGER_NAME: String.raw`(?:INSTALLED\.md|装机台账|tool-register(?:\.md)?|工具台账)`,
+  // 批 285 第二轮复核(红队第 3 份 BP-2):同一句(按 。!?换行 切)里出现欠账表 / 欠账台账 / gate-debts / 欠账 ⇒ 该句不剔——
+  //   「这个超时 bug 在欠账表和工具台账里都登记了,先不修」原被剔成无登记句放行,而它正是登记进欠账表的拖延声明。
+  //   只少剔不多剔 ⇒ 只会多拦带欠账表的句子(它们本就该给失效期)。V.noDebtKeep 只给变异用。
+  _stripLedger: (s, V = {}) => {
+    const L = RULE_T._LEDGER_NAME;
+    const keep = (m, off, str) => {
+      if (V.noDebtKeep) return " ";
+      const a = Math.max(...["。", "!", "?", "！", "？", "\n"].map((c) => str.lastIndexOf(c, off - 1))) + 1;
+      const rel = str.slice(off + m.length).search(/[。!?！？\n]/);
+      const sent = str.slice(a, rel < 0 ? str.length : off + m.length + rel);
+      // 批 285 第三轮(误拦猎手第二轮 FB-1):只在欠账表与装机台账**并列作登记宾语**时不剔(「欠账表和工具台账里都登记了」);
+      //   「欠账表无新增」「本批无欠账」这类旁述 / 否定照剔(原见「欠账」二字就不剔 ⇒ 装机落账句被拦)
+      const D = String.raw`(?:欠账表|欠账台账|gate-debts(?:\.md)?|欠账)`, J = String.raw`[^。！？!?\n]{0,12}?(?:和|与|及|跟|、)[^。！？!?\n]{0,12}?`;
+      return new RegExp(`${D}${J}${L}|${L}${J}${D}`, "i").test(sent) ? m : " ";
+    };
+    return String(s)
+      .replace(new RegExp(`${L}\\s*(?:里|中|上|内)?\\s*(?:已|也|都)?\\s*登记了?`, "g"), keep)
+      .replace(new RegExp(`登记(?:进|到|入|在)了?\\s*${L}`, "g"), keep)
+      .replace(/^[ \t>*\-]*(?:装了没登记|登记了已不在|登记了没装)(?=[ \t]|[:：])/gm, keep)
+      .replace(/(?:装了没登记|登记了已不在|登记了没装)(?:的)?(?:工具|载体|插件|件)?\s*[:：]?\s*\d+\s*(?:条|个|项|件|处)/g, keep);
+  },
+  detect: (ctx, V = {}) => {
     // 引号内不算（同 Q：引用闸自己的报告不该触发它）
     //   批 259(红队 a391d46c (b)):反引号里的也是引用(「闸报的 `已登记未修` 不算处置」)
-    const t = String(ctx.text || "").replace(/「[^」]*」|«[^»]*»|"[^"]*"|`[^`\n]*`/g, " ");
+    // 批 285(D160④ 误拦;原是 D171⑧ 让出面,用户 10-27「误拦比漏放贵」后按纯剔除重开,不加新判据):剥引号**之前**先对原文剔两式——
+    //   ① `--decision` / `--outcome` 之后 30 字内的「登记了 N 个决定 / 成果(…)」:batch-goal 子命令的转述,括号里写什么都不是处置声明
+    //      (「用 --outcome 登记了 2 个成果(部署与探针)」原被拦;`--outcome` 常写在反引号里,先剥就没了,故在原文上做);
+    //   ② 括号里紧跟**反引号包的编号**(「登记了 1 个决定(`259-D1` 不改口径)」):与下面 t2 的「(编号…」同一后看,只多容一个反引号
+    //      ——原先反引号先被剥成空格,后看失配。
+    //   两式只把命中段换成空格 ⇒ 只会少命中、不会多拦。代价(漏放):「用 --decision 登记了决定(之后再看)」这类借子命令名的拖延句不再拦。
+    //   失效条件:反例「285 D160④:」各条或正例「285 D160④ 对照:」翻红。
+    // 批 285 第二轮复核(codex 285-debt-fix-audit-r1 断言 3,本批新引入的误拦):上面两式原有两处副作用——
+    //   a. 括号里带失效期(「用 --outcome 登记了 1 个成果(该坑失效期 ≤286)」)时整段剔掉,失效期一并没了,同轮别处的真登记被判「没给失效期」;
+    //   b. 命中段里的单个反引号(`--decision` 的收尾那个)被一起剔掉,反引号配对错位,后面「原话 `已登记未修`」的引号内容暴露成登记句。
+    //   修法:括号内是 PAT.expiry 认得的失效期写法 ⇒ 该段不剔;剔时保留命中段里的反引号(其余字换空格),配对不变。只少剔 ⇒ 不会多放。
+    //   V.oldD160 只给变异用(退回无这两处保护的原式)。
+    const d160 = (m) => {
+      if (V.oldD160) return " ";
+      const par = m.match(/[(（]([^)）\n]*)[)）]$/);
+      if (par && matchAny(par[1], PAT.expiry).length) return m;
+      return m.replace(/[^`]+/g, " ");
+    };
+    // 批 285 收口(本会话实撞两次,窄例外③判据过重):「决定和成果都登记了」「已记进误报账 / 记了误报」是 batch-goal 台账与 --fp 误报账的动作,
+    //   不是把缺陷登记了拖着不修 ⇒ 先剔。只剔这几个固定写法;「这个洞登记了」照拦。V.noLedgerAct 只给变异用。
+    const tLa = V.noLedgerAct ? String(ctx.text || "") : String(ctx.text || "")
+      .replace(/(?:决定(?:与|和|、)成果|成果(?:与|和|、)决定)都?(?:已)?登记了?(?=[。，,;；\s]|$)/g, " ")
+      .replace(/(?:已)?记(?:进|入)(?:了)?误报账|记了?(?:一笔)?误报|--fp\b[^。\n]{0,40}/g, " ")
+      // 否定式「不是 / 并非 / 而非 / 没有 …挂着(不修)」是在否认拖延,不是登记声明(本会话实撞:「不是把缺陷挂着不修」)
+      .replace(/(?:不是|并非|而非|没有)[^。\n]{0,12}?挂着(?:不修|没修|不管)?/g, " ");
+    const t0 = V.noD160 ? tLa : tLa
+      .replace(/--(?:decision|outcome)\b[^。\n]{0,30}?登记了?\s*(?:\d+\s*个)?\s*(?:的)?(?:决定(?:与|和|、)成果|成果(?:与|和|、)决定|决定|成果)\s*[(（][^)）\n]{0,120}[)）]/g, d160)
+      .replace(/登记了?\s*(?:\d+\s*个)?\s*(?:的)?(?:决定(?:与|和|、)成果|成果(?:与|和|、)决定|决定|成果)(?=[(（]\s*`\s*(?:编号|\d|[A-Z]?\d))/g, d160);
+    const t = t0.replace(/「[^」]*」|«[^»]*»|"[^"]*"|`[^`\n]*`/g, " ");
     // 批 258(T-a,09-18 后 8 次报警自签误报 4 次):「登记」当功能名 / 类别名也被当成处置声明。
     //   只剔这两种写法(先剔再判,剩下的照旧算):「登记了 / 登记(N 个)决定 / 成果」(`--decision/--outcome` 子命令)、
     //   普查器类别名(批 259 撤,见下)。复核红队一轮 BP-3:先前改成「弱登记词须同句有缺陷名词」放过了
@@ -4154,11 +4583,20 @@ const RULE_T = {
     //   剔除只能猜自由文本,批 258 五轮来回即其代价。写类别名就加「」(上一行已剥引号),裸写照拦(接受的误拦,出路一对引号)。
     //   红队 a391d46c 附节二⑤:batch-goal 惯用「用 --decision 登记了 8 个决定(编号…」,后看须认左括号——
     //   但只认括号里紧跟编号的(收口轮 BP-7:「这个漏放登记了决定(之后再看)」不得被剔)
-    const t2 = t.replace(/登记了?\s*(?:\d+\s*个)?\s*(?:的)?(?:决定(?:与|和|、)成果|成果(?:与|和|、)决定|决定|成果)(?=[。，,;；、\s)）]|[(（]\s*(?:编号|\d|[A-Z]?\d)|$)/g, " ");
+    // 批 285(D156② 误拦半):「登记了」与「决定 / 成果」之间夹 D 编号或提交哈希也是功能名(「batch-goal 登记了 D149 的决定与成果」),
+    //   原式只认紧邻形 ⇒ 当处置声明拦。现容许夹一个或几个(顿号 / 和 / 与连接)「D号 / 批号-D号 / 7–40 位十六进制哈希」再接可选「的」;
+    //   后看(句读 / 句尾 / 左括号接编号)不变,「登记了 D149 的决定下批再看」照拦。V.noIdGap 只给变异用。
+    //   代价(漏放方向,接受):夹编号的功能名写法不再被追失效期;失效条件:出现一次真实漏放损失即重开。
+    const T_ID = "(?:\\d{3}[a-z]?-)?D\\d+|[0-9a-f]{7,40}";
+    const tReg = V.noIdGap
+      ? /登记了?\s*(?:\d+\s*个)?\s*(?:的)?(?:决定(?:与|和|、)成果|成果(?:与|和|、)决定|决定|成果)(?=[。，,;；、\s)）]|[(（]\s*(?:编号|\d|[A-Z]?\d)|$)/g
+      : new RegExp(`登记了?\\s*(?:(?:${T_ID})(?:\\s*(?:、|和|与|,|，)\\s*(?:${T_ID}))*\\s*)?(?:\\d+\\s*个)?\\s*(?:的)?(?:决定(?:与|和|、)成果|成果(?:与|和|、)决定|决定|成果)(?=[。，,;；、\\s)）]|[(（]\\s*(?:编号|\\d|[A-Z]?\\d)|$)`, "g");
+    const t2 = t.replace(tReg, " ");
     // J 法定的触发层答案「靠人记得——已知风险,登记在案」不是处置声明(复核红队一轮附节二⑤:J × T 互撞)。
     //   二轮 BP-4:裸用于缺陷的「这个漏放是已知风险,登记在案」照旧算登记 ⇒ 正文提到「触发层 / 靠人记得」才剔;
     //   三轮 BP-2 / BP-8:语境只当条件,剔除范围只限那八个字(否则锚词与短语之间的真登记被一并吃掉)。
-    const t3 = /触发层|靠人记得/.test(t2) ? t2.replace(/已知风险[,，]\s*登记在案/g, " ") : t2;
+    const t3a = /触发层|靠人记得/.test(t2) ? t2.replace(/已知风险[,，]\s*登记在案/g, " ") : t2;
+    const t3 = V.noLedgerStrip ? t3a : RULE_T._stripLedger(t3a, V);
     // 失效期在全文里找。批 259 曾按 codex 259-d158-design-r1 D4 改为逐句绑定,红队 a391d46c 语料回放:新拦 32 轮、新放 0 轮,
     //   连本规则出路②「下一批必修」写成单独一句都会被再拦;标题 / 引导句 / 列表 / 表格里的失效期全不认 ⇒ 按停止出口①退回全文找。
     //   「失效期从别的句子借」这一漏放面登记在 D156④(本条第六轮改动,此后新形态只登记)。
@@ -4191,6 +4629,8 @@ const RULE_T = {
     `      出路:\n${renderEscapes(RULE_T.escapes)}\n` +
     `      仅写「已登记」不给失效期等于静默改规矩。`,
   mutations: [
+    // 批 285(D156②):剔除式退回只认紧邻形 ⇒ 夹 D 号 / 哈希的功能名被拦。证人 = neg「285 D156②」两条。
+    { name: "285 D156② 退回:功能名剔除式不容中间夹编号", apply: (r) => ({ ...r, detect: (ctx) => RULE_T.detect(ctx, { noIdGap: true }) }) },
     { name: "不看失效期（登记就报）", apply: (r) => ({ ...r, detect: (ctx) =>
       (matchAny(ctx.text, PAT.registered).length ? ["x"] : []) }) },
     { name: "不剥引号", apply: (r) => ({ ...r, detect: (ctx) => {
@@ -4203,6 +4643,15 @@ const RULE_T = {
       const hit = matchAny(t, PAT.registered)[0];
       return hit && !matchAny(t, PAT.expiry).length ? [hit] : [];
     } }) },
+    // 批 285 D160④:剥引号前的两式剔除去掉(证人 = neg「285 D160④:」三条)
+    { name: "子命令转述 / 反引号编号不剔(D160④ 之前)", apply: (r) => ({ ...r, detect: (ctx) => RULE_T.detect(ctx, { noD160: true }) }) },
+    // 批 285 第二轮复核:三处修法各留一条退回(证人 = neg「285 二轮 codex 断言 3」两条 / pos「285 二轮 红队 3 BP-2」两条)
+    { name: "285 二轮退回:D160④ 剔除吃掉括号里的失效期与单个反引号", apply: (r) => ({ ...r, detect: (ctx) => RULE_T.detect(ctx, { oldD160: true }) }) },
+    { name: "285 二轮退回:同句有欠账表也照剔装机台账登记", apply: (r) => ({ ...r, detect: (ctx) => RULE_T.detect(ctx, { noDebtKeep: true }) }) },
+    { name: "285 收口退回:台账动作 / 误报账 / 否认挂着不修也当登记", apply: (r) => ({ ...r, detect: (ctx) => RULE_T.detect(ctx, { noLedgerAct: true }) }) },
+    // 批 285(D139③ / D158⑤):装机台账处所与普查器输出格式不剔(证人 = neg「285 D139③」「285 D158⑤」三条)
+    { name: "285 退回:装机台账登记 / 普查器行首标签与计数不剔", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_T.detect(ctx, { noLedgerStrip: true }) }) },
     // 批 258 T-a:功能名不剔(证人 = neg「登记了决定与成果」);批 259 起类别名不再剔,本变异只剩功能名一面
     { name: "功能名不剔", apply: (r) => ({ ...r, detect: (ctx) => {
       const t = String(ctx.text || "").replace(/「[^」]*」|«[^»]*»|"[^"]*"/g, " ");
@@ -4232,19 +4681,52 @@ const RULE_T = {
       { name: "259:类别名裸写 ⇒ 拦(出路加「」)", text: "普查结果分两类:登记了没装和装了没登记。" },
       { name: "259:这条只登记了没装上 ⇒ 拦", text: "这条只登记了没装上,回头补。" },
       { name: "259 收口轮 BP-7:登记了决定(之后再看)不被功能名剔除式吃掉 ⇒ 拦", text: "这个漏放登记了决定(之后再看)。" },
+      // 批 285 D160④ 对照:两式剔除不外溢——括号里反引号包的不是编号、或前面没有子命令名 ⇒ 照拦
+      { name: "285 D160④ 对照:登记了决定(`之后再看`)⇒ 拦", text: "这个漏放登记了决定(`之后再看`)。" },
+      { name: "285 D160④ 对照:没有子命令名的「登记了 2 个成果(之后再验)」⇒ 拦", text: "两条缺陷登记了 2 个成果(之后再验)。" },
+      // 批 285(D156②)反向钉:容许夹编号不外溢——后看不变,「登记了 D149 的决定下批再看」仍是登记声明
+      { name: "285 D156② 反向钉:登记了 D149 的决定下批再看 ⇒ 拦", expectBlock: true, text: "这个洞登记了 D149 的决定下批再看。" },
+      // 批 285 贴边:剔的只是台账名那几个字 / 行首普查标签,同一回合别处的真登记照拦
+      { name: "285 D139③ 贴边:装机台账落账 + 另一句真登记 ⇒ 拦", text: "装机台账登记了新管的载体。那个超时 bug 先登记下来。" },
+      { name: "285 贴边:欠账台账不在装机台账名表里 ⇒ 拦", text: "欠账台账里登记了这个洞,回头看。" },
+      { name: "285 D158⑤ 贴边:普查标签不在行首、后面也没计数 ⇒ 拦", text: "这条只登记了没装,回头补。" },
+      // 批 285 第二轮复核(红队第 3 份 BP-2):同句点了欠账表,装机台账那几个字不剔 ⇒ 是拖延登记,照拦
+      { name: "285 二轮 红队 3 BP-2:欠账表和工具台账里都登记了,先不修 ⇒ 拦", text: "这个超时 bug 在欠账表和工具台账里都登记了,先不修。" },
+      { name: "285 二轮 红队 3 BP-2:欠账表与 INSTALLED.md 都登记了这个洞 ⇒ 拦", text: "欠账表与 INSTALLED.md 都登记了这个洞。" },
     ],
     neg: [
       // 批 258:删「自签」支后,给了失效期即放行(原 pos「已登记未修,失效条件:下一批必修」)
       { name: "258:已登记未修 + 失效期 ⇒ 放行(不再要求独立复核)", text: "已登记未修,失效条件:下一批必修。" },
       // 批 258 T-a:「登记」当功能名 / 类别名
       { name: "258 T-a:新增子命令登记了决定与成果", text: "batch-goal 新增子命令,登记了决定与成果。" },
+      // 批 285(D156② 误拦半):功能名中间夹 D 编号 / 提交哈希
+      { name: "285 D156②:batch-goal 登记了 D149 的决定与成果", text: "batch-goal 登记了 D149 的决定与成果。" },
+      { name: "285 D156②:登记了 285-D1、285-D2 和 3eaadf4 的成果", text: "收尾时用 --outcome 登记了 285-D1、285-D2 和 3eaadf4 的成果。" },
       // 批 259:类别名不再靠剔除式猜,加「」即不算登记声明(判据剥引号)
       { name: "259:类别名加引号不算登记声明", text: "普查结果分两类:「装了没登记」、「登记了没装」各 1 条。" },
+      // 批 285(D139③ / D158⑤,误拦):装机台账落账、普查器原样输出与计数摘要都不是处置声明
+      { name: "285 D139③:装机台账登记了新管的载体(已做完的装机落账)", text: "装机台账登记了新管的这批载体。" },
+      { name: "285 D139③:登记进 INSTALLED.md", text: "三个新插件都登记进 INSTALLED.md 了。" },
+      // 批 285 第三轮(误拦猎手第二轮 FB-1):同句旁述「欠账表无新增 / 本批无欠账」不让装机落账句被拦
+      { name: "285 三轮 FB-1:装机台账落账 + 欠账表无新增", text: "新装的 lanes 插件在 INSTALLED.md 登记了,欠账表无新增。" },
+      { name: "285 三轮 FB-1:工具台账登记 + 本批无欠账", text: "工具台账里登记了 rg,本批无欠账。" },
+      // 批 285 收口(本会话实撞两次):台账动作与否认拖延的原话
+      { name: "285 收口:决定和成果都登记了(batch-goal 台账)", text: "决定和成果都登记了。现在只等收口那对猎手。" },
+      { name: "285 收口:记进误报账 + 否认挂着不修", text: "这次 T 误拦已记进误报账。上一条我说的是用 `batch-goal --decision` / `--outcome` 把本批的两个决定和成果写进了批台账，本批结清时 `--clear` 会核这几条，不是把缺陷挂着不修。" },
+      { name: "285 D158⑤:普查器行首标签原样贴出", text: "普查器输出:\n装了没登记  bins: rg 14.1\n登记了已不在 plugins: foo" },
+      { name: "285 D158⑤:类别名后紧跟计数", text: "普查:登记了没装工具 1 条,已补装。" },
       { name: "259:登记句 + 下一句以失效开头 ⇒ 放行", text: "P7 已登记未修。失效期 ≤262。" },
       // 批 259 红队(a391d46c)BP-9 / BP-10:出路②写成单独一句、失效期在标题 / 引导句里——诚实写法,放行
       { name: "259 红队 BP-9:出路②写成单独一句 ⇒ 放行", text: "P7 已登记未修。下一批必修。" },
       { name: "259 红队 BP-10:失效期写在标题里 ⇒ 放行", text: "## 遗留(失效期 ≤262)\n- P7:登记了\n- P8:登记在案" },
       { name: "259 红队附节二⑤:--decision 登记了 N 个决定(编号…)⇒ 不是处置声明", text: "用 --decision 登记了 8 个决定(编号 259-D1~D8)。" },
+      // 批 285 D160④(误拦,原 D171⑧ 让出面):子命令转述的括号内容不限编号;括号里的编号带反引号
+      { name: "285 D160④:用 --outcome 登记了 2 个成果(部署与探针)⇒ 不是处置声明", text: "用 --outcome 登记了 2 个成果(部署与探针)。" },
+      { name: "285 D160④:用 `--decision` 登记了 3 个决定(改判据、加夹具、补注释)⇒ 不是处置声明", text: "用 `--decision` 登记了 3 个决定(改判据、加夹具、补注释)。" },
+      { name: "285 D160④:登记了 1 个决定(`259-D1` 不改口径)⇒ 不是处置声明", text: "登记了 1 个决定(`259-D1` 不改口径)。" },
+      // 批 285 第二轮复核(codex 285-debt-fix-audit-r1 断言 3):D160④ 剔除不得吃掉括号里的失效期、不得拆散反引号配对
+      { name: "285 二轮 codex 断言 3a:括号里的失效期不随剔除丢失", text: "这个坑先登记下来。用 --outcome 登记了 1 个成果(该坑失效期 ≤286)。" },
+      { name: "285 二轮 codex 断言 3b:剔反引号编号不拆散后文引号", text: "用 `--decision` 登记了 1 个决定(编号 285-D1)。原话 `已登记未修`。" },
       { name: "259 红队(b):反引号引用的登记句不算", text: "闸报的 `已登记未修` 不算处置,我当场修了。" },
       { name: "258 复核三轮 BP-8:J 答案跨句号仍不算登记声明", text: "触发层:靠人记得。已知风险,登记在案。" },
       { name: "258 复核附节⑤:J 法定答案「已知风险,登记在案」不是处置声明", text: "触发层:靠人记得——已知风险,登记在案。" },
@@ -4517,6 +4999,11 @@ const RULE_P = {
       return H.ENGINE_PATH_RE.test(s);
     },
     isCarrierOrEngine(p, root) { return isCarrierPath(CARRIER_SURFACE, p) || RULE_P._p.isEnginePath(p, root); },
+    /** 批 285(D145 误拦子项):开工闸 hook-start-gate 判「这次写入是不是改闸引擎」的唯一入口——与 P 同一份锚定口径(isEnginePath)。
+     *  原来它直接用未锚定的 GATE_ENGINE 整串正则:批已武装、通道没跑齐时,写外发暂存树 `clipboard/oss/public-repo/scripts/…` 里的闸副本
+     *  被 deny(P 自己并不把副本当闸引擎)。代价:未锚定正则还会认的 `….mjs.bak` 之类不再拦;worktree 里的闸副本(按 hook 所在 checkout
+     *  化相对形后仍落在 `.claude/worktrees/` 下)也不再在开工面拦——与 P 同口径,收尾面照旧按 P 判。 */
+    startGateHit(target, root) { return !!target && RULE_P._p.isEnginePath(String(target), root || null); },
 
     /** git 事实;null = 取不到或没接(⇒ 回退语法判据)。 */
     facts(ctx) {
@@ -4963,7 +5450,7 @@ const RULE_P = {
     elsewhereHit(ctx, f) {
       const H = RULE_P._p;
       if (!(typeof ctx.didCommit === "function" && ctx.didCommit())) return false;
-      if (H.elsewhereCarrier(ctx, f.root)) return true;
+      if (H.elsewhereCarrier(ctx, f.root, f)) return true;
       return H.commitsElsewhere(ctx, f) && H.ownSyntaxCarrier(ctx);
     },
 
@@ -5046,9 +5533,14 @@ const RULE_P = {
       //   批 276b(BP-7):装钩子脚本与钩子目录同样算绑定
       return /hook-stop-closure|hook-guard|hook-remote-check(?!\.selftest)|install-git-hooks|git-hooks\/[\w.-]+\.mjs|gate-[\w-]+\.mjs|write-effects|fp-audit|gate-deps|\.diff\b|规则 ?id|rule ids?|\bRULE_[A-Z0-9]+\b|批 ?\d{3}|\bD\d{3}\b/i.test(p);
     },
-    /** 旧整串正则(hook-start-gate 按名引用它判「本批碰没碰闸引擎」,口径与本条同源;P 自己改用上面三件)。 */
+    /** 旧整串正则(口径与本条同源;P 自己改用上面三件)。批 285(D145):hook-start-gate 已改用 `startGateHit`(锚定口径),不再引用它;
+     *  另有 gate-rules 文件头的承重面判据(约 168 行)仍在用。 */
     //   批 276c(FB-5):通用名两支只认仓相对形(串首或空白 / 引号 / 等号之后的 `scripts/…`);hook-start-gate 先把本仓内的绝对路径化成相对形再判
-    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check)\.mjs|(?:^|[\s"'=])scripts\/(?:install-git-hooks\.mjs|git-hooks\/[\w.-]+\.mjs)|scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs|scripts\/gate-deps\/package(?:-lock)?\.json|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|fp-audit|hook-remote-check|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier|replay))\.mjs\b/i,
+    //   批 285(D160 误拦余项):各支扩展名后原无右界(末支是 `\b`)⇒ `write-effects.mjs.orig`、`gate-rules.mjs.bak` 这类备份件
+    //   被 hook-start-gate / G④ 当成闸引擎。右界改为 `(?![\w-]|\.\w)`:后面不能再接词字符或「.+词字符」;句末标点 `.`、空白、引号照认
+    //   (不用分诊草图的 `(?![\w.])`,它会让「改了 scripts/hook-guard.mjs。」之外的英文句号结尾也失配,换成漏放)。
+    //   代价:无——备份件不被任何会话当闸加载;失效条件:自测「D160:GATE_ENGINE 备份件」翻红。
+    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check)\.mjs(?![\w-]|\.\w)|(?:^|[\s"'=])scripts\/(?:install-git-hooks\.mjs|git-hooks\/[\w.-]+\.mjs)(?![\w-]|\.\w)|scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs(?![\w-]|\.\w)|scripts\/gate-deps\/package(?:-lock)?\.json(?![\w-]|\.\w)|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|fp-audit|hook-remote-check|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier|replay))\.mjs(?![\w-]|\.\w)/i,
 
     /** 本批提交是否**带进了闸引擎改动**(D11 收紧的适用面)。
      *  · git 事实在 ⇒ **只认** `基点..HEAD` 上被带进的提交里有没有本仓闸引擎文件(派出方 a27628dd 口径①:
@@ -5177,13 +5669,22 @@ const RULE_P = {
     },
     /** git 事实在时的补充面:git 看不见的**别的 checkout** 的承重提交(他仓宪法照样算,D93′)。
      *  只认绝对路径落在本仓根之外的承重写入 / 暂存;相对路径默认在本 checkout,由 git 事实负责。 */
-    elsewhereCarrier(ctx, root) {
+    //   批 285(D149⑨,误拦):原把**窗口**(前几轮)里根外绝对路径的承重写入与本轮同等看待——前几轮只 `Edit E:/elsewhere/AGENTS.md`
+    //   没提交、本轮只在本仓提交(或本仓提交失败)⇒ 计 1 笔别处承重提交。现:本轮的写入 / 命令照旧直接算;窗口里的那部分
+    //   须本轮另有「提交落在别处」的正向证据(commitsElsewhere,同一调用内 cd / -C 根外)才算。`f` 缺(旧调用形)⇒ 窗口那部分不算。
+    //   代价(漏放,按用户「误拦比漏放贵」接受):前几轮写他仓承重件、本轮用 commitOutsideRoot 认不出的形态(变量 cd、嵌套 shell)
+    //   在他仓提交 ⇒ 不计;同轮另有本仓提交时 commitsElsewhere 为否(D149⑪ 老洞)⇒ 同样不计。
+    elsewhereCarrier(ctx, root, f) {
       const H = RULE_P._p, w = H.win(ctx);
       const isOut = (p) => H.outside(p, root) && H.isCarrierOrEngine(p);
-      if ([...(ctx.writes || []), ...((w && w.writes) || [])].some(isOut)) return true;
-      return H.cmdPairs(ctx, true).some(([cmd, d]) => {
+      const cmdHit = ([cmd, d]) => {
         try { return H.writeTargets(cmd, isOut, d).length > 0 || (H.hasCommit(cmd, d) && H.gitPathArgs(cmd, d).some(isOut)); } catch { return false; }
-      });
+      };
+      if ((ctx.writes || []).some(isOut)) return true;
+      if (H.cmdPairs(ctx, false).some(cmdHit)) return true;
+      const winPairs = (w && Array.isArray(w.bashCmds)) ? w.bashCmds.map((cmd, i) => [cmd, w.bashDialects?.[i]]) : [];
+      if (!(((w && w.writes) || []).some(isOut) || winPairs.some(cmdHit))) return false;
+      try { return !!f && H.commitsElsewhere(ctx, f); } catch { return false; }
     },
 
     /** 触发面。 */
@@ -5369,12 +5870,14 @@ const RULE_P = {
 
     // ── 合回分支的点名抵账(a2a9f58b BP-8)——2026-10-11 已撤 ──
     //   codex 257-p-gitfacts-r2 断言 6 证伪:「红队 prompt 点名了分支名」可被只在背景里提到、明说不审的 prompt 满足 ⇒ 放过真欠账。
-    //   commitNames / namesAny / namedCover 三个函数随之删除(史料见 git 4c1b04b);BP-8 误拦退回残余 D149④,待非文本判据。
+    //   commitNames / namesAny / namedCover 三个函数随之删除(史料见 git 4c1b04b);BP-8 退回残余 D149④,待非文本判据。
+    //   批 285(D149④,只改注释):BP-8 **不是误拦**(红队 a12212b9 问 2:A+B 合起来的状态从没被红队过,第二次合回被要求补跑是未满足的要求),
+    //   此处与下方 hunterMet 两处原写「BP-8 误拦」系归错,已改。
     /** 闸引擎面的红队凭证是否已在(detect、计账清零同一取值):时刻切点池里有绑定红队(点名覆盖已撤,见上)。 */
     hunterMet(ctx) {
       const H = RULE_P._p, ch = H.hunterCh();
       // 点名覆盖(namedCover)已撤:codex 257-p-gitfacts-r2 断言 6 实证——prompt 只在背景里列了分支名、且明说不在审查范围,
-      //   照样抵掉该分支带进的闸改动 ⇒ 它会放过真欠账,不是单纯收紧误拦,不属窄例外③;BP-8 误拦退回为残余(D149④)。
+      //   照样抵掉该分支带进的闸改动 ⇒ 它会放过真欠账,不是单纯收紧误拦,不属窄例外③;BP-8 退回为残余(D149④;BP-8 本身不是误拦,见上方注)。
       // 批 266:闸引擎面要红队(找漏放)与误拦猎手(找误拦,跑 gate-replay 回放)两者都在——
       //   用户 10-19:「我们设计了一堆防漏放,结果误拦了,得不偿失」「这样二者才等级」(ADR 0028 / 265b-D1)
       return H.hunterMissingWhich(ctx).length === 0;
@@ -5538,6 +6041,12 @@ const RULE_P = {
       segments(String(cmd)).some((s) => /^(\w+=\S+\s+)*git\b/.test(s) && /\bcommit\b/.test(s) && !/--dry-run/.test(s)) }) },
     { name: "不按 hook checkout 化相对形(worktree 会话自己的闸文件被当成副本)", apply: swapP({ isEnginePath: (orig) => (p) => orig(p, null) }) },
     { name: "git 面不认别的 checkout 的承重提交", apply: swapP({ elsewhereCarrier: () => () => false }) },
+    // 批 285(D149⑨):退回旧口径(窗口里根外承重写入不要「提交落在别处」的证据)⇒ 证人 = 反例「D149⑨:窗口里 Edit 他仓宪法未提交…」
+    { name: "D149⑨ 退回:窗口里根外承重写入无条件算别处", apply: swapP({ elsewhereCarrier: () => (ctx, root) => {
+      const H = RULE_P._p, w = H.win(ctx), isOut = (p) => H.outside(p, root) && H.isCarrierOrEngine(p);
+      if ([...(ctx.writes || []), ...((w && w.writes) || [])].some(isOut)) return true;
+      return H.cmdPairs(ctx, true).some(([cmd, d]) => { try { return H.writeTargets(cmd, isOut, d).length > 0 || (H.hasCommit(cmd, d) && H.gitPathArgs(cmd, d).some(isOut)); } catch { return false; } });
+    } }) },
     { name: "路径参数不限子命令位(git 段里任意位置的路径都算暂存)", apply: swapP({ gitPathArgs: () => (cmd) =>
       segments(String(cmd)).filter((s) => /^(\w+=\S+\s+)*git\b/.test(s)).flatMap((s) => s.split(/\s+/).slice(2).filter((t) => t && !t.startsWith("-"))) }) },
     { name: "cd 不解析(walk 丢掉 cwd)", apply: swapP({ walk: (orig) => (cmd, d) => orig(cmd, d).map((x) => ({ ...x, cwd: null })) }) },
@@ -6046,6 +6555,11 @@ const RULE_P = {
         text: "第五笔,两边各提交一次。", pLedger: { carriers: 4 }, write: "E:/elsewhere/AGENTS.md",
         bash: ["git add -A src/app/page.tsx && git commit -m x", "cd E:/elsewhere && git add -A && git commit -m y"],
         headFacts: { root: "/repo", commits: [{ files: ["src/app/page.tsx"] }] } },
+      // 批 285(D149⑨)收窄后的拦截侧:窗口里写他仓宪法,本轮同一调用内 cd 他仓提交(提交落在别处的正向证据)⇒ 照样计
+      { name: "D149⑨:窗口里 Edit 他仓宪法、本轮同一调用内 cd 他仓提交 ⇒ 照样触发",
+        text: "第五笔,在他仓提交宪法。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "改他仓宪法", write: "E:/elsewhere/AGENTS.md" }],
+        bash: ["cd E:/elsewhere && git add -A && git commit -m x"], headFacts: { root: "/repo", commits: [] } },
       // git 面切点:比本次范围更早的最后一次带闸改动的提交晚于红队 ⇒ 红队不抵本次(单变量:与 a00051d BP-2 neg 只差 engineAnchorAt)
       { name: "a27628dd git 面切点:上一次带闸改动的提交晚于红队 ⇒ 仍欠",
         text: "再改一版判据,提交。", at: "2026-10-10T10:30:00Z", pLedger: { carriers: 0 },
@@ -6747,6 +7261,15 @@ const RULE_P = {
         text: "在他仓提交业务改动。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
         prior: [{ text: "上批改法典", write: "docs/laws/collab.md" }],
         bash: ["cd E:/elsewhere && git add -A && git commit -m x"], headFacts: { root: "/repo", commits: [] } },
+      // 批 285(D149⑨,误拦):窗口里只有他仓绝对路径的承重写入(没提交),本轮只在本仓做业务提交 ⇒ 不计别处承重提交
+      { name: "D149⑨:窗口里 Edit 他仓宪法未提交、本轮本仓业务提交 ⇒ 不触发",
+        text: "提交业务改动。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "顺手改了他仓宪法草稿", write: "E:/elsewhere/AGENTS.md" }],
+        bash: ["git add -A src/app/page.tsx && git commit -m x"], headFacts: { root: "/repo", commits: [{ files: ["src/app/page.tsx"] }] } },
+      { name: "D149⑨:窗口里 Edit 他仓宪法未提交、本轮本仓提交失败 ⇒ 不触发",
+        text: "提交。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
+        prior: [{ text: "顺手改了他仓宪法草稿", write: "E:/elsewhere/AGENTS.md" }],
+        bash: ["git commit -m x"], headFacts: { root: "/repo", commits: [] } },
       // BP-1 接受侧:聚合项净差只带业务码 ⇒ 不触发(聚合不等于一律越限)
       { name: "a9af71da BP-1:聚合项(61 笔)净差只有 src/ ⇒ 不触发",
         text: "合回。", pLedger: { carriers: 0 },
@@ -7452,9 +7975,15 @@ export const RULE_W = {
       if (this.isNodeCheck(s)) return true;
       return false;
     },
+    /** 段头去目录前缀与 `.exe`(批 285,D136⑥)。 */
+    baseHead(seg) {
+      return String(this.segHead(seg)).replace(/\\/g, "/").split("/").pop().replace(/\.exe$/i, "");
+    },
     isReadSeg(seg) {
       const masked = stripQuoted(seg);
-      const head = this.segHead(seg);
+      // 批 285(D136⑥,误拦):原用裸段头比 readHead ⇒ `/usr/bin/grep … write-node.mjs`、`grep.exe …` 被当生产写。
+      //   改为先剥目录前缀与 .exe(与 heredoc 属主 / ownerDataHead 同一取法)。代价:同目录里冒名叫 grep 的脚本会被当读,属蓄意形态不计。
+      const head = this.baseHead(seg);
       if (this.BG_AMP.test(masked)) return false;   // BP-6:`tail -f x & node write-node --apply`
       if (!this.readHead.test(head)) return false;
       if (/[({`]/.test(masked)) return false;
@@ -7479,8 +8008,9 @@ export const RULE_W = {
       if (live.some((seg) => !this.isReadSeg(seg))) return true;
       // 管道守卫同样跳过惰性段——否则 `node batch-goal --cond "write-node.mjs 过了" | tail -1`
       // 会被「段头 node 不在 pipeHead」带着命中(BP-12 的同族误拦)。
+      //   批 285(D136⑥):管道级段头同样先剥目录前缀与 .exe(`… | /usr/bin/head -5` 不再因路径前缀算执行)
       if (/(?<!\|)\|(?!\|)/.test(stripQuoted(s)) &&
-          segs.some((seg) => !this.pipeHead.test(this.segHead(seg)) && !this.inertSeg(seg))) return true;
+          segs.some((seg) => !this.pipeHead.test(this.baseHead(seg)) && !this.inertSeg(seg))) return true;
       return false;
     },
     contentWrote(ctx) {
@@ -7509,7 +8039,10 @@ export const RULE_W = {
     //   且其后必须是句读/语气词/行尾(「别外审了」「不需要外审。」),后面还跟别的字(太久/错/旧稿)不算;
     //   ③补「不需要」「免于」「无需进行」三形。
     userExempt(ctx) {
-      const t = maskQuoted(String(ctx.userText || ""));
+      // 批 285 D143⑫:长轮里轮开口滚出 400 条窗口时,开口说的「别外审」由 gate-ctx 远端续扫放进 `userTextFar`(同一用户轮,
+      //   边界判法与近端相同),这里一并认——否则豁免随窗口丢失,W 误拦。只并进本判据,不并进 userText(ND 不因此多拦)。
+      //   代价:远端上限(生产 5000 条)外的开口仍丢(误拦残余)。
+      const t = maskQuoted(String(ctx.userText || "") + "\n" + String(ctx.userTextFar || ""));
       // 红队 182 BP-4:「不要跳过外审」「不能免审」是**要求外审**——豁免词前面带否定的一律不算(否定-否定)。
       const RE = /(?<!不要|不能|不许|不得|不可|别|避|请勿|勿)(别|不用|不必|不需要|无需|无须|毋须|免于?|不要|不做|跳过)\s*(再|进行)?\s*(外审|外部审查|四眼|battle|codex|审读|复核)\s*(了|吧|啦|的)?\s*(?=[,，。;;!！?？)\)\]\s]|$)/i;
       return RE.test(t);
@@ -7630,6 +8163,9 @@ export const RULE_W = {
         if (/[({`]/.test(masked)) return false;
         return !(/^sed$/i.test(head) && /(?:^|\s)(?:-[a-zA-Z]*i|--in-place)/.test(masked));
       } }) }) },
+    // 批 285(D136⑥):真退回——读类段头不剥目录前缀与 .exe(/usr/bin/grep 读脚本被当生产写),证人 = neg「285 D136⑥」
+    { name: "285 D136⑥ 退回:读类段头不剥路径前缀与 .exe", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, baseHead(seg) { return this.segHead(seg); } }) }) },
     { name: "253b BP-12 退回:引号里/git 参数里的脚本名也算生产写(阻断式误拦复活)", apply: (r) => ({ ...r,
       detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, inertSeg: () => false }) }) },
     { name: "253b BP-12 过头:只要脚本名在引号里就放行(bash -c / node \"脚本\" 漏放)", apply: (r) => ({ ...r,
@@ -7817,6 +8353,10 @@ export const RULE_W = {
       { name: "D130 BP-2:本仓写正文唯一调用形 node write-node --apply 仍命中(变异「按段头判」在此翻面)",
         text: "写完收工。",
         bash: ["node scripts/write-node.mjs --apply clipboard/payload.json", "node --no-warnings scripts/batch-goal.mjs --clear"] },
+      // 批 285(D136⑥)剥路径后的贴边正例:带路径的 sed -i 仍是写(剥路径不得把 -i 守卫一并绕开)
+      { name: "285 D136⑥ 贴边:/usr/bin/sed -i 改写 write-node.mjs ⇒ 命中",
+        text: "改完收工。",
+        bash: ["/usr/bin/sed -i 's/a/b/' scripts/write-node.mjs", "node --no-warnings scripts/batch-goal.mjs --clear"] },
       { name: "D130 BP-3 回归钉(ca7b33b):cat <(node write-node …) 段头是 cat 但真跑 ⇒ 命中",
         text: "收工。",
         bash: ["cat <(node scripts/write-node.mjs --apply p.json)", "node --no-warnings scripts/batch-goal.mjs --clear"] },
@@ -7984,6 +8524,12 @@ export const RULE_W = {
         text: "只读了脚本,收工。",
         bash: ["cat scripts/write-node.mjs | head -50", "Get-Content scripts/deploy-prod.ps1 | Select-Object -First 40",
                "node --no-warnings scripts/batch-goal.mjs --clear"] },
+      // 批 285(D136⑥,误拦):读类段头带目录前缀或 .exe ⇒ 仍是读(变异「读类段头不剥路径前缀」在此翻面)
+      { name: "285 D136⑥:/usr/bin/grep、grep.exe、管道下游 /usr/bin/head 读脚本 ⇒ 不算生产写",
+        text: "只读了脚本,收工。",
+        bash: ["/usr/bin/grep -n apply scripts/write-node.mjs", "grep.exe -n apply scripts/write-node.mjs",
+               "/usr/bin/cat scripts/write-node.mjs | /usr/bin/head -5",
+               "node --no-warnings scripts/batch-goal.mjs --clear"] },
       // ── 批 253b BP-12(阻断式误拦):文本面提及 / git 参数路径 / node --check 都不是执行 ──
       { name: "253b BP-12:提交信息与 --cond 文本里提到 write-node.mjs ⇒ 不算生产写",
         text: "改完提交,收工。",
@@ -8110,6 +8656,26 @@ RULE_W.cases.pos.push({
   write: "clipboard/oss/public-repo/README.md",
   prior: [{ user: "这份 README 别外审了,直接关账。", text: "在写" }, { interrupt: true, text: "接着写" }, { text: "补了一处", stop: "blocked" }],
 });
+// 批 285 D143⑫:长轮里轮开口滚出 400 条近端窗口(priorFar = 窗口外那段),近端回扫走到头没碰到边界 ⇒ 远端续扫认开口的免审。
+RULE_W.cases.neg.push({
+  name: "批 285 D143⑫:轮开口的「别外审」滚出近端窗口(被拦链上)⇒ 仍认",
+  text: "收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+  write: "clipboard/oss/public-repo/README.md",
+  priorFar: [{ user: "这份 README 别外审了,直接关账。", text: "在写" }, { text: "写了一大段", stop: "blocked" }],
+  prior: [{ text: "补了一处" }, { text: "又补一处", stop: "blocked" }],
+});
+RULE_W.cases.pos.push({
+  // 反向钉:远端续扫的边界与近端相同——窗口外那段里有一次已放行的 Stop,之前的开口属于旧轮,不带进来
+  name: "批 285 D143⑫ 反向:窗口外已放行的 Stop 之前那一轮的「别外审」不带进来",
+  text: "收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+  write: "clipboard/oss/public-repo/README.md",
+  priorFar: [{ user: "这份 README 别外审了,直接关账。", text: "在写", stop: "released" }, { text: "子代理回报到了" }],
+  prior: [{ text: "补了一处" }, { text: "又补一处", stop: "blocked" }],
+});
+RULE_W.mutations.push({
+  name: "批 285 D143⑫ 退回:用户免审只看 userText(窗口外的轮开口不认)",
+  apply: (r) => ({ ...r, detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, userExempt: (c) => RULE_W._w.userExempt({ ...c, userTextFar: "" }) }) }),
+});
 RULE_W.cases.pos.push({
   // 红队 182 BP-4:否定-否定形态是**要求外审**
   name: "BP-4:「不要跳过外审」「不能免于复核」是要求外审,不是免审",
@@ -8186,8 +8752,15 @@ export const RULE_V = {
   _ASK_LOOSE: /⏸|等[^。！？!?\n]{0,8}你|需你|由你|要你|摊给你|呈给你|挂在你|给你签|你来?(?:签|裁|定|点头|拍板|确认)/,
   /** 本轮算不算呼签。变异证人:`opt.nounOld` = 273 之前「名词呈签单也直接算」;`opt.nounNever` = 名词一律不算;
    *  `opt.noStrip` = 待办口不去引文;`opt.askLoose` = 待办口不排除否定 / 定语用法;`opt.noNew` = 不认起单信号。 */
+  // 批 285(D175 r3 BP-9,窄例外③,只提示项):否定句不是加项 / 不是摊事——「这条不必纳入呈签单」「无需新增需你裁的项」
+  //   「本轮没有需你裁的」被当成呼签。先把「否定词 + (加项动词) + 呈签单 / 需你裁」整段抹掉再判;只抹否定紧贴的那一段,
+  //   同轮别处真摊的事照认;逗号 / 句读隔开的不抹(「不必再等,已纳入呈签单」照提示)。
+  //   代价(漏放侧,接受):否定词其实只管半句时(「不用补进呈签单那份,另起一张」)会少一次提示。
+  //   两种形各要求紧贴:A 否定 + 加项动词 + ≤6 字 + 呈签单 / 需你裁;B 没有 / 并无 / 无 + (新的 / 别的 / 其他 / 任何)? + 需你裁。
+  _NEG_ADD: /(?:不必|无需|无须|不用|不需要?|不要|别|没有?)\s*(?:再|另外?|额外)?\s*(?:补充|新增|增加|补|列|放|加|写|并|记|挂|收|塞|录|归|纳入|登记)[^。！？!?\n，,;；]{0,6}?(?:呈签单|需你裁)|(?:没有|并无|无)(?:新的?|别的|其他|任何)?需你裁/g,
   _calls: (text, opt = {}) => {
-    const t = String(text || "");
+    const t0 = String(text || "");
+    const t = opt.noNeg ? t0 : t0.replace(RULE_V._NEG_ADD, (s) => " ".repeat(s.length));
     if (opt.nounOld) return /需你裁|呈签|请亲签|待你亲签|需要你亲签/.test(t);
     if (RULE_V._CALL.test(t)) return true;
     if (!/呈签单/.test(t) || opt.nounNever) return false;
@@ -8341,6 +8914,8 @@ export const RULE_V = {
       ["待办口不去引文(引号里的「你定」也算)", { noStrip: true }],
       ["待办口不排除否定 / 定语(「请你签的…不用你签」也算)", { askLoose: true }],
       ["不认起单信号(「整理进一张呈签单」漏放)", { noNew: true }],
+      // 批 285(D175 r3 BP-9):否定句不抹 ⇒ neg「285 BP-9」三条复红
+      ["否定句也算呼签(285 BP-9「不必纳入呈签单」误拦回来)", { noNeg: true }],
     ].map(([name, opt]) => ({ name, apply: (r) => ({ ...r, detect: (ctx) =>
       !r._calls(ctx.text, opt) || /免签例外已核/.test(ctx.text)
         || r._fourEach(ctx.text, opt) ? [] : ["变异"] }) })),
@@ -8394,6 +8969,9 @@ export const RULE_V = {
       { name: "276 BP-15:收进呈签单", text: "这两项我拿不准,收进呈签单了。" },
       { name: "276 BP-15:登记到呈签单", text: "删 worktree 属不可逆,登记到呈签单第 3 项。" },
       { name: "276 BP-15:纳入呈签单", text: "D122 已纳入呈签单。" },
+      // 批 285 反向钉:否定词被逗号隔开、管不到加项动词 ⇒ 照提示
+      { name: "285 BP-9 反向:不必再等,已纳入呈签单", text: "不必再等,D122 已纳入呈签单。" },
+      { name: "285 BP-9 反向:没有异议的那条需你裁", text: "两件里没有异议的那条也需你裁:发布授权。" },
       // 批 276b BP-6:「到」形全开、双字动词
       { name: "276b BP-6:放到呈签单", text: "这两项我拿不准,放到呈签单第 4 项了。" },
       { name: "276b BP-6:补充进呈签单", text: "D123 改守卫语义,已补充进呈签单。" },
@@ -8428,6 +9006,10 @@ export const RULE_V = {
       // 批 276 BP-15 反向钉:「记在 / 写在呈签单里」是回指已有内容,不是加项
       { name: "276 BP-15 反向:核对结果记在呈签单开头", text: "V 项已处理,核对结果记在呈签单开头。\n**下一步**:提交。" },
       { name: "276b BP-6 反向:收到呈签单是收件不是加项", text: "已收到呈签单的回签,四项都签了。\n**下一步**:按签字落笔。" },
+      // 批 285(D175 r3 BP-9):否定句不是加项 / 不是摊事
+      { name: "285 BP-9:不必纳入呈签单", text: "这条不必纳入呈签单。" },
+      { name: "285 BP-9:无需新增需你裁的项", text: "无需新增需你裁的项。" },
+      { name: "285 BP-9:本轮没有需你裁的", text: "本轮没有需你裁的事,收工。" },
       { name: "273 样本形态:完成条件对照(引号里的「你定」不算待办口)",
         text: "- **条件 1:达成。** 呈签单 `202-auto-deploy-sign.md` 在;新条文 21 行,都曾逐字给你看过。\n- 随做:第 2 项按你的「你定」撤回,撤回理由写在呈签单里。\n还不 `--clear`:正在等 codex 和第五轮红队复核。\n**下一步**:处置发现 → 单独提交 → 推送。" },
     ],
@@ -8531,7 +9113,12 @@ export const RULE_O = {
       .replace(scheme === "http" ? /:80$/ : /:443$/, "");
     const path = host + (m[3] || "").replace(/\/+$/, "");
     if (opt.noQuery) return path;
-    const parts = rawQ.split("&").filter(Boolean);
+    // 批 285(D136⑬,误拦):查询串保留后,带追踪参数的引文(`?utm_source=…`)对裸网址取页被判成两页。
+    //   只剔**纯追踪参数**(utm_* / fbclid / gclid / dclid / msclkid / mc_cid / mc_eid / igshid / spm / ref_src),
+    //   它们不改页面身份;`?id=1` 与 `?id=2` 照旧是两页(pos 18 钉着)。`opt.keepTracking` = 变异用的修前式。
+    //   代价:真靠这几个键区分内容的页面会被当同一页(按用户取舍接受的漏放)。
+    const TRACK = /^(?:utm_[\w-]*|fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid|spm|ref_src)(?:=|$)/i;
+    const parts = rawQ.split("&").filter(Boolean).filter((p) => opt.keepTracking || !TRACK.test(p));
     const q = (opt.rawQuery ? parts : parts.slice().sort()).join("&");
     return q ? `${path}?${q}` : path;
   },
@@ -8708,6 +9295,21 @@ export const RULE_O = {
     if (!opt.noPipe && RULE_O._pipeDiscards(next)) return { urls: [], wild: false };
     return { urls: RULE_O._urls(bare), wild: false };
   },
+  /** 批 285(D152 g1,误拦):`for id in a b; do curl "https://…/$id"; done` 按列表展开成逐项命令。
+   *  原先循环体那一段段头是 `do`,整段不认 ⇒ 真取过的两页被报「本轮没取过」(2026-10-11 arxiv 实撞,fp 台账有记)。
+   *  列表项含 `$` / 反引号 / 通配 / 括号(`$(cat ids)`、`*.txt`)⇒ 展不开,循环体原样返回(网址里留着 `$id`,下游按通配认)。
+   *  只认 bash 的 `for V in …; do …; done`(分号或换行分隔);PowerShell foreach 不展开,靠下游「网址带变量 ⇒ 通配」。 */
+  _expandFor: (cmd) => {
+    const out = [];
+    const RE = /\bfor\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*?)\s*(?:;|\n)\s*do\b([\s\S]*?)(?:;|\n)\s*done\b/g;
+    for (const m of String(cmd || "").matchAll(RE)) {
+      const v = m[1], items = RULE_O._argv(m[2]), body = m[3];
+      if (!items.length || items.some((x) => /[$`*?(){}]/.test(x))) { out.push(body); continue; }
+      const ref = new RegExp(`\\$\\{${v}\\}|\\$${v}(?!\\w)`, "g");
+      for (const x of items) out.push(body.replace(ref, () => x));
+    }
+    return out;
+  },
   /** 某一个 ctx(本轮或窗口)里真取过的网址。 */
   _fetchedIn: (c, opt = {}) => {
     const got = new Set();
@@ -8718,7 +9320,8 @@ export const RULE_O = {
       if (typeof u === "string" && /^https?:\/\//i.test(u)) got.add(RULE_O._norm(u, opt));
       else wild = true;
     }
-    for (const cmd of (c?.bashCmds || [])) {
+    for (const cmd0 of (c?.bashCmds || [])) {
+     for (const cmd of (opt.noForIn ? [cmd0] : [cmd0, ...RULE_O._expandFor(cmd0)])) {
       const outNull = !opt.noPipe && /\|\s*out-null\b/i.test(String(cmd));
       for (const stages of RULE_O._chains(cmd)) {
         for (let i = 0; i < stages.length; i++) {
@@ -8726,9 +9329,20 @@ export const RULE_O = {
           if (!r) continue;
           if (r.wild) { wild = true; continue; }
           if (outNull) continue;
-          for (const u of r.urls) got.add(RULE_O._norm(u, opt));
+          for (const u of r.urls) {
+            // 批 285(D152 g1):取页网址里还留着 shell / PowerShell 变量(`$id`、`${id}`)⇒ 展不开,按通配认(与 --json 同口径,只认本轮)。
+            //   代价(漏放面,按用户取舍接受):本轮任何一次「变量拼网址」的真取页会放行本轮全部引文;出现一次真实漏放损失即重开。
+            //   `${id}` 的花括号不在 _URL_RE 字符集里,网址截在 `$` 处 ⇒ 尾部孤 `$` 同样算变量
+            //   批 285 第二轮复核(误拦猎手第 3 份 FB-1):这类网址**同时**按字面收进集合——窗口那一路不看 wild、只看集合,
+            //   上一轮 `curl -sL 'https://services.odata.org/V4/TripPinServiceRW/$metadata'`(`$metadata` 是 OData 的字面路径段)
+            //   原整条被丢,本轮引它被报「没取过」。本轮那一路 wild 已整轮放行,多收一条字面网址不改结论。
+            //   代价(漏放侧,接受):窗口里真带变量的网址(`…/$id`)其字面形也进集合,只有本轮引文恰好逐字写出 `$id` 才会被它放过。
+            if (!opt.noVarWild && /\$(?:\{|[A-Za-z_]|$)/.test(u)) { wild = true; if (!opt.noDollarLit) got.add(RULE_O._norm(u, opt)); continue; }
+            got.add(RULE_O._norm(u, opt));
+          }
         }
       }
+     }
     }
     return { got, wild };
   },
@@ -8839,6 +9453,16 @@ export const RULE_O = {
       detect: (ctx) => RULE_O._detect(ctx, { noPrev: true }) }) },
     { name: "退回分支不认引用式定义 / 自动链接 / Sources 段(批 276 BP-16)", apply: (r) => ({ ...r,
       detect: (ctx) => RULE_O._detect(ctx, { noRef: true }) }) },
+    // ── 批 285:D152 g1 / D136⑬ 三处修法各留一条真退回 ─────────────────────────
+    { name: "285 退回:for … in 列表不展开(循环体段头是 do,真取页不认)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_O._detect(ctx, { noForIn: true }) }) },
+    { name: "285 退回:网址带变量不按通配(展不开的 $var 网址当字面页)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_O._detect(ctx, { noVarWild: true }) }) },
+    { name: "285 退回:归一不剔追踪参数(?utm_source= 与裸网址判成两页)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_O._detect(ctx, { keepTracking: true }) }) },
+    // 批 285 第二轮复核(误拦猎手第 3 份 FB-1):证人 = neg「285 二轮 FB-1:窗口里取过 OData $metadata」
+    { name: "285 二轮退回:带字面 $ 的网址不收进已取集合(窗口那一路丢失)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_O._detect(ctx, { noDollarLit: true }) }) },
   ],
   cases: {
     // ⚠️ pos 的**下标被 escapes 的 forPos 引用**:0–14、19–31 只引一个网址(样例取得动),
@@ -8898,6 +9522,12 @@ export const RULE_O = {
       { text: "hooks 会收到 cwd 字段。\n\n参考链接如下:\n\n- https://x.test/a" },                                           // 31
       //   BP-3:正文依据段已有一个取过的网址,文末 Sources 另列一个没取的 ⇒ 后者照报(两个网址,不进 forPos)
       { text: "出处:https://x.test/a 第三节。\n\nSources:\n\n- https://x.test/b", bash: "curl -sL https://x.test/a" },    // 32
+      // 批 285(D152 g1)贴边:for 循环展开后只取了 a、b,引的是 c ⇒ 照报(展开不是「循环里取过就全放」)
+      { name: "285 D152 g1 贴边:for 列表展开只覆盖列表里的页", text: "出处:https://x.test/c。",
+        bash: "for p in a b; do curl -sL \"https://x.test/$p\"; done" },                                              // 33
+      // 批 285(D136⑬)贴边:只剔追踪参数,真参数照旧区分页面
+      { name: "285 D136⑬ 贴边:带追踪参数但真参数不同 ⇒ 照报", text: "出处:https://x.test/a?id=2&utm_source=tw。",
+        bash: "curl -sL \"https://x.test/a?id=1\"" },                                                               // 34
     ],
     neg: [
       // 真取过页
@@ -8939,6 +9569,20 @@ export const RULE_O = {
       { name: "276 BP-16 反向:资源清单的指针", text: "草稿正文逐字给你看过。\n\n下一步:提交。\n\n## 资源清单\n\n- https://x.test/a" },
       { name: "276b BP-4 反向:不带冒号的「Source …」须独占一行才算标签", text: "Source code is here, see the repo.\n- https://x.test/a" },
       { name: "276 BP-16 反向:引文块里原文自带的自动链接", text: "README 首段的措辞我逐字对过。\n\n改动后的那段:\n\n> 请勿据代码推断线上能力。\n> 评价以 <https://x.test/a> 实测为准。\n\n我只改了措辞。" },
+      // ── 批 285(D152 g1,误拦):for … in 列表里的 $var 网址逐项展开(2026-10-11 arxiv 实撞原形)
+      { name: "285 D152 g1:for 列表展开后两页都取过 ⇒ 放行",
+        text: "原文见 https://arxiv.org/abs/2608.02464 与 https://arxiv.org/abs/2607.02599 。",
+        bash: "for id in 2608.02464 2607.02599; do curl -sL \"https://arxiv.org/abs/$id\" | head -50; done" },
+      { name: "285 D152 g1:列表展不开($(cat …))⇒ 网址带变量按通配(只认本轮)",
+        text: "原文见 https://x.test/p1 。",
+        bash: "for id in $(cat ids.txt); do curl -sL \"https://x.test/${id}\"; done" },
+      // ── 批 285(D136⑬,误拦):引文带追踪参数、取的是裸网址 ⇒ 同一页
+      { name: "285 D136⑬:引文带 utm_* / fbclid、取页是裸网址 ⇒ 放行",
+        text: "出处:https://x.test/a?utm_source=tw&fbclid=abc 写着那句话。", bash: "curl -sL https://x.test/a" },
+      // 批 285 第二轮复核(误拦猎手第 3 份 FB-1):上一轮取过带字面 $ 的 OData 网址,本轮引同一网址 ⇒ 放行
+      { name: "285 二轮 FB-1:窗口里取过 OData $metadata,本轮引它 ⇒ 放行",
+        text: "出处:https://services.odata.org/V4/TripPinServiceRW/$metadata 里列着 People 实体集。",
+        prior: [{ text: "上一轮", bash: "curl -sL 'https://services.odata.org/V4/TripPinServiceRW/$metadata'" }] },
       // 只是给了个地址,没当依据用
       { text: "仓库在 https://example.test/repo,回头看。" },
       { text: "今天没有引任何外部页面。" },
@@ -8962,6 +9606,10 @@ export const RULE_O = {
  *  出路时序(a2155edb):动作与声明只认晚于本轮最近一次名词提问的(时间线 `ctx.turnLog`,含被拦链上窗口前那段);
  *  失效条件:gate-ctx 不再给 `turnLog`(退回不切的旧口径,BP-1 复活)/ `bashWriteTargets` 改回手写正则(BP-2/7 复活)
  *  ——两者各有变异证人(「不按最近一次提问切」「Bash 面提到日记即算」)。 */
+/** ND 的名词提问句式(批 285 D156①:原因 / 状况问按「问的对象」排除,见 detect 内注)。 */
+const ND_Q = /((?:到底)?(?<!报的|出的)(?:是什么|是啥)(?!原因|问题|情况|回事|时候|导致|造成|引起|引发|让|使得|毛病|错误|报错|故障|状况|状态|异常|情形)|什么意思|啥意思|什么东西)/;
+/** 批 258 原式,只给 ND 的变异「退回批 258 排除表」用。 */
+const ND_Q_258 = /((?:到底)?(?:是什么|是啥)(?!原因|问题|情况|回事|时候)|什么意思|啥意思|什么东西)/;
 const RULE_ND = {
   id: "ND",
   blocking: true,   // 2026-08-31 用户亲签:「日记要不要加闸项——加了吧」
@@ -8981,7 +9629,12 @@ const RULE_ND = {
     //   复核红队一轮 BP-4:先前排除表还含「样 / 作用 / 用处 / 问题 / 区别 / 关系」,放过了「RVC 是什么样的技术」「worktree 是什么作用」
     //   这类名词问 ⇒ 收回到只问原因 / 状况的词;「是什么导致的 / 毛病 / 错误」等仍拦(老问题,D156 登记)。
     //   二轮 BP-7:「问题」是 1a9880a 起就在的原因问(「部署失败了,是什么问题」),一轮收回时误删,放回。
-    const Q = /((?:到底)?(?:是什么|是啥)(?!原因|问题|情况|回事|时候)|什么意思|啥意思|什么东西)/;
+    // 批 285(D156① 误拦半):「是什么导致的」「这是什么毛病」「到底是什么状况」「是什么错误」问的是原因 / 状况。
+    //   按「问的对象」判,不再只靠排除表五词:①「是什么 / 是啥」后接致因动词(导致 / 造成 / 引起 / 引发 / 让 / 使得)⇒ 问原因;
+    //   ② 后接毛病 / 错误 / 报错 / 故障 / 状况 / 状态 / 异常 / 情形 ⇒ 问状况;③ 前面是「报的 / 出的」(「这报的是什么」)⇒ 问报错内容。
+    //   V.oldQ 只给变异用(退回批 258 的排除表)。代价(漏放方向,接受):「X 是什么状态机」这类以状况词起头的名词问也放过;
+    //   失效条件:出现一次真实漏放损失(用户事后问「进日记了吗」而当轮没拦)即重开。
+    const Q = V.oldQ ? ND_Q_258 : ND_Q;
     const mask = V.noMask ? (s) => String(s || "") : (s) => maskQuoted(String(s || ""));
     const m = mask(ctx.userText).match(Q);
     if (!m) return [];
@@ -9021,6 +9674,8 @@ const RULE_ND = {
     `${renderEscapes(RULE_ND.escapes)}\n` +
     `      天花板:句式白名单只认「是什么/是啥/什么意思」族;「为什么 X」类机制问抓不到,那半仍靠自觉。`,
   mutations: [
+    // 批 285(D156①):退回批 258 的排除表 ⇒ 原因 / 状况问被当名词问拦。证人 = neg「285 D156①」各条。
+    { name: "285 D156① 退回:原因 / 状况问只排除批 258 的五词", apply: (r) => ({ ...r, detect: (ctx) => RULE_ND.detect(ctx, { oldQ: true }) }) },
     { name: "去掉两条出路(动了日记/声明了也照拦)", apply: (r) => ({ ...r, detect: (ctx) => RULE_ND.detect(ctx, { noEscapes: true }) }) },
     { name: "不剥引文(用户引用一句含「是什么」的话也拦)", apply: (r) => ({ ...r, detect: (ctx) => RULE_ND.detect(ctx, { noMask: true }) }) },
     // a2155edb 附节二②:「Bash 只认写入」的变异证人——退回「命令里提到日记就算动过」必须被 grep 正例逮住
@@ -9063,6 +9718,14 @@ const RULE_ND = {
       { name: "258 ND:到底是啥原因 ⇒ 不是名词问", user: "这闸老拦,到底是啥原因?", text: "原因是判据把关键词当成了提问。" },
       { name: "258 ND:是什么情况 ⇒ 不是名词问", user: "部署失败了,是什么情况?", text: "是 pnpm 的依赖校验没关。" },
       { name: "258 复核二轮 BP-7:是什么问题 ⇒ 不是名词问", user: "部署失败了,是什么问题?", text: "是 pnpm 的依赖校验没关。" },
+      // 批 285(D156① 误拦半;复核红队 258 BP-6 列的四句 + 「报的是什么」):问原因 / 状况 / 报错内容,不是名词问
+      ...[
+        ["是什么导致的", "构建突然变慢,是什么导致的?"],
+        ["这是什么毛病", "页面一直白屏,这是什么毛病?"],
+        ["到底是什么状况", "闸连拦三轮,到底是什么状况?"],
+        ["是什么错误", "退出码 2,是什么错误?"],
+        ["这报的是什么", "终端一片红,这报的是什么?"],
+      ].map(([n, user]) => ({ name: `285 D156①:${n} ⇒ 不是名词问`, user, text: "原因是依赖版本没锁。" })),
       // 动作面出路:真追加了日记
       { user: "RVC 是什么?", text: "RVC 是检索式声音转换,已补日记。", write: "/repo/docs/noun-diary.md" },
       // Bash 追加写进日记同样算
@@ -9098,6 +9761,12 @@ const RULE_ND = {
       // 复核红队 aaf414b6 BP-3(误拦,365fd54 引入):引号里的单个 `>` 被当裸重定向算子、连 `-Path` 一起剔 ⇒ `-Value` 吞掉真路径
       { name: "aaf414b6 BP-3:PS Add-Content -Value 单个 > 再 -Path 日记", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
         ps: "Add-Content -Value \">\" -Path docs/noun-diary.md" },
+      // 批 285 D148 余项(误拦,复核红队 aaf414b6 老问题):贴身脚本块的命令名带 `{` / `%{` ⇒ 写目标认不出;
+      //   管道后段首的 `%{`(加不加空格)同样认不出
+      { name: "285 D148:ForEach-Object {Add-Content 日记} 贴身写法", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
+        ps: "1..1 | ForEach-Object {Add-Content docs/noun-diary.md \"| winget | pm |\"}" },
+      { name: "285 D148:管道后 %{Add-Content -Value … -Path 日记}", user: "winget 是什么?", text: "winget 是包管理器,已补日记。",
+        ps: "1..1 | %{Add-Content -Value \"| winget | pm |\" -Path docs/noun-diary.md}" },
       // 红队 a2155edb BP-5:被拦后排队的是**非提问**消息 ⇒ 不切掉之前的日记写入
       { name: "a2155edb BP-5:非提问的排队消息不切先前的日记写入", text: "补了 K,收工。",
         prior: [{ user: "winget 是什么?", text: "winget 是包管理器,已补日记。", write: "/repo/docs/noun-diary.md", stop: "blocked" },
@@ -9170,10 +9839,118 @@ const DP_UNWRAP = (seg, wrap, depth = 0) => {
 };
 // heredoc 喂 shell(`bash <<'EOF' … git push private … EOF`):切段前要剥 heredoc,正文里的推送会跟着丢(D161⑫)。
 //   含 heredoc 的整条命令先交语法树看一眼,看到推送就把整条命令作为该命令的第一段放进去(段序不变,其后的探针照常算在推送之后)
-const DP_SEGS = (cmds, wrap = DP_WRAP) => (cmds || []).flatMap((c) => {
-  const segs = segments(DP_UNCOMMENT(stripHeredoc(String(c)))).flatMap((seg) => DP_UNWRAP(seg, wrap));
-  return /<</.test(String(c)) && DP_AST(String(c)) === true ? [String(c), ...segs] : segs;
-}).map((s) => s.trim()).filter(Boolean);
+//   (批 285:原 DP_SEGS 并入下方 DP_SEGS_T,切段 / 剥壳 / heredoc 处理不变,另给每段带「确知在别的仓」标记)
+// 批 285(D161①,误拦):DP 原来只看远端名、不看在哪个仓里推——`cd /d/lacuna && git push private main`、别的仓里先 cd 再裸 `git push`
+//   都被当成推 本仓私仓(语料实见)。现在跟踪**本命令里**的去向,确知落在 git-common-dir 与本仓不同的别的仓时,该段推送不计:
+//   ① 命令**第一段**是 `cd|pushd|sl|Set-Location <字面绝对路径>`,且其后接 `&&` / `;` / 换行;
+//   ② 段内 `git -C <路径>`(绝对路径重新定起点,相对路径接在已知起点后)。
+//   一律判严的情形(照旧计入):去向带变量 / 引号外反斜杠 / 相对路径起点 / 目录不存在 / git 取不到 common-dir;
+//   第一段之后再出现任何 cd 类词(含包装器、子 shell、`{ }` 里的,按原文找,宁多勿少);`||` 之后;命令里有后台 `&`;
+//   带 GIT_DIR / GIT_WORK_TREE / --git-dir / --work-tree;段里写了 app-private(按 URL 推私仓不因所在目录放过);一段里不止一个 git。
+//   本仓自己的推送另有 reflog 事实路径(各 worktree 共用 reflog)兜底,这里只撤命令解析那一路的误拦。
+//   代价(漏放,按用户「误拦比漏放贵」接受):在别的仓里按**远端名**推、而那个远端其实指向 app-private(远端名不是 URL)⇒ 不计;
+//   会话 cwd 已经持久停在别的仓(上一条 Bash 的 cd)时本条看不见,照旧计入(误拦残余,不是漏放)。
+const DP_CD_WORD = /^(?:cd|chdir|pushd|sl|set-location|push-location)$/i;
+const DP_CD_ANY = /(?:^|[\s({;&|"'`])(?:cd|chdir|pushd|popd|sl|set-location|push-location|pop-location)(?=$|[\s;)}"'`])/i;
+/** 字面绝对目录 ⇒ 规范成正斜杠形;判不出 ⇒ null(调用方按本仓算)。 */
+const dpAbsDir = (tok) => {
+  if (typeof tok !== "string" || !tok) return null;
+  let t = tok;
+  const q = /^(["'])([\s\S]*)\1$/.exec(t);
+  if (q) t = q[2];
+  else if (/\\/.test(t)) return null;                    // 引号外的反斜杠:bash 会当转义吃掉,去向判不出
+  if (!t || /[$`%*?]/.test(t) || t.startsWith("~")) return null;
+  t = t.replace(/\\/g, "/").replace(/^\/([a-z])(?=\/|$)/i, "$1:");
+  if (/^[A-Za-z]:(?:\/|$)/.test(t)) return t;
+  return process.platform !== "win32" && t.startsWith("/") ? t : null;
+};
+const DP_RAW_TOKS = (s) => String(s).match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || [];
+/** cd 类段 ⇒ {dir}(dir=null 判不出);不是 cd 段 ⇒ undefined。 */
+const dpCdTarget = (seg) => {
+  const ts = DP_RAW_TOKS(seg);
+  if (!ts.length || !DP_CD_WORD.test(ts[0])) return undefined;
+  const rest = ts.slice(1).filter((t) => !/^-(?:Path|LiteralPath)$/i.test(t));
+  return { dir: rest.length === 1 ? dpAbsDir(rest[0]) : null };
+};
+/** 与 gate-cmd 的 `segments` 同一切法(&& || ; | 换行,引号外转义跳过),另带每段之后的运算符。 */
+const dpSegOps = (cmd) => {
+  const raw = String(cmd || ""), masked = stripQuoted(raw), out = [];
+  let at = 0;
+  for (let i = 0; i < masked.length; i++) {
+    if (masked[i] === "\\") { i++; continue; }
+    const two = masked.slice(i, i + 2);
+    let op = null;
+    if (two === "&&" || two === "||") op = two;
+    else if (masked[i] === ";" || masked[i] === "|" || masked[i] === "\n") op = masked[i];
+    if (!op) continue;
+    out.push({ s: raw.slice(at, i).trim(), op });
+    at = i + op.length; i += op.length - 1;
+  }
+  out.push({ s: raw.slice(at).trim(), op: "" });
+  return out.filter((x) => x.s);
+};
+/** 一段(已剥壳)推送的去向是否确知落在别的仓。base = 本命令第一段 cd 落定的别仓目录(null = 本仓)。 */
+const dpSegAway = (u, base, awayOf) => {
+  const s = String(u);
+  if (/app-private/i.test(s) || /\bGIT_(?:DIR|WORK_TREE|COMMON_DIR)\b|--git-dir|--work-tree/i.test(s)) return false;
+  const ts = DP_RAW_TOKS(s);
+  const gi = ts.map((t, i) => (/^(?:\S*[\\/])?git(?:\.exe)?$/i.test(t) ? i : -1)).filter((i) => i >= 0);
+  if (gi.length > 1) return false;
+  const cs = [];
+  if (gi.length === 1) {
+    for (let i = gi[0] + 1; i < ts.length && ts[i].startsWith("-"); i++) {
+      if (ts[i] === "-C") { cs.push(ts[i + 1] ?? ""); i++; }
+      else if (/^(?:-c|--namespace|--config-env|--exec-path|--super-prefix)$/.test(ts[i])) i++;
+    }
+  }
+  if (!cs.length) return base !== null;
+  let dir = base;
+  for (const v of cs) {
+    const abs = dpAbsDir(v);
+    if (abs) dir = abs;
+    else if (dir !== null && v && !/["'`$%*?~\\]/.test(v)) dir = `${dir.replace(/\/+$/, "")}/${v}`;
+    else dir = null;
+  }
+  return dir !== null && awayOf(dir);
+};
+const DP_COMMON = new Map();
+const dpCommonDir = (dir) => {
+  const k = String(dir).toLowerCase();
+  if (DP_COMMON.has(k)) return DP_COMMON.get(k);
+  let v = null;
+  try {
+    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+      const out = execFileSync("git", ["-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true }).trim();
+      if (out) v = out.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    }
+  } catch { v = null; }
+  DP_COMMON.set(k, v);
+  return v;
+};
+/** root = hook 所在 checkout(ctx.hookCheckout,缺则进程 cwd);两边 common-dir 都取得到且不同才算别的仓。 */
+const dpAwayOf = (root) => (dir) => {
+  const a = dpCommonDir(dir), b = dpCommonDir(root);
+  return !!a && !!b && a !== b;
+};
+const DP_SEGS_T = (cmds, wrap = DP_WRAP, awayOf = null) => (cmds || []).flatMap((c) => {
+  const body = DP_UNCOMMENT(stripHeredoc(String(c)));
+  const ops = dpSegOps(body);
+  // 后台 `&`(`cd X && a & git push`:and-list 整个进了子 shell,cd 不改外层)⇒ 本命令不做去向判定
+  const bg = /(^|[^&>|])&(?![&>])/.test(stripQuoted(body));
+  let base = null;
+  const out = [];
+  ops.forEach(({ s, op }, k) => {
+    if (awayOf && !bg) {
+      if (k === 0) {
+        const cd = dpCdTarget(s);
+        if (cd && cd.dir && (op === "&&" || op === ";" || op === "\n") && awayOf(cd.dir)) base = cd.dir;
+      } else if (ops[k - 1].op === "||" || DP_CD_ANY.test(s)) base = null;
+    }
+    for (const u of DP_UNWRAP(s, wrap)) out.push({ s: u, away: !!awayOf && !bg && dpSegAway(u, base, awayOf) });
+  });
+  return /<</.test(String(c)) && DP_AST(String(c)) === true ? [{ s: String(c), away: false }, ...out] : out;
+}).map((x) => ({ s: x.s.trim(), away: x.away })).filter((x) => x.s);
 // 前导锚含反引号(BP-G2:`` echo `git push …` `` 反引号命令替换原完全认不出,段头 guard 里的反引号判断成了死码)
 const DP_PUSH_RE = /(?:^|[\s(&{`])(?:\S*[\\/])?git(?:\.exe)?(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace)(?:\s+\S+)?|\s+--?[\w-]+(?:=\S+)?)*\s+push\b(.*)$/i;
 // 段头是打印/写文本类命令 ⇒ 后面的 `git push` 只是它的参数(BP-E);`VAR=x` 前缀跳过
@@ -9370,14 +10147,18 @@ const DP_FACTS = (f) => {
   const at = new Date(f.lastPushTs * 1000).toISOString().replace("T", " ").slice(0, 16);
   return [`${f.pushRef || "private"} 于 ${at}Z 推送(reflog);其后无欠账探针标记`];
 };
-const DP_DETECT = (ctx, { ordered = true, useWindow = true, wrap = DP_WRAP, probe = DP_IS_PROBE, headCheck = true, useFacts = true, facts = DP_FACTS, ast = true } = {}) => {
+// 批 285(D161②):`isPush` 是推送识别的注入口,只给 mutations 换形态用(钉住 D139⑤ 的「只排除字面公开名」口径);
+//   `away`(D161①):关掉即回到「不看在哪个仓里推」的修前形态(反向证人在 hook-stop-closure 自测,要真的别仓目录,写不进静态夹具)。
+const DP_DETECT = (ctx, { ordered = true, useWindow = true, wrap = DP_WRAP, probe = DP_IS_PROBE, headCheck = true, useFacts = true, facts = DP_FACTS, ast = true, isPush = DP_IS_PUSH, away = true } = {}) => {
   if (!toolPresent("scripts/verify-prod.mjs")) return [];
   const byFacts = useFacts && ctx.debtFacts && typeof ctx.debtFacts === "object" ? facts(ctx.debtFacts) : [];
   if (byFacts.length) return byFacts;   // 事实这一路判出即拦,文本声明不认
   const w = useWindow && typeof ctx.window === "function" ? ctx.window() : null;
-  const segs = DP_SEGS([...((w && w.bashCmds) || []), ...(ctx.bashCmds || [])], wrap);
+  const root = (typeof ctx.hookCheckout === "string" && ctx.hookCheckout) || process.cwd();
+  const tagged = DP_SEGS_T([...((w && w.bashCmds) || []), ...(ctx.bashCmds || [])], wrap, away ? dpAwayOf(root) : null);
+  const segs = tagged.map((x) => x.s);
   let lastPush = -1;
-  segs.forEach((s, i) => { if (DP_IS_PUSH(s, { headCheck, ast })) lastPush = i; });
+  tagged.forEach((x, i) => { if (!x.away && isPush(x.s, { headCheck, ast })) lastPush = i; });
   if (lastPush < 0) return [];
   if ((ordered ? segs.slice(lastPush + 1) : segs).some(probe)) return [];
   return [segs[lastPush].slice(0, 60)];
@@ -9421,6 +10202,11 @@ const RULE_DP = {
     { name: "事实替代解析(有事实就不再跑命令解析;codex 复核判死的形态)", apply: (r) => ({ ...r, detect: (ctx) => (ctx.debtFacts && typeof ctx.debtFacts === "object" ? DP_FACTS(ctx.debtFacts) : DP_DETECT(ctx)) }) },
     { name: "同秒放行(`>=`)", apply: (r) => ({ ...r, detect: (ctx) => DP_DETECT(ctx, { facts: (f) => (!f.lastPushTs || (f.lastProbeTs !== null && f.lastProbeTs >= f.lastPushTs) ? [] : ["x"]) }) }) },
     { name: "事实路径时刻比反(探针早于推送也放行)", apply: (r) => ({ ...r, detect: (ctx) => DP_DETECT(ctx, { facts: (f) => (!f.lastPushTs || (f.lastProbeTs !== null && f.lastProbeTs <= f.lastPushTs) ? [] : ["x"]) }) }) },
+    // 批 285(D161②):钉住 D139⑤ 的远端口径——换回「≠ origin 即算」(推 custodiet 也欠探针)或收窄成「只认字面 private」都必须变红
+    { name: "远端口径换回「≠ origin 即算」(D139⑤ 修前)", apply: (r) => ({ ...r, detect: (ctx) => DP_DETECT(ctx, {
+      isPush: (s, o) => DP_IS_PUSH(s, o) || (/(?:^|\s)git(?:\s+-\S+(?:\s+(?!push\b)\S+)?)*\s+push\b/.test(stripQuoted(s)) && !/\s(?:--dry-run|-n)\b/.test(s) && !/\bpush\s+(?:-\S+\s+)*origin\b/.test(s)) }) }) },
+    { name: "远端口径收窄成「只认字面 private」(红队 a415bf26 BP-1~3 修前)", apply: (r) => ({ ...r, detect: (ctx) => DP_DETECT(ctx, {
+      isPush: (s, o) => DP_IS_PUSH(s, o) && /\bpush\b(?:\s+-\S+)*\s+private\b/.test(s) }) }) },
   ],
   cases: {
     pos: [
@@ -9457,6 +10243,10 @@ const RULE_DP = {
       // 探针在推之前跑的 ⇒ 量的是推之前的世界,不算
       { text: "先查后推。", bash: ["node --no-warnings scripts/verify-prod.mjs --debt-only", "git push private master"] },
       { text: "推了。", bash: "git -C /repo push private master" },
+      // 批 285(D161①):去向判不出 ⇒ 照旧按本仓算(只撤「确知别的仓」那一种;放行方向的证人在 hook-stop-closure 自测,要真的别仓目录)
+      { name: "285 D161①:cd 到变量目录后推 private 照算", text: "推了。", bash: "cd \"$REPO\" && git push private master" },
+      { name: "285 D161①:cd 到不存在的目录后推 private 照算", text: "推了。", bash: "cd E:/no-such-dir-285 && git push private master" },
+      { name: "285 D161①:cd 之后是 || 照算", text: "推了。", bash: "cd E:/no-such-dir-285 || git push private master" },
       // BP-1:推送在上文窗口,本轮什么都没做
       { text: "收到。", prior: [{ bash: "git push private master" }] },
       // BP-3:包装器与不在段首
@@ -9618,6 +10408,10 @@ const RULE_AD = {
   law: "docs/laws/reporting.md#开工先立完成条件",
   detect: adDetect(),
   exempts: [],
+  // 批 285(D184 FB-3):去重身份 = 批号。原来去重按首行,首行带「最新命中引文 + 等 N 条提交」,
+  //   同一批每多一条签字词提交就换键、多续一轮(git log 单批最多 4 条);新提交是不是新决定本就判不出,多续的那轮模型拿不到可用的新信息。
+  //   代价(漏放侧,按用户「误拦比漏放贵」接受):同会话同批里后来的签字词提交不再单独提示;换批号照报。
+  noticeKey: (hits, ctx) => `batch:${String(ctx?.batchGoal?.batch ?? "")}`,
   message: (hits) =>
     `**本批提交信息里像是有已签的决定,而本批决定清单为空**(${quoteUntrusted(String(hits[0] || ""), 80)})。\n` +
     `      是新决定 ⇒ \`node --no-warnings scripts/batch-goal.mjs --decision "<一句话>"\` 登记(--clear 时会要求对应 ADR 写着该编号);` +
@@ -9699,14 +10493,25 @@ const RULE_MF = {
     return t ? t[1].toLowerCase() : null;
   },
   //   误拦 r6 FB-2:user 类多是关于用户的事实,只有带持久指令措辞时才算规则
-  _USER_CUE: /以后|每次|一律|必须|总是|永远|默认|不要|别再|务必|always|never|by default/i,   // 「默认」:codex 276-r6-fix-audit 附 2
+  _USER_CUE: /以后|(?<!用户|他|她)每次|一律|必须|总是|永远|默认|不要|别再|务必|always|never|by default/i,   // 「默认」:codex 276-r6-fix-audit 附 2
+  //   批 285(D179 误拦 r7 FB-4):「用户每次开学前重排课表」是描述用户习惯的事实,不是给执行方的指令 ⇒ 主语紧贴的「每次」不算措辞。
+  //   代价(漏放侧,接受):「用户每次说 X 时都要先 Y」这类借用户主语写的指令,若别处没有措辞词,不再触发。
   //   批 279:小改的改动段里不许出现的指令措辞(宽:含单字「不 / 要 / 应 / 别 / 只 / 先 / 再」,误伤只是多查一次)
   _RULE_CUE: /以后|今后|每次|一律|必须|总是|永远|默认|禁止|务必|不|要|应|别|只|须|先|再|\b(?:always|never|must|should|only|don'?t|do not|by default)\b/i,   // 英文按整词(误拦猎手 279 FB-3:commonly 里的 only)
   // 执行面行:取标签后到行尾的值判
-  faceOk(body) {
+  faceOk(body, V = {}) {
     const ids = new Set(RULES.map((r) => r.id));   // 调用时 RULES 已定义(r6 BP-3:规则 id 须真实存在)
     for (const line of String(body || "").split(/\r?\n/)) {
-      const m = line.match(/(?:执行面|触发层)\s*(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*(.+)$/);
+      //   批 285(D179 误拦 r6 FB-1):「机器检查兜底:」「机器兜底:」「机器闸:」与「执行面:」同等(值照同一套判据核,只多认标签名)
+      //   批 285 第二轮复核(红队第 2 份 BP-2):标签前紧挨否定词(无 / 暂无 / 没有 / 尚无 / 未)不算标签——
+      //   「无机器闸:目前 scripts/hook-guard.mjs 管不到这条」原被当成「机器闸:<路径>」放行。只少认标签 ⇒ 只会多拦这类自认没有的写法;
+      //   同一行后面另有真标签(「暂无机器闸;执行面:scripts/x.mjs」)照认。V.noNegLabel 只给变异用。
+      //   批 285 第三轮(误拦猎手第二轮 FB-2):否定前缀标签后接「不可机械化:理由」⇒ 照认作出路(「暂无机器闸:不可机械化:靠用户口述触发」
+      //   与「执行面:不可机械化:理由」同义;只认这一形,带路径的否定前缀标签照旧不算)
+      if (!V.noNegLabel && /(?:无|暂无|没有|没|还没|尚无|尚未|未|缺少|缺乏)[\s*]*(?:执行面|触发层|机器检查兜底|机器兜底|机器闸)\s*(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*不可机械化\s*[:：]\s*\S.+/.test(line)) return true;
+      const m = V.noNegLabel
+        ? line.match(/(?:执行面|触发层|机器检查兜底|机器兜底|机器闸)\s*(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*(.+)$/)
+        : line.match(/(?<!(?:无|暂无|没有|没|还没|尚无|尚未|未|缺少|缺乏)[\s*]*)(?:执行面|触发层|机器检查兜底|机器兜底|机器闸)\s*(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*(.+)$/);
       if (!m) continue;
       const v = m[1].replace(/[`*「」"]/g, "").replace(/\\/g, "/").trim();
       if (/^不可机械化\s*[:：]\s*\S.+/.test(v)) return true;   // 误拦 r7 FB-2:「执行面:不可机械化:理由」
@@ -9714,8 +10519,11 @@ const RULE_MF = {
       const hasD = /\bD\d{2,4}[a-z]?\b/.test(v.replace(/\bD17[89]\b/g, ""));
       // 如实说没有 ⇒ 须附 D 号(r5 BP-3);否定词在值的任意处都认(r6 BP-2:「目前没有,候选是 scripts/…」「无机器闸」)
       //   codex 276-r6-fix-audit §1:否定词只认值开头,或明说「没有执行者」的短语——「scripts/x.mjs(此脚本暂无副作用)」不算没有
+      //   批 285(D179 误拦 r9 FB-1,阻断级):「scripts/hook-guard.mjs(只查路径,没有检查语义)」里「没有检查」后接宾语,
+      //   说的是这个执行者**不查什么**(范围限定),不是「没有执行者」⇒ 判据 / 检查后紧接汉字(作动词带宾语)时不算否定。
+      //   代价(漏放侧,接受):「没有检查器」「没有判据可查」这类后接汉字的真否定,带路径时会放过。
       if (/^(?:无|暂无|没有|尚无|还没有?|目前没有|未有|待定|n\/?a)(?=$|[\s,，。;；:：(（])/i.test(v) ||
-        /无机器(?:闸|判据|检查)|没有机器|(?:暂无|尚无|目前没有|还没有|没有)(?:执行面|执行者|机器|闸|判据|检查)/.test(v)) {
+        /无机器(?:闸|判据|检查)|没有机器|(?:暂无|尚无|目前没有|还没有|没有)(?:执行面|执行者|机器|闸|(?:判据|检查)(?![一-鿿]))/.test(v)) {
         if (hasD) return true;
         continue;
       }
@@ -9727,11 +10535,16 @@ const RULE_MF = {
         !/(^|\/)(?:memory\/|MEMORY\.md$)/i.test(path[0]) && !RULE_MF._MEM.test(path[0])) return true;
       const idHit = [...v.matchAll(/\b([A-Z][A-Z0-9]{0,2})\s*项|\bRULE_([A-Z0-9]+)\b|(?:收尾闸|规则)\s*([A-Z][A-Z0-9]{0,2})\b/g)].some((x) => ids.has(x[1] || x[2] || x[3]));
       if (idHit || /npm run [\w:.-]+|(?:^|\s)\/[a-z][\w-]*:[\w-]+/.test(v) || hasD) return true;
+      //   批 285(D179 误拦 r7 FB-3):别的工装的检查项编号「verify-prod 的 S5 项」——工装名在本仓 scripts/ 下真有同名 .mjs 才认(编号本身不核)。
+      //   代价(漏放侧,接受):工装真在、编号是编的也放过;与「只证那一行在」的既有天花板同形。
+      const toolItem = v.match(/(?:^|[^\w./-])([\w-]{2,40})(?:\.mjs)?\s*的\s*[A-Z][A-Z0-9]{0,3}\s*(?:项|检查)/);
+      if (toolItem && bareScript(`${toolItem[1]}.mjs`)) return true;
     }
     // 不可机械化:只认行首标签(r6 BP-5:正文讨论这种格式不算);理由 ≥2 字(误拦 r6 FB-5「判语义」)
     //   误拦 r7 FB-2:编号列表 / 引用块前缀、行首加粗小标题(「**How to apply:** 不可机械化:…」)同等对待
+    //   批 285(D179 r9):冒号写在加粗外(「**How to apply**:不可机械化:…」)同等对待——标题后允许一个冒号
     return String(body || "").split(/\r?\n/).some((l) =>
-      /^\s*(?:[-*>]\s+|\d+[.)]\s+)?(?:\*\*[^*\n]{1,20}\*\*\s*)?(?:\*\*)?不可机械化(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*\S.+/.test(l));
+      /^\s*(?:[-*>]\s+|\d+[.)]\s+)?(?:\*\*[^*\n]{1,20}\*\*\s*[:：]?\s*)?(?:\*\*)?不可机械化(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*\S.+/.test(l));
   },
   detect: (ctx, V = {}) => {
     const H = RULE_MF;
@@ -9783,7 +10596,7 @@ const RULE_MF = {
         if (ty !== "feedback" && ty !== "user") continue;
         if (ty === "user" && !H._USER_CUE.test(body.replace(/^\s+/, "").replace(/^﻿?---\r?\n[\s\S]*?\r?\n---/, ""))) continue;
       }
-      if (!V.noEscapes && H.faceOk(body)) continue;
+      if (!V.noEscapes && H.faceOk(body, V)) continue;
       hits.push(p);
     }
     return hits.slice(0, 3);
@@ -9796,6 +10609,8 @@ const RULE_MF = {
   mutations: [
     { name: "去掉出路(带了执行面也照拦)", apply: (r) => ({ ...r, detect: (ctx) => RULE_MF.detect(ctx, { noEscapes: true }) }) },
     { name: "不看 type(写任何 memory 都拦)", apply: (r) => ({ ...r, detect: (ctx) => RULE_MF.detect(ctx, { anyType: true }) }) },
+    // 批 285 第二轮复核(红队第 2 份 BP-2):证人 = pos「MF 285 二轮 红队 2 BP-2」四条
+    { name: "285 二轮退回:否定前缀里的「机器闸」也算执行面标签", apply: (r) => ({ ...r, detect: (ctx) => RULE_MF.detect(ctx, { noNegLabel: true }) }) },
     // 批 279「小改的 Edit 不查」(smallEdit)钉在 hook 自测「279 MF」那组 hp 用例上:夹具键造不出带 old_string 的 Edit,变异在这里杀不死
   ],
   cases: {
@@ -9830,6 +10645,18 @@ const RULE_MF = {
         write: "/repo/.claude/agent-memory/rev/notes.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n回复先给结论。" },
       { name: "MF r6 BP-8:type 冒号前带空格", text: "已存。",
         write: "C:/Users/u/.claude/projects/example-project/memory/c7.md", written: "---\nname: x\nmetadata:\n  type : feedback\n---\n回复先给结论。" },
+      // 批 285 反向钉:各放宽只到报告的那一形
+      { name: "MF 285 反向:路径后自认「没有检查」(无宾语)仍是否定", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/p285f.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n回复先给结论。\n执行面:scripts/hook-guard.mjs(没有检查)" },
+      { name: "MF 285 反向:工装不存在的检查项编号不算", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/p285g.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n部署后跑探针。\n执行面:zzz-no-such-tool 的 S5 项" },
+      { name: "MF 285 反向:user 类无主语的「每次…」仍是指令", text: "记下了。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/p285h.md", written: "---\nname: n\nmetadata:\n  type: user\n---\n每次回复先给结论。" },
+      // 批 285 第二轮复核(红队第 2 份 BP-2):标签前的否定词 ⇒ 自认没有,不是执行面
+      // 批 285 三轮(红队第二轮 BP-2):没 / 还没 / 缺、带空格、加粗否定词同样不算标签
+      ...["无机器闸", "暂无机器闸", "没有机器闸", "暂无机器兜底", "没机器闸", "还没机器闸", "无 机器闸", "**无**机器闸"].map((lab, i) => ({ name: `MF 285 二轮 红队 2 BP-2:${lab}:<路径> 不算执行面`, text: "已存。",
+        write: `C:/Users/u/.claude/projects/example-project/memory/neg285-${i}.md`,
+        written: `---\nname: n\nmetadata:\n  type: feedback\n---\n回复先给结论。\n${lab}:目前 scripts/hook-guard.mjs 管不到这条` })),
       { name: "MF r5 BP-8:type 值带引号", text: "改好了。",
         write: "C:/Users/u/.claude/projects/example-project/memory/me.md", written: "---\nname: me\nmetadata:\n  type: \"feedback\"\n---\n先跑自测。" },
     ],
@@ -9856,6 +10683,14 @@ const RULE_MF = {
         write: "C:/Users/u/.claude/projects/example-project/memory/r6a.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n先跑自测。\n执行面:scripts/lib/gate-rules.mjs(此脚本暂无副作用)" },
       { name: "MF 误拦 r7 FB-1:真实 id + 覆盖范围限定语", text: "已存。",
         write: "C:/Users/u/.claude/projects/example-project/memory/r7a.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n自查出错必附闸怎么拦。\n执行面:收尾闸 SE 项(提示级,尚无阻断;升阻断待定)" },
+      // 批 285 收口(误拦猎手 FB-4):「补缺 / 缺省」里的「缺」不是否定词 ⇒ 标签照认
+      { name: "MF 285 收口 FB-4:补缺机器闸:<路径>(D 号)照认", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/fb4-bq.md",
+        written: "---\nname: n\nmetadata:\n  type: feedback\n---\n回复先给结论。\n补缺机器闸:scripts/hook-guard.mjs(D190)" },
+      // 批 285 第三轮(误拦猎手第二轮 FB-2):否定前缀标签 + 不可机械化:理由 ⇒ 照认作出路
+      ...["暂无机器闸", "尚无执行面", "无触发层"].map((lab, i) => ({ name: `MF 285 三轮 FB-2:${lab}:不可机械化:理由`, text: "已存。",
+        write: `C:/Users/u/.claude/projects/example-project/memory/fb2-${i}.md`,
+        written: `---\nname: n\nmetadata:\n  type: feedback\n---\n回复先给结论。\n${lab}:不可机械化:靠用户口述触发,无工具事件可挂` })),
       { name: "MF 误拦 r7 FB-2:执行面行里写不可机械化", text: "已存。",
         write: "C:/Users/u/.claude/projects/example-project/memory/r7b.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n说话别绕。\n执行面:不可机械化:要判语气" },
       { name: "MF 误拦 r7 FB-2:加粗小标题后写不可机械化", text: "已存。",
@@ -9868,6 +10703,17 @@ const RULE_MF = {
         write: "C:/Users/u/.claude/projects/example-project/memory/d105c.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n只读代理别跑写形命令。\n执行面:hook-guard(D105c)" },
       { name: "MF 误拦 r6 FB-5:不可机械化三字理由", text: "已存。",
         write: "C:/Users/u/.claude/projects/example-project/memory/nm.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n说话别绕。\n不可机械化:判语义" },
+      // 批 285(D179 设计复核后只落误拦那半)
+      { name: "MF 285 r9 FB-1:执行面带路径 + 范围限定「没有检查语义」", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/p285a.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n回复先给结论。\n执行面:scripts/hook-guard.mjs(只查路径,没有检查语义)" },
+      { name: "MF 285 r9:冒号在加粗外的不可机械化", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/p285b.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n说话别绕。\n**How to apply**:不可机械化:要判语气" },
+      { name: "MF 285 r7 FB-3:真实工装的检查项编号", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/p285c.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n部署后跑探针。\n执行面:gate-migrate-check 的 S5 项" },
+      { name: "MF 285 r7 FB-4:user 类「用户每次…」是习惯描述", text: "记下了。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/p285d.md", written: "---\nname: n\nmetadata:\n  type: user\n---\n用户每次开学前重排课表。" },
+      { name: "MF 285 r6 FB-1:「机器检查兜底:」标签", text: "已存。",
+        write: "C:/Users/u/.claude/projects/example-project/memory/p285e.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n回复先给结论。\n机器检查兜底:scripts/hook-guard.mjs" },
       { name: "MF r6 BP-25:插件命令 / 不带「项」的规则名", text: "已存。",
         write: "C:/Users/u/.claude/projects/example-project/memory/pc.md", written: "---\nname: n\nmetadata:\n  type: feedback\n---\n关账前跑一致性检查。\n执行面:/nlpm:check 关账;收尾闸 MF" },
     ],
@@ -9913,7 +10759,7 @@ const RULE_SE = {
   //   红队 4b92c89 BP-2:原来见「其实」就剥 ⇒「我算错了数字,其实已经提交了」也被吞掉;只剥「其实 X,不是 / 而不是 Y」这种更正句式里的 X
   heavySent(sent) { return RULE_SE._HEAVY.test(String(sent || "").replace(/(?:其实|实际上|本来)[^，,。；;：:]*(?=[，,]\s*(?:而)?不是)/g, " ")); },
   // codex 284-r1 附 4:needHeavy ⇒ 跳过不带后果的认错接着找(原来只取第一处,「我说错了一个路径。另:我算错了数字,报告已提交。」被首句小错遮住)
-  firstAdmission(t, needHeavy) {
+  firstAdmission(t, needHeavy, V = {}) {
     const H = RULE_SE;
     for (const m of t.matchAll(new RegExp(H._PAT.source, "g"))) {
       const s0 = Math.max(t.lastIndexOf("。", m.index), t.lastIndexOf("\n", m.index), t.lastIndexOf("!", m.index), t.lastIndexOf("?", m.index),
@@ -9928,7 +10774,14 @@ const RULE_SE = {
       // 误拦 r6 FB-9:同句点名 D 号且带登记语境 = 复述已登记的错;
       //   只有 D 号不算(codex 276-r6-fix-audit §2:「我说错了,D150 那条的状态写反了」里 D150 是被说错的对象)
       const sentD = sent.replace(/\bD17[89]\b/g, "");
-      if (/\bD\d{2,4}[a-z]?\b/.test(sentD) && /登记|登进|记为|记账|已撤销|已结清|已修|在册|见\s*D\d/.test(sentD)) continue;
+      //   批 285(D179 r9):语境表补「已结 / 撤销」(「D150 已结」「D150 那条撤销了」)——复述已结账的旧错不提示;
+      //   代价(漏放侧,接受):被说错的对象恰是一条「已结」的 D 号时不提示
+      //   批 285 第二轮复核(红队第 2 份 BP-4):裸「撤销」收窄为指向欠账状态的写法(已撤销 / 被撤销 / 撤销了 D号 / D号[那条]撤销了)——
+      //   「结论已提交,这就撤销那笔提交重做」里的撤销是动作不是账目状态,原因同句有 D 号被当成复述旧账、不提示。
+      //   只少认语境 ⇒ 只会多提示(SE 只提示不阻断)。V.bareRevoke 只给变异用。
+      const ctxRe = V.bareRevoke ? /登记|登进|记为|记账|已撤销|撤销|已结|已修|在册|见\s*D\d/
+        : /登记|登进|记为|记账|已撤销|被撤销|撤销了\s*D\d|\bD\d{2,4}[a-z]?\s*(?:那条|这条|那项|这项|那笔|这笔)?\s*撤销了|已结|已修|在册|见\s*D\d/;
+      if (/\bD\d{2,4}[a-z]?\b/.test(sentD) && ctxRe.test(sentD)) continue;
       if (needHeavy && !H.heavySent(sent)) continue;
       return m[0];
     }
@@ -9939,7 +10792,7 @@ const RULE_SE = {
     //   误拦 r6 FB-10:行内代码与代码围栏里复述判据词不算
     const raw = String(ctx.text || "").replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
     const t = V.noMask ? raw : maskQuoted(raw);
-    const hit = H.firstAdmission(t, !V.noGate);
+    const hit = H.firstAdmission(t, !V.noGate, V);
     if (!hit) return [];
     const m = [hit];
     // 批 284(交接单 20261028 第四条,用户 10-27「SE 有点过犹不及……再给他去立个闸有点没必要」):量级门槛反过来做——
@@ -9968,7 +10821,8 @@ const RULE_SE = {
       //   没进产物等),理由至少 4 字;只是让「不值得」能说出口,不再逼出低价值候选闸。
       //   红队 279 BP-8 / BP-9:「不立闸」必写全「闸」、后跟冒号、理由 ≥4 个非空白字;理由里有推迟词就作废(不看先后);
       //   认的是重型错(假读数 / 推翻了别人 / 据此提交)时不认这个出口
-      const okRe = /\bD\d{3}[a-z]?\b|\b[A-Z][A-Z0-9]{0,2}\s*项|RULE_[A-Z0-9]+|不可机械化\s*[:：,,]?\s*\S.{3,}/;
+      //   批 285(D179 r9):D 号认两位(D55 / D82 这类老号同样在册)
+      const okRe = /\bD\d{2,4}[a-z]?\b|\b[A-Z][A-Z0-9]{0,2}\s*项|RULE_[A-Z0-9]+|不可机械化\s*[:：,,]?\s*\S.{3,}/;
       const DEFER = /还没想好|没想好|回头|以后再|稍后|待定|再说|懒得|^\s*先(?!前)/;
       //   批 279 的「不立闸:<理由>」出口已随批 284 的量级门槛撤掉:小错根本不提示,能走到这里的都是重型错,而重型错本就不认那条出口
       //   (红队 279 BP-8)。重型判据挪到 _HEAVY(误拦猎手 279 FB-6:只看认错那一句,排除否定)
@@ -9987,6 +10841,8 @@ const RULE_SE = {
     { name: "不剥引文(引用别人的「我说错了」也提示)", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noMask: true }) }) },
     // 批 284:去掉量级门槛 ⇒ 小错又被逼着设计闸。证人 = neg「SE 284:…」
     { name: "去掉量级门槛(小错也提示)", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noGate: true }) }) },
+    // 批 285 第二轮复核(红队第 2 份 BP-4):证人 = pos「SE 285 二轮 红队 2 BP-4」
+    { name: "285 二轮退回:登记语境认裸「撤销」", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { bareRevoke: true }) }) },
   ],
   cases: {
     // 批 284 量级门槛:正例的认错那一句都带后果(已提交 / 已发布 / 据此… / 假读数);同形的小错版本在 neg「SE 284」
@@ -10012,10 +10868,17 @@ const RULE_SE = {
       { name: "SE 红队 4b92c89 BP-2:「其实」后的后果不剥(非更正句式)", text: "我算错了数字,其实已提交。" },
       // 284b:红队 4b92c89 BP-3 / 284 终版 BP-4 的同义写法已退回(误拦猎手 284 终版 FB-2),对应正例移到 neg「SE 284b」
       { name: "SE codex r6-fix §2:同句 D 号是被说错的对象,不是登记", text: "我说错了,D150 那条的状态写反了,已提交。" },
+      // 批 285 第二轮复核(红队第 2 份 BP-4):撤销是动作(撤那笔提交)不是账目状态 ⇒ 照提示
+      { name: "SE 285 二轮 红队 2 BP-4:同句 D 号 + 「这就撤销那笔提交」不是复述旧账", text: "我读错了 D150 的退出码,结论已提交,这就撤销那笔提交重做。" },
     ],
     neg: [
       // 批 284 量级门槛:小错(认错那句里没有后果)不提示。前三条是旧正例的小错原形
       { name: "SE 284:小错不提示(旧正例原形)", text: "我上一轮说错了,那个文件其实没落盘。现在重写。" },
+      // 批 285(D179 r9)
+      { name: "SE 285:复述已结的旧错(「D150 已结」)", text: "我上一轮读错了日志,结论已提交,D150 已结。" },
+      { name: "SE 285:闸怎么拦指两位 D 号", text: "是我的锅,那份报告已提交。闸怎么拦:D82 已管这一形,不另立。" },
+      // 批 285 第二轮复核(红队第 2 份 BP-4)收窄后的反向钉:指向账目状态的撤销写法照旧算复述旧账
+      { name: "SE 285 二轮:「D150 那条撤销了」仍是复述旧账", text: "我上一轮读错了日志,结论已提交,D150 那条撤销了。" },
       { name: "SE 284:小错不提示(当轮改掉)", text: "我不小心写错了路径,已改。" },
       { name: "SE 284:小错 + 嘴上说回头,也不提示", text: "是我的锅,回头想想闸怎么拦。" },
       { name: "SE 284:某会话 实撞(漏报一笔 gitignore 面下载)", text: "我那句写错了,那笔下载落在 gitignore 面的 clipboard/server-backups/ 里,补上。" },

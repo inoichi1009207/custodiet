@@ -117,7 +117,10 @@ const DELIVERABLE_EXCLUDE = new RegExp(
   "|clipboard/(?:[^/]*/)*\\.[^/]*\\.md$" +
   "|clipboard/(?:[^/]*/)*[^/]*(?:disposition|回件|(?<![^/_-])(?:codex|grill|battle)-audit|audit-r\\d+|(?<![^/_-])task-\\d+|\\d+-task(?=[-_.]))[^/]*\\.md$", "i");
 /** 生产内容写入命令(W′ 修正案的判据面,2026-08-22 亲签):
- *  ai-note/feed/bulk 管线全部经这些脚本走生产——动作面上可见,单源在此。 */
+ *  ai-note/feed/bulk 管线全部经这些脚本走生产——动作面上可见,单源在此。
+ *  **部署(deploy-prod)也在对象内**:W′ 亲签实现提交 a18fedd 的提交信息原文列「write-node/prod-lib/bulk/deploy」,
+ *  它从上线首日就在判据里(批 285 D132 补这句,原注释只写三条内容管线,与判据实含不符)。
+ *  天花板(D132,按接受风险结清):只认这四个脚本名——绕开 deploy-prod.ps1 直接 ssh 敲部署步不命中。 */
 export const CONTENT_WRITE_RE = /write-node\.mjs|prod-lib\.mjs|bulk[-_]?create|deploy-prod/;
 
 /** 写它算「产出交付物」吗(W 项的判据面)。 */

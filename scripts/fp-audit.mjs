@@ -16,8 +16,9 @@
 // 什么时候跑:batch-goal `--clear` 收尾自动调一次(结果一行打在误报率表后面);也可手动跑。
 // 天花板:codex 也只看得到转录片段;「判不出」不进任何一边的账。审过的行不再审(按台账行哈希 h 记)。
 //   ① 盲只盲到 `--fp` 的理由:同规则第二次报警时,当轮正文里执行方对上一次报警的反驳照样进上下文(grill 259 F5b);
-//   ② 取证按时刻找「fp 之前 3 小时内最后一次该规则报警」,跨会话或同规则连报时可能取到别的那次——
-//      `--fp` 不记会话与报警编号,根治要改记账格式(grill 259 F4,登记 D159);
+//   ② 取证按时刻找「fp 之前 3 小时内最后一次该规则报警」,跨会话或同规则连报时可能取到别的那次(grill 259 F4,D159①)——
+//      批 285 起 `--fp` 记账时另记 `alert`(报警台账里最后一行含该规则的 h / sid / ts),locate 先按它定位;
+//      旧台账行没有这个字段,照旧按时刻找;同一工作树两会话前后脚报同一规则时仍可能指认错;
 //   ③ codex 在临时快照目录里跑(只有报警当时的规则与法条),但只读沙箱读得到全盘,「不读别处」靠任务件约束。
 //
 // 用法:node --no-warnings scripts/fp-audit.mjs [--max N] [--dry] [--self-test]
@@ -145,16 +146,38 @@ export function isGateLine(o) {
   return false;
 }
 
-/** 按时刻在本项目转录里找那次闸提示:取 fp 时刻之前 3 小时内、含 `[id]` 的最后一条收尾闸提示。 */
+/** 批 285(D159① 工装缺陷):`--fp` 记账时顺手指认「拦的是哪一次」——报警台账(`.gate-alerts.jsonl`)里**最后一行**
+ *  `ids` 含该规则、且在 `now` 之前 3 小时内的,取其 h / sid / ts 记进 claimed_fp 的 `alert` 字段。
+ *  locate 有它就先按会话 + 报警时刻直接定位,不再只按「3 小时内最后一次」猜(跨会话 / 同规则连报时会审到别的那次)。
+ *  取不到 ⇒ null,locate 退回旧口径。天花板:同一工作树里两个会话前后脚报同一规则时,指认的是最后报的那个。 */
+export function alertRefFor(rows, id, now = Date.now()) {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const r = rows[i];
+    if (!r || !Array.isArray(r.ids) || !r.ids.includes(id)) continue;
+    const ts = Date.parse(r.ts);
+    if (!Number.isFinite(ts) || ts > now + 60e3 || ts < now - 3 * 3600e3) return null;
+    return { ...(r.h ? { h: String(r.h) } : {}), ...(r.sid ? { sid: String(r.sid) } : {}), ts: String(r.ts) };
+  }
+  return null;
+}
+
+/** 按时刻在本项目转录里找那次闸提示:取 fp 时刻之前 3 小时内、含 `[id]` 的最后一条收尾闸提示。
+ *  批 285(D159①):claim 带 `alert`(`--fp` 记账时指认的报警行)⇒ 先在该会话的转录里(该文件在场时)取与报警时刻
+ *  相差 2 分钟内、最接近的那条;一条都对不上才用旧口径的结果(旧口径照旧扫全部文件,不比旧行为少找到)。 */
 export function locate(claim, dir) {
   const t = Date.parse(claim.ts);
   if (!Number.isFinite(t)) return null;
+  const ref = claim.alert && typeof claim.alert === "object" ? claim.alert : null;
+  const refT = ref ? Date.parse(ref.ts) : NaN;
   let files = [];
   try {
     files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl")).map((f) => path.join(dir, f))
       .filter((p) => { try { return fs.statSync(p).mtimeMs >= t - 60e3; } catch { return false; } });
   } catch { throw new Error(`转录目录读不到:${dir}`); }   // 环境故障 ≠ 取证失败,不得写进台账(grill 259 F12)
-  let best = null;
+  // 指认的会话文件在场 ⇒ 按报警时刻定位只认它;旧口径(best)照旧扫全部文件,作退路
+  const sidOf = (p) => path.basename(p, ".jsonl");
+  const ownOnly = !!(ref && ref.sid && files.some((p) => sidOf(p) === String(ref.sid)));
+  let best = null, bestRef = null;
   for (const p of files) {
     let txt; try { txt = fs.readFileSync(p, "utf8"); } catch { continue; }
     if (!txt.includes(`[${claim.id}]`)) continue;
@@ -174,8 +197,12 @@ export function locate(claim, dir) {
       const msg = gateMessageFor(lineText(o), claim.id);
       if (msg.length < 30 || /^\[[A-Z0-9]+\]\s*[((]全文已附给模型/.test(msg)) continue;
       if (!best || ts > best.ts) best = { ts, file: p, idx: i, lines, msg };
+      if (Number.isFinite(refT) && (!ownOnly || sidOf(p) === String(ref.sid)) && Math.abs(ts - refT) <= 120e3
+        && (!bestRef || Math.abs(ts - refT) < Math.abs(bestRef.ts - refT)))
+        bestRef = { ts, file: p, idx: i, lines, msg };
     }
   }
+  if (bestRef) best = bestRef;
   if (!best || !best.msg) return null;
   const ctx = turnContext(best.lines, best.idx);
   return { at: new Date(best.ts).toISOString(), session: path.basename(best.file, ".jsonl"), msg: best.msg, ...ctx };
@@ -329,6 +356,28 @@ function selfTest() {
     { text: "前文 (执行方理由,盲审遮去) 后文", hits: 1 });
   ok("遮理由:8 字短理由也遮", redactReasons("这是检索不是写入", ["这是检索不是写入"]).hits, 1);
   ok("遮理由:长理由整句遮,不留后半截", redactReasons("A".repeat(40) + "TAIL_REASON", ["A".repeat(40) + "TAIL_REASON"]).text.includes("TAIL_REASON"), false);
+  // 批 285 D159①:--fp 记报警指认,locate 按会话 + 报警时刻定位(跨会话 / 同规则连报时不再取到「最后一次」)
+  {
+    const N = Date.parse("2026-10-28T12:00:00Z");
+    const A = [{ ts: "2026-10-28T11:00:00Z", ids: ["V"], sid: "s1", h: "h1" }, { ts: "2026-10-28T11:30:00Z", ids: ["K", "V"], sid: "s2", h: "h2" },
+      { ts: "2026-10-28T11:50:00Z", ids: ["K"], sid: "s3", h: "h3" }];
+    ok("D159①:取最后一行含该规则的报警", alertRefFor(A, "V", N), { h: "h2", sid: "s2", ts: "2026-10-28T11:30:00Z" });
+    ok("D159①:3 小时外 / 没有 ⇒ null", [alertRefFor(A, "V", N + 4 * 3600e3), alertRefFor(A, "P", N)], [null, null]);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fp-audit-st-"));
+    const gate = (ts, tag) => JSON.stringify({ type: "attachment", timestamp: ts, attachment: { type: "hook_blocking_error",
+      content: `收尾闸阻断 1 项:\n  [V] ${tag} 本批交付物审读未绑定文件名,这一行凑够三十个字符以上` } });
+    try {
+      fs.writeFileSync(path.join(dir, "sessA.jsonl"), gate("2026-10-28T11:40:00Z", "甲次") + "\n");
+      fs.writeFileSync(path.join(dir, "sessB.jsonl"), gate("2026-10-28T11:55:00Z", "乙次") + "\n");
+      for (const f of ["sessA.jsonl", "sessB.jsonl"]) fs.utimesSync(path.join(dir, f), new Date(N), new Date(N));   // locate 只看 fp 时刻后还动过的文件
+      const claim = { id: "V", ts: "2026-10-28T12:00:00Z" };
+      const tagOf = (loc) => (loc && /甲次/.test(loc.msg) ? "甲" : loc && /乙次/.test(loc.msg) ? "乙" : null);
+      ok("D159①:无指认 ⇒ 旧口径取最后一次(乙)", tagOf(locate(claim, dir)), "乙");
+      ok("D159①:指认会话 A + 报警时刻 ⇒ 取甲", tagOf(locate({ ...claim, alert: { sid: "sessA", ts: "2026-10-28T11:40:03Z" } }, dir)), "甲");
+      ok("D159①:指认对不上(时刻差 >2 分钟)⇒ 退回旧口径", tagOf(locate({ ...claim, alert: { sid: "sessA", ts: "2026-10-28T11:20:00Z" } }, dir)), "乙");
+      ok("D159①:指认会话文件不在场 ⇒ 按报警时刻在全部文件里找", tagOf(locate({ ...claim, alert: { sid: "gone", ts: "2026-10-28T11:40:00Z" } }, dir)), "甲");
+    } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 空 */ } }
+  }
   ok("任务件不含执行方理由", buildTask([{ claim: { id: "V", why: "我的理由XYZ" }, loc: { at: "t", session: "abcdefgh12", msg: "[V] m", tools: [], texts: [] } }]).includes("我的理由XYZ"), false);
   console.log(`fp-audit 自测 ${pass}/${pass + fail}`);
   return fail ? 1 : 0;

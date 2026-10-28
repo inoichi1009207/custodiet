@@ -16,7 +16,7 @@ import path from "node:path";
 //   把 Q 从阻断改成提示,它照样显示「一致」(codex 060 §4.2 判出,采纳)。
 //   会比 block 的比对器一直躺在注册表里没被调用。
 import { validateRules, runRules } from "./lib/gate-registry.mjs";
-import { buildCtx } from "./lib/gate-ctx.mjs";
+import { buildCtx, BATCH_GOAL_INPUT_KEYS } from "./lib/gate-ctx.mjs";
 import { RULES, toolPresent } from "./lib/gate-rules.mjs";
 // ⚠️ 别删:DIVERGENCE_DIR.P 的成因谓词用。缺它 ⇒ 谓词 ReferenceError ⇒ 被 fail-closed 的
 //   catch 吞成「不放行」⇒ 42 条全报未指名——与四个 RULE_P 候选当年**同一个病**,
@@ -285,8 +285,18 @@ console.log("正反例:");
 //   **注入通道**(官方 background_tasks[] 载荷 / 收尾时点三查①结果),不进 entries。
 //   第十六次:`ps`(2026-10-11 红队 a811daae BP-6)——走 **PowerShell 工具**的命令(顶层与 `prior` 项同写法)。
 //     写目标解析按工具名选方言;平铺夹具只发 Bash ⇒「同一串、不同工具、不同结论」写不出来。
+//   第十八次:`justAdded`(批 285,D136②)——「同轮造件分两次提交」这一漏放形态原先在夹具层无机器证人(只能拿 tracked 近似);
+//     注入面与 tracked / preExisted 同形,值为仓根相对路径数组。只补夹具通道,不改任何判据。
 //   第十七次:`batchEverArmed`(批 265,K0 在「从没立过批的仓」不判;实时 hook 才注入,夹具不加写不出这一形)。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "preExisted", "batchGoal", "batchEverArmed", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "resolveRev", "hookCheckout", "gateTouched", "at", "then"]);
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "justAdded", "preExisted", "batchGoal", "batchEverArmed", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "resolveRev", "hookCheckout", "gateTouched", "at", "then", "expectBlock", "priorFar"]);
+//   第十八次:`expectBlock`(批 285,D128④)——**断言键,不是注入通道**:正例原来只断言「命中一条」,不断言阻断级
+//     ⇒ 修法若落在 `blocking:false` 或一条到不了升阻断的分支上照样全绿(与 D126 同族)。写了 `expectBlock: true/false`
+//     的正例,命中那条的 `block` 必须与之相等;不写 ⇒ 不断言(旧夹具逐字不变)。只许写在 pos 里(反例零命中,无阻断级可断)。
+//   同批(D128①):`batchGoal` 的**子键**也做白名单校验(BATCH_GOAL_INPUT_KEYS,取自 gate-ctx 归一化实际读的键)——
+//     buildCtx 对 batchGoal 只交出约定字段,夹具写了它不读的键(如直接写输出名 `closedCount`)会被静默丢掉,用例跑在
+//     「那个字段为空」的世界里;顶层与 prior 早有键名校验,唯独这里没有。
+//   第十八次:`priorFar`(批 285 D143⑫)——`prior` **之前**、滚出近端窗口的那段(写法同 `prior` 项),拼成 `priorScanEntries`
+//     (尾部与 priorEntries 是同一批对象,生产上两者取自同一份转录缓存)。没它,「轮开口滚出 400 条窗口、W 的用户免审丢失」写不出来。
 //   第十五次:`then`(2026-10-10 红队 a2155edb BP-1;与十三、十四次同日由另一 worktree 并行加,合并时重编号)——**本窗口内**主 assistant 条目之后再接的条目(写法同 `prior` 项),
 //   ND 的「出路要晚于最近一次名词提问」要写出 [问1, 写日记, 排队问2, 说] 这种窗口内时序;平铺夹具只有「一条用户行 + 一条
 //   assistant」,时序根本写不出来——与上面各次同族:夹具支持面不足会让规则「测不出来」。
@@ -314,6 +324,13 @@ const mkEntries = (c) => {
   if ("at" in c) {
     if (!Number.isFinite(Date.parse(String(c.at)))) throw new Error(`夹具 at 解析不出时刻:${JSON.stringify(c.at)} —— 用 ISO 串(如 "2026-09-09T10:00:00Z");解析不出会让用例静默退回回退路径`);
   }
+  // 批 285(D128①):batchGoal 子键白名单(见 FIXTURE_KEYS 第十八次注)。
+  if (c.batchGoal && typeof c.batchGoal === "object") {
+    for (const k of Object.keys(c.batchGoal)) {
+      if (!BATCH_GOAL_INPUT_KEYS.includes(k)) throw new Error(`batchGoal 夹具子键不认识:「${k}」—— buildCtx 不读它,会被静默丢弃并伪装成规则缺陷。合法键:${BATCH_GOAL_INPUT_KEYS.join(", ")}`);
+    }
+  }
+  if ("expectBlock" in c && typeof c.expectBlock !== "boolean") throw new Error(`夹具 expectBlock 须是 true / false:${JSON.stringify(c.expectBlock)}`);
   const blocks = [{ type: "text", text: c.text }];
   if (c.commit) blocks.push({ type: "tool_use", name: "Bash", input: { command: "git commit -m x" } });
   // `written` = 写进文件的**正文**(J 需要:触发层声明写进法条正文同样算数)。
@@ -436,6 +453,8 @@ const mkPriorAssistant = (x) => {
 const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...(c.tracked ? { tracked: new Set(c.tracked) } : {}),
   ...(c.preExisted ? { preExisted: new Set(c.preExisted) } : {}),
+  // 批 285(D136②):`justAdded` = hook 侧 `git log -1 --diff-filter=A` 那份集合;不写 ⇒ 不传(与旧夹具逐字同)
+  ...(c.justAdded ? { justAdded: new Set(c.justAdded) } : {}),
   ...("batchGoal" in c ? { batchGoal: c.batchGoal } : {}),
   ...("batchEverArmed" in c ? { batchEverArmed: c.batchEverArmed } : {}),
   ...("bgTasks" in c ? { bgTasks: c.bgTasks } : {}),
@@ -451,7 +470,11 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...("gateTouched" in c ? { gateTouched: c.gateTouched } : {}),
   // `prior` = [{text, write?, …}, …] ⇒ 拼成 assistant entries 交给 priorEntries。
   // 没写 `prior` 就**不传**(window() 保持 null),与生产上「取不到窗口」一致。
-  ...(Array.isArray(c.prior) ? { priorEntries: c.prior.flatMap(mkPriorEntries) } : {}),
+  ...(Array.isArray(c.prior) ? (() => {
+    const pe = c.prior.flatMap(mkPriorEntries);
+    // 批 285 D143⑫:priorFar 只在有 prior 时生效,远端切片 = priorFar 展开 + **同一个** pe 数组里的对象(gate-ctx 按引用核尾部)
+    return { priorEntries: pe, ...(Array.isArray(c.priorFar) ? { priorScanEntries: [...c.priorFar.flatMap(mkPriorEntries), ...pe] } : {}) };
+  })() : {}),
 });
 // ── `--migrate-check <id>`:**单条规则**的迁移标准(秒级)────────────────────────
 // 立此模式的理由(2026-08-20,用户问「迁移和切换的具体标准是什么」):
@@ -468,6 +491,12 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
 // D43①(grill Q3):EXPECTED_*/DIVERGENCE_DIR 是裸对象查表,原型链键(constructor/toString)
 // 会被读成登记项;此前不炸仅因上游 id 正则收窄到 [A-Z]\d?。查表一律走 hasOwn,不赌上游。
 const own = (tbl, k) => (Object.hasOwn(tbl, k) ? tbl[k] : undefined);
+/** 批 285(D128④):正例判定 = 恰命中一条,且写了 expectBlock 时阻断级与之相等。全量路径与 --migrate-check 共用这一份。 */
+function posOk(r, c) {
+  const f = runRules([r], mkCtx(c));
+  if (f.length !== 1) return false;
+  return !("expectBlock" in c) || !!f[0].block === c.expectBlock;
+}
 if (process.argv.includes("--migrate-check")) {
   const id = process.argv[process.argv.indexOf("--migrate-check") + 1];
   const r = RULES.find((x) => x.id === id);
@@ -479,12 +508,13 @@ if (process.argv.includes("--migrate-check")) {
   const crit = [
     ["装载期不变量过", () => validateRules([r]).length === 0,
       () => validateRules([r]).join(" | ")],
-    ["正例 ≥1 且全命中", () => r.cases.pos.length >= 1 && r.cases.pos.every((c) => runRules([r], mkCtx(c)).length === 1),
-      () => { const bad = r.cases.pos.filter((c) => runRules([r], mkCtx(c)).length !== 1);
+    // 批 285(D128④):写了 expectBlock 的正例连阻断级一起断言(posOk)。
+    ["正例 ≥1 且全命中", () => r.cases.pos.length >= 1 && r.cases.pos.every((c) => posOk(r, c)),
+      () => { const bad = r.cases.pos.filter((c) => !posOk(r, c));
         return `${r.cases.pos.length - bad.length}/${r.cases.pos.length}` + (bad.length ? `;没命中:${bad.slice(0, 8).map((c) => `«${c.name}»`).join(" ")}` : ""); }],
-    ["反例 ≥1 且全放行", () => r.cases.neg.length >= 1 && r.cases.neg.every((c) => runRules([r], mkCtx(c)).length === 0),
+    ["反例 ≥1 且全放行", () => r.cases.neg.length >= 1 && r.cases.neg.every((c) => !("expectBlock" in c) && runRules([r], mkCtx(c)).length === 0),
       // 批 266:未过时点名是哪几条(原来只报计数,排查要另写脚本)
-      () => { const bad = r.cases.neg.filter((c) => runRules([r], mkCtx(c)).length !== 0);
+      () => { const bad = r.cases.neg.filter((c) => ("expectBlock" in c) || runRules([r], mkCtx(c)).length !== 0);
         return `${r.cases.neg.length - bad.length}/${r.cases.neg.length}` + (bad.length ? `;误命中:${bad.slice(0, 8).map((c) => `«${c.name}»`).join(" ")}` : ""); }],
     ["≥2 变异且各有证人", () => {
       const ms = r.mutations || [];
@@ -532,12 +562,13 @@ for (const r of RULES) {
     `${r.id} 正例 ${r.cases.pos.length} 条在本树全沉默(${needs} 不在场,按设计退场);以下各项在桩目录里照常核`);
   withTool(r, () => {
   for (const c of r.cases.pos) {
-    const f = runRules([r], mkCtx(c));
-    say(f.length === 1, `${r.id} 正例应命中:${c.text.slice(0, 24)}…`);
+    // 批 285(D128④):写了 expectBlock 的正例连阻断级一起断言
+    say(posOk(r, c), `${r.id} 正例应命中${"expectBlock" in c ? (c.expectBlock ? "且阻断" : "且只提示") : ""}:${c.text.slice(0, 24)}…`);
   }
   for (const c of r.cases.neg) {
     const f = runRules([r], mkCtx(c));
-    say(f.length === 0, `${r.id} 反例应放行:${c.text.slice(0, 24)}…`);
+    // expectBlock 只许写在正例(反例零命中,无阻断级可断;写了说明放错了组)
+    say(f.length === 0 && !("expectBlock" in c), `${r.id} 反例应放行:${c.text.slice(0, 24)}…`);
   }
   // ── 出路自证(批 117):消息里印的每条出路,接在**本规则自己的正例**后面必须放行。
   //   立法动机=本批一天撞到七次「闸承诺的出路,判据不认」。根因是出路清单与判据

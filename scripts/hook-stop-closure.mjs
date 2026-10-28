@@ -89,6 +89,115 @@ const BLOCK_ON_R = process.env.STOP_CLOSURE_BLOCK_R !== "0";
  *  规则自读的代价已实测:同一条用例在「当前批 arm 过」与「没 arm」下结果不同,
  *  自测从 34/34 掉到 13/34,而代码一行没改。
  *  读不到 ⇒ 返回 `null`(**不是空对象**):「没有批次状态」与「批次状态是空的」是两件事。 */
+// ── 批 285(281 / 284 三次实撞):批状态读**本会话的那份** ──────────────────────────────
+//   本闸进程锚在仓根(见生产段 chdir),批状态原来只读主树的 `.claude/.batch-goal.json`。会话在 `.claude/worktrees/<名>/` 里武装批时,
+//   收尾闸读到的是主树上别的会话的批或已结清的旧批:K 判「结清半路出错」(281)、K0 判「未武装」(284 两次,其中一次会话主目录已切回主树)。
+//   修法:在主树与 `.claude/worktrees/*` 的批状态里挑**本会话的**(armedBy 等于本会话 / 本会话转录里武装过该批号,判法 isForeignBatch),
+//   优先未结清,其次武装时刻最新;一个都不是本会话的 ⇒ 照旧读主树(外来批由 S / K 的 foreign 处理)。
+//   只在生产路径生效(`_liveSid` 由生产段设);自测、回放、CLI 一律读当前目录。
+//   代价:每次 Stop 多读 worktree 数个小 JSON;worktree 里的批状态被手改成「本会话的」可让闸读它(属故意伪造,同 armedBy 天花板)。
+let _liveSid = null, _liveCwd = null, _batchDirMemo = null;
+//   红队 285 第 4 份 BP-1 / BP-2 / 误拦 BP-3 后改:
+//   ① 排序先比**批号**(数字部分,再比后缀;batch-goal 拒绝复用已结清的批号 ⇒ 批号只增)——原「未结清优先」会挑中别的 worktree 里
+//     忘了关的**旧**批(284),主树已结清 285 之后照常动工 K0 不响(BP-1);同号再比未结清优先、武装时刻;
+//   ② `.claude/worktrees/*` 里的候选只认 **armedBy 严格等于本会话**——转录认领(「本会话跑过 --arm 同批号」)只用于主树那一份
+//     (批 281 口径);否则别的会话在 worktree 里武装的同号批会被认领(BP-2,一个批号同时在多个 worktree 是常态)。
+/** 候选目录的批状态是不是本会话的(pickBatchDir 与 ownBatchDirs 共用这一处判法)。 */
+function ownBatchCand(c, sid, entries) {
+  const g = c && c.g;
+  if (!g || typeof g !== "object" || !sid) return false;
+  const { foreign: _f, ...gc } = g;
+  return c.dir === "." ? !isForeignBatch(gc, sid, entries) : g.armedBy === sid;
+}
+/** 本会话的批状态所在目录(主树按 isForeignBatch、worktree 按 armedBy 严格等于本会话)。 */
+export function ownBatchDirs(cands, sid, entries) {
+  return (cands || []).filter((c) => ownBatchCand(c, sid, entries)).map((c) => c.dir);
+}
+/** 批 285 第二轮复核(误拦猎手 FB-1):把本会话几份台账(`.batch-goal.jsonl` 的行串数组)按每行 `at` 合并成一份时间序。
+ *  每份内部原有次序保持不变(某行 `at` 缺 / 坏 ⇒ 沿用同份上一行的时刻);同一时刻按传入次序、再按行序。只有一份 ⇒ 原样返回。 */
+export function mergeJournalRows(lists) {
+  const ls = (lists || []).filter(Array.isArray);
+  if (ls.length <= 1) return ls[0] || [];
+  const all = [];
+  ls.forEach((rows, k) => {
+    let prev = 0;
+    rows.forEach((s, i) => {
+      let at = NaN;
+      try { at = Date.parse(String(JSON.parse(s)?.at || "")); } catch { at = NaN; }
+      prev = Number.isFinite(at) ? Math.max(prev, at) : prev;
+      all.push({ s, at: prev, k, i });
+    });
+  });
+  all.sort((a, b) => a.at - b.at || a.k - b.k || a.i - b.i);
+  return all.map((x) => x.s);
+}
+//   ③ 红队 285 第二轮 BP-1 / BP-4:「先比批号」把具名批(hk-x / hw-check-skill,台账里 hk-* 有 19 个)恒排在数字批之后——
+//     先在 worktree 结清 285、再回主树做具名批 ⇒ 挑中已结清的 285,S 不拦停工、K0 按 285 的条数核、主树提交被判未武装(误拦)。
+//     改为**只比武装时刻**:最新开始的批就是当前批,不论名字、不论结清与否(--clear 自本批起保留 armedAt);同刻优先主树。
+//     旧结清态没有 armedAt ⇒ 记 0,排最后。前几轮的形态(旧批没关、跨 checkout 关旧开新、同轮结清)都落在「最新武装」这一判据下。
+//   ④ 误拦猎手第二轮 FB-3:「只比武装时刻」又误拦——worktree 里 285 正在做,主树插做一个小批并当场结清 ⇒ 挑中主树的结清态,K0 拦 285 的活。
+//     「忘了关的旧批」与「正在做的批」在状态上同形,分辨它们的是**会话此刻所在的 checkout**(hook 载荷的 cwd,由 batchDir 换成候选目录 cwdDir):
+//     · cwd 所在 checkout 的批是本会话的,且(未结清,或比所有未结清的本会话批武装得更晚)⇒ 取它;
+//     · 否则取武装最新的未结清批;都结清了取武装最新的。
+//     三轮报过的排布(旧批没关、跨 checkout 关旧开新、同轮结清、具名批、插做小批)逐一核过;cwd 取不到时退回后两条。
+//     代价(漏放,接受):cwd 不在任何本会话 checkout 里、又有忘了关的旧批时,读那份旧批(K0 不响)。
+export function pickBatchDir(cands, sid, entries, cwdDir = null) {
+  const mine = [];
+  for (const c of cands) if (ownBatchCand(c, sid, entries)) mine.push({ dir: c.dir, cleared: !!c.g.cleared, t: Date.parse(String(c.g.armedAt || "")) || 0 });
+  if (!mine.length) return ".";
+  const newest = (xs) => xs.reduce((b, x) => (!b || x.t > b.t || (x.t === b.t && x.dir === ".") ? x : b), null);
+  // 收口误拦猎手 FB-2(FB-3 的镜像):cwd 所在 checkout 刚结清的小批顶掉另一份正在做的批 ⇒ K0 误拦。按「误拦比漏放贵」定序:
+  //   **有本会话未结清的批就读它**(cwd 那份未结清优先,否则取武装最新的未结清);都结清了才看 cwd 那份、再取最新。
+  //   收口红队 BP-1(cwd 停主树、批在 worktree)随之堵上;剩下的漏放只有「真忘了关的旧批」——登记 D192。
+  const unc = mine.filter((x) => !x.cleared);
+  const here = cwdDir ? mine.find((x) => x.dir === cwdDir) : null;
+  if (unc.length) return (here && !here.cleared ? here : newest(unc)).dir;
+  return (here || newest(mine)).dir;
+}
+/** hook 载荷的 cwd ⇒ 候选目录名("." 或 ".claude/worktrees/<名>");不在本仓 ⇒ null。root = 本仓根(进程已锚定)。 */
+export function cwdBatchDir(cwd, root) {
+  if (typeof cwd !== "string" || !cwd) return null;
+  const norm = (p) => path.resolve(p).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const c = norm(cwd), r = norm(root);
+  if (c !== r && !c.startsWith(r + "/")) return null;
+  const m = /^\.claude\/worktrees\/([^/]+)/.exec(c.slice(r.length + 1));
+  return m ? `.claude/worktrees/${m[1]}` : ".";
+}
+function batchDir() {
+  if (_batchDirMemo !== null) return _batchDirMemo;
+  if (!_liveSid || process.env.STOP_CLOSURE_SELFTEST === "1") return ".";
+  _batchDirMemo = ".";
+  try {
+    const dirs = ["."];
+    try { for (const d of fs.readdirSync(".claude/worktrees")) dirs.push(path.join(".claude/worktrees", d)); } catch { /* 没有 worktree */ }
+    const cands = dirs.map((dir) => { try { return { dir, g: JSON.parse(fs.readFileSync(path.join(dir, ".claude/.batch-goal.json"), "utf8")) }; } catch { return null; } }).filter(Boolean);
+    const cwdDir = cwdBatchDir(_liveCwd, process.cwd());
+    // 收口红队附三:cwdBatchDir 已整体转小写 ⇒ 这里比对也转小写(worktree 目录名带大写时原来永远对不上,静默退回「最新未结清」)
+    const hit = cwdDir ? cands.find((c) => c.dir.replace(/\\/g, "/").toLowerCase() === cwdDir) : null;
+    _batchDirMemo = pickBatchDir(cands, _liveSid, _allEntriesCache || [], hit ? hit.dir : null);
+    _ownDirsMemo = ownBatchDirs(cands, _liveSid, _allEntriesCache || []);
+  } catch { _batchDirMemo = "."; }
+  return _batchDirMemo;
+}
+// 批 285 第二轮复核(误拦猎手 FB-1):「刚关掉那批」的条件数从**本会话各台账合并**里找——在 worktree A 里 --clear 285、
+//   同一轮在别处(主树 / worktree B)--arm 286 时,clear 行与 arm 行分在两份台账,只读挑中那份(286 所在)就找不到 clear ⇒
+//   K 报「取不到刚关掉那批的条件数」且无出路。合并范围:主树台账(主树批状态是本会话的)+ armedBy 为本会话的 worktree 台账;
+//   别的会话的台账不并入。只有一份(或挑中的目录不在本会话列表里)⇒ 只读挑中那份,行为不变。挑中那份读不到 ⇒ 抛(调用方按读不到处理)。
+//   代价:合并后主树台账里别的会话同时刻的行也按时间插进来(主树台账多会话共用,原本就如此)。
+let _ownDirsMemo = null;
+function priorJournalRows() {
+  const here = batchDir();
+  const own = Array.isArray(_ownDirsMemo) ? _ownDirsMemo : [];
+  const dirs = own.includes(here) ? own : [here];
+  const lists = [];
+  for (const d of dirs) {
+    try { lists.push(fs.readFileSync(path.join(d, ".claude/.batch-goal.jsonl"), "utf8").trim().split("\n")); }
+    catch (e) { if (d === here) throw e; }
+  }
+  return mergeJournalRows(lists);
+}
+const bgPath = (f) => path.join(batchDir(), f);
+
 function readBatchGoal() {
   // ⚠️ 我此前在提交信息里说过「注入之后 STOP_CLOSURE_SELFTEST 就不再需要存在」——**那是错的**,
   //   在此更正:注入解决的是「规则自己读磁盘」,没解决「自测跑在真磁盘状态上」。
@@ -105,7 +214,7 @@ function readBatchGoal() {
   //   排障者看到的是「必需通道缺席」而不是被误导去 --arm 一个新批。
   //   (D2 的另一半——「静默降级」——已被 K0 强化与切换改向,坏文件从不响变成了必响。)
   let raw;
-  try { raw = fs.readFileSync(".claude/.batch-goal.json", "utf8"); }
+  try { raw = fs.readFileSync(bgPath(".claude/.batch-goal.json"), "utf8"); }
   catch { return null; }                       // 文件不在:真没武装
   try { g = JSON.parse(raw); }
   catch { return undefined; }                  // 文件在但坏:UNKNOWN,fail-closed
@@ -119,7 +228,7 @@ function readBatchGoal() {
   //     追加 `{action:"clear", batch, conditions}`,那才是「确实关掉过一个有条件的批」的证据。
   if (g && g.cleared && !Array.isArray(g.conditions)) {
     try {
-      const lines = fs.readFileSync(".claude/.batch-goal.jsonl", "utf8").trim().split("\n");
+      const lines = fs.readFileSync(bgPath(".claude/.batch-goal.jsonl"), "utf8").trim().split("\n");
       const last = JSON.parse(lines[lines.length - 1]);
       // ⚠️ **末行的批号必须与状态文件一致**(grill:edge-cases E6)。
       //   `journal()` 的 `catch {}` 把写失败整个吞掉,而 `atomicWrite` 照常成功、
@@ -143,7 +252,7 @@ function readBatchGoal() {
   //   让 K 在「同一轮关旧批、开新批」时能核对旧批有没有逐条对照。台账读不到或形状对不上 ⇒ 不补(K 报取不到,fail-closed)。
   if (g && !g.cleared && Array.isArray(g.conditions)) {
     try {
-      const rows = fs.readFileSync(".claude/.batch-goal.jsonl", "utf8").trim().split("\n");
+      const rows = priorJournalRows();   // 批 285 第二轮复核:本会话各台账合并(只有一份时同原读法)
       g = priorClosedFromJournal(rows, g);
     } catch { /* 读不到 ⇒ 不补 */ }
   }
@@ -154,7 +263,7 @@ function readBatchGoal() {
 
 /** 给批状态补 `batchLog`(`git log <baseCommit>..HEAD` 的提交全文,每条一项)。纯函数式:git 可注入(自测)。
  *  不该查 / 取不到 ⇒ 原样返回(不加键 ⇒ ctx 里 batchLog=null ⇒ AD 沉默;提示面 fail-open)。 */
-function attachBatchLog(g, git = (args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], windowsHide: true })) {
+function attachBatchLog(g, git = (args) => execFileSync("git", args, { encoding: "utf8", cwd: path.resolve(batchDir()), timeout: 5000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], windowsHide: true })) {
   if (!g || typeof g !== "object" || g.cleared || !Array.isArray(g.conditions)) return g;
   if (typeof g.baseCommit !== "string" || !/^[0-9a-f]{7,64}$/i.test(g.baseCommit)) return g;
   if (Array.isArray(g.decisions) && g.decisions.length) return g;
@@ -240,7 +349,29 @@ export function fpRightNotManual(ledger) {
 /** 误报率分母口径(fpTable 与 --fp-report 表头共用,红队 a30a87d8 BP-3):只数主 Stop 通道、不数 UNKNOWN。 */
 export const fpRowCounted = (a) => !!a && a.channel !== "SubagentStop";
 export const fpIdsOf = (a) => ((a && a.ids) || []).filter((id) => id !== "UNKNOWN");
-export function fpTable(alerts, ledger, { minAlerts = 20, minRate = 0.15 } = {}) {
+// 批 285(D157③):`since` = {规则 id: 毫秒} —— 该规则**最后一次改判据**的时刻(取自规则对象的 `criteriaSince`)。
+//   给了 ⇒ 该规则的报警、自签与撤回只数此刻之后的(撤回 / 盲审行按其指向那笔自签的时刻归窗,指不到再看自己的 ts),
+//   「待修」按窗口内的数判,全量数挂在 `all` 上照列。没给 ⇒ 逐字是原表。
+//   病例:I 的 17 笔自签误报全部早于 2026-10-10,批 259 / 260 换判据之后 0 笔,全量 22% 仍把它列进待修 ⇒ 误开修批。
+//   代价:criteriaSince 靠改判据的人手标,忘了标 ⇒ 退回全量口径(即修前行为,不会更糟);ts 缺失或解析不出的行按窗口外算。
+export function fpTable(alerts, ledger, { minAlerts = 20, minRate = 0.15, since = null } = {}) {
+  const base = fpTableAll(alerts, ledger, { minAlerts, minRate });
+  if (!since) return base;
+  const tsOf = (x) => Date.parse(String((x && x.ts) || ""));
+  const claimTs = new Map();
+  for (const x of ledger || []) if (x && x.kind === "claimed_fp" && x.h) claimTs.set(x.h, tsOf(x));
+  const inWin = (x, s) => { const t = x.ref && claimTs.has(x.ref) ? claimTs.get(x.ref) : tsOf(x); return Number.isFinite(t) && t >= s; };
+  return base.map((row) => {
+    const s = since[row.id];
+    if (!Number.isFinite(s)) return row;
+    const al = (alerts || []).filter((a) => { const t = tsOf(a); return Number.isFinite(t) && t >= s; });
+    const lg = (ledger || []).filter((x) => !x || x.id !== row.id || inWin(x, s));
+    const w = fpTableAll(al, lg, { minAlerts, minRate }).find((r) => r.id === row.id)
+      || { id: row.id, alerts: 0, fp: 0, rate: 0, confirmed: 0, hot: false };
+    return { ...w, since: new Date(s).toISOString(), all: { alerts: row.alerts, fp: row.fp, rate: row.rate, confirmed: row.confirmed } };
+  });
+}
+function fpTableAll(alerts, ledger, { minAlerts = 20, minRate = 0.15 } = {}) {
   const per = {}, fp = {};
   // 只数主 Stop 通道、不数 UNKNOWN:子代理通道只在观察档落 I/M/L/B 提示行,混进来会摊薄分母、让规则掉出「待修」
   //   (红队 a0dfbfce BP-4);UNKNOWN 是「没判成」,不是一条规则
@@ -425,7 +556,7 @@ export function batchBaseFromRows(rows) {
 }
 const _batchJournalBase = () => {
   if (process.env.STOP_CLOSURE_SELFTEST === "1") return null;   // 自测隔离(同 readPLedger:测出来的东西不得取决于磁盘上碰巧有什么)
-  try { return batchBaseFromRows(fs.readFileSync(".claude/.batch-goal.jsonl", "utf8").trim().split("\n")); }
+  try { return batchBaseFromRows(fs.readFileSync(bgPath(".claude/.batch-goal.jsonl"), "utf8").trim().split("\n")); }
   catch { return null; }                                          // 台账读不到 ⇒ 无退路
 };
 /** 退路 `batchBase`(可注入,自测):reflog 那支取不到(截断 / 读不懂 / 无时间戳 / HEAD@{} 解析不出)时,当前批的 `baseCommit`
@@ -1924,7 +2055,9 @@ const wrapperOptTakesNext = (w, spec) => {
 };
 /** 段首的 shell 保留字 / PowerShell 关键字:**其后**仍是命令位(BP-4:`then cp …`、`do …`、`{ cp …; }`、`! cp …`
  *  原被当成命令名)。`SH_NO_CMD`:其后不是命令(`for x in …` 的变量名、`case x in`)——整段无命令。 */
-const SH_LEAD = /^(?:then|do|else|elif|if|while|until|!|\{|try|finally)$/;
+// 批 285(D148):`%{`(ForEach-Object 的别名脚本块)在管道切段后总落在**段首**,而下面 cmdPositions 的 `%?\{` 回扫从 1 号位起
+//   ⇒ `… | %{ Add-Content 日记 … }`(加不加空格都)认不出写目标(ND 误拦)。段首也认 `%{`,右界截在 `}` 与 `{` 同法。
+const SH_LEAD = /^(?:then|do|else|elif|if|while|until|!|\{|%\{|try|finally)$/;
 const SH_NO_CMD = /^(?:for|foreach|select|case|in|function|done|fi|esac|\}|;;)$/;
 /** 一个子段的词序列里哪些位置是**命令位**:返回 `[{k, end}]`,`end` = 该命令参数的右界(不含)——
  *  find `-exec … \;`/`+` 的终止符、`{ … }` 的右括号都在这里截住(否则 `{ cp a b }` 的 `}` 被当成 cp 的目标)。见调用点注释。 */
@@ -1936,7 +2069,7 @@ function cmdPositions(words) {
       if (k >= end) return;
       const n = cmdName(words[k]);
       if (SH_LEAD.test(n)) {
-        if (n === "{") { const c = words.indexOf("}", k + 1); if (c > k && c < end) end = c; }
+        if (n === "{" || n === "%{") { const c = words.indexOf("}", k + 1); if (c > k && c < end) end = c; }
         k++; continue;
       }
       if (SH_NO_CMD.test(n)) return;
@@ -1977,6 +2110,30 @@ function cmdPositions(words) {
  *  (ND 误拦;`Set-Content -Value "<" -Path AGENTS.md` 对 P 不可见)。现吃 `codexWordsShaped` 的词:在 `shape`
  *  (引号内 / 转义字符已换成 \u0001)上判算子,`">x"`、`\>`、`` `> `` 都是参数;`>"x y"` 的算子在引号外,照剔。
  *  失效条件:调用方改回喂纯词数组(无 `shape`)⇒ 按 `w` 判,退回旧行为(BP-3 复活),自测「BP-3b:」各条翻红。 */
+/** 批 285(D148 余项,ND 误拦):PowerShell 贴身脚本块 `ForEach-Object {Add-Content docs/noun-diary.md …}` / `%{Add-Content …}`
+ *  分词后命令名是 `{Add-Content`,`cmdPositions` 只认独立成词的 `{` / `%{` ⇒ 写目标认不出 ⇒ 诚实写了日记照样被 ND 拦
+ *  (I / P 同时漏看)。PS 分词器里裸 `{` `}` 永远单独成 token(本机 `Parser.ParseInput` 实测:`%{Add-Content` ⇒ `%` `{` `Add-Content`;
+ *  `a}` ⇒ `a` `}`),故 ps 口径下把**引号外**的词首 `{` / `%{`、词尾 `}` 拆成独立词,与加空格的写法同解。
+ *  只拆裸字符(看 shape);词内另有裸 `{` 的不拆词尾(`${env:TEMP}`、`@{a=1}` 原样)。只在 ps 口径调用——bash 的 `{a,b}` 是花括号展开。
+ *  代价:贴身写法里真写新载体的命令从此与加空格写法一样被 I / P 看见(原为漏看,不是新的误拦形态)。
+ *  失效条件:自测「D148:」各条翻红,或语料里出现 `{`/`}` 拆分把非脚本块的 PS 参数拆坏的实例。 */
+function psSplitBraces(shaped) {
+  const out = [];
+  for (const x of shaped) {
+    let { w, shape } = x;
+    const lead = /^%?\{/.exec(shape);
+    if (lead && shape.length > lead[0].length) {
+      out.push({ w: w.slice(0, lead[0].length), shape: lead[0] });
+      w = w.slice(lead[0].length); shape = shape.slice(lead[0].length);
+    }
+    const tail = [];
+    while (shape.length > 1 && shape.endsWith("}") && !shape.slice(0, -1).includes("{")) {
+      tail.push({ w: "}", shape: "}" }); w = w.slice(0, -1); shape = shape.slice(0, -1);
+    }
+    out.push({ w, shape }, ...tail);
+  }
+  return out;
+}
 const REDIR_WORD = /^(?:\d+|&|\*)?(?:>>|>\||>&|<<<|<&|&>>|&>|>|<)(.*)$/s;
 function dropRedirWords(words) {
   const out = [];
@@ -2110,7 +2267,7 @@ function rawWriteTargets(noHeredoc, depth, ps = false) {
       // 解释器内联脚本里的写调用:入参在引号里,扫原文(「提到」与「真写」shell 层分不开——见上方已知误报,保留 fail-closed)
       for (const re of API_WRITE_RES) { re.lastIndex = 0; for (const m of part.matchAll(re)) out.push(m[2]); }
       // 分词与掩码同一方言(BP-6);重定向词先剔掉,不让它冒充命令名或参数(BP-3)
-      const words = dropRedirWords(codexWordsShaped(part, ps));   // 带 shape:引号里的 `>`/`<` 不是算子(aaf414b6 BP-3)
+      const words = dropRedirWords(ps ? psSplitBraces(codexWordsShaped(part, ps)) : codexWordsShaped(part, ps));   // 带 shape:引号里的 `>`/`<` 不是算子(aaf414b6 BP-3)
       // ⚠️ `(?<![=\-])` 的旧意(2026-08-22 实撞,--fp 第 3 笔):箭头函数不是重定向——现由 redirectTargets 的前一字符检查承接。
       // ⚠️ D100(2026-09-06):盘符 / `~` 路径要整段取到——现由按词取承接(不再走 PATH_TOK 字符类)。
       for (const t of redirectTargets(part, ps)) out.push(t);
@@ -2277,6 +2434,19 @@ function _priorWindow(turn) {
     return _allEntriesCache.slice(Math.max(0, cut - PRIOR_WINDOW_ENTRIES), cut);
   } catch { return undefined; }
 }
+/** 批 285 D143⑫:同源更长的切片(尾部就是 `_priorWindow` 那一段的同一批对象),**只**给 gate-ctx 回扫「轮开口滚出 400 条窗口」用,
+ *  不进 `ctx.window()`——窗口条数照旧 400,别的规则看到的跨轮动作一条不多(多了会改 P / I 的计账口径,那是另一件事)。
+ *  上限 5000 条:红队 a811daae 实测的长轮约 200 次工具调用 ≈ 400 条;放宽到 12 倍再丢豁免属误拦残余,出现即复议。
+ *  代价:每次 Stop 多一次 slice(引用拷贝)与最多 4600 条的倒扫(只在近端没碰到轮边界时才扫)。 */
+const PRIOR_SCAN_ENTRIES = 5000;
+function _priorScan(turn) {
+  try {
+    if (!Array.isArray(_allEntriesCache) || !_allEntriesCache.length) return undefined;
+    const cut = _allEntriesCache.length - (Array.isArray(turn) ? turn.length : 0);
+    if (cut <= PRIOR_WINDOW_ENTRIES) return undefined;   // 近端已含转录开头,远端无可扫
+    return _allEntriesCache.slice(Math.max(0, cut - PRIOR_SCAN_ENTRIES), cut);
+  } catch { return undefined; }
+}
 /** 整份 transcript 的缓存,由 `run()` 填。只为 `_priorWindow` 服务。 */
 let _allEntriesCache;
 /** 本次 `run()` 的会话号,只给 emit 落报警台账用(批 265:观察档数据事后要能回到原会话)。 */
@@ -2311,6 +2481,11 @@ export function isForeignBatch(g, sid, entries) {
 
 /** 批 281(D184 FB-2):阻断轮随附的提示按会话去重——返回本轮还该随附的提示(没见过的 + 带 unknown 的),并把本轮全部提示记为见过。
  *  台账与非阻断轮的去重同一份(`.claude/.gate-notice-seen.json`,按会话分桶,留最近 20 个会话);读写失败 ⇒ 原样全列(宁吵)。 */
+/** 批 285(D184 / D179 附三③):提示去重键。finding 带结构化命中身份 `key`(规则 noticeKey 或本文件直推行)⇒ `[id] #key`;
+ *  否则退回 brief(首行原文)。抽成函数只为自测能直接喂。 */
+export function noticeKeyOf(brief) {
+  return (f) => (f && typeof f.key === "string" && f.key ? `  [${f.id}] #${f.key}` : brief(f));
+}
 export function dedupNotices(file, sid, notices, keyOf) {
   if (!notices.length) return notices;
   let seen = {};
@@ -2381,8 +2556,19 @@ export function settleP(P, eCtx, eFindings) {
   //   账永不清零,爬满后窗口一滑走就全额讨税——教科书 reset 病长在自己刚写的代码里)。
   //   天花板写明:窗口里的旧一轮通道在滑出前可能多次抵账(有界宽松,上限=400 条窗口),方向是少收税。
   // codex 185「你没问到」3 / 派出方 a27628dd 口径⑤:计账与判据同一取值池、同一谓词(`channelsMet`;BP-8 的点名抵账已撤)。
-  const allThree = P.channelsMet(eCtx).every(Boolean);
-  const next = allThree ? 0 : prior + t.n;
+  const met = P.channelsMet(eCtx);
+  const allThree = met.every(Boolean);
+  // 批 285(D149⑦,误拦):detect 经 tierFilter(轻档 = 本批承重改动全是测试文件 ⇒ 免跨模型 / 外部先例),这里原不经过 ⇒
+  //   轻档批 detect 放行、账却照涨(测试文件提交也计),下一个非轻档批更早撞阈值。现:缺的只有两条软通道且 tierFilter
+  //   把它们全免掉 ⇒ 本次**不累加**(账冻结在 prior,不清零)。没照分诊草图「当作齐了清零」:清零会把窗口外累计的
+  //   非轻档承重提交一并免掉(新漏放);冻结只停掉轻档提交自己的计数。代价:轻档批里夹着的、tierFilter 认作覆盖到的
+  //   非测试承重提交——不存在(coversWrites 要求全部承重写入都在轻档 diff 里),故无新漏放面。
+  let tierExempt = false;
+  if (!allThree && typeof P.tierFilter === "function" && P.SOFT_CH instanceof RegExp) {
+    const miss = P.CH.map((ch, i) => (met[i] ? null : { ch: ch.key })).filter(Boolean);
+    if (miss.every((h) => P.SOFT_CH.test(String(h.ch)))) { try { tierExempt = P.tierFilter(eCtx, miss).length === 0; } catch { tierExempt = false; } }
+  }
+  const next = allThree ? 0 : tierExempt ? prior : prior + t.n;
   const shas = [...new Set([...priorShas, ...t.shas])].slice(-400);
   // 批 278(D173③):两猎手覆盖到的改闸提交按 sha 记进共用账,别的会话的 D11 判定按 sha 认(判据唯一实现 `huntedShas`)
   const priorHunted = (eCtx.pLedger && Array.isArray(eCtx.pLedger.hunted)) ? eCtx.pLedger.hunted : [];
@@ -2568,6 +2754,9 @@ catch (e) {
 // 批 257 r2:自测核「hook 端作业目录与 codex-run 的 JOB_ROOT 同算法」用。只在 --self-test 形态加载、缺件(公开树)不计。
 const _codexRunForSelfTest = process.argv.includes("--self-test")
   ? await import("./codex-run.mjs").catch(() => null) : null;
+// 批 285 D159①:`--fp` 记报警指认用 fp-audit 的 alertRefFor(动态加载、失败静默不记)⇒ 自测钉住它可加载且口径不变
+const _fpAuditForSelfTest = process.argv.includes("--self-test")
+  ? await import("./fp-audit.mjs").catch(() => null) : null;
 // D1/批 102:两份台账的追加改走行级 hash 链(完整性告警;担保边界见 ledger-chain 头注)
 import { ledgerAppend, verifyFile as ledgerVerify } from "./lib/ledger-chain.mjs";
 import { readTouched, selfTest as touchSelfTest } from "./lib/gate-touch.mjs";   // 批 279「修闸 tag」
@@ -2680,7 +2869,8 @@ export function run(transcriptPath, ctx = {}) {
   const findings = [];
   if (cx.broken && !a.open.length) {
     findings.push({
-      id: "A", block: false, unknown: true,
+      // 批 285(D184 FB-1):首行嵌了错误文本前 60 字,文本若每轮变就每轮换键续轮 ⇒ 去重键固定(unknown 照旧每轮经 systemMessage 投给人)
+      id: "A", block: false, unknown: true, key: "codex-ledger-broken",
       msg: `[判据异常,codex 委派账本轮**未能判定**] ${cx.broken} —— 有没有未读的 codex 回件判不了;发过委派的照实写明未知。`,
     });
   } else if (a.open.length || cx.open.length) {
@@ -2862,7 +3052,7 @@ export function run(transcriptPath, ctx = {}) {
           const g = isForeignBatch(gClean, ctx.sessionId, _allEntriesCache) ? { ...gClean, foreign: true } : gClean;
           try {
             const ts = (Array.isArray(turn) ? turn : []).map((e) => Date.parse(String((e && e.timestamp) || ""))).filter(Number.isFinite);
-            const rows = fs.readFileSync(".claude/.batch-goal.jsonl", "utf8").trim().split("\n");
+            const rows = fs.readFileSync(bgPath(".claude/.batch-goal.jsonl"), "utf8").trim().split("\n");
             const tbs = ts.length ? turnBatchStartOf(rows, Math.min(...ts)) : null;
             return tbs ? { ...g, turnBatchStart: tbs } : g;
           } catch { return g; }
@@ -2911,6 +3101,8 @@ export function run(transcriptPath, ctx = {}) {
         //   窗口取**上一个回合边界之前的若干轮**,按条数封顶控成本;
         //   取不到 ⇒ 不传(`window()` 仍返回 null,规则侧 fail-closed,与原行为一致)。
         priorEntries: ctx.priorEntries !== undefined ? ctx.priorEntries : _priorWindow(turn),
+        // 批 285 D143⑫:只供 gate-ctx 的「轮开口滚出窗口」远端续扫(W 的用户免审);调用方自带 priorEntries(夹具)时不给
+        ...(ctx.priorEntries !== undefined ? {} : { priorScanEntries: _priorScan(turn) }),
       });
       // ⚠️ **装载期不变量必须在真跑的闸里执行**(2026-08-20 grill:recon 查出,已验)。
       //   `grep -c validateRules scripts/hook-stop-closure.mjs` ⇒ **0**:
@@ -3215,6 +3407,10 @@ function emit(findings, streak = 0, opts = {}) {
   // 提示项只留首行——多行说明是给「第一次撞到」的人看的,重复刷屏反而淹没结论;
   // 阻断项保留全文,因为那几行写的是**出路**,是收到即可执行的东西。
   const brief = (f) => `  [${f.id}] ${String(f.msg).split("\n")[0]}`;
+  // 批 285(D184 FB-3 / FB-1,D179 附三③):去重键 = 结构化命中身份(规则 noticeKey / 本文件直推行的 key)优先,没有才退回首行。
+  //   带 key 的行,首行里有计数 / 最新引文 / 错误文本,按首行认会每轮换键、多续一轮;key 不随这些变。
+  //   代价(漏放侧,接受):同一身份下首行变了(新计数、新引文)模型不再看到;没有 key 的规则行为不变。
+  const noticeKey = noticeKeyOf(brief);
   // D184(批 276,用户 2026-10-24:「这玩意成死循环了啊,就算不阻断也依然会一直撞」):
   //   非阻断提示每输出一次,模型就续一轮;同一条提示每轮重报 ⇒ 等后台任务时成了停不下来的空转(本会话 AD 连撞十余轮)。
   //   ⇒ **本轮无阻断项**时,本会话已经提示过的同一行(规则 id + 首行原文)不再输出;只要出现新的一行就整批照报。
@@ -3239,7 +3435,7 @@ function emit(findings, streak = 0, opts = {}) {
     //   给模型重报又是空转,而它本来也修不了判据)。引擎里阻断项的判据异常是 block:true,有阻断项时根本不进这里;
     //   A 的账抛错单独出现时是 block:false + unknown(进这里),并进原生任务阻断时那条阻断也带 unknown;
     //   被 STOP_CLOSURE_BLOCK_<X>=0 降级的阻断项会进这里,带 unknown 的由下面这条 systemMessage 兜住。
-    const key = brief;
+    const key = noticeKey;
     const cur = findings.map(key);
     if (cur.every((l) => mine.has(l))) {
       const unk = findings.filter((f) => f.unknown).map(brief);
@@ -3290,7 +3486,7 @@ function emit(findings, streak = 0, opts = {}) {
     // 批 281(D184 FB-2):随阻断一起显示的提示也记为见过、且见过的不再随附(结构标记 unknown 的照列)——
     //   原来阻断轮不碰见过台账 ⇒ 同一条提示(如 AD)每个阻断轮都挂在消息尾、阻断解除后又按「新提示」再续一轮
     const notices = (live && _ledgerSid && process.env.STOP_CLOSURE_NOTICE_DEDUP !== "0")
-      ? dedupNotices(".claude/.gate-notice-seen.json", _ledgerSid, findings.filter((f) => !blocking.includes(f)), brief)
+      ? dedupNotices(".claude/.gate-notice-seen.json", _ledgerSid, findings.filter((f) => !blocking.includes(f)), noticeKey)
       : findings.filter((f) => !blocking.includes(f));
     process.stdout.write(JSON.stringify(withWarn({
       decision: "block",
@@ -3496,10 +3692,12 @@ function selfTest() {
     // 本例同时跑了探针(满足 E0 要求的「真动作」),故只考核冒号那一处。
     // ⚠️ E0 与 E2 出路**故意不同**:E2 认一句声明,E0 要真动作(见 E0 注释「出路刻意留便宜」)。
     //   所以纯文本回合里写「机械判据:已跑」豁免 E2 但不豁免 E0——那是设计,不是 bug。
-    { name: "E2 不命中:全角冒号写的就地声明(伴随真探针)",
+    // 批 285 第二轮复核:期望由 ["E1"] 改 []——批 285 D117(057c5cf)起,探针已跑 + 就地声明肯定的机械判据 ⇒ E1 也不再提示
+    //   (全局规范 3.1「纯机器判据不必走」);本条考核的全角冒号那一处不变,E2 仍不命中。
+    { name: "E2 不命中:全角冒号写的就地声明(伴随真探针;285 D117 后 E1 也不提示)",
       lines: [U("go"), A("根因是缓存未失效导致的。**机械判据：已跑** grep 对账。", [
         { name: "Bash", input: { command: "node scratchpad/cache-probe.mjs" } },
-      ])], want: ["E1"] },   // E1 属正确:跑了探针=过「形」,未跨模型=缺「独立性」
+      ])], want: [] },
     // N:正文报出计数即满足法条的「指出第二个 agent 在哪」,不必本轮再读一次文件。
     { name: "N 不命中:递给用户但正文已报出 agent 计数",
       lines: [U("go"), A("`/xros:sharpen` 只能你亲手下(`parallel(` 2 处,多 agent 管线)。", [])], want: [] },
@@ -4342,6 +4540,28 @@ function selfTest() {
         sc("255 真 git:trackedInFs 含本文件(--full-name 仓根相对)", (trackedInFs(checkoutOfFs(own)) || new Set()).has("scripts/hook-stop-closure.mjs"), true);
         sc("255 真 git:cwd 绝对路径下的既有文件 ⇒ 非新建", buildCtx([], ev).isNew(own), false);
       }
+      // ── 批 285 D143⑫:远端切片 `_priorScan` 与近端 `_priorWindow` 同源(尾部同一对象)、窗口条数不变 ──
+      {
+        const save = _allEntriesCache;
+        try {
+          const H = (s) => ({ type: "user", origin: { kind: "human" }, message: { content: s } });
+          const filler = (n) => Array.from({ length: n }, (_, i) => ({ type: "assistant", message: { content: [{ type: "text", text: `t${i}` }] } }));
+          const turn = [{ type: "assistant", message: { content: [{ type: "text", text: "收工" }] } }];
+          _allEntriesCache = [H("这份 README 别外审了"), ...filler(600), ...turn];
+          const pw = _priorWindow(turn), ps = _priorScan(turn);
+          sc("D143⑫ 近端窗口条数照旧 400", pw.length, PRIOR_WINDOW_ENTRIES);
+          sc("D143⑫ 远端切片含轮开口、尾部与近端同一对象", ps.length === 601 && ps[0].type === "user" && ps[ps.length - 1] === pw[pw.length - 1], true);
+          const c = buildCtx(turn, { priorEntries: pw, priorScanEntries: ps });
+          sc("D143⑫ 接线:开口滚出近端窗口 ⇒ userTextFar 认得到、userText 不收", c.userTextFar.includes("别外审") && !c.userText.includes("别外审"), true);
+          _allEntriesCache = [H("x"), ...filler(300), ...turn];
+          sc("D143⑫ 近端已含转录开头 ⇒ 不给远端", _priorScan(turn), undefined);
+          // 接线钉(同 255③ 的做法):run() 构造 ctx 时必须把远端切片交给 buildCtx,退回不传即红
+          const srcRun = fs.readFileSync(fileURLToPath(import.meta.url), "utf8");
+          const runIdx = srcRun.indexOf("export function run(transcriptPath");
+          const runBody = runIdx < 0 ? "" : srcRun.slice(runIdx, srcRun.indexOf("validateRules", runIdx));
+          sc("D143⑫ 接线:run() 把 _priorScan(turn) 作 priorScanEntries 交给 buildCtx", /priorScanEntries:\s*_priorScan\(turn\)/.test(runBody), true);
+        } finally { _allEntriesCache = save; }
+      }
       // ── D100 消费者侧(codex 复核 2026-09-06「你没问到」①):按会话、按路径**首笔**。
       //   台账改道临时文件;探完把缓存与环境变量复原,不影响本进程后面的真读取。
       {
@@ -4752,6 +4972,21 @@ function selfTest() {
         hp("265 误报率表:子代理通道行与 UNKNOWN 不计入分母(红队 a0dfbfce BP-4)",
           JSON.stringify(fpTable([{ ids: ["M"] }, { ids: ["M", "UNKNOWN"], channel: "SubagentStop" }, { ids: ["UNKNOWN"] }], []).map((r) => [r.id, r.alerts])), '[["M",1]]');
         hp("误报率表:按报警量降序", tb.map((r) => r.id).join(","), "S,K");
+        // 批 285(D157③):按「最后一次改判据」开窗——窗口前的报警与自签不计,待修按窗口判;全量挂在 all 上
+        {
+          const T0 = "2026-10-01T00:00:00Z", T1 = "2026-10-20T00:00:00Z", cut = Date.parse("2026-10-12T00:00:00Z");
+          const alW = [...Array(20)].map(() => ({ ids: ["I"], ts: T0 })).concat([...Array(20)].map(() => ({ ids: ["I"], ts: T1 })));
+          const lgW = [...Array(8)].map((_, i) => ({ kind: "claimed_fp", id: "I", h: `old${i}`, ts: T0 }))
+            .concat([{ kind: "claimed_fp", id: "I", h: "new1", ts: T1 },
+              // 窗口后写的撤回指向窗口前那笔 ⇒ 按所指那笔归窗(窗口外),不扣窗口内的数
+              { kind: "retraction", id: "I", ref: "old0", by: "assistant", ts: T1 }]);
+          const full = fpTable(alW, lgW).find((r) => r.id === "I");
+          const win = fpTable(alW, lgW, { since: { I: cut } }).find((r) => r.id === "I");
+          hp("285 D157③ 开窗前:全量 40 报警 / 8 误报(9 笔自签 − 1 撤回)⇒ 进待修", `${full.alerts}/${full.fp}/${full.hot}`, "40/8/true");
+          hp("285 D157③ 开窗后:窗口内 20 报警 / 1 误报 ⇒ 不进待修,全量挂在 all", `${win.alerts}/${win.fp}/${win.hot}/${win.all.alerts}/${win.all.fp}`, "20/1/false/40/8");
+          hp("285 D157③ 没给 since 的规则逐字是原表", JSON.stringify(fpTable(al, lg, { since: { I: cut } })), JSON.stringify(fpTable(al, lg)));
+          hp("285 D157③ 窗口内仍 ≥15% ⇒ 照进待修", fpTable(alW, lgW.concat([...Array(3)].map((_, i) => ({ kind: "claimed_fp", id: "I", h: `n${i}`, ts: T1 }))), { since: { I: cut } }).find((r) => r.id === "I").hot, true);
+        }
         // 2026-10-12:confirmed_fp 是对已有自签的加签,不另计一笔(原先 K 会计 3)
         hp("误报率表:加签行不重复计数(K 自签 2 + 加签 1 = 2)", k.fp, 2);
         // 批 259(grill F1 / F8):撤回按笔推导——codex 判拦对了的每笔扣一次;同笔重复判、旧 by:codex 撤回行都不多扣;
@@ -4814,6 +5049,23 @@ function selfTest() {
           { type: "tool_use", name: "Agent", input: { subagent_type: "grill:testing" } }, { type: "tool_use", name: "WebSearch", input: { query: "先例" } }];
         hp("settleP:三通道齐 ⇒ 清零(sha 照记)", JSON.stringify(settleP(P_, sc({ ledger: { carriers: 4 }, facts: law3, extra: all3 }), []).ledger),
           JSON.stringify({ carriers: 0, shas: [S1, S2, S3], hunted: [] }));
+        // 批 285(D149⑦):轻档批(承重改动全是测试文件)detect 免两条软通道 ⇒ 结算不累加(冻结,不清零);重档 / 缺独立视角照涨
+        {
+          const TF = "scripts/lib/ledger-chain.test.mjs";
+          const tc = ({ files, diff, extra }) => buildCtx(
+            [{ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: `git add -A ${files[0]} && git commit -m x` } }, ...extra] } }],
+            { pLedger: { carriers: 4 }, headFacts: () => ({ root: "/repo", head: HD, commits: [{ sha: S1, files }] }),
+              diffTier: () => ({ root: "/repo", files: diff }) });
+          const grill = [{ type: "tool_use", name: "Agent", input: { subagent_type: "grill:edge-cases" } }];
+          const lightDiff = [{ path: TF, status: "M", readable: true }];
+          hp("D149⑦:轻档 + 独立视角在 ⇒ detect 放行,账冻结在 4(原 +1 到 5)",
+            JSON.stringify([RULES.find((r) => r.id === "P").detect(tc({ files: [TF], diff: lightDiff, extra: grill })).length,
+              settleP(P_, tc({ files: [TF], diff: lightDiff, extra: grill }), []).ledger.carriers]), "[0,4]");
+          hp("D149⑦ 反例:轻档但缺独立视角 ⇒ 照涨到 5",
+            settleP(P_, tc({ files: [TF], diff: lightDiff, extra: [] }), []).ledger.carriers, 5);
+          hp("D149⑦ 反例:重档(改法典)+ 独立视角 ⇒ 照涨到 5",
+            settleP(P_, tc({ files: ["docs/laws/collab.md"], diff: [{ path: "docs/laws/collab.md", status: "M", readable: true }], extra: grill }), []).ledger.carriers, 5);
+        }
         // 批 284(交接单 20261028 第三条):三通道计数只数本会话的提交;账按会话分格
         {
           const T0 = Date.parse("2026-10-28T01:00:00Z"), iso = (t) => new Date(t).toISOString();
@@ -4914,6 +5166,20 @@ function selfTest() {
           const cW = buildCtx([[T, [bash("git commit -am x")]]].map(E_), { pLedger: { carriers: 0 }, headFacts: () => ({ ...engF(T + 1e3), engineAnchorAt: iso(T - 40000e3) }), priorEntries: [[T - 36000e3, [hunter, fbHunter]]].map(E_) });
           hp("279 红队 BP-1:陈旧猎手 + 本批新提交 ⇒ 不记", JSON.stringify(P_.huntedShas(cW)), "[]");
         }
+        // 批 285 D107 出路②:接缝面钉 P 凭证池主路径——手写带 timestamp 的转录条目 + batchGoal.armedAt 直接走 buildCtx
+        //   (此前主路径只有规则用例面的证人,hook 真路径 buildCtx 吃 timestamp / batchGoal 那段零证人)。
+        //   不接 headFacts ⇒ 走「取不到 git 事实」的主路径:切点 = max(武装时刻, 窗口最后一次提交)。三态只差猎手时间戳。
+        {
+          const E_ = (ts, c) => ({ type: "assistant", ...(ts ? { timestamp: ts } : {}), message: { content: c } });
+          const commitAct = { type: "tool_use", name: "Bash", input: { command: "git add -A scripts/lib/gate-rules.mjs && git commit -m x" } };
+          const armed = { armedAt: "2026-09-09T10:00:00Z", conditions: ["甲"] };
+          const seam = (hAt, fAt) => PR.detect(buildCtx([E_("2026-09-09T12:00:00Z", [commitAct])],
+            { pLedger: { carriers: 0 }, batchGoal: armed, priorEntries: [E_(hAt, [hunter]), E_(fAt, [fbHunter])] }))
+            .some((h) => /独立视角/.test(h.ch));
+          hp("285 D107 接缝:两猎手早于 armedAt ⇒ 不在凭证池、仍欠独立视角", seam("2026-09-09T09:00:00Z", "2026-09-09T09:01:00Z"), true);
+          hp("285 D107 接缝:两猎手晚于 armedAt ⇒ 在凭证池、不欠", seam("2026-09-09T11:00:00Z", "2026-09-09T11:01:00Z"), false);
+          hp("285 D107 接缝:猎手无时间戳 ⇒ 回退路径(窗口无提交 ⇒ 整窗入池)、不欠", seam(null, null), false);
+        }
         // 批 281:外来批判定(isForeignBatch)
         {
           const arm = (cmd) => ({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: cmd } }] } });
@@ -4932,6 +5198,67 @@ function selfTest() {
           hp("281 误拦猎手终版 FB-1:grep 查谁武装的 ⇒ 不算本会话武装过", isForeignBatch(g, "me-session-5678", [arm("grep -n \"batch-goal.mjs --arm 280\" .claude/.batch-goal.jsonl")]), true);
           hp("281:cd 后再跑武装 ⇒ 认", isForeignBatch(g, "me-session-5678", [arm("cd /repo && node --no-warnings scripts/batch-goal.mjs --arm 280 --cond x")]), false);
           hp("281:会话号缺 ⇒ 按本会话的批算", isForeignBatch({ batch: "280", armedBy: "x-session-0000" }, "", []), false);
+          // 批 285:批状态挑本会话的 checkout(281 / 284 三次实撞)
+          {
+            const me = "me-session-5678", other = "ot-session-9999";
+            const C = (dir, g) => ({ dir, g });
+            const wt = ".claude/worktrees/batch284";
+            hp("285 pickBatchDir:主树是别人的批、worktree 是本会话的 ⇒ 读 worktree",
+              pickBatchDir([C(".", { batch: "280", armedBy: other, conditions: ["x"] }), C(wt, { batch: "284", armedBy: me, conditions: ["y"], armedAt: "2026-10-28T02:12:00Z" })], me, []), wt);
+            hp("285 pickBatchDir:主树本会话已结清、worktree 本会话未结清 ⇒ 读 worktree(284 实撞形)",
+              pickBatchDir([C(".", { batch: "283", armedBy: me, cleared: true, armedAt: "2026-10-27T10:00:00Z" }), C(wt, { batch: "284", armedBy: me, conditions: ["y"], armedAt: "2026-10-28T02:12:00Z" })], me, []), wt);
+            hp("285 pickBatchDir:都不是本会话的 ⇒ 照旧读主树",
+              pickBatchDir([C(".", { batch: "280", armedBy: other, conditions: ["x"] }), C(wt, { batch: "277", armedBy: other, conditions: ["z"] })], me, []), ".");
+            hp("285 pickBatchDir:两份都是本会话未结清 ⇒ 取武装时刻新的",
+              pickBatchDir([C(".", { batch: "285", armedBy: me, conditions: ["a"], armedAt: "2026-10-28T05:00:00Z" }), C(wt, { batch: "284", armedBy: me, conditions: ["b"], armedAt: "2026-10-28T02:00:00Z" })], me, []), ".");
+            hp("285 pickBatchDir:没有会话号 ⇒ 主树", pickBatchDir([C(wt, { batch: "284", armedBy: me, conditions: ["b"] })], "", []), ".");
+            // 批 285 第二轮复核(派出方改的排序:先比批号、再未结清优先、再武装时刻;worktree 只认 armedBy 严格等于本会话)
+            const wtA = ".claude/worktrees/a", wtB = ".claude/worktrees/b";
+            // 285 三轮:会话在主树(cwd)⇒ 主树结清态比旧的未结清 284 武装晚 ⇒ 挑主树(BP-1 漏放堵上);cwd 取不到 ⇒ 退回未结清的 284(接受的漏放)
+            hp("285 收口 pickBatchDir:主树已结清 285 + worktree 忘了关的旧批 284,会话在主树 ⇒ 读未结清的 284(接受的漏放,D192;误拦比漏放贵)",
+              pickBatchDir([C(".", { batch: "285", armedBy: me, cleared: true, armedAt: "2026-10-28T05:00:00Z" }), C(wt, { batch: "284", armedBy: me, conditions: ["y"], armedAt: "2026-10-28T02:00:00Z" })], me, [], "."), wt);
+            hp("285 三轮 pickBatchDir:同上但 cwd 取不到 ⇒ 读未结清的 284(接受的漏放)",
+              pickBatchDir([C(".", { batch: "285", armedBy: me, cleared: true, armedAt: "2026-10-28T05:00:00Z" }), C(wt, { batch: "284", armedBy: me, conditions: ["y"], armedAt: "2026-10-28T02:00:00Z" })], me, []), wt);
+            // 误拦猎手第二轮 FB-3:worktree 里 285 正在做,主树插做小批并结清 ⇒ 会话在 worktree 时挑 worktree;cwd 取不到也挑未结清的 285
+            hp("285 三轮 FB-3:worktree 285 未结清 + 主树后武装并结清的小批,会话在 worktree ⇒ 挑 worktree",
+              pickBatchDir([C(".claude/worktrees/batch285", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".", { batch: "hw-check-skill", armedBy: me, cleared: true, armedAt: "2026-10-28T06:10:00Z" })], me, [], ".claude/worktrees/batch285"), ".claude/worktrees/batch285");
+            hp("285 三轮 FB-3:同上 cwd 取不到 ⇒ 挑未结清的 285",
+              pickBatchDir([C(".claude/worktrees/batch285", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".", { batch: "hw-check-skill", armedBy: me, cleared: true, armedAt: "2026-10-28T06:10:00Z" })], me, []), ".claude/worktrees/batch285");
+            hp("285 三轮 cwdBatchDir:主树 / worktree 子目录 / 仓外",
+              [cwdBatchDir("/repo", "/repo"), cwdBatchDir("\\repo\\.claude\\worktrees\\batch285\\scripts", "/repo"), cwdBatchDir("E:/cbot", "/repo"), cwdBatchDir("", "/repo")].join(","),
+              ".,.claude/worktrees/batch285,,");
+            hp("285 二轮 pickBatchDir:worktree 里别的会话武装的 285 + 本会话转录跑过 --arm 285 ⇒ 不挑它(BP-2)",
+              pickBatchDir([C(".", { batch: "280", armedBy: other, conditions: ["x"] }), C(wtA, { batch: "285", armedBy: other, conditions: ["z"] }), C(wtB, { batch: "284", armedBy: me, conditions: ["b"] })],
+                me, [arm("node scripts/batch-goal.mjs --arm 285 --cond x")]), wtB);
+            // 红队 285 第二轮 BP-1 / BP-4:具名批不再恒输给数字批;在 worktree 里结清旧批不抢走主树的新批
+            hp("285 三轮 pickBatchDir:worktree 已结清 285 + 主树后武装的具名批 hk-x ⇒ 挑主树",
+              pickBatchDir([C(".", { batch: "hk-x", armedBy: me, conditions: ["a", "b", "c"], armedAt: "2026-10-28T06:00:00Z" }), C(".claude/worktrees/batch285", { cleared: true, batch: "285", armedBy: me, armedAt: "2026-10-28T02:12:00Z" })], me, []), ".");
+            hp("285 三轮 pickBatchDir:主树未结清 285 + 之后在 worktree 结清的旧批 284(武装更早)⇒ 挑主树",
+              pickBatchDir([C(".", { batch: "285", armedBy: me, conditions: ["a"], armedAt: "2026-10-28T03:00:00Z" }), C(wt, { batch: "284", armedBy: me, cleared: true, armedAt: "2026-10-28T01:00:00Z" })], me, []), ".");
+            hp("285 收口 pickBatchDir:worktree A 结清 285 + worktree B 未结清 284,会话在 A ⇒ 读未结清的 B(接受的漏放,D192)",
+              pickBatchDir([C(wtA, { batch: "285", armedBy: me, cleared: true, armedAt: "2026-10-28T05:00:00Z" }), C(wtB, { batch: "284", armedBy: me, conditions: ["b"], armedAt: "2026-10-28T03:00:00Z" })], me, [], wtA), wtB);
+            hp("285 收口 FB-2:主树 285 未结清 + 会话进 worktree hw 做小批并结清、cwd 留在 hw ⇒ 读主树 285(不误拦)",
+              pickBatchDir([C(".", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".claude/worktrees/hw", { batch: "hw-x", armedBy: me, cleared: true, armedAt: "2026-10-28T06:00:00Z" })], me, [], ".claude/worktrees/hw"), ".");
+            hp("285 收口 红队 BP-1:worktree 285 未结清 + 主树插做并结清的小批,cwd 在主树 ⇒ 读 worktree 285",
+              pickBatchDir([C(".claude/worktrees/batch285", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".", { batch: "hw-check-skill", armedBy: me, cleared: true, armedAt: "2026-10-28T06:10:00Z" })], me, [], "."), ".claude/worktrees/batch285");
+            // batch-goal --clear 留下的结清态形状(cleared + batch + armedBy + armedAt,无 conditions)照样被认作本会话的
+            hp("285 二轮 ownBatchDirs:结清态(--clear 留 armedBy)的 worktree 算本会话的",
+              JSON.stringify(ownBatchDirs([C(wtA, { cleared: true, batch: "285", armedBy: me, armedAt: "2026-10-28T01:00:00Z" }), C(wtB, { cleared: true, batch: "285" })], me, [])), JSON.stringify([wtA]));
+            // 批 285 第二轮复核(误拦猎手 FB-1):A 里 --clear 285、别处 --arm 286 ⇒ 合并本会话两份台账后找得到刚关掉的 285
+            {
+              const J = (o) => JSON.stringify(o);
+              const jA = [J({ action: "arm", batch: "285", conditions: ["甲", "乙"], at: "2026-10-28T01:00:00Z" }), J({ action: "clear", batch: "285", conditions: ["甲", "乙"], at: "2026-10-28T05:00:00Z" })];
+              const jMain = [J({ action: "arm", batch: "284", conditions: ["丙"], at: "2026-10-27T01:00:00Z" }), J({ action: "arm", batch: "286", conditions: ["丁"], at: "2026-10-28T05:01:00Z" })];
+              const g286 = { batch: "286", conditions: ["丁"], armedAt: "2026-10-28T05:01:00Z" };
+              const merged = mergeJournalRows([jMain, jA]);
+              hp("285 二轮 FB-1:合并本会话两份台账 ⇒ 补出刚关掉的 285 与 2 条条件",
+                JSON.stringify([priorClosedFromJournal(merged, g286).priorClosedBatch, (priorClosedFromJournal(merged, g286).priorClosedConditions || []).length]), JSON.stringify(["285", 2]));
+              hp("285 二轮 FB-1 对照:只读 286 所在那份 ⇒ 补不出 285(改前行为)", priorClosedFromJournal(jMain, g286).priorClosedBatch ?? null, null);
+              hp("285 二轮 FB-1:只有一份台账 ⇒ 原样返回(行为不变)", mergeJournalRows([jA]), jA);
+              hp("285 二轮 FB-1:缺 at 的行沿用同份上一行时刻、份内次序不乱",
+                JSON.stringify(mergeJournalRows([[J({ at: "2026-10-28T02:00:00Z", k: 1 }), J({ k: 2 })], [J({ at: "2026-10-28T03:00:00Z", k: 3 })]]).map((s) => JSON.parse(s).k)), JSON.stringify([1, 2, 3]));
+            }
+          }
           hp("281:armedBy 就是本会话 ⇒ 不算外来", isForeignBatch({ batch: "280", armedBy: "me-session-5678" }, "me-session-5678", []), false);
         }
         // 批 281(D184 FB-2):阻断轮随附提示的去重
@@ -4948,6 +5275,33 @@ function selfTest() {
           hp("281 FB-2:带 unknown 的照列", n3.length, 2);
           hp("281 FB-2:别的会话不受影响", n4.map((f) => f.id).join(","), "AD");
           try { fs.unlinkSync(df); } catch { /* 无 */ }
+        }
+        // 批 285(D184 FB-3 / FB-1):去重按结构化命中身份(noticeKey / key),不按首行字面
+        {
+          const AD = RULES.find((r) => r.id === "AD");
+          const g = (log) => ({ batchGoal: { batch: "285", conditions: ["x"], baseCommit: "abc1234", decisions: [], batchLog: log } });
+          const c1 = "feat: 甲(用户签)", c2 = "fix: 乙(用户已批准)";
+          const f1 = runRules([AD], g([c1]))[0], f2 = runRules([AD], g([c2, c1]))[0];
+          const fOther = runRules([AD], { batchGoal: { ...g([c1]).batchGoal, batch: "286" } })[0];
+          const brief = (f) => `  [${f.id}] ${String(f.msg).split("\n")[0]}`;
+          const nk = noticeKeyOf(brief);
+          hp("285 D184 FB-3:AD 首行确实随新提交变(前提)", brief(f1) !== brief(f2), true);
+          hp("285 D184 FB-3:AD 同批多一条签字词提交 ⇒ 去重键不变", nk(f1) === nk(f2), true);
+          hp("285 D184 FB-3:AD 换批号 ⇒ 去重键变(照报)", nk(f1) === nk(fOther), false);
+          hp("285 D184:没声明 noticeKey 的规则 ⇒ 键退回首行", nk({ id: "C", msg: "标题\n第二行" }), "  [C] 标题");
+          hp("285 D184:noticeKey 抛错 ⇒ 不带 key(退回首行,只会多报)",
+            runRules([{ ...AD, noticeKey: () => { throw new Error("x"); } }], g([c1]))[0].key, undefined);
+          hp("285 D184:消息渲染失败行不带 key(命中数在首行,照按首行认)",
+            runRules([{ ...AD, message: () => { throw new Error("x"); } }], g([c1]))[0].key, undefined);
+          const df = path.join(os.tmpdir(), `notice-key-selftest-${process.pid}.json`);
+          try { fs.unlinkSync(df); } catch { /* 无 */ }
+          const d1 = dedupNotices(df, "s1", [f1], nk), d2 = dedupNotices(df, "s1", [f2], nk);
+          const a1 = dedupNotices(df, "s1", [{ id: "A", key: "codex-ledger-broken", msg: "[判据异常] codex 账自身出错(ENOENT a)" }], nk);
+          const a2 = dedupNotices(df, "s1", [{ id: "A", key: "codex-ledger-broken", msg: "[判据异常] codex 账自身出错(ENOENT b)" }], nk);
+          hp("285 D184 FB-3:AD 新计数的首行同批第二次不再随附", [d1.length, d2.length].join(","), "1,0");
+          hp("285 D184 FB-1:A 账坏行错误文本变了 ⇒ 键不变不再随附", [a1.length, a2.length].join(","), "1,0");
+          try { fs.unlinkSync(df); } catch { /* 无 */ }
+          hp("285 D184 FB-1:A 账坏行在源码里带固定 key", /id: "A", block: false, unknown: true, key: "codex-ledger-broken"/.test(fs.readFileSync(fileURLToPath(import.meta.url), "utf8")), true);
         }
         // 批 279「修闸 tag」:记账判据(lib/gate-touch.mjs touchWhy / readTouched;零件注入,避免循环导入)
         {
@@ -5000,8 +5354,54 @@ function selfTest() {
           .map((p) => `${_Pp.GATE_ENGINE.test(p) ? 1 : 0}${_Pp.ENGINE_PATH_RE.test(p) ? 1 : 0}${_Pp.hunterBound({ input: { prompt: "只看 " + p } }) ? 1 : 0}`).join(" "),
         "111 111 001 000 001 001");
       hp("GATE_ENGINE 认写入效果分析器与盲审", ["scripts/lib/write-effects.mjs", "scripts/fp-audit.mjs", "scripts/gate-deps/package.json"].map((p) => _Pp.GATE_ENGINE.test(p) ? 1 : 0).join(""), "111");
+      // 批 285 D160(误拦余项):备份件(.orig / .bak / -old)不是闸引擎;句末标点、引号照认
+      hp("D160:GATE_ENGINE 备份件不认、句末标点照认",
+        ["scripts/lib/write-effects.mjs.orig", "scripts/hook-guard.mjs.bak", "scripts/lib/gate-rules.mjs-old", "scripts/gate-deps/package.json.bak",
+          "scripts/git-hooks/pre-push.mjs.orig", "改了 scripts/hook-guard.mjs.", "\"scripts/lib/gate-rules.mjs\"", "/repo/scripts/lib/write-effects.mjs"]
+          .map((p) => _Pp.GATE_ENGINE.test(p) ? 1 : 0).join(""), "00000111");
+      // 批 285 D159①:--fp 的报警指认零件在场、取最后一行含该规则的报警(fp-audit 自测另钉 locate 的定位)
+      hp("D159①:--fp 用的 alertRefFor 可加载且取最后一行含该规则的报警",
+        _fpAuditForSelfTest && typeof _fpAuditForSelfTest.alertRefFor === "function"
+          ? _fpAuditForSelfTest.alertRefFor([{ ts: new Date(Date.now() - 60e3).toISOString(), ids: ["V"], sid: "s1", h: "h1" },
+            { ts: new Date().toISOString(), ids: ["K"], sid: "s2", h: "h2" }], "V")?.sid ?? "无" : "零件缺席", "s1");
       hp("276 GATE_ENGINE / ENGINE_PATH_RE 认 hook-remote-check、不认其 .selftest(D171③)",
         ["scripts/hook-remote-check.mjs", "scripts/hook-remote-check.selftest.mjs", "hook-remote-check.mjs"].map((p) => `${_Pp.GATE_ENGINE.test(p) ? 1 : 0}${_Pp.ENGINE_PATH_RE.test(p) ? 1 : 0}`).join(" "), "11 00 11");
+      // 批 285(D145 误拦子项):开工闸与 P 同一份锚定口径——外发暂存树里的闸副本不拦;本仓闸文件(绝对 / 相对 / 带 `./`)照拦;他仓同名通用件不拦
+      {
+        const R = "E:/repo285";
+        hp("285 D145 startGateHit:本仓闸 / 暂存树副本 / worktree 副本 / 他仓通用名 / 带 ./ 的钩子 / 本仓非闸",
+          [`${R}/scripts/hook-stop-closure.mjs`, "scripts/lib/gate-rules.mjs", `${R}/clipboard/oss/public-repo/scripts/hook-stop-closure.mjs`,
+            "clipboard/oss/public-repo/scripts/lib/gate-rules.mjs", `${R}/.claude/worktrees/x/scripts/hook-guard.mjs`,
+            "E:/lacuna/scripts/install-git-hooks.mjs", `${R}/scripts/./git-hooks/pre-push.mjs`, `${R}/scripts/batch-goal.mjs`]
+            .map((p) => (_Pp.startGateHit(p, R) ? 1 : 0)).join(""), "11000010");
+        // 接线证人:hook-start-gate 必须走 startGateHit,不得退回未锚定的 GATE_ENGINE 整串正则
+        let sg = "";
+        try { sg = fs.readFileSync(new URL("./hook-start-gate.mjs", import.meta.url), "utf8"); } catch { /* 公开树缺件 ⇒ 下条判空 */ }
+        hp("285 D145 hook-start-gate 走 startGateHit、不再直接 GATE_ENGINE.test", sg ? [/_p\.startGateHit\(/.test(sg), /GATE_ENGINE\.test\(/.test(sg)] : [true, false], [true, false]);
+      }
+      // 批 285(D161①,误拦):DP 的命令解析一路确知推送落在别的仓(git-common-dir 不同)时不计;判不出 / 回到本仓 / 按 URL 推私仓照算。
+      //   要一个真的别仓目录,静态夹具写不进,故在这里起临时 git 仓当反向证人(把 DP_DETECT 的 away 关掉,前三条会变红)。
+      {
+        const DP = RULES.find((r) => r.id === "DP");
+        const here = process.cwd().replace(/\\/g, "/");
+        let other = null;
+        try {
+          other = fs.mkdtempSync(path.join(os.tmpdir(), "dp285-")).replace(/\\/g, "/");
+          execFileSync("git", ["init", "-q", other], { windowsHide: true, stdio: "ignore" });
+        } catch { other = null; }
+        if (DP && other && fs.existsSync("scripts/verify-prod.mjs")) {
+          const hit = (cmd) => DP.detect({ bashCmds: [cmd], hookCheckout: here }).length > 0 ? 1 : 0;
+          hp("285 D161① DP:别仓 cd 后推 / 别仓 cd 后裸推 / git -C 别仓 ⇒ 不计",
+            [`cd ${other} && git push private main`, `cd "${other}" && git push`, `git -C ${other} push private main`].map(hit).join(""), "000");
+          hp("285 D161① DP:再 cd 回本仓 / || / 管道 / 后台 & / GIT_DIR / 包装器里 cd / -C 回本仓 / 按 URL 推私仓 / 子 shell 首段 ⇒ 照算",
+            [`cd ${other} && cd ${here} && git push private`, `cd ${other} || git push private`, `cd ${other} | git push private`,
+              `cd ${other} && sleep 1 & git push private`, `cd ${other} && GIT_DIR=${here}/.git git push private`,
+              `cd ${other} && bash -c "cd ${here} && git push private"`, `cd ${other} && git -C ${here} push private`,
+              `cd ${other} && git push https://github.com/x/app-private.git master`, `(cd ${other} && git push private)`].map(hit).join(""), "111111111");
+          hp("285 D161① DP:本仓目录 cd 后推照算", hit(`cd ${here} && git push private`), 1);
+        } else hp("285 D161① DP 证人:临时仓起不来或缺 verify-prod(公开树)⇒ 跳过", true, true);
+        try { if (other) fs.rmSync(other, { recursive: true, force: true }); } catch { /* 临时目录清不掉不影响判定 */ }
+      }
       // 批 266:原样装入的闸引擎(安装清单核对)。假 git:按 `<sha>:<path>` 返回树里的内容
       {
         const ENG = "export const x = 1;\r\n", isEng = (p) => _Pp.ENGINE_REL.test(p);
@@ -5062,6 +5462,13 @@ function selfTest() {
         rc("node scripts/batch-goal.mjs --clear; echo done"), true);
       hp("ranClear:结清带后续管道", rc("node scripts/batch-goal.mjs --clear | tail -1"), true);
       hp("ranClear:别的脚本的 --clear", rc("node scripts/other.mjs --clear"), false);
+      // 批 285(D126):读 / 打印命令段不是执行(口径与 batchGoalOps 同一份 bgSegIsRead);执行形态不受影响
+      hp("285 D126 ranClear:不带引号的 grep 源码 --clear", rc("grep -n -- --clear scripts/batch-goal.mjs"), false);
+      hp("285 D126 ranClear:rg 读源码", rc("rg -n -- --clear scripts/batch-goal.mjs"), false);
+      hp("285 D126 ranClear:echo 打印结清命令", rc("echo node scripts/batch-goal.mjs --clear"), false);
+      hp("285 D126 ranClear:VAR= 前缀后的 cat 仍是读", rc("LC_ALL=C cat scripts/batch-goal.mjs --clear"), false);
+      hp("285 D126 ranClear:VAR= 前缀的真结清仍算", rc("NODE_OPTIONS=--no-warnings node scripts/batch-goal.mjs --clear"), true);
+      hp("285 D126 ranClear:管道左侧读、右侧真结清仍算", rc("echo y | node scripts/batch-goal.mjs --clear"), true);
     }
 
     const RE = /scripts\/[\w.-]+\.mjs|\.claude\/agents\//;
@@ -5140,6 +5547,14 @@ function selfTest() {
       hp("BP-4:find -exec cp … \\; 的终止符不是目标(旧取到 `;`)", bashWriteTargets("find . -name x -exec cp {} scripts/lib/gate-rules.mjs \\;", GR), ["scripts/lib/gate-rules.mjs"]);
       hp("语料对照:find -exec mv -t DIR {} + 取 DIR(旧取到 `+`)", bashWriteTargets("find packets -name x -exec mv -t packets/math {} +", /[\s\S]/), ["packets/math"]);
       hp("BP-4:PS if { Copy-Item } 的 `}` 不是参数", bashWriteTargets("if (Test-Path x) { Copy-Item a scripts/lib/gate-rules.mjs }", GR, "ps"), ["scripts/lib/gate-rules.mjs"]);
+      // 批 285 D148 余项(复核红队 aaf414b6):贴身脚本块的命令名带 `{`,旧给 [](ND 误拦)
+      hp("D148:ForEach-Object {Add-Content 日记 …} 贴身写法", bashWriteTargets(`1..2 ${P} ForEach-Object {Add-Content docs/noun-diary.md "x"}`, D, "ps"), ["docs/noun-diary.md"]);
+      hp("D148:%{Add-Content -Value x -Path 日记} 词尾 `}` 不粘进路径", bashWriteTargets(`1..2 ${P} %{Add-Content -Value x -Path docs/noun-diary.md}`, D, "ps"), ["docs/noun-diary.md"]);
+      hp("D148:管道后段首的 %{ Add-Content … }(加空格,旧同样给 [])", bashWriteTargets(`1..2 ${P} %{ Add-Content docs/noun-diary.md x }`, D, "ps"), ["docs/noun-diary.md"]);
+      hp("D148:{Copy-Item a 目标} 词尾 `}` 拆开", bashWriteTargets("if (Test-Path x) {Copy-Item a scripts/lib/gate-rules.mjs}", GR, "ps"), ["scripts/lib/gate-rules.mjs"]);
+      hp("D148 对照:引号里的 {Add-Content 不拆(载荷不是命令)", bashWriteTargets(`Write-Output "{Add-Content docs/noun-diary.md}"`, D, "ps"), []);
+      hp("D148 对照:${env:TEMP} / @{a=1} 原样", psSplitBraces(codexWordsShaped("Set-Content ${env:TEMP}/x @{a=1}", true)).map((x) => x.w), ["Set-Content", "${env:TEMP}/x", "@{a=1}"]);
+      hp("D148 对照:bash 口径不拆(花括号展开)", bashWriteTargets("cp a scripts/lib/{gate-rules}.mjs", /[\s\S]/, "bash"), ["scripts/lib/{gate-rules}.mjs"]);
       // BP-4 对照组(不得因跳保留字/包装器而多认)
       hp("BP-4 对照:for 的变量名不是命令", bashWriteTargets("for cp in a scripts/lib/gate-rules.mjs; do :; done", GR), []);
       hp("BP-4 对照:if 后的 grep 不是写", bashWriteTargets("if grep -q cp scripts/lib/gate-rules.mjs; then :; fi", GR), []);
@@ -5403,7 +5818,15 @@ if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
     const reason = why.join(" ").trim();
     if (!id || !reason) { console.error('用法: --fp <规则id> <为什么拦错了>(理由不得为空白)'); process.exit(2); }
     ckId(id);
-    put({ kind: "claimed_fp", id, why: reason, by: "assistant" });
+    // 批 285(D159① 工装缺陷):顺手指认「拦的是哪一次」(报警台账里最后一行含该规则的 h / sid / ts),
+    //   fp-audit 盲审据此按会话 + 报警时刻取证,不再只按「3 小时内最后一次」猜。取不到不影响记账。
+    let alert = null;
+    try {
+      const { alertRefFor } = await import("./fp-audit.mjs");
+      const rows = fs.readFileSync(".claude/.gate-alerts.jsonl", "utf8").split("\n").map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      alert = alertRefFor(rows, id);
+    } catch { alert = null; }
+    put({ kind: "claimed_fp", id, why: reason, by: "assistant", ...(alert ? { alert } : {}) });
     console.log(`已记 误报:${id}(自签有效,2026-08-22 用户亲裁;批次结清时交 codex 盲审,判拦对了自动撤回)`);
   } else if (argv[0] === "--fp-retract") {
     // 批 258 条件 4:撤回一笔自己记错的误报(那次其实拦对了)。台账只追加,撤回是新的一行,报表按规则扣。
@@ -5496,11 +5919,15 @@ if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
     console.log(`未命中抽查: 已审 ${sampled},发现漏报 ${found}${found > 0 ? " ← 涉事规则不得再称「已验收」" : ""}`);
     console.log(`RECALL=UNKNOWN —— 本台账量不了漏报率;「没看到漏报」≠「没有漏报」`);
     // 批 258 条件 4:按规则的报警量 × 误报率表;误报率 ≥15% 且报警 ≥20 ⇒ 下一批待修(`--hot` 只印待修行,供 batch-goal 开批时列出)
-    const tbl = fpTable(alerts, led);
+    // 批 285(D157③):带 criteriaSince 的规则按「最后一次改判据之后」开窗,待修按窗口内判;全量数在行尾方括号里照列
+    const since = Object.fromEntries(RULES.filter((r) => r.criteriaSince).map((r) => [r.id, Date.parse(r.criteriaSince)]).filter(([, t]) => Number.isFinite(t)));
+    const tbl = fpTable(alerts, led, { since });
     const hotOnly = argv.includes("--hot");
     // 批 272:加「盲审确认误拦」列——独立模型判「拦错了」的笔数,不受自签减法与阈值边界影响;排修理优先级先看这一列
     if (!hotOnly) console.log("\n规则  报警  误报  误报率  盲审确认误拦  待修");
-    for (const r of tbl) if (!hotOnly || r.hot) console.log(`${hotOnly ? "待修 " : ""}${r.id.padEnd(4)}  ${String(r.alerts).padStart(4)}  ${String(r.fp).padStart(4)}  ${(r.rate * 100).toFixed(1).padStart(5)}%  ${String(r.confirmed).padStart(12)}  ${r.hot ? "← 下一批待修" : ""}`);
+    // 窗口注写在「← 下一批待修」之前:batch-goal 只剥行尾那个标记(batch-goal.mjs 读 --hot 的那段)
+    const winNote = (r) => (r.since ? `  [判据窗口起 ${r.since.slice(0, 16)}Z;全量 报警 ${r.all.alerts} 误报 ${r.all.fp} ${(r.all.rate * 100).toFixed(1)}%]` : "");
+    for (const r of tbl) if (!hotOnly || r.hot) console.log(`${hotOnly ? "待修 " : ""}${r.id.padEnd(4)}  ${String(r.alerts).padStart(4)}  ${String(r.fp).padStart(4)}  ${(r.rate * 100).toFixed(1).padStart(5)}%  ${String(r.confirmed).padStart(12)}${winNote(r)}  ${r.hot ? "← 下一批待修" : ""}`);
   }
   process.exit(0);
 }
@@ -5608,6 +6035,9 @@ let payload = "";
 try { payload = fs.readFileSync(0, "utf8"); } catch {}
 let hookInput = {};
 try { hookInput = JSON.parse(payload || "{}"); } catch {}
+// 批 285:批状态按本会话挑 checkout(batchDir / pickBatchDir);只有生产路径设它
+_liveSid = typeof hookInput.session_id === "string" && hookInput.session_id ? hookInput.session_id : null;
+_liveCwd = typeof hookInput.cwd === "string" && hookInput.cwd ? hookInput.cwd : null;   // 批 285 第三轮:会话所在 checkout(pickBatchDir 的 cwdDir)
 
 // ── SubagentStop:在**子代理自己的边界**上判它自己的动作(D60,批 112)────────────
 //

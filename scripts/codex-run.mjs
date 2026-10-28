@@ -5,8 +5,13 @@
 // CLI 子进程可杀、可设截止时间、`--json` 出 JSONL 事件流可当心跳。
 // 同理**不复用** cc-suite 锁版 codex-runner.mjs:它住插件缓存的版本号目录下,插件一升级即漂移。
 //
-// 沙箱缺省 read-only(-C 当前项目根 ⇒ codex **可读仓库、可联网、但写入被 OS 拒**);2026-09-05 用户裁定后
+// 沙箱缺省 read-only(-C 当前项目根 ⇒ codex 可读仓库、可联网;2026-08-09 实测写入被 OS 拒);2026-09-05 用户裁定后
 //   `--sandbox workspace-write` 作显式可选项接受(见下方 FORBIDDEN_FLAGS 注释),其余越权旗标照旧拒。守卫装在被调函数内部而非调用处。
+//   ⚠️ 批 285 D141:「read-only 拦写」在本机**已不成立**——2026-10-09 的 256b-final 那次 read-only 运行在 clipboard/ 写出了
+//   审计报告与两个探针文件。本壳不做事后写入核对(漏放侧,批 285 按接受风险处理,见欠账 D141),
+//   所以任务书要禁写就写明禁写,别指望沙箱兜底。
+// 双源:运行权威在 ~/.claude/scripts/(user 级),仓内是版本化副本;改了本文件合回主干后跑
+//   `node scripts/codex-entry-sync.mjs --install` 归一(每次发起与 --doctor 都比一次,漂移只打 NOTE / WARN 不阻断)。
 //
 // 进程分层(>120s 转后台的实现):
 //   父进程 = 取号 + 起 worker(detached) + 前台等 --wait-ms;超期则打印交接块后自身退出 0。
@@ -154,7 +159,8 @@ export function resultHeader(job, threadId) {
     "---",
     `codex 版本: ${job.codexVersion}`,
     `模型: ${model}`,
-    `sandbox: ${job.sandbox || "read-only"}(${job.sandbox === "workspace-write" ? "用户点名放开,可写" : "缺省,写被 OS 拒"})`,
+    // 批 285 D141:「写被 OS 拒」在本机已被 10-09 实例推翻,头部别再替沙箱打包票(行数不变,收尾闸按第 9 行认正文)
+    `sandbox: ${job.sandbox || "read-only"}(${job.sandbox === "workspace-write" ? "用户点名放开,可写" : "缺省;本机实测未必拦得住写入(D141)"})`,
     "network: on(codex 自带通道;2026-08-09 实测 read-only 下四客户端全 200)",
     `repo_brief: ${job.repoBrief || "(none)"}`,
     `复看: codex resume ${threadId || "(未取到 thread-id)"}`,
@@ -257,6 +263,17 @@ export async function waitForTerminal({ read, waitMs, sleep = (ms) => new Promis
   }
 }
 
+/** 批 285 D131②:codex 的 hooks 配置解析失败时**整份作废**(批 240 实撞:一个多余顶层键让 hook-guard /
+ *  hook-remote-check 在 codex 会话里零加载),运行照常、只在日志里留一行 error ⇒ 不读日志就永远看不见。
+ *  worker 跑完扫一遍日志,命中就记进台账 `warn`,机器块多一行 `CODEX_WARN=`(收尾闸按键名取字段,多一键不影响解析)。
+ *  只提示不阻断:作业本身照常 done / failed。返回提示串或 null(纯函数,自测直接调)。 */
+export const HOOKS_PARSE_FAIL_RE = /failed to parse hooks config\s+(\S+?):?\s/i;
+export function hooksConfigWarn(logText) {
+  const m = HOOKS_PARSE_FAIL_RE.exec(String(logText || ""));
+  if (!m) return null;
+  return `codex 的 hooks 配置解析失败(${m[1]}):该文件里注册的钩子本次全部未加载,查日志里 failed to parse hooks config 那行`;
+}
+
 export function formatJobBlock(job, { kind = "launch", log } = {}) {
   const lines = [`CODEX_JOB=${job.id}`];
   const st = job.state === "running" ? (kind === "launch" ? "background" : "running") : job.state;
@@ -265,6 +282,7 @@ export function formatJobBlock(job, { kind = "launch", log } = {}) {
     if (job.errorCode) lines.push(`CODEX_ERROR_CODE=${job.errorCode}`);
     lines.push(`CODEX_ERROR=${job.error || "(未记录)"}`);
   }
+  if (job.warn) lines.push(`CODEX_WARN=${job.warn}`);
   if (log || job.log) lines.push(`CODEX_LOG=${log || job.log}`);
   if (job.result) lines.push(`CODEX_RESULT=${job.result}`);
   if (st === "background") lines.push(`CODEX_POLL=node scripts/codex-run.mjs --poll ${job.id}`);
@@ -406,11 +424,15 @@ async function runWorker(jobId) {
     });
 
     let jsonl = "";
+    let errHead = "";   // 批 285 D131②:stderr 前 256KB 留一份扫 hooks 配置解析失败(该错出在启动期,不必全留)
     child.stdout.on("data", (d) => {
       jsonl += d.toString();
       logStream.write(d);
     });
-    child.stderr.on("data", (d) => logStream.write(d));
+    child.stderr.on("data", (d) => {
+      if (errHead.length < 262144) errHead += d.toString();
+      logStream.write(d);
+    });
     child.stdin.write(stdinPayload);
     child.stdin.end();
 
@@ -441,10 +463,13 @@ async function runWorker(jobId) {
     fs.writeFileSync(job.result, header + body, "utf8");
 
     const outcome = classifyOutcome({ code, body });
+    // 批 285 D131②:hooks 配置解析失败只提示、不改判定;没命中就不写 warn 键(台账形状照旧)
+    const warn = hooksConfigWarn(jsonl) || hooksConfigWarn(errHead);
+    const warnExtra = warn ? { warn } : {};
     if (outcome.state === "failed") {
-      finish("failed", { threadId, exitCode: code, errorCode: outcome.errorCode, error: outcome.error });
+      finish("failed", { threadId, exitCode: code, errorCode: outcome.errorCode, error: outcome.error, ...warnExtra });
     }
-    finish("done", { threadId, exitCode: code });
+    finish("done", { threadId, exitCode: code, ...warnExtra });
   } catch (e) {
     // 写 R 之前就失败 ⇒ R 还是发起时的占位行:删掉,别在 clipboard 留一份写着「运行中」的残件(v7,红队附二-6)
     try { if (job.result && isPlaceholder(fs.readFileSync(job.result, "utf8"))) fs.rmSync(job.result, { force: true }); } catch { /* 读不到就不动 */ }
@@ -473,17 +498,24 @@ function doctor(cwd) {
   process.stdout.write(`认证状态: ${loginLine}\n`);
 
   // 双源漂移检查(只提示不阻断——阻断会在最忙时挡路)
-  const repoCopy = path.join(cwd, "scripts", "codex-run.mjs");
-  if (fs.existsSync(repoCopy) && path.resolve(repoCopy) !== path.resolve(SELF)) {
-    const h = (p) => crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex").slice(0, 12);
-    const a = h(SELF);
-    const b = h(repoCopy);
-    process.stdout.write(
-      a === b ? "副本一致: 运行权威 == 仓内副本\n" : `WARN drift: 运行=${a} 仓内=${b}(跑 codex-entry-sync.mjs --install 归一)\n`,
-    );
-  }
+  const d = copyDrift(SELF, cwd);
+  if (d) process.stdout.write(d.same ? "副本一致: 运行权威 == 仓内副本\n" : `WARN ${d.text}\n`);
   void bin;
   return found && !/not logged in|未登录/i.test(loginLine) ? 0 : 1;
+}
+
+/** 双源漂移(运行的这支 vs <cwd>/scripts/codex-run.mjs)。不是两支不同文件(就是仓内那支在跑、或仓内没有)⇒ null。
+ *  批 285 D141:原来只在 --doctor 里比,用户级副本缺 6a5ea8e 的 windowsHide 很久无人发现 ⇒ 每次发起也比一次,
+ *  漂移时在 stdout 打一行 NOTE(不进 CODEX_ 机器块、不改退出码;只提示不阻断——worktree 分支改了本文件
+ *  还没合回主干时也会提示,那时不该 --install,提示语写明「合回后」)。 */
+export function copyDrift(self, cwd) {
+  try {
+    const repoCopy = path.join(cwd, "scripts", "codex-run.mjs");
+    if (!fs.existsSync(repoCopy) || path.resolve(repoCopy) === path.resolve(self)) return null;
+    const h = (p) => crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex").slice(0, 12);
+    const a = h(self), b = h(repoCopy);
+    return { same: a === b, text: `drift: 运行=${a} 仓内=${b}(仓内版合回主干后跑 node scripts/codex-entry-sync.mjs --install 归一)` };
+  } catch { return null; }
 }
 
 // 批 257:poll 先打机器块(带 J 的 CODEX_JOB / CODEX_STATE,收尾闸据此把 poll 归属到作业),
@@ -513,7 +545,8 @@ const HELP = `codex-run.mjs — /codex 通用入口薄壳(沙箱缺省 read-only
   --doctor               只探不发:PATH / 认证 / 版本 / 副本漂移
   --self-test            全离线自测(含反向用例)
 
-  沙箱缺省 read-only:codex 可读仓库、可联网,但写入被 OS 拒;--sandbox workspace-write 放开写(只在用户点名时用)。
+  沙箱缺省 read-only:codex 可读仓库、可联网;本机实测 read-only 未必拦得住写入(D141),要禁写就在任务书里写明;
+  --sandbox workspace-write 放开写(只在用户点名时用)。
   见到 CODEX_STATE=background 就 --poll 轮询,绝不重新 --task 发一次。
 `;
 
@@ -585,6 +618,9 @@ async function main() {
   if (fellBack) {
     process.stdout.write(`NOTE clipboard/ 不在场,结果件退回临时目录:${result}\n`);
   }
+  // 批 285 D141:每次发起比一次双源(见 copyDrift);只打 NOTE,不进机器块
+  const drift = copyDrift(SELF, cwd);
+  if (drift && !drift.same) process.stdout.write(`NOTE ${drift.text}\n`);
 
   // 前台等 --wait-ms,轮询 job 台账(worker 已 detached,轮询是唯一的观察面)。
   const deadline = Date.now() + opts.waitMs;

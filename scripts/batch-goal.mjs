@@ -356,9 +356,43 @@ export function hasDecisionId(text, id) {
   return new RegExp(`(?<![0-9A-Za-z\-])${bPat}\\s*[-‐‑–—－]\\s*D0*${Number(n)}(?![0-9])`, "i").test(String(text || ""));
 }
 
-/** ADR 正文是否**声明**了这个编号(批 256b BP-1):编号所在行须含「决定编号」或「取代」。 */
+/** ADR 正文是否**声明**了这个编号(批 256b BP-1):编号所在行须含「决定编号」或「取代」。
+ *  批 285(D140⑧,误拦):照模板写也会被拒的三形当场放行——①全角数字「２５６-D1」(先过 normWidth 再判);
+ *  ②「决定编号:」行本身不带编号、编号分列在紧接着的列表行(须比标签行缩进更深,标签行不是列表项时任意缩进;
+ *  空行或非列表行即止);③表头格写「决定编号」、编号写在下面数据行的**同一列**(连续表格行,分隔行跳过)。
+ *  只放宽、不收紧:任何此前算已声明的写法照旧算。代价(漏放面,按用户取舍不修):列表 / 同列里顺带写的兄弟编号
+ *  也算已声明,与 D140⑦ 同族。 */
 export function adrDeclaresId(text, id) {
-  return String(text || "").split(/\r?\n/).some((l) => /决定编号|取代/.test(l) && hasDecisionId(l, id));
+  const lines = normWidth(text).split(/\r?\n/);
+  const LABEL = /决定编号|取代/;
+  const HAS_ID = /\d+\s*[-‐‑–—－]\s*D\d/i;
+  const LIST = /^(\s*)(?:[-*+]|\d+[.)])\s+/;
+  const cellsOf = (l) => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|");
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!LABEL.test(l)) continue;
+    if (hasDecisionId(l, id)) return true;
+    if (/^\s*\|/.test(l)) {
+      // ③ 表头:取含「决定编号」的那一格的列号,往下扫连续表格行的同一列
+      const col = cellsOf(l).findIndex((c) => /决定编号/.test(c));
+      if (col < 0) continue;
+      for (let j = i + 1; j < lines.length && /^\s*\|/.test(lines[j]); j++) {
+        const cells = cellsOf(lines[j]);
+        if (cells.every((c) => /^\s*:?-{3,}:?\s*$/.test(c))) continue;
+        if (hasDecisionId(cells[col] ?? "", id)) return true;
+      }
+      continue;
+    }
+    if (HAS_ID.test(l) || !/决定编号/.test(l)) continue;   // ② 只在「决定编号」标签行本身不带编号时往下并
+    const lm = l.match(LIST);
+    const baseIndent = lm ? lm[1].length : -1;
+    for (let j = i + 1; j < lines.length; j++) {
+      const m = lines[j].match(LIST);
+      if (!m || m[1].length <= baseIndent) break;
+      if (hasDecisionId(lines[j], id)) return true;
+    }
+  }
+  return false;
 }
 
 /** 编号尾部的 D 号(`256-D07` ⇒ 7);不是编号 ⇒ 0。 */
@@ -416,7 +450,8 @@ export function parseBatchId(s) {
  *  批 256b(BP-7)起再认 `批 255 与 256` / `和` / `+`、反序 `256 批` / `255、256 批`,全角数字先归一。
  *  正序与反序都出现时取**位置靠前**的那个。 */
 const D_ID = "\\d+[A-Za-z]*";
-const D_LIST = `${D_ID}(?:\\s*(?:[–—~～\\-/、,,+]|与|和)\\s*${D_ID})*`;
+// 批 285(D140⑧,误拦):日记连接词再认「及 / 以及」(「批 255 及 256」照模板写也被拒)
+const D_LIST = `${D_ID}(?:\\s*(?:[–—~～\\-/、,,+]|与|和|以及|及)\\s*${D_ID})*`;
 const RE_DESIG_FWD = new RegExp(`批\\s*(${D_LIST})`);
 const RE_DESIG_REV = new RegExp(`(?<![0-9A-Za-z])(${D_LIST})\\s*批`);
 export function parseDesignator(cell) {
@@ -426,7 +461,7 @@ export function parseDesignator(cell) {
   if (!m) return null;
   const items = [];
   let pendingRange = false;
-  for (const t of m[1].matchAll(/(\d+[A-Za-z]*)|([–—~～-])|([/、,,+]|与|和)/g)) {
+  for (const t of m[1].matchAll(/(\d+[A-Za-z]*)|([–—~～-])|([/、,,+]|与|和|以及|及)/g)) {
     if (t[1]) {
       const id = parseBatchId(t[1]);
       if (pendingRange && items.length) items[items.length - 1].hi = id; else items.push({ lo: id });
@@ -689,6 +724,42 @@ export function debtTableIssues(text) {
   if (heads.length) out.push(`${heads.length} 个小节标题重复(${heads.slice(0, 3).map(([k, n]) => `「${k.replace(/^## /, "")}」×${n}`).join(" ")})`);
   return out;
 }
+/** 批 285(D133):债表一行切成列。反引号代码段里的 `|` 与转义的 `\|` 不是列分隔(坏行里的竖线几乎都出在代码段里),
+ *  先换成占位再切、切完还原。返回去掉首尾空串的各列;列数由调用方判(到期腿要求恰为 6)。
+ *  天花板:代码段外的裸竖线(描述里直接写 a|b)仍会把行切多——那种行被点名跳过,不猜。 */
+export function debtRowCells(line) {
+  const P = "\u0001";
+  return String(line || "")
+    .replace(/`[^`\n]*`/g, (s) => s.replace(/\|/g, P))
+    .replace(/\\\|/g, "\\" + P)
+    .split("|").slice(1, -1)
+    .map((c) => c.split(P).join("|"));
+}
+
+/** 到期腿的逐行判定(批 285 D133 从 --arm 分支抽出)。rows = 债表里 `| Dnn |` 起头的行;cur = 本批号(数)。
+ *  返回 { mine, yours, colBad }:到期未结的【我做】/【需你裁】条目,与列数异常被跳过的 D 号。 */
+export function debtDue(rows, cur) {
+  const mine = [], yours = [], colBad = [];
+  for (const l of rows) {
+    const id = (l.match(/^\| (D\d+) \|/) || [])[1];
+    // 批 285(D133):先掩码反引号代码段与 `\|` 再切列(debtRowCells),且列数必须**恰为** 6。
+    //   原守卫 `cells.length < 6` 只挡太少不挡太多:描述列里一个代码段竖线(正则、matcher)就把行切多,
+    //   第 4 列读到的是描述片段 ⇒ 失效期取不到(静默漏提示)或「已结」字样落进错位格(整行被当已结)。
+    //   实测(批 285 当时的债表):190 行里旧切法 33 行不是 6 列,掩码后剩 14 行;那 14 行点名跳过(原来只报个数)。
+    //   代价:点名跳过的行仍看不见到期——比读错列安全(不猜)。只是提示层,不阻断。
+    let cells = debtRowCells(l);
+    // 批 285 收尾:正文里反引号是单数(D129 / D130 实况)时,掩码把成对关系配错、切出 2 列;这时若按裸竖线切恰为 6 列 ⇒ 用它
+    if (cells.length !== 6) { const naive = String(l).split("|").slice(1, -1); if (naive.length === 6) cells = naive; }
+    if (cells.length !== 6) { colBad.push(id); continue; }   // 列数不对 ⇒ 不猜,点名后跳过
+    const expiryCell = cells[3];
+    if (/~~[^~]*≤/.test(expiryCell) || /已(修|结|销)/.test(expiryCell)) continue;  // 已结
+    const m = expiryCell.match(/≤\s*0?(\d+)/);
+    if (!(m && Number.isFinite(cur) && cur > +m[1])) continue;
+    (/亲签|呈签|归用户|用户裁/.test(l) ? yours : mine).push(`${id}(≤${m[1]})`);
+  }
+  return { mine, yours, colBad };
+}
+
 function debtTableWarn() {
   try {
     const issues = debtTableIssues(fs.readFileSync("docs/gate-debts.md", "utf8"));
@@ -718,6 +789,28 @@ function selfTest() {
     t("284 欠账表结构:正文里提到 D104 不算行", debtTableIssues(ok + "见 | D104 | 的说明\n"), []);
   }
   t("空条件 ⇒ null", evaluate({ conditions: [] }, "x"), null);
+  // ── 批 285(D133):到期腿切列掩码代码段竖线、列数恰为 6、坏行点名 ──
+  {
+    const okRow = "| D900 | 描述 | 280 | **≤281** | 来源 | 出路 |";
+    const codeRow = "| D901 | matcher 写成 `Edit|Write|MultiEdit` 一条 | 280 | **≤281** | 来源 | 出路 |";
+    const escRow = "| D902 | 正则 a\\|b 转义 | 280 | **≤281** | 来源 | 出路 |";
+    const bareRow = "| D903 | 描述里裸写 a|b | 280 | **≤281** | 来源 | 出路 |";
+    const thinRow = "| D904 | 只有三列 | 280 |";
+    t("285 D133:正常行切出 6 列", debtRowCells(okRow).length, 6);
+    // 批 285 收尾:正文反引号是单数 ⇒ 掩码切错,退回裸竖线切法(D129 实况)
+    t("285 收尾:单数反引号的行退回裸切法,失效期照取",
+      debtDue(["| D900 | 某 `x 的说明 | 285 | **≤280** | 来源 | 出路 |"], 286).mine, ["D900(≤280)"]);
+    t("285 D133:代码段里的竖线不切列,失效期列取得到", debtRowCells(codeRow)[3].trim(), "**≤281**");
+    t("285 D133:代码段内容切完还原", debtRowCells(codeRow)[1].includes("`Edit|Write|MultiEdit`"), true);
+    t("285 D133:转义的 \\| 不切列", debtRowCells(escRow).length, 6);
+    const r = debtDue([okRow, codeRow, escRow, bareRow, thinRow], 285);
+    t("285 D133:代码段 / 转义行照常判到期", r.mine, ["D900(≤281)", "D901(≤281)", "D902(≤281)"]);
+    t("285 D133:列数太多与太少的坏行都点名跳过(原守卫只挡太少)", r.colBad, ["D903", "D904"]);
+    // 旧切法下这行的第 4 列是「批」列(含「已结」字样)⇒ 整行被当已结;掩码后第 4 列才是真失效期
+    const shiftRow = "| D905 | 描述 `a|b` | 已结过一轮的 270 | **≤281** | 来源 | x |";
+    t("285 D133:对照——旧切法第 4 列读到错位格", shiftRow.split("|").slice(1, -1)[3].trim(), "已结过一轮的 270");
+    t("285 D133:掩码后不再被错位格的「已结」当成已结", debtDue([shiftRow], 285).mine, ["D905(≤281)"]);
+  }
   // ⚠️ **「结清后再武装」这条序列此前零覆盖**(2026-08-20 实撞后补)。
   //   为修 grill E6 我让 `--clear` 把批号写进状态文件 ⇒ 结清后是 `{cleared:true, batch:"073"}`;
   //   而 `--arm` 的守卫只判 `cur.batch` 存在,于是**结清之后再 --arm 当场崩**
@@ -793,6 +886,15 @@ function selfTest() {
   t("BP-1:顺带提及(另见 256-D2(待写))不算声明", adrCoverage(dec, "abc1234", fakeGit({ "docs/adr/0009-a.md": "- 决定编号:256-D1\n另见 256-D2(待写)\n" })).missing, ["256-D2"]);
   t("BP-1:「被 X 部分取代」算声明", adrDeclaresId("- **部分取代**:一句被 256-D6(ADR 0014)部分取代", "256-D6"), true);
   t("BP-1:同一行「决定编号」列多个编号都算", adrDeclaresId("- 决定编号:256-D1、256-D2", "256-D2"), true);
+  // 批 285(D140⑧):三形误拦当场放行;反例钉「只放宽到所列形态」
+  t("D140⑧:全角数字「２５６-D1」算声明", adrDeclaresId("- 决定编号:２５６-D1", "256-D1"), true);
+  t("D140⑧:编号分列在下一行列表项", adrDeclaresId("决定编号:\n- 256-D1\n- 256-D2\n", "256-D2"), true);
+  t("D140⑧:标签行是列表项、编号在更深一层", adrDeclaresId("- 决定编号:\n  - 256-D1\n", "256-D1"), true);
+  t("D140⑧ 反例:同级的下一条列表项不并进来", adrDeclaresId("- 决定编号:\n- 另见 256-D2(待写)\n", "256-D2"), false);
+  t("D140⑧ 反例:空行之后的列表不并进来", adrDeclaresId("决定编号:\n\n- 256-D2\n", "256-D2"), false);
+  t("D140⑧ 反例:标签行已带编号时下一行列表不并进来", adrDeclaresId("决定编号:256-D1\n- 另见 256-D2\n", "256-D2"), false);
+  t("D140⑧:表头「决定编号」列、编号在数据行同列", adrDeclaresId("| 决定编号 | 内容 |\n|---|---|\n| 256-D1 | 甲 |\n| 256-D2 | 乙 |\n", "256-D2"), true);
+  t("D140⑧ 反例:编号在数据行的别的列不算", adrDeclaresId("| 决定编号 | 内容 |\n|---|---|\n| 256-D1 | 另见 256-D2 |\n", "256-D2"), false);
   t("BP-5:-z 输出里多张 ADR(含中文名)全都读到", adrCoverage(dec, "abc1234", fakeGit({ "docs/adr/0009-中文.md": "- 决定编号:256-D1", "docs/adr/0010-b.md": "- 决定编号:256-D2" })).missing, []);
   t("BP-8:256-D01 认作 256-D1", hasDecisionId("- 决定编号:256-D01", "256-D1"), true);
   t("BP-8:256-D01 仍不抵 256-D10", hasDecisionId("- 决定编号:256-D01", "256-D10"), false);
@@ -821,6 +923,8 @@ function selfTest() {
   t("BP-7:「批 255 和 256」「批 255+256」含 256", [diaryHasBatch("| d | 批 255 和 256:x | y | e |", "256"), diaryHasBatch("| d | 批 255+256:x | y | e |", "256")], [true, true]);
   t("BP-7:反序合并「255、256 批」含 256", diaryHasBatch("| d | 255、256 批:x | y | e |", "256"), true);
   t("BP-7:全角数字「批２５６」归一", diaryHasBatch("| d | 批２５６:x | y | e |", "256"), true);
+  t("D140⑧:「批 255 及 256」「批 255 以及 256」含 256", [diaryHasBatch("| d | 批 255 及 256:x | y | e |", "256"), diaryHasBatch("| d | 批 255 以及 256:x | y | e |", "256")], [true, true]);
+  t("D140⑧ 反例:「批 255 及用户讨论 256」不把 256 并进来", diaryHasBatch("| d | 批 255 及用户讨论 256 | y | e |", "256"), false);
   t("BP-7:「批 255 和用户讨论 256」不把 256 并进来", diaryHasBatch("| d | 批 255 和用户讨论 256 | y | e |", "256"), false);
   t("BP-7:正序在前时反序量词不抢位(批 255:回顾 256 批)", diaryHasBatch("| d | 批 255:回顾 256 批 | y | e |", "256"), false);
   t("BP-4:日记读错误(非 ENOENT)⇒ unknown", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => { const e = new Error("busy"); e.code = "EBUSY"; throw e; } }); return [!!o.unknown, o.diaryMissing]; })(), [true, false]);
@@ -936,6 +1040,18 @@ function selfTest() {
     cli("--arm", "304", "--cond", "乙", "--force"); const a3 = st().armedAt;
     return [typeof a1 === "string" && a1 === a2, a3 !== a1];
   }), [true, true]);
+  // 批 285 第二轮复核(误拦猎手第 4 份 FB-2 / FB-3):--clear 后结清态保留 armedBy / armedAt(收尾闸 pickBatchDir 据此认出本会话刚结清的批)
+  {
+    const sidKey = "CLAUDE_CODE_SESSION_ID", sid0 = process.env[sidKey];
+    process.env[sidKey] = "selftest-sess-0285";
+    try {
+      t("285 二轮:--clear 后状态文件保留 armedBy / armedAt", sandbox(({ cli, st }) => {
+        cli("--arm", "309", "--cond", "甲"); const a = st();
+        cli("--no-decision", "自测"); const r = cli("--clear"); const c = st();
+        return [r.status, c.cleared === true, c.batch, c.armedBy, typeof a.armedAt === "string" && c.armedAt === a.armedAt];
+      }), [0, true, "309", "selftest-sess-0285", true]);
+    } finally { if (sid0 === undefined) delete process.env[sidKey]; else process.env[sidKey] = sid0; }
+  }
   // 批 278(D173①):批号结清过 ⇒ 不带 --force 拒复用(台账多会话共用,另一会话 --arm 277 时 277 已结清过)
   t("集成 278 D173①:结清过的批号再武装 ⇒ 拒(exit 2、状态不变);换号放行;--force 放行", sandbox(({ cli, st }) => {
     cli("--arm", "305", "--cond", "甲"); cli("--no-decision", "自测"); cli("--clear");
@@ -1102,7 +1218,11 @@ if (argv.includes("--clear")) {
     //   (Windows 上文件被占用即触发),而 atomicWrite 照常成功、CLI 照常 exit 0
     //   ⇒ **三天前另一批的 clear 行会顶替成本轮证据**,且没有任何一处会说出来。
     //   留下批号,闸就能要求「台账末行的批号 == 状态文件的批号」——写失败时对不上。
-    atomicWrite({ cleared: true, batch: prev?.batch ?? null });
+    //   批 285(误拦猎手第 4 份 FB-2 / FB-3):武装者与武装时刻也留着——收尾闸在主树与各 worktree 的批状态里挑「本会话的」那份
+    //   (hook-stop-closure pickBatchDir),结清态原来丢了 armedBy,worktree 里本会话刚结清的批认不出,挑中了别处没关的旧批
+    atomicWrite({ cleared: true, batch: prev?.batch ?? null,
+      ...(typeof prev?.armedBy === "string" && prev.armedBy ? { armedBy: prev.armedBy } : {}),
+      ...(typeof prev?.armedAt === "string" && prev.armedAt ? { armedAt: prev.armedAt } : {}) });
     console.log("已结清批级完成条件(留结清标记,下次 --arm 覆盖;条件已存入 .batch-goal.jsonl)");
     debtTableWarn();
     // 批 258 条件 4:收尾自动出一张报警量 × 误报率表(按规则),待修行下一批 --arm 会再列一次
@@ -1266,19 +1386,9 @@ if (argv.includes("--arm")) {
     //   ⇒ 失效期只从**第 4 列**取(表头:`| # | 欠账 | 批 | 失效期 | 复核来源 | 出路 |`),
     //   并按**结构**判已结:该列被 `~~` 划掉,或含 已修/已结/已销 之一。
     //   天花板:仍依赖表格列序;列序若变,本腿会静默失准 ⇒ 下面加了列数断言。
-    const mine = [], yours = [];
-    let colWarn = 0;
-    for (const l of rows) {
-      const id = (l.match(/^\| (D\d+) \|/) || [])[1];
-      const cells = l.split("|").slice(1, -1);           // 去掉首尾空串
-      if (cells.length < 6) { colWarn++; continue; }      // 列数不对 ⇒ 不猜,计数后跳过
-      const expiryCell = cells[3];
-      if (/~~[^~]*≤/.test(expiryCell) || /已(修|结|销)/.test(expiryCell)) continue;  // 已结
-      const m = expiryCell.match(/≤\s*0?(\d+)/);
-      if (!(m && Number.isFinite(cur) && cur > +m[1])) continue;
-      (/亲签|呈签|归用户|用户裁/.test(l) ? yours : mine).push(`${id}(≤${m[1]})`);
-    }
-    if (colWarn) console.log(`⚠ 到期腿:${colWarn} 行列数异常已跳过 —— 表格列序可能变了,本腿会失准`);
+    //   (批 285 D133:逐行判定抽成 debtDue,便于自测)
+    const { mine, yours, colBad } = debtDue(rows, cur);
+    if (colBad.length) console.log(`⚠ 到期腿:${colBad.length} 行列数异常已跳过(${colBad.join(" ")})—— 描述列里有代码段外的竖线,或表格列序变了;这些行的到期本腿看不见`);
     const due = [...mine, ...yours];
     if (due.length) {
       console.log(`⚠ **到期未结的债 ${due.length} 条**(本批号已超过其失效期):`);

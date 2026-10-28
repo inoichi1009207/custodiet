@@ -215,7 +215,12 @@ export function runRules(rules, ctx) {
       msg = `[消息渲染失败,判据本身已命中 ${hits.length} 处] ${e.message}\n` +
             `      **不得读作「未命中」**——判据成立,只是消息渲染坏了。`;
     }
-    findings.push({ id: r.id, block: isBlocking(r, ctx), msg, ...(renderFailed ? { unknown: true } : {}) });
+    // 批 285(D184 FB-3 / D179 附三③):规则可声明 `noticeKey(hits, ctx)` = 结构化命中身份,收尾闸提示去重按它认「见过」,
+    //   不按首行字面——首行里带计数 / 最新引文的规则(AD)每多一条命中就换一次键、多续一轮空转。
+    //   没声明 / 抛错 / 非字符串 ⇒ 不带 key,去重照旧按首行(只会多报,不会多静音)。
+    let key;
+    if (typeof r.noticeKey === "function") { try { const k = r.noticeKey(hits, ctx); if (typeof k === "string" && k) key = k; } catch { key = undefined; } }
+    findings.push({ id: r.id, block: isBlocking(r, ctx), msg, ...(renderFailed ? { unknown: true } : {}), ...(key && !renderFailed ? { key } : {}) });
   }
   return findings;
 }

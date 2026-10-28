@@ -27,8 +27,10 @@
 //     后台任务载荷、观察档、连拦降级(yielding)也不模拟。P / DP / A / K 这类依赖实时面的规则,读数要打折看。
 //   · 每回合只取末尾 `--tail` 条条目,更早的历史证据看不到;解析依赖(tree-sitter,scripts/gate-deps)两版共用主 checkout 那一份,没随基线冻结。
 //   · 判「阻断」= finding.block 为真。语料是本人的历史会话:写规则的人与语料同源,新增阻断少不等于对别的仓也少。
-//   · **回放面小于闸引擎面**:改前版本只拷 hook-stop-closure.mjs 与 scripts/lib/**——hook-guard.mjs、fp-audit.mjs、gate-deps、本文件自己的改动
-//     回放恒为空,只能靠读 diff(误拦猎手回件 a48b3bca 附节二⑤)。
+//   · **回放面小于闸引擎面**:只回放 Stop 规则,改前版本只拷 hook-stop-closure.mjs 与 scripts/lib/**——hook-guard.mjs、fp-audit.mjs、gate-deps、本文件自己的改动,
+//     以及批 276 起并入闸引擎面的远端守卫三件(hook-remote-check.mjs / install-git-hooks.mjs / git-hooks/*.mjs)和开工闸 hook-start-gate.mjs,
+//     回放恒为空,只能靠读 diff 与各自的自测(误拦猎手回件 a48b3bca 附节二⑤;批 285 D174⑥ 补远端守卫一句)。
+//   · 语料目录:本 checkout 与主树(git-common-dir 的父目录)两处的项目转录目录都进缺省语料(批 285 D174⑥:原先 worktree 里缺省语料为空)。
 //   · 语料含正在写的会话转录:两次运行之间可用回合数会变,洗牌后入样的回合就换一批;只有语料不动时种子才可复现(同上附节二③)。
 //   · 不写真台账:run() 不传 live,台账 / 心跳 / journal 的落盘都在 live 门后(hook-stop-closure.mjs)。
 //   · **MF 在 detect 里直接读此刻盘面**上那条 memory 的全文(D179):回放历史回合时读到的是今天的文件内容,不是当时的;
@@ -86,11 +88,23 @@ export function diffRuns(jobs, runBefore, runAfter) {
   };
 }
 
-function corpusDirs(extra) {
-  const slug = ROOT.replace(/[:\\/]/g, "-");
-  const own = path.join(os.homedir(), ".claude", "projects", slug);
+// 批 285(D174⑥,工装缺陷):原来只按本 checkout 的根推项目转录目录——在 worktree 里跑时 slug 是 worktree 自己的路径,
+//   那个目录往往不存在或只有零星会话 ⇒ 缺省语料为空(退出 4),误拦猎手只能手带 `--corpus`。现在主树根(git-common-dir 的父目录)
+//   的转录目录一并纳入;本 checkout 自己的目录在就也留着。主树里跑时两者相同,去重后与原来一致。
+export function corpusRoots(root = ROOT) {
+  const roots = [root];
+  try {
+    const common = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true }).trim();
+    if (common) roots.push(path.dirname(path.resolve(root, common)));
+  } catch { /* 不在 git 里:只用本 checkout 的根 */ }
+  return roots;
+}
+export function corpusDirs(extra, roots = corpusRoots(), home = os.homedir(), exists = fs.existsSync) {
+  //   slug 另把 `.` 换成 `-`(Claude Code 的项目目录名实见 `example-project--claude-worktrees-…`;主树 `\repo` 不含点,与原来同)
+  const own = roots.map((r) => path.join(home, ".claude", "projects", path.resolve(r).replace(/[:\\/.]/g, "-"))).filter((d) => exists(d));
   // 去重(同一目录给两次会让回合重复入样)、排序(codex 266-r1 §9)
-  return [...new Set([...(fs.existsSync(own) ? [own] : []), ...extra].map((d) => path.resolve(d)))].sort();
+  return [...new Set([...own, ...extra].map((d) => path.resolve(d)))].sort();
 }
 
 function collectJobs(dirs, tail) {
@@ -226,6 +240,16 @@ function selfTest() {
   chk("diffRuns:新增按规则计(含两边都拦但多出的规则)", d.newBlocksByRule, { K0: 1, S: 1 });
   const e = diffRuns([{ file: "f", idx: 9, text: "", entries: [] }], () => { throw new Error("boom"); }, () => []);
   chk("diffRuns:一边出错 ⇒ 记出错、不进新增 / 解除", [e.errors, e.added.length, e.removed.length], [1, 0, 0]);
+  // 批 285(D174⑥):worktree 里跑时主树的转录目录也进缺省语料;slug 把 `.` 也换成 `-`;不存在的目录不进
+  {
+    const H = path.resolve("/h285"), P = (s) => path.join(H, ".claude", "projects", s);
+    const seen = new Set([P("D--m"), P("D--m--claude-worktrees-w")]);
+    const got = corpusDirs([], [path.resolve("E:/m/.claude/worktrees/w"), path.resolve("E:/m")], H, (d) => seen.has(d)).map((d) => path.basename(d));
+    chk("285 D174⑥ corpusDirs:worktree 自己的目录 + 主树目录都进", got, ["D--m", "D--m--claude-worktrees-w"]);
+    chk("285 D174⑥ corpusDirs:主树目录缺 ⇒ 只剩存在的", corpusDirs([], [path.resolve("E:/m/x"), path.resolve("E:/m")], H, (d) => seen.has(d)).map((d) => path.basename(d)), ["D--m"]);
+    const cr = corpusRoots();
+    chk("285 D174⑥ corpusRoots:末项是主树根(含 .git 目录)", cr.length === 1 || fs.existsSync(path.join(cr[cr.length - 1], ".git")), true);
+  }
   console.log(`\ngate-replay 自测 ${pass}/${total}`);
   return pass === total ? 0 : 1;
 }

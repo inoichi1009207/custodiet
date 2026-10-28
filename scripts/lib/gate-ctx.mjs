@@ -157,6 +157,14 @@ export function isBlockedStop(entries, i, ids = null) {
   return false;
 }
 
+/** 批 285(D128①):`extra.batchGoal` 归一化**读**的输入键全集(buildCtx 内 batchGoal 段)。
+ *  验收台(gate-migrate-check)按它校验夹具的 batchGoal 子键——此前白名单净化把不认的键静默丢掉,
+ *  夹具写了等于没写(红队批 236 实测,与本仓十一次「夹具支持面不足伪装成规则缺陷」同族)。 */
+export const BATCH_GOAL_INPUT_KEYS = Object.freeze([
+  "batch", "armedAt", "clearedArmedAt", "priorClosedArmedAt", "turnBatchStart", "cleared", "foreign", "clearRefusedAt",
+  "conditions", "closedConditions", "priorClosedBatch", "priorClosedConditions", "baseCommit", "decisions", "batchLog",
+]);
+
 export function buildCtx(entries, extra = {}) {
   /** 助理说的话。**只取 assistant 的 text 块**——不含工具输出、不含用户输入、
    *  不含被读文件的内容。想判「他说了什么」只能用这个。 */
@@ -415,8 +423,18 @@ export function buildCtx(entries, extra = {}) {
   //   否则旧的「别外审了」会压过本轮新说的「必须外审」(W 豁免串轮);②数组形态的 prompt 同样收(与窗口内同一提取函数)。
   //   a2155edb BP-3:本轮若以用户的**打断行**开头,同理不补——打断之前的那一轮已被用户掐断。
   const turnHasHuman = entries.some((e) => (e?.type === "user" && e.origin?.kind === "human" && e.isCompactSummary !== true) || isInterruptLine(e));
+  /** 批 285 D143⑫:窗口(400 条)前那段**同一用户轮**里用户亲口的话——只给 W 的用户免审认,**不进 userText / turnLog**。
+   *  病:长轮(约 200 次工具调用)里轮开口说的「这份别外审了」滚出 400 条窗口,回扫走到窗口头也没碰到开口 / 已放行 Stop,
+   *  豁免随之丢失 ⇒ W 误拦(红队 a811daae 实测:问句距窗口 384 条仍认、404 条起丢)。
+   *  修法:调用方另给 `extra.priorScanEntries`(更长的同源切片,尾部就是 priorEntries 本身——按引用核),
+   *  近端回扫**没碰到任何轮边界**时才接着往远端扫,边界判法与近端逐字相同(开口行 / 打断行 / 已放行 Stop)。
+   *  为什么不并进 userText:ND 也读 userText,远端问句并进去会让长轮里早已滚出窗口的「X 是什么」重新拦人——
+   *  那是 ND 的漏放面(按用户 10-27 取舍接受风险),本修只补 W 的误拦那一半,不顺手多拦。
+   *  代价:远端仍有上限(调用方定,生产 5000 条);再长的轮照旧丢豁免(误拦残余,出现即复议上限)。 */
+  let userTextFar = "";
   if (Array.isArray(extra.priorEntries) && !turnHasHuman) {
     const pe = extra.priorEntries;
+    let hitBoundary = false;
     const qs = [];
     /** 窗口前那一段(同一用户轮、被拦链上)的时间线,倒着收、最后翻正接到 turnLog 前头。
      *  写入 / Bash / 助理的话**全收**,不再在这里按「最近一次提问」截——哪句算提问是规则的事(a2155edb BP-5:
@@ -432,13 +450,14 @@ export function buildCtx(entries, extra = {}) {
         const q = typeof c === "string" ? c + "\n" : Array.isArray(c) ? c.filter((b) => b?.type === "text").map((b) => (b.text || "") + "\n").join("") : "";
         qs.unshift(q);
         if (q.trim()) prior.push({ k: "ask", v: cleanUser(q) });
+        hitBoundary = true;
         break;
       }
       // 打断行是轮边界(a2155edb BP-3):不停的话会一路走到上一轮的开口,把旧豁免(「别外审」)带进来
-      if (isInterruptLine(e)) break;
+      if (isInterruptLine(e)) { hitBoundary = true; break; }
       // 回扫停在上一次**已放行**的 Stop(那一轮真收尾了,之前排队的话属于旧轮:红队终审 BP-3/6)。
       //   **被拦**的 Stop 不停——被拦后续跑仍是同一个用户轮,排队问的「X 是什么」、说的「别外审」都还算数。
-      if (e?.type === "system" && e.hookCount !== undefined && !isBlockedStop(pe, i, ids)) break;
+      if (e?.type === "system" && e.hookCount !== undefined && !isBlockedStop(pe, i, ids)) { hitBoundary = true; break; }
       if (e?.type === "assistant" && Array.isArray(e.message?.content)) {
         for (let j = e.message.content.length - 1; j >= 0; j--) {
           const b = e.message.content[j];
@@ -461,6 +480,28 @@ export function buildCtx(entries, extra = {}) {
     const head = qs.filter((q) => q && !userText.includes(q)).join("");
     userText = head + userText;
     turnLog.unshift(...prior.reverse());
+    // 批 285 D143⑫ 远端续扫(判据见 userTextFar 头注)。尾部按引用核:不是同源切片 ⇒ 不扫(回到改前判定)。
+    const scan = extra.priorScanEntries;
+    if (!hitBoundary && Array.isArray(scan) && scan.length > pe.length && pe.length > 0 && scan[scan.length - 1] === pe[pe.length - 1]) {
+      const farQs = [];
+      const sIds = blockedStopIds(scan);
+      for (let i = scan.length - pe.length - 1; i >= 0; i--) {
+        const e = scan[i];
+        // 批 285 第二轮复核(误拦猎手第 1 份附报,漏放):压缩摘要是模型转述不是用户原话,与窗口内(上方 isCompactSummary 跳过)同口径——
+        //   不收、不当轮边界,接着往前找真开口;原把摘要里转述的「别外审」当开口收进 userTextFar,白送 W 豁免。
+        if (e?.isCompactSummary === true) continue;
+        if (e?.type === "user" && e.origin?.kind === "human") {
+          const c = e.message?.content;
+          farQs.unshift(typeof c === "string" ? c + "\n" : Array.isArray(c) ? c.filter((b) => b?.type === "text").map((b) => (b.text || "") + "\n").join("") : "");
+          break;
+        }
+        if (isInterruptLine(e)) break;
+        if (e?.type === "system" && e.hookCount !== undefined && !isBlockedStop(scan, i, sIds)) break;
+        if (e?.type === "attachment" && e.attachment?.type === "queued_command" && e.attachment.origin?.kind === "human") farQs.unshift(queuedText(e.attachment.prompt));
+      }
+      userTextFar = cleanUser(farQs.join(""));
+      if (userTextFar.length > SCAN_CAP) userTextFar = userTextFar.slice(-SCAN_CAP);
+    }
   }
   // 用户面同样留尾不留头;清洗与截断在补收**之后**做,窗口内外同一道(a2155edb 附节二③)。
   userText = cleanUser(userText);
@@ -490,6 +531,8 @@ export function buildCtx(entries, extra = {}) {
    *
    *  取不到 ⇒ `null`(不是空对象):**「没有批次状态」与「批次状态是空的」是两件事**,
    *  后者才是「未武装」的证据。规则须自己判 null。 */
+  // 批 285(D128①):下方归一化**读**的输入键全集见模块级 BATCH_GOAL_INPUT_KEYS——加 / 删一个键两处同改,
+  //   自测「每个登记键都被读」钉住登记表不多列;验收台按它校验夹具子键,漏列的键在夹具里一写就报错(不会静默)。
   const batchGoal = (() => {
     const g = extra.batchGoal;
     // ⚠️ **三态,不是两态**(2026-08-20 迁 K/K0 时才补齐):
@@ -550,6 +593,8 @@ export function buildCtx(entries, extra = {}) {
   return {
     text, userText, actions, bashCmds, bashDialects, commits, writes, reads, toolNames, skills, written, isNew,
     window, batchGoal, turnLog,
+    /** 批 285 D143⑫:窗口前同一用户轮里用户亲口的话(只给 W 的用户免审;未注入 priorScanEntries / 近端已碰到边界 ⇒ "")。 */
+    userTextFar,
     /** 批 265:本仓是否立过批(实时 hook 注入:台账或状态文件在场)。false ⇒ K0 不判(批是可选做法);
      *  undefined = 没接这条通道(夹具 / 自测)⇒ 判法照旧。 */
     batchEverArmed: typeof extra.batchEverArmed === "boolean" ? extra.batchEverArmed : undefined,
@@ -701,6 +746,15 @@ export function selfTest() {
       chk(`动作只带 name / input / at(${isErr ? "报错" : "非报错"})`, JSON.stringify(Object.keys(ea("x", isErr)).sort()), JSON.stringify(["at", "input", "name"]));
     }
   }
+  // 批 285 D107:钉「条目 timestamp ⇒ 动作 at」与 codex 191 的 1970 修正(此前自测只核 at 这个键名在场)。
+  //   P 的红队凭证池主路径按 at 切;at 取错(或 epoch 被真值兜底吞成 null)⇒ 主路径静默退回整窗口。
+  {
+    const atOf = (ts) => buildCtx([{ type: "assistant", ...(ts === undefined ? {} : { timestamp: ts }), message: { content: [use("Bash", { command: "ls" })] } }]).actions[0].at;
+    chk("285 D107:timestamp ⇒ at(毫秒)", atOf("2026-09-09T10:00:00Z"), Date.parse("2026-09-09T10:00:00Z"));
+    chk("285 D107:1970 是合法时刻 ⇒ at=0(不被真值兜底吞成 null)", atOf("1970-01-01T00:00:00Z"), 0);
+    chk("285 D107:非法时间串 ⇒ null", atOf("不是时间"), null);
+    chk("285 D107:没有 timestamp ⇒ null(夹具 / 回退路径)", atOf(undefined), null);
+  }
   // ad3e4f93 附二:headFacts.base 只收全长 sha(短 sha ⇒ null ⇒ tally 不去重)
   chk("ad3e4f93:headFacts base 短 sha ⇒ null", buildCtx([A([txt("x")])], { headFacts: () => ({ base: "abc1234", commits: [] }) }).headFacts().base, null);
   chk("ad3e4f93:headFacts base 全长 ⇒ 透传", buildCtx([A([txt("x")])], { headFacts: () => ({ base: "b".repeat(40), commits: [] }) }).headFacts().base, "b".repeat(40));
@@ -832,6 +886,31 @@ export function selfTest() {
       const big = "x".repeat(SCAN_CAP + 100);
       const c12 = buildCtx([A([txt("收工")])], { priorEntries: [H(big), A([txt("做")]), ATT2("s1"), { ...SUMB, toolUseID: "s1" }, Q("winget 是什么?")] });
       chk("附节二③:补收后 userText 受 SCAN_CAP 约束且留尾(最近的排队问题还在)", c12.userText.length <= SCAN_CAP && c12.userText.includes("winget"), true);
+      // 批 285 D143⑫:轮开口滚出近端窗口。远端切片尾部就是近端切片(同一批对象)。
+      {
+        const near = [A([txt("做")]), ATT2("f1"), { ...SUMB, toolUseID: "f1" }, A([txt("补")])];
+        const far = (head) => [...head, ...near];
+        const ctxF = (head, more = {}) => buildCtx([A([txt("收工")])], { priorEntries: near, priorScanEntries: far(head), ...more });
+        const OPEN = H("这份 README 别外审了");
+        chk("D143⑫ 开口在近端窗口外 ⇒ userTextFar 收到", ctxF([OPEN, A([txt("开工")])]).userTextFar.includes("别外审"), true);
+        chk("D143⑫ 远端只给 W:userText 不变(ND 不因远端问句多拦)", ctxF([H("winget 是什么?"), A([txt("开工")])]).userText.includes("winget"), false);
+        chk("D143⑫ 远端只给 W:turnLog 不收远端", ctxF([H("winget 是什么?"), A([txt("开工")])]).turnLog.some((x) => x.k === "ask" && /winget/.test(x.v)), false);
+        chk("D143⑫ 远端遇已放行 Stop 即停(旧轮的免审不带进来)",
+          ctxF([OPEN, A([txt("做完")]), { type: "system", subtype: "stop_hook_summary", hookCount: 1, hookErrors: [] }, A([txt("新活")])]).userTextFar.includes("别外审"), false);
+        chk("D143⑫ 远端遇打断行即停", ctxF([OPEN, A([txt("做")]), INT, A([txt("接着做")])]).userTextFar.includes("别外审"), false);
+        chk("D143⑫ 远端被拦 Stop 不停(同一用户轮)", ctxF([OPEN, A([txt("做")]), ATT2("f0"), { ...SUMB, toolUseID: "f0" }]).userTextFar.includes("别外审"), true);
+        chk("D143⑫ 远端排队的免审也收", ctxF([H("先做甲"), Q("这份 README 别外审了"), A([txt("做")])]).userTextFar.includes("别外审"), true);
+        // 近端已碰到边界(开口在近端里)⇒ 不扫远端:远端里更早一轮的话不得带进来
+        chk("D143⑫ 近端碰到开口 ⇒ 不扫远端",
+          buildCtx([A([txt("收工")])], { priorEntries: [H("新活"), ...near], priorScanEntries: [OPEN, A([txt("旧")]), H("新活"), ...near] }).userTextFar, "");
+        // 尾部不是同一对象(不是同源切片)⇒ 不扫,回到改前判定
+        chk("D143⑫ 远端切片尾部对不上近端 ⇒ 不扫", buildCtx([A([txt("收工")])], { priorEntries: near, priorScanEntries: [OPEN, ...near.slice(0, -1), A([txt("补")])] }).userTextFar, "");
+        chk("D143⑫ 未注入远端 ⇒ 空串(旧调用方不变)", buildCtx([A([txt("收工")])], { priorEntries: near }).userTextFar, "");
+        chk("D143⑫ 本轮以用户亲口开头 ⇒ 不扫远端", buildCtx([H("新指令"), A([txt("收工")])], { priorEntries: near, priorScanEntries: far([OPEN]) }).userTextFar, "");
+        // 批 285 第二轮复核(误拦猎手第 1 份附报):远端遇压缩摘要不收(摘要转述的「别外审」不是用户原话)
+        const SUMM = { type: "user", origin: { kind: "human" }, isCompactSummary: true, message: { content: "摘要:用户先前说过这份 README 别外审了" } };
+        chk("285 二轮:远端压缩摘要不收", ctxF([H("先做甲"), A([txt("做")]), SUMM, A([txt("开工")])]).userTextFar.includes("别外审"), false);
+      }
     }
     // isBlockedStop:唯一实现的四种形态各一条
     {
@@ -924,6 +1003,16 @@ export function selfTest() {
     chk("批 256:提交信息单条封顶 8000", g256.batchLog[1].length, 8000);
     chk("批 256:基点不是 sha 形 ⇒ null(不透传任意串)", buildCtx(base, { batchGoal: { batch: "x", conditions: [], baseCommit: "HEAD; rm -rf" } }).batchGoal.baseCommit, null);
     chk("批 256:没注入提交信息 ⇒ null(AD 不判)", buildCtx(base, { batchGoal: { batch: "x", conditions: [] } }).batchGoal.batchLog, null);
+    // 批 285(D128①):BATCH_GOAL_INPUT_KEYS 每个登记键都真被读——逐个删掉,归一化输出必须变(登记表不多列;
+    //   漏列的方向由验收台的子键校验当场报错兜住)。
+    const full = { batch: "285", armedAt: "2026-10-28T00:00:00Z", clearedArmedAt: "2026-10-27T00:00:00Z",
+      priorClosedArmedAt: "2026-10-26T00:00:00Z", turnBatchStart: "2026-10-25T00:00:00Z", cleared: true, foreign: true,
+      clearRefusedAt: "2026-10-28T01:00:00Z", conditions: ["甲"], closedConditions: ["乙"], priorClosedBatch: "284",
+      priorClosedConditions: ["丙"], baseCommit: "3eaadf4", decisions: [{ id: "285-D1" }], batchLog: ["m"] };
+    chk("285 D128①:夹具全集恰覆盖登记键", Object.keys(full).sort().join(","), [...BATCH_GOAL_INPUT_KEYS].sort().join(","));
+    const outOf = (g) => JSON.stringify(buildCtx(base, { batchGoal: g }).batchGoal);
+    const unread = BATCH_GOAL_INPUT_KEYS.filter((k) => { const { [k]: _drop, ...rest } = full; return outOf(rest) === outOf(full); });
+    chk("285 D128①:每个登记键删掉后输出都变(都被读)", unread.join(","), "");
   }
 
   // ── 批 255:isNew 按目标 checkout 取追踪集 ──────────────────────────────────
@@ -955,6 +1044,22 @@ export function selfTest() {
     chk("255④ 未注入 ⇒ 原判据(worktree 既有文件仍判新建)", legacy.isNew(`${W}/docs/a.md`), true);
     chk("255④ 未注入 ⇒ 原判据(主树既有 ⇒ 非新建)", legacy.isNew(`${M}/docs/shared.md`), false);
     chk("255④ 只注入一个函数 ⇒ 原判据", buildCtx([A([txt("x")])], { tracked: idx[M], checkoutOf }).isNew(`${W}/docs/a.md`), true);
+    // 批 285 D138⑥:批 255 的 6 条变异当时是一次性手跑、没接进验收台;下面各条分别钉住 isNewInCheckout 里一个分支,
+    //   删掉 / 改坏该分支即有一条转红(本批手跑核过,见提交信息)。
+    // preExisted 在按 checkout 取证这一支里同样认(worktree 未追踪、写前实测已存在 ⇒ 非新建;删掉该行即红)
+    chk("285 D138⑥ checkout 支认 preExisted(写前已存在)", inj({ preExisted: new Set([`${W}/docs/untracked.md`]) }).isNew(`${W}/docs/untracked.md`), false);
+    chk("285 D138⑥ 对照:无 preExisted ⇒ 新建", inj().isNew(`${W}/docs/untracked.md`), true);
+    // 前缀比对带分隔符:root=E:/r 不得认领 E:/r2/…(改成裸 startsWith 即红)——认领了会拿 E:/r 的索引判 E:/r2 的文件
+    chk("285 D138⑥ 根前缀须到分隔符为止(E:/r 不认领 E:/r2)",
+      buildCtx([A([txt("x")])], { tracked: new Set(), checkoutOf: () => M, trackedIn: () => new Set(["/docs/a.md", "2/docs/a.md", "docs/a.md"]), hookCheckout: M }).isNew("E:/r2/docs/a.md"), true);
+    // 根与路径大小写不一(Windows 盘符)⇒ 仍同根(去掉 toLowerCase 即红)
+    chk("285 D138⑥ 根比对不分大小写", buildCtx([A([txt("x")])], { checkoutOf: () => "e:/R", trackedIn: () => new Set(["docs/a.md"]) }).isNew("E:/r/docs/a.md"), false);
+    // checkoutOf / trackedIn 抛错:前者回原判据、后者按新建(去掉 try 即整个 isNew 抛错)
+    // (用 worktree 里的既有文件:按 checkout 取证判非新建,原判据经 relOf 剥不出主树键 ⇒ 判新建,两条路结论相反才有鉴别力)
+    chk("285 D138⑥ checkoutOf 抛错 ⇒ 原判据", inj({ checkoutOf: () => { throw new Error("x"); } }).isNew(`${W}/docs/a.md`), true);
+    chk("285 D138⑥ trackedIn 抛错 ⇒ 新建", inj({ trackedIn: () => { throw new Error("x"); } }).isNew(`${M}/docs/a.md`), true);
+    // hookCheckout 未注入 ⇒ justAdded 照旧参与(sameAsHook 默认真;改成默认假即红)
+    chk("285 D138⑥ 未注入 hookCheckout ⇒ justAdded 照旧参与", buildCtx([A([txt("x")])], { tracked: idx[M], checkoutOf, trackedIn, justAdded: new Set(["docs/a.md"]) }).isNew(`${W}/docs/a.md`), true);
   }
 
   let pass = 0;

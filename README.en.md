@@ -72,7 +72,7 @@ Full tour and build order: [`docs/playbook.md`](docs/playbook.md), a build manua
 
 ## The gate is gated too
 
-- **Mutation acceptance**: every rule ships at least 2 mutations that break its predicate, and its fixtures must kill all of them (`gate-migrate-check.mjs`). On the day this went live, 40 of 97 mutations survived the existing suite.
+- **Mutation acceptance**: every rule ships at least 2 mutations that break its predicate, and its fixtures must kill all of them (`gate-migrate-check.mjs`). On the day this went live, 40 of 97 mutations survived the existing suite (a one-off historical measurement recorded by the author in 2026-08; there is no script in this repo that recomputes it).
 - **Load-time invariants**: blocking rules must carry a law anchor and positive/negative cases; the check runs in the production hook, not only in CI.
 - **False-positive ledger**: every alert goes into a denominator ledger; claimed false positives are recorded with a reason. Misses cannot be measured, so the report prints `RECALL=UNKNOWN`.
 - **Debts expire**: each known defect is a ledger row with a batch deadline and returns to the to-do list when it expires (listed by `batch-goal --arm`).

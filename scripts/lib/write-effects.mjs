@@ -195,7 +195,8 @@ export function analyzeBash(cmd, opts = {}) {
   if (tree.rootNode.hasError) { res.incomplete.push("语法树有错"); return res; }
   res.ok = true;
   const root = opts.root ?? process.cwd();
-  // op:"write"(可能新建的落点)/"modify"(只改既有文件,如 sed -i,不会新建)/"delete"(rm、mv 的源)。
+  // op:"write"(可能新建的落点)/"modify"(只改既有文件,如 sed -i,不会新建)/"delete"(rm、mv 的源)/
+  //   "restore"(批 285 D160③:从索引 / HEAD 还原已追踪文件,不会新建)。
   //   调用方判「新建」时只看 write(红队 a391d46c BP-8:`sed -i … "scripts/$name.mjs"` 改既有脚本被 I 判新建)
   const isAbs = (s) => /^(?:[A-Za-z]:[\\/]|\/|~)/.test(s);
   const pushLit = (s, cwd, via, op, expr) => {
@@ -237,13 +238,55 @@ export function analyzeBash(cmd, opts = {}) {
     //      替换文本、断言字符串里提到的 `AGENTS.md` 不是落点(BP-3 语料实撞 3 条);
     //   ③ 带插值的路径(f'{root}/docs/laws/x.md'、`${root}/AGENTS.md`):插值换 X,按形状判(BP-1)。
     //   有非字面写调用时 hint 照给(只供不问新旧的调用方用,见 touched)。
+    // 批 285(D159⑩ 误拦余项):**读调用实参里的路径不是落点**。`readFileSync(\`${cwd}/AGENTS.md\`)` 读宪法、往 clipboard 写
+    //   (写调用的落点是变量)⇒ 插值候选 `X/AGENTS.md` 让 J 判「改宪法」;`open('AGENTS.md').read()` 同理。
+    //   只剔**位置落在读调用实参区间内**的候选(按位置,不按字面:同一路径若另在写调用 / path.join 里出现,那一处照算)。
+    //   读调用 = 返回内容或布尔、不返回路径的那些(readFileSync / existsSync / statSync …;realpathSync / readlinkSync 返回路径、
+    //   可能再被写,不列);python `open(…)` 无写模式串、`Path(…).read_text()/read_bytes()`。
+    //   代价:漏放只在「读调用的实参本身又是写落点」时出现——这类读 API 的返回值不是路径,构不成;变量装路径再写(⑩)本来就看不见。
+    //   失效条件:J 正例「285 D159:读…写同一插值路径」或反例「285 D159:读宪法写 clipboard」翻红。
+    const readRanges = [];
+    const argEnd = (i) => {   // T[i] === "(" ⇒ 配对右括号下标(引号内的括号不计);配不上 ⇒ T.length
+      let d = 0, q = null;
+      for (let j = i; j < T.length; j++) {
+        const ch = T[j];
+        if (q) { if (ch === "\\") j++; else if (ch === q) q = null; continue; }
+        if (ch === "'" || ch === '"' || ch === "`") { q = ch; continue; }
+        if (ch === "(") d++;
+        else if (ch === ")" && --d === 0) return j;
+      }
+      return T.length;
+    };
+    for (const m of T.matchAll(/\b(?:readFileSync|readFile|createReadStream|existsSync|statSync|lstatSync|accessSync|readdirSync|open|Path)\s*\(/g)) {
+      const o = m.index + m[0].length - 1, e = argEnd(o);
+      const args = T.slice(o + 1, e);
+      // open(…) 只在「单参」或「第二参是不带 w/a/x/+ 的字面模式串」时算读;模式是变量 / 关键字参数以外的形状 ⇒ 不剔(拿不准取误拦侧)
+      if (/^open\b/.test(m[0])) {
+        let d = 0, q = null, comma = -1;
+        for (let j = 0; j < args.length && comma < 0; j++) {
+          const ch = args[j];
+          if (q) { if (ch === "\\") j++; else if (ch === q) q = null; continue; }
+          if (ch === "'" || ch === '"' || ch === "`") q = ch;
+          else if (ch === "(" || ch === "[" || ch === "{") d++;
+          else if (ch === ")" || ch === "]" || ch === "}") d--;
+          else if (ch === "," && d === 0) comma = j;
+        }
+        if (comma >= 0 && !/^\s*(?:mode\s*=\s*)?(['"])[rRbBtU]*\1\s*(?:,|$)/.test(args.slice(comma + 1))) continue;
+      }
+      if (/^Path\b/.test(m[0]) && !/^\)\s*\.\s*(?:read_text|read_bytes|exists|is_file|stat)\s*\(/.test(T.slice(e))) continue;   // Path(…) 之后不是读方法 ⇒ 不剔
+      readRanges.push([o, e]);
+    }
+    const inRead = (i) => readRanges.some(([a, b]) => i > a && i < b);
     const seen = new Set();
     for (const m of T.matchAll(/(['"`])((?:[A-Za-z]:[\\/]|~[\\/]|\.{0,2}[\\/])?[\w.@~-]+(?:[\\/][\w.@~-]+)+)\1/g))
-      if (/[\\/][\w@~-][\w.@~-]*\.[A-Za-z][A-Za-z0-9]{0,7}$/.test(m[2])) seen.add(m[2]);
-    for (const m of T.matchAll(/\b(?:join|resolve|Path|open|PurePath)\s*\(((?:[^()]|\([^()]*\))*)\)/g))
-      for (const q of m[1].matchAll(/(['"])([\w@~-][\w.@~-]*\.[A-Za-z][A-Za-z0-9]{0,7})\1/g)) seen.add(q[2]);
+      if (/[\\/][\w@~-][\w.@~-]*\.[A-Za-z][A-Za-z0-9]{0,7}$/.test(m[2]) && !inRead(m.index)) seen.add(m[2]);
+    for (const m of T.matchAll(/\b(?:join|resolve|Path|open|PurePath)\s*\(((?:[^()]|\([^()]*\))*)\)/g)) {
+      const base = m.index + m[0].indexOf("(") + 1;
+      for (const q of m[1].matchAll(/(['"])([\w@~-][\w.@~-]*\.[A-Za-z][A-Za-z0-9]{0,7})\1/g)) if (!inRead(base + q.index)) seen.add(q[2]);
+    }
     for (const c of seen) addLit(c, cwd, via + "(载荷里的路径,可能被写)");
     for (const m of T.matchAll(/(?:\bf|\$)?(['"`])([^'"`\n]*(?:\{[^}\n]*\})[^'"`\n]*)\1/g)) {
+      if (inRead(m.index)) continue;   // 批 285 D159⑩:读调用实参里的插值路径不是落点
       const shape = m[2].replace(/\$?\{[^}]*\}/g, "X").replace(/\\/g, "/");
       if (/\//.test(shape) && /\.[A-Za-z][A-Za-z0-9]{0,7}$/.test(shape)) res.effects.push({ known: false, expr: m[0], suffix: "", pattern: shape, via: via + "(插值路径)", op: "write" });
     }
@@ -584,11 +627,25 @@ export function analyzeBash(cmd, opts = {}) {
           if (sub === "restore" && flags.some((f) => /^(?:--staged|-S)$/.test(f)) && !flags.some((f) => /^(?:--worktree|-W)$/.test(f))) return;
           const dd = rest.findIndex((w) => w.v === "--");
           const paths = dd >= 0 ? rest.slice(dd + 1) : sub === "restore" ? nonOpt(rest) : [];
+          // 批 285(D160③ 误拦):**从索引 / HEAD 还原**(`git restore 路径` 不带 --source、`git checkout [HEAD|@] -- 路径`)只是丢弃改动,
+          //   能还原出来的文件必在索引或 HEAD 里(已追踪),这一步造不出新载体。原 op=write 让 I / G① 走 isNew,
+          //   文件若恰在最近一次新增提交里(justAdded,名不副实——见 gate-ctx 注③)就判「新建」⇒ 丢弃改动被 I 拦。
+          //   改记 op=restore:只问新建的调用方(touched 的 onlyNew)跳过,J 这类不问新旧的照算。
+          //   从别的版本拣(`--source` / `-s`、`checkout <rev> --`,rev 非 HEAD)仍记 write——会新建(红队收口轮 BP-3)。
+          //   代价:索引里有、HEAD 里没有的「已暂存未提交新载体」被删后再 restore 回来,I 不再在这一步看见;它当初被写出来那一步照算。
+          const revs = dd >= 0 ? nonOpt(rest.slice(0, dd)) : [];
+          // 批 285 第二轮复核(派出方追加,红队第 1 份):git 认长选项的无歧义缩写与短选项捆绑——`--sour=x` / `--so x`
+          //   (`--source` 的 ≥2 字母前缀;restore 里 `--s` 与 --staged 有歧义、git 拒收)、`-Ws x` / `-Wsx` / `-sW`(捆绑里含 s,
+          //   s 之前只能是不带值的 W / S / p / q / m)都算带来源 ⇒ 记 write,I 照拦。原只认全拼 `--source` 与 `-s` 起头。
+          //   只会把「丢弃改动」误认成「拣回」的方向多算(fail-closed);诚实的 `restore --staged -W 路径` 不含 s,不受影响。
+          const fromIndexOrHead = sub === "restore"
+            ? !flags.some((f) => /^--so(?:u(?:r(?:c(?:e)?)?)?)?(?:=|$)/.test(f) || /^-(?!-)[WSpqm]*s/.test(f))
+            : dd >= 0 && (revs.length === 0 || (revs.length === 1 && revs[0].v != null && /^(?:HEAD|@)$/.test(revs[0].v)));
           for (const w of paths) {
             if (w.v != null && /^-/.test(w.v)) continue;
             if (w.v != null && (/[\\/]$/.test(w.v) || isDirOnDisk(w.v, gs.cwd))) res.effects.push({ known: false, expr: w.v, suffix: "", pattern: normalize(joinCwd(gs.cwd ?? "X", w.v.replace(/[\\/]+$/, "")), root) + "/X.md", via: `git ${sub}`, op: "modify" });
             // op=write:checkout / restore 对工作树里不存在的路径会新建(从别的分支拣回新脚本),新旧交 isNew 判(红队收口轮 BP-3)
-            else gAdd(w, `git ${sub}`, "write");
+            else gAdd(w, `git ${sub}`, fromIndexOrHead ? "restore" : "write");
           }
         }
         return;
