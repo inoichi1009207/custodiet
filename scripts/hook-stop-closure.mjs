@@ -96,7 +96,7 @@ const BLOCK_ON_R = process.env.STOP_CLOSURE_BLOCK_R !== "0";
 //   优先未结清,其次武装时刻最新;一个都不是本会话的 ⇒ 照旧读主树(外来批由 S / K 的 foreign 处理)。
 //   只在生产路径生效(`_liveSid` 由生产段设);自测、回放、CLI 一律读当前目录。
 //   代价:每次 Stop 多读 worktree 数个小 JSON;worktree 里的批状态被手改成「本会话的」可让闸读它(属故意伪造,同 armedBy 天花板)。
-let _liveSid = null, _liveCwd = null, _batchDirMemo = null;
+let _liveSid = null, _liveCwd = null, _batchDirMemo = null, _turnRanClear = false;
 //   红队 285 第 4 份 BP-1 / BP-2 / 误拦 BP-3 后改:
 //   ① 排序先比**批号**(数字部分,再比后缀;batch-goal 拒绝复用已结清的批号 ⇒ 批号只增)——原「未结清优先」会挑中别的 worktree 里
 //     忘了关的**旧**批(284),主树已结清 285 之后照常动工 K0 不响(BP-1);同号再比未结清优先、武装时刻;
@@ -141,7 +141,10 @@ export function mergeJournalRows(lists) {
 //     · 否则取武装最新的未结清批;都结清了取武装最新的。
 //     三轮报过的排布(旧批没关、跨 checkout 关旧开新、同轮结清、具名批、插做小批)逐一核过;cwd 取不到时退回后两条。
 //     代价(漏放,接受):cwd 不在任何本会话 checkout 里、又有忘了关的旧批时,读那份旧批(K0 不响)。
-export function pickBatchDir(cands, sid, entries, cwdDir = null) {
+//   ⑤ 最后一轮误拦猎手 FB-1:插做小批并**当轮结清**时,上面的「有未结清就读它」读到另一份没结清的批 ⇒ K 报「结清半路出错」,出路只剩谎标 ⏸。
+//     ⇒ 本轮跑过 --clear(turnRanClear)时,若本会话有一份**武装晚于所有未结清批**的结清态,读它(那才是刚关掉的批)。
+//     代价(漏放,接受):本轮 --clear 被拒、而另有一份更晚的旧结清态时读旧的,K 不响。
+export function pickBatchDir(cands, sid, entries, cwdDir = null, turnRanClear = false) {
   const mine = [];
   for (const c of cands) if (ownBatchCand(c, sid, entries)) mine.push({ dir: c.dir, cleared: !!c.g.cleared, t: Date.parse(String(c.g.armedAt || "")) || 0 });
   if (!mine.length) return ".";
@@ -151,6 +154,10 @@ export function pickBatchDir(cands, sid, entries, cwdDir = null) {
   //   收口红队 BP-1(cwd 停主树、批在 worktree)随之堵上;剩下的漏放只有「真忘了关的旧批」——登记 D192。
   const unc = mine.filter((x) => !x.cleared);
   const here = cwdDir ? mine.find((x) => x.dir === cwdDir) : null;
+  if (turnRanClear && unc.length) {
+    const cl = newest(mine.filter((x) => x.cleared));
+    if (cl && cl.t > Math.max(...unc.map((x) => x.t))) return cl.dir;
+  }
   if (unc.length) return (here && !here.cleared ? here : newest(unc)).dir;
   return (here || newest(mine)).dir;
 }
@@ -174,7 +181,7 @@ function batchDir() {
     const cwdDir = cwdBatchDir(_liveCwd, process.cwd());
     // 收口红队附三:cwdBatchDir 已整体转小写 ⇒ 这里比对也转小写(worktree 目录名带大写时原来永远对不上,静默退回「最新未结清」)
     const hit = cwdDir ? cands.find((c) => c.dir.replace(/\\/g, "/").toLowerCase() === cwdDir) : null;
-    _batchDirMemo = pickBatchDir(cands, _liveSid, _allEntriesCache || [], hit ? hit.dir : null);
+    _batchDirMemo = pickBatchDir(cands, _liveSid, _allEntriesCache || [], hit ? hit.dir : null, _turnRanClear);
     _ownDirsMemo = ownBatchDirs(cands, _liveSid, _allEntriesCache || []);
   } catch { _batchDirMemo = "."; }
   return _batchDirMemo;
@@ -2841,6 +2848,12 @@ export function run(transcriptPath, ctx = {}) {
   const entries = ctx.entries ? ctx.entries : (transcriptPath ? readTranscript(transcriptPath) : []);
   const turn = ctx.turn !== undefined ? ctx.turn : lastTurn(entries);
   _allEntriesCache = entries;      // 供 `_priorWindow()` 取跨轮窗口(见其头注)
+  // 批 285 最后一轮(误拦猎手 FB-1):本轮跑没跑过 batch-goal --clear(段首是 node、不是读/打印命令),供 pickBatchDir 选结清态
+  try {
+    _turnRanClear = (Array.isArray(turn) ? turn : []).some((e) => ((e && e.message && e.message.content) || []).some((b) =>
+      b && b.type === "tool_use" && /^(Bash|PowerShell)$/.test(String(b.name || "")) &&
+      segments(String((b.input && b.input.command) || "")).some((s) => /^\s*(?:\w+=\S*\s+)*node\b[^\n]*batch-goal\.mjs[^\n]*--clear\b/.test(String(s)))));
+  } catch { _turnRanClear = false; }
   const text = ctx.text !== undefined ? ctx.text : assistantText(turn);
   const tools = toolNames(turn);
 
@@ -5239,6 +5252,11 @@ function selfTest() {
               pickBatchDir([C(wtA, { batch: "285", armedBy: me, cleared: true, armedAt: "2026-10-28T05:00:00Z" }), C(wtB, { batch: "284", armedBy: me, conditions: ["b"], armedAt: "2026-10-28T03:00:00Z" })], me, [], wtA), wtB);
             hp("285 收口 FB-2:主树 285 未结清 + 会话进 worktree hw 做小批并结清、cwd 留在 hw ⇒ 读主树 285(不误拦)",
               pickBatchDir([C(".", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".claude/worktrees/hw", { batch: "hw-x", armedBy: me, cleared: true, armedAt: "2026-10-28T06:00:00Z" })], me, [], ".claude/worktrees/hw"), ".");
+            // 最后一轮误拦猎手 FB-1:插做小批并当轮结清 ⇒ 本轮跑过 --clear 时读那份更晚的结清态(K 不误报「结清半路出错」)
+            hp("285 末轮 FB-1:主树 285 未结清 + worktree hw 小批当轮结清(本轮跑过 --clear)⇒ 读 hw 结清态",
+              pickBatchDir([C(".", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".claude/worktrees/hw", { batch: "hw-x", armedBy: me, cleared: true, armedAt: "2026-10-28T06:00:00Z" })], me, [], ".claude/worktrees/hw", true), ".claude/worktrees/hw");
+            hp("285 末轮 FB-1 对照:同排布本轮没跑 --clear ⇒ 读未结清的 285",
+              pickBatchDir([C(".", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".claude/worktrees/hw", { batch: "hw-x", armedBy: me, cleared: true, armedAt: "2026-10-28T06:00:00Z" })], me, [], ".claude/worktrees/hw", false), ".");
             hp("285 收口 红队 BP-1:worktree 285 未结清 + 主树插做并结清的小批,cwd 在主树 ⇒ 读 worktree 285",
               pickBatchDir([C(".claude/worktrees/batch285", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".", { batch: "hw-check-skill", armedBy: me, cleared: true, armedAt: "2026-10-28T06:10:00Z" })], me, [], "."), ".claude/worktrees/batch285");
             // batch-goal --clear 留下的结清态形状(cleared + batch + armedBy + armedAt,无 conditions)照样被认作本会话的
