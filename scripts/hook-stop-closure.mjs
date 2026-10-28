@@ -2340,13 +2340,12 @@ function readPLedger(sid) {
 //   旧账没有 bySid ⇒ 各会话从 0 起(一次性少计,漏放方向,按用户「误拦比漏放贵」接受)。去重用的 shas 跟着按会话分(每格封顶 200,codex 284-r1 附 1);
 //   顶层 shas 只为旧版读者保留并集;`hunted` 仍全仓共用(D11 按 sha 认账要跨会话)。
 const pSidKey = (sid) => (typeof sid === "string" && (/^[\w-]{8,80}$/.test(sid) || /^batch-[\w-]{1,40}$/.test(sid)) ? sid : "_");
-/** 红队 284 终版 BP-3:只按会话号分格 ⇒ 一批拆到几个会话里做(交接单续跑 / `/clear`)每个会话都从 0 起,宽限永远攒不满。
- *  ⇒ 格键优先取**本会话的批**(盘上批状态、不是外来批;已结清的也算——结清那一轮不能因换键而把欠账清掉),没有批才退回会话号。
- *  并行会话各武装各的批号 ⇒ 不同格,不会互相攒;同一批跨会话续做 ⇒ 同一格。 */
-export function pLedgerKey(g, foreign, sid) {
-  const b = g && typeof g === "object" && !foreign ? String(g.batch ?? "").replace(/[^\w-]/g, "") : "";
-  return b ? `batch-${b}` : sid;
-}
+/** P 账的格键 = 会话号。
+ *  批 284 曾按「本会话的批」分格(红队 284 终版 BP-3:按会话分格时一批拆到几个会话做就从 0 起),
+ *  红队 4b92c89 BP-1 证它更坏:每开新批号就从 0 起,08-22 亲签的「跨批持久计账」整个失效 ⇒ 284b 退回按会话号。
+ *  接受的漏放(用户「误拦比漏放贵」):换会话(交接续跑 / `/clear`)从 0 起;D11 两猎手那格不走宽限,不受影响。
+ *  保留函数形状(g / foreign 不再参与),调用点与自测不必两改。 */
+export function pLedgerKey(_g, _foreign, sid) { return sid; }
 export function pLedgerView(j, sid) {
   const by = j && j.bySid && typeof j.bySid === "object" && !Array.isArray(j.bySid) ? j.bySid : null;
   const e = by ? by[pSidKey(sid)] : null;
@@ -2832,15 +2831,8 @@ export function run(transcriptPath, ctx = {}) {
       //   且旧的产出已被 `kept` 丢掉 ⇒ 标准的「两边都不响」,而 emit 会打印
       //   「收尾闸:全跑,无命中。」——与真·全过逐字节相同。
       //   `gate-ctx.mjs` 早就备好了 `extra.lastAssistantMessage` 这个入口,缝没接。
-      // 红队 284 终版 BP-3:P 账的格键(本会话的批 > 会话号;判法同 batchGoal 注入处的 isForeignBatch)
-      const _pKey = ctx.pLedger !== undefined ? ctx.sessionId : (() => {
-        try {
-          const g0 = readBatchGoal();
-          if (!g0 || typeof g0 !== "object") return ctx.sessionId;
-          const { foreign: _f, ...g } = g0;
-          return pLedgerKey(g, isForeignBatch(g, ctx.sessionId, _allEntriesCache), ctx.sessionId);
-        } catch { return ctx.sessionId; }
-      })();
+      // P 账的格键(284b 退回会话号,见 pLedgerKey 头注)
+      const _pKey = pLedgerKey(null, false, ctx.sessionId);
       const eCtx = buildCtx(turn, {
         // tracked / justAdded(grill A3:少了它「取证时机前移」原样失效)/ preExisted(D56)/
         //   checkoutOf + trackedIn + hookCheckout(批 255:按目标 checkout 取追踪集)——全部来自 `isNewEvidence`
@@ -4845,13 +4837,13 @@ function selfTest() {
           hp("P 284 分账:别的会话那格保留、本会话写新值、shas 与盘上现账取并集",
             JSON.stringify([m1.bySid["aaaaaaaa-1"].n, m1.bySid["bbbbbbbb-2"].n, m1.shas]), JSON.stringify([4, 1, [S1, S2]]));
           hp("P 284 分账:读本会话那格", pLedgerView(m1, "aaaaaaaa-1").carriers, 4);
-          hp("P 284 终版 BP-3:格键取本会话的批(含已结清),外来批 / 无批退回会话号",
-            [pLedgerKey({ batch: "284" }, false, "s1"), pLedgerKey({ batch: "284", cleared: true }, false, "s1"), pLedgerKey({ batch: "280" }, true, "s1"), pLedgerKey(null, false, "s1")].join(), "batch-284,batch-284,s1,s1");
-          hp("P 284 终版 BP-3:同一批跨会话续做 ⇒ 同一格累计", pLedgerView(mergePLedger(null, { carriers: 4, shas: [], hunted: [] }, "batch-284", "t"), "batch-284").carriers, 4);
+          // 红队 4b92c89 BP-1:按批分格时换批号即从 0 起(跨批计账失效)⇒ 284b 退回按会话号;本例钉住「换批号不换格」
+          hp("P 284b:格键恒为会话号(换批号不清零)",
+            [pLedgerKey({ batch: "285" }, false, "aaaaaaaa-1"), pLedgerKey({ batch: "286" }, false, "aaaaaaaa-1"), pLedgerKey(null, false, "aaaaaaaa-1")].join(), "aaaaaaaa-1,aaaaaaaa-1,aaaaaaaa-1");
           {
             const bg = buildCtx([{ type: "assistant", timestamp: iso(T0), message: { content: [{ type: "tool_use", name: "Bash", input: { command: "pnpm test:all && git commit -am x", run_in_background: true } }] } }],
               { pLedger: { carriers: 0 }, headFacts: () => ({ root: "/repo", head: HD, commits: [{ ...mine, at: iso(T0 + 1200e3) }] }) });
-            hp("P 284 终版 BP-2:后台命令的提交落在 +1200 秒仍认领", P_.tally(bg).n, 1);
+            hp("P 284b(误拦猎手终版 FB-1):后台命令窗口退回 900 秒,+1200 秒的提交不认领(接受的漏放)", P_.tally(bg).n, 0);
           }
           hp("P 284 codex 附 1:去重 shas 按会话分(别的会话记过的 sha 不挡本会话)",
             JSON.stringify([pLedgerView(m1, "bbbbbbbb-2").shas, pLedgerView(m1, "aaaaaaaa-1").shas]), JSON.stringify([[S2], []]));
