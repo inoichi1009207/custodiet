@@ -2651,6 +2651,11 @@ const RULE_K = {
   _detect: (ctx) => {
     const g = ctx.batchGoal;
     if (!g || g.cleared) return [];                       // 已结清 ⇒ 结清成功了,关账对照归 K0
+    // 批 284(281 留账,实撞):盘上这批是别的会话武装的(hook 侧 isForeignBatch 打 foreign)⇒ 当作没有批,与 S 同口径。
+    //   281 那次:我在 worktree 里 --clear 了自己的批,收尾闸读的是主树台账上别的会话的批 280,判成「结清半路出错」。
+    //   代价(漏放方向):本会话在别的 checkout 里结清失败时,这里看不见——那个 checkout 的批状态本会话下次武装 / 结清时自会报;
+    //   `/clear` 后会话号换了,自己原来武装的批也判成外来、结清失败不追(红队 284 终版 BP-5;同 S 的已知上限,isForeignBatch 头注)
+    if (g.foreign) return [];
     const conds = Array.isArray(g.conditions) ? g.conditions : [];
     if (!conds.length) return [];                         // 从未武装 ⇒ K0
     // 「尝试过结清」看动作面,**不走 ranClear 的拒清例外**:ranClear 在带拒清痕迹时恒返回 false,
@@ -2710,6 +2715,8 @@ const RULE_K = {
       `真要放弃本批,明说并留痕;要停下问用户,标 ⏸ 并写明停工类别。`;
   },
   mutations: [
+    // 批 284:外来批照追 ⇒ worktree 里结清自己的批被主树别人的批拦。证人 = neg「K 284:外来批不追结清」
+    { name: "外来批照追结清", apply: (r) => ({ ...r, detect: (ctx) => RULE_K._detect(ctx && ctx.batchGoal && ctx.batchGoal.foreign ? { ...ctx, batchGoal: { ...ctx.batchGoal, foreign: false } } : ctx) }) },
     // 退回瘦身前:批开着就每轮报 ⇒ 空转回来。证人 = neg「武装批、只说话」。
     { name: "恢复每轮提醒(批开着就报)", apply: (r) => ({ ...r, detect: (ctx) => {
       const g = ctx.batchGoal;
@@ -2797,6 +2804,9 @@ const RULE_K = {
         batchGoal: { batch: "250", conditions: ["甲", "乙"] } },
     ],
     neg: [
+      // 批 284(281 实撞):在 worktree 里结清了自己的批,盘上读到的是别的会话武装的批 ⇒ 不响
+      { name: "K 284:外来批不追结清", text: "批 281 结清。", bash: "cd .claude/worktrees/batch281 && node --no-warnings scripts/batch-goal.mjs --clear",
+        batchGoal: { batch: "280", conditions: ["甲", "乙"], foreign: true } },
       // 武装批、只说话(瘦身前每轮提醒的主形态)。
       { text: "这个字段存的是批号。", batchGoal: { batch: "250", conditions: ["甲", "乙"] } },
       // 武装批、中途提交、零对照。
@@ -4657,17 +4667,67 @@ const RULE_P = {
       const f = H.facts(ctx);
       if (!f) return { n: Math.max(H.carrierCommitCount(ctx), 1), shas: [] };
       const seen = new Set(((ctx.pLedger && ctx.pLedger.shas) || []).map((s) => String(s).toLowerCase()));
+      const own = H.ownCommitFilter(ctx);
       // 去重键(codex 257-p-agg-r1 断言 2 证伪「HEAD sha 去重」):聚合项代表「基点..HEAD」整段,只按 HEAD sha 去重时,
       //   基点回退再前进到同一 HEAD,范围变大却被整项吞掉(61 笔历史实测最后一步计 0)。改按范围 `agg:<基点>..<HEAD>` 去重;
       //   取不到基点 ⇒ 不去重(重计,偏严)。普通提交仍按自身 sha。
       const key = (c) => (c.aggregated ? (f.base && c.sha ? `agg:${f.base}..${c.sha}`.toLowerCase() : null) : (c.sha ? String(c.sha).toLowerCase() : null));
-      const fresh = H.gitCarrierCommits(f).filter((c) => { const k = key(c); return !(k && seen.has(k)); });
+      // 批 284(交接单 20261028 第三条):只数本会话自己的提交(ownCommitFilter);别人的不计、也不记进 shas(留给它的主人计)
+      const fresh = H.gitCarrierCommits(f).filter(own).filter((c) => { const k = key(c); return !(k && seen.has(k)); });
       const away = H.elsewhereHit(ctx, f) ? (H.commitsElsewhere(ctx, f) ? Math.max(H.carrierCommitCount(ctx), 1) : 1) : 0;
       // 红队 a9af71da BP-1:聚合项(范围超 CAP,整段当一笔)带承重改动 ⇒ 按范围提交数 `count` 计(其中几笔带承重改动取不到,
       //   按全数计);count 缺 ⇒ 61——是下界不是上界(实际 75 笔取不到总数时计 61),仍远超宽限门槛 5,方向上照拦。
       //   去重按范围键(见上):同一段范围不重计;范围变了(HEAD 前移或基点变)⇒ 整段再计一次(偏严)。
       const weight = (c) => (c.aggregated ? (Number.isInteger(c.count) && c.count > 0 ? c.count : H.AGG_MIN) : 1);
       return { n: fresh.reduce((s, c) => s + weight(c), 0) + away, shas: fresh.map(key).filter((s) => typeof s === "string" && s) };
+    },
+
+    /** 批 284(交接单 20261028 第三条,某会话 实撞):三通道的承重提交计数按仓不按会话——范围里别的会话的提交
+     *  (共用 checkout 里落进本会话 HEAD 的)也算进本会话的配额:批 280 那次本会话只提交了 1 笔 docs-only,P 报「本批 5 次」。
+     *  修法 = 按时刻认领:本会话(窗口 ∪ 本轮)的提交类命令执行时刻附近落的提交才算本会话的——
+     *    · 产生提交的命令(git commit / merge / pull / revert / cherry-pick / 别名 / 包装,见下面 NO_COMMIT 反向表)⇒
+     *      提交时刻落在命令时刻 −120 秒 ~ +900 秒(合并类原「之前全部都算」一支已撤,误拦猎手 284 FB-1 / FB-2)。
+     *  返回谓词;动作全无时刻(夹具 / 回放)⇒ 恒真(旧判法)。聚合项、提交缺时刻 ⇒ 算(偏严)。解析失败的命令按提交命令算。
+     *  只影响三通道的计数(tally);D11 的改闸提交另由 selfTouched 判(批 279),不走这里。
+     *  代价(漏放方向,按用户「误拦比漏放贵」接受):子代理在自己 worktree 里的提交、脚本子进程里的提交认不出(合并类认领之前全部的那一支已撤,合回时也兜不住);
+     *  时刻窗口会把窗内落的别人提交一并认领(多计,偏严;codex 284-r1 断言 3);
+     *  别的仓里同一时刻的提交命令会把本仓别人的提交认领进来(多计,偏严)。 */
+    ownCommitFilter(ctx) {
+      const H = RULE_P._p, w = H.win(ctx);
+      const acts = [...((w && Array.isArray(w.actions)) ? w.actions : []), ...(Array.isArray(ctx.actions) ? ctx.actions : [])];
+      if (!acts.some((a) => a && Number.isFinite(a.at))) return () => true;
+      // 误拦猎手 284 FB-1 / FB-2:原把 merge / pull / cherry-pick / revert / am / rebase 当合并类、认领命令之前的**全部**提交 ⇒
+      //   revert / cherry-pick 自己一笔、空 pull、`merge --abort` 都把范围里别人更早的提交算给本会话(真阻断)。合并前的 HEAD 转录里拿不到,
+      //   分不清「这次合进来的」⇒ 撤掉这一支,所有产生提交的命令一律按时刻窗口认领。代价(漏放,接受):子代理在自己 worktree 里的提交合回时认不出
+      // 红队 284 BP-1:原来只认 `git commit` 一种写法,`bash -c "git commit"`、别名 `git ci`、PowerShell `& git commit`、带引号的 git.exe 全路径、
+      //   eval / xargs / `pnpm run commit` / codex 代跑都认不出 ⇒ 计 0。改成反向:git 段只有**确知不产生提交**的子命令(下表)才不算;
+      //   别名等未知子命令、`commit-tree` 算;解析不出 git 段而命令里出现 commit 字样(读 / 打印类段头除外)也算。多认的方向是多计(偏严)
+      const NO_COMMIT = /^(?:status|log|diff|show|fetch|push|add|remote|config|rev-parse|ls-files|ls-tree|grep|blame|describe|shortlog|reflog|cat-file|ls-remote|rev-list|merge-base|for-each-ref|symbolic-ref|check-ignore|check-attr|show-ref|name-rev|count-objects|help|version|worktree|branch|tag|restore|checkout|switch|stash|reset|clean|mv|rm|init|clone|gc|fsck)$/;
+      const READ_HEAD = /^(?:grep|rg|cat|echo|printf|sed|awk|head|tail|less|wc|Select-String|Get-Content|type|Write-Output|Write-Host)\b/i;
+      const marks = [];   // 本会话产生提交的命令时刻
+      for (const a of acts) {
+        if (!a || !Number.isFinite(a.at) || !/^(Bash|PowerShell)$/.test(String(a.name || ""))) continue;
+        const cmd = a.input && a.input.command;
+        if (typeof cmd !== "string" || !/git|commit/i.test(cmd)) continue;
+        const d = H.dOf(a);
+        let commit = false;
+        try {
+          if (H.hasCommit(cmd, d)) commit = true;
+          for (const { seg } of H.walk(cmd, d)) {
+            const s = String(seg).trim().replace(/^(?:\(\s*|\{\s+)+/, "").replace(/^(?:\w+=\S*\s+)+/, "");
+            const g = gitArgs(s);
+            if (g) { if (!NO_COMMIT.test(g.sub)) commit = true; }
+            else if (/commit/i.test(s) && !READ_HEAD.test(s)) commit = true;
+          }
+        } catch { commit = true; }
+        // 红队 284 终版 BP-2:后台跑的命令没有 10 分钟上限 ⇒ 窗口放到 6 小时
+        if (commit) marks.push([a.at, a.input && a.input.run_in_background ? 6 * 3600e3 : 900000]);
+      }
+      return (c) => {
+        if (!c || c.aggregated || !Number.isFinite(c.at)) return true;
+        // codex 284-r1 附 2:`pnpm test && git commit` 提交落在调用后 660 秒 ⇒ 原 600 秒上限漏计;放到 900 秒(前台命令上限 600 秒 + 余量)
+        return marks.some(([t, up]) => c.at >= t - 120000 && c.at <= t + up);
+      };
     },
 
     /** a2a9f58b BP-4:本轮有提交命令,而本仓范围里**没有本轮的提交** ⇒ 这些提交落在别处(同一调用内
@@ -5429,13 +5489,13 @@ const RULE_P = {
       const who = miss.length === 2 ? "两个都要起——`_gate-bypass-hunter`(找漏放)与 `_gate-false-block-hunter`(找误拦,跑 scripts/gate-replay.mjs 回放)"
         : miss[0] === "_gate-bypass-hunter" ? "缺红队 `_gate-bypass-hunter`(找漏放);误拦猎手那格已有"
         : "缺误拦猎手 `_gate-false-block-hunter`(找误拦,跑 scripts/gate-replay.mjs 回放;已起过但 `--base` 不合格也算缺);红队那格已有";
-      return `**闸引擎面提交,红队 / 误拦猎手未跑齐**(D11,独立于「每 ${h0.every} 次武装一次」的宽限;本仓 P 账累计 ${h0.commits} 次承重提交——账跨会话共用,含别的会话的提交;另两通道仍在宽限内)。\n` +
+      return `**闸引擎面提交,红队 / 误拦猎手未跑齐**(D11,独立于「每 ${h0.every} 次武装一次」的宽限;本会话 P 账累计 ${h0.commits} 次承重提交——批 284 起按会话分账、只数本会话提交时刻附近落的提交;另两通道仍在宽限内)。\n` +
         `      本项只对**本会话碰过闸**的会话响(修闸 tag:写过闸文件 / 合并类 git / 可写 codex,含子代理;账 .claude/.gate-touch.jsonl,按本会话 sid 查 why 字段)。\n` +
       `      别的会话已按两猎手审过的改闸提交按 sha 认账、不再要你审;tag 若是误记(只读命令被记上)⇒ 照实记 --fp P。\n` +
         `      处置:${who},` +
         `prompt 里带上本批闸文件名 / 规则 id / diff 文件(空 prompt 不算,上一批的调用不抵账);误拦猎手派单里**只写一个** \`--base <sha>\`(只认 --base 参数,说明文字里的 base: 不算;写了多个不同的 --base——哪怕是「别用 --base HEAD」的提醒——也不认),sha 要早于 P 范围(本会话上次 P 结清以来)里第一笔改闸提交(不能填 HEAD,也不能填那一笔及之后的提交——那样回放恒为零新增;有疑问就填开工前的提交 sha)。回件处置后再提交或关账。grill 在此格**不充分**。`;
     }
-    return `承重面批次三通道未跑够(本批 ${h0.commits} 次承重面提交 ⇒ 各需 ${h0.need} 遍,` +
+    return `承重面批次三通道未跑够(本会话 ${h0.commits} 次承重面提交 ⇒ 各需 ${h0.need} 遍,` +
       `每 ${h0.every} 次重新武装一次)。缺:${hits.map((h) => `${h.ch} ${h.got}/${h.need}`).join(" / ")}\n` +
       (hits.some((h) => /闸引擎面每批必跑|独立视角/.test(String(h.ch))) && RULE_P._p ?
         `      （闸引擎面的「独立视角」要 \`_gate-bypass-hunter\` 与 \`_gate-false-block-hunter\` 两者都在,且入参绑定闸文件/规则 id;误拦猎手派单里只写一个 \`--base <sha>\`(早于 P 范围里第一笔改闸提交;多个不同的 --base 不认)${(() => { const ms = hits.flatMap((h) => Array.isArray(h.missing) ? h.missing : []); return ms.length === 1 ? `;**本次缺的是 \`${ms[0]}\`**` : ""; })()};grill 在该格不充分——D11。）\n` : "") +
@@ -9816,7 +9876,8 @@ const RULE_MF = {
 /** SE:自查出错必附「闸怎么拦」(批 276,D178)。
  *  规则正文原住 memory `self-caught-error-propose-gate-fix`(用户 2026-09-04:「以后如果你自己发现自己锅了能不能主动想闸怎么修这个?」),
  *  从未闸化;本批用户问「我记得有一个闸就是这种东西错了必须自动做成闸?为什么这次没弹出来」——检索面见 D178。
- *  判据:本轮正文(剥引文后)出现认错措辞,而本轮既没往本仓 docs/gate-debts.md 新登记 D 号行、也没写「闸怎么拦:」+ 规则 id / D 号 / 不可机械化 ⇒ 提示。
+ *  判据:本轮正文(剥引文后)出现认错措辞**且认错那一句带可观测后果**(批 284 量级门槛,见 _HEAVY),
+ *    而本轮既没往本仓 docs/gate-debts.md 新登记 D 号行、也没写「闸怎么拦:」+ 规则 id / D 号 / 不可机械化 ⇒ 提示。
  *  只提示不阻断:认错措辞是措辞锚,误触面宽(复述别人的错、讨论历史),阻断会逼人少说实话。
  *  批 276 红队 r4:BP-5 召回约 23%(「我」与动词之间插宾语就漏)⇒ 允许同一分句内 ≤12 字的插入并补「搞反 / 漏掉 / 失误 / 错了」;
  *    BP-6 出路过宽(碰一下欠账表、「闸怎么拦:回头再想」即过)⇒ 收紧;BP-16「假读数」裸词、「不是我的锅」⇒ 要求主语、排除否定。
@@ -9831,11 +9892,11 @@ const RULE_SE = {
     { say: "补一节「闸怎么拦」并往本仓 docs/gate-debts.md 新登记 D 号行:错型归族 / 候选闸(机械判据)/ 仪器 / 失效条件",
       sample: { write: "/repo/docs/gate-debts.md", written: "| D180 | 错型 … 候选闸 … | 276 | ≤280 | … | … |" } },
     { say: "就地写 ⟪闸怎么拦:⟫ + 已有规则 id(如「X 项」)/ D 号 / 「不可机械化」及理由", sample: { text: "闸怎么拦:已有 E2 项管这一形,不另立。" } },
-    // 批 279(用户 10-27「SE 过犹不及」):错小、当轮已改、没进产物的,说一句不值得即可,不必现场设计闸
-    { say: "错的量级小(当轮已改正、没进产物 / 没据此推翻别人)⇒ 写 ⟪闸怎么拦:不立闸:⟫ + 理由", sample: { text: "我刚才写错了路径。闸怎么拦:不立闸:当轮自己发现并改掉,没进任何产物。" },
-      // 重型错(假读数 / 据此提交)本就不认这条出口 ⇒ 不对那两个正例自证(pos[1]「我的假读数」、pos[13] 红队 279 BP-8)
-      forPos: [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17] },
   ],
+  //   批 284 量级门槛:认错那一句里要有可观测后果才提示;排除否定(「也没据此提交」,误拦猎手 279 FB-6)
+  //   误拦猎手 284 FB-4:否定补「不会 / 不 / 别」(「所以不会据此提交」)
+  //   红队 284 终版 BP-4:补同义写法(已经提交了 / 已 commit / 推到 private / 已部署 / 已合进 master / 据此改了判据)
+  _HEAVY: /(?<!没|未|并未|也没|没有|不会|不|别)(?:假读数|推翻了|据此(?:提交|推送|发布|裁决|改了)|已(?:经)?\s*(?:提交|发布|推送|部署|上线|合进|合回|推到|commit|push|merge)|推到了?\s*(?:private|远端|服务器|线上)|(?:进|写进)了(?:报告|产物|提交))/i,
   //   r5 BP-12:「我」与动词之间的插入不许含假设 / 否定 / 疑问 / 防范词,主语不认「我们」
   //   r6 BP-9:原排除表把「发现 / 觉得 / 确认 / 核对」也排了 ⇒「我发现自己读错了」漏;这几个词改由 detect 里的评他人判(见 _OTHER)
   //   误拦 r6 FB-10:防范句「以免 / 防止 / 怕 / 确保 / 不再 / 不(不小心除外)」排除
@@ -9845,7 +9906,10 @@ const RULE_SE = {
   //   插入段里有「发现 / 觉得 / 确认…」且主语换成了别人(codex / 子代理 / 他…)而没回到「自己」⇒ 评他人,不算(原 r5 BP-12 的反例)
   _OTHER: /codex|子代理|红队|猎手|对方|用户|上游|他|她|它|[A-Za-z]{3,}/,
   /** 逐个候选判,返回第一个算数的认错句;都不算 ⇒ null。 */
-  firstAdmission(t) {
+  // 批 284 量级判定(唯一实现):认错所在那句有没有后果。误拦猎手 284 FB-4:「其实 / 实际上 / 本来」引出的是更正后的事实,不是错的后果 ⇒ 先剥掉
+  heavySent(sent) { return RULE_SE._HEAVY.test(String(sent || "").replace(/(?:其实|实际上|本来)[^，,。；;：:]*/g, " ")); },
+  // codex 284-r1 附 4:needHeavy ⇒ 跳过不带后果的认错接着找(原来只取第一处,「我说错了一个路径。另:我算错了数字,报告已提交。」被首句小错遮住)
+  firstAdmission(t, needHeavy) {
     const H = RULE_SE;
     for (const m of t.matchAll(new RegExp(H._PAT.source, "g"))) {
       const s0 = Math.max(t.lastIndexOf("。", m.index), t.lastIndexOf("\n", m.index), t.lastIndexOf("!", m.index), t.lastIndexOf("?", m.index),
@@ -9861,6 +9925,7 @@ const RULE_SE = {
       //   只有 D 号不算(codex 276-r6-fix-audit §2:「我说错了,D150 那条的状态写反了」里 D150 是被说错的对象)
       const sentD = sent.replace(/\bD17[89]\b/g, "");
       if (/\bD\d{2,4}[a-z]?\b/.test(sentD) && /登记|登进|记为|记账|已撤销|已结清|已修|在册|见\s*D\d/.test(sentD)) continue;
+      if (needHeavy && !H.heavySent(sent)) continue;
       return m[0];
     }
     return null;
@@ -9870,9 +9935,13 @@ const RULE_SE = {
     //   误拦 r6 FB-10:行内代码与代码围栏里复述判据词不算
     const raw = String(ctx.text || "").replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
     const t = V.noMask ? raw : maskQuoted(raw);
-    const hit = H.firstAdmission(t);
+    const hit = H.firstAdmission(t, !V.noGate);
     if (!hit) return [];
     const m = [hit];
+    // 批 284(交接单 20261028 第四条,用户 10-27「SE 有点过犹不及……再给他去立个闸有点没必要」):量级门槛反过来做——
+    //   只有认错那一句带**可观测后果**(假读数 / 推翻了 / 据此提交·推送·发布·裁决 / 已提交 / 已发布 / 已推送 / 进了报告或产物)才提示;
+    //   当轮自己发现、口头更正的小错一律不提示。原来是「默认提示、小错写『不立闸:理由』才放过」,成本仍压在认错上。
+    //   代价(漏放方向,按用户「误拦比漏放贵」接受):后果写在别的句子里(「我读错了。……那份报告已提交」)不提示
     if (V.noEscapes) return [m[0]];
     const norm = (p) => String(p || "").replace(/\\/g, "/");
     const ids = (s) => new Set(String(s || "").match(/\bD\d{3}\b/g) || []);
@@ -9897,14 +9966,8 @@ const RULE_SE = {
       //   认的是重型错(假读数 / 推翻了别人 / 据此提交)时不认这个出口
       const okRe = /\bD\d{3}[a-z]?\b|\b[A-Z][A-Z0-9]{0,2}\s*项|RULE_[A-Z0-9]+|不可机械化\s*[:：,,]?\s*\S.{3,}/;
       const DEFER = /还没想好|没想好|回头|以后再|稍后|待定|再说|懒得|^\s*先(?!前)/;
-      //   误拦猎手 279 FB-7:同义写法「没必要立闸 / 不另立闸」也认,冒号或逗号都行(「不立闸怎么行」没有标点,仍不算)
-      const nl = /(?:不立闸|不值得立闸|没必要立闸|不必立闸|不另立闸)\s*[:：,，]\s*(.*)$/.exec(v);
-      //   误拦猎手 279 FB-6:重型错只在**认错那一句**与「闸怎么拦」的值里找,且排除否定(「也没据此提交」);
-      //   原来扫整轮,收尾状态句「批 279 已提交」就让出口失效
-      const HEAVY = /(?<!没|未|并未|也没|没有)(?:假读数|推翻了|据此(?:提交|推送|发布|裁决)|已提交|已发布)/;
-      const admSent = t.split(/[。！？!?\n]/).find((s) => s.includes(hit)) || hit;
-      const heavy = HEAVY.test(admSent) || HEAVY.test(v);
-      if (nl && !heavy && nl[1].replace(/\s/g, "").length >= 4 && !DEFER.test(nl[1])) return [];
+      //   批 279 的「不立闸:<理由>」出口已随批 284 的量级门槛撤掉:小错根本不提示,能走到这里的都是重型错,而重型错本就不认那条出口
+      //   (红队 279 BP-8)。重型判据挪到 _HEAVY(误拦猎手 279 FB-6:只看认错那一句,排除否定)
       const ok = v.search(okRe), late = v.search(DEFER);
       if (ok >= 0 && (late < 0 || late > ok)) return [];
     }
@@ -9912,38 +9975,52 @@ const RULE_SE = {
   },
   exempts: [],
   message: (hits) =>
-    `**本轮认了一个错(「${hits[0]}」),却没写「闸怎么拦」**(用户 2026-09-04 要求:自己发现自己锅了要主动想闸怎么修;D178)。\n` +
+    `**本轮认了一个带后果的错(「${hits[0]}」,认错那句里有假读数 / 已提交 / 已发布 / 推翻了这类后果),却没写「闸怎么拦」**(用户 2026-09-04 要求:自己发现自己锅了要主动想闸怎么修;D178。没有后果的小错本项不提示,批 284)。\n` +
     `${renderEscapes(RULE_SE.escapes)}\n` +
     `      天花板:措辞锚,换说法认错仍会漏;只证登记,不证候选闸写得对。`,
   mutations: [
     { name: "去掉两条出路(登记了也照提示)", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noEscapes: true }) }) },
     { name: "不剥引文(引用别人的「我说错了」也提示)", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noMask: true }) }) },
+    // 批 284:去掉量级门槛 ⇒ 小错又被逼着设计闸。证人 = neg「SE 284:…」
+    { name: "去掉量级门槛(小错也提示)", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noGate: true }) }) },
   ],
   cases: {
+    // 批 284 量级门槛:正例的认错那一句都带后果(已提交 / 已发布 / 据此… / 假读数);同形的小错版本在 neg「SE 284」
     pos: [
-      { name: "SE:认错没登记", text: "我上一轮说错了,那个文件其实没落盘。现在重写。" },
+      { name: "SE:认错没登记", text: "我上一轮说错了,那个文件其实没落盘,报告已提交。现在重写。" },
       { name: "SE:我的假读数", text: "那是我的假读数,结论是反的,已重测。" },
-      { name: "SE:嘴上说回头补不算", text: "是我的锅,回头想想闸怎么拦。" },
-      { name: "SE r4 BP-5:我与动词之间插宾语", text: "batch-goal 那条是我路径搞错了,脚本在 /repo 下。现在重跑。" },
-      { name: "SE r4 BP-6:碰一下欠账表不算登记", text: "我上一轮说错了,那个文件没落盘。顺手把 D150 挪进已结清。", write: "/repo/docs/gate-debts.md", written: "~~D150~~ 已结清" },
-      { name: "SE r4 BP-6:「闸怎么拦:」后随便写不算", text: "是我的锅。闸怎么拦:回头再想。" },
-      { name: "SE r5 BP-6:回声 D178 / 引 SE 自身 / 不可机械化不写理由都不算", text: "是我的锅。闸怎么拦:D178。另:SE 项。不可机械化。" },
-      { name: "SE r6 BP-9:我发现自己读错了", text: "我发现自己读错了,那条结论不成立,已重测。" },
-      { name: "SE r6 BP-9:我觉得对的那个数其实算错了", text: "我觉得对的那个数其实算错了,重算。" },
-      { name: "SE r6 BP-11:推迟句里顺带规则 id 不算", text: "是我的锅。闸怎么拦:还没想好,先把 M 项自测跑了。" },
-      { name: "SE r6 BP-11:闸怎么拦只写回声 D179 不算", text: "是我的锅。闸怎么拦:归 D179 一起处置。" },
-      { name: "SE:我不小心写错了", text: "我不小心写错了路径,已改。" },
-      { name: "SE 279:「不立闸」不写理由不算", text: "我写错了路径。闸怎么拦:不立闸。" },
+      { name: "SE:嘴上说回头补不算", text: "是我的锅,那份报告已发布,回头想想闸怎么拦。" },
+      { name: "SE r4 BP-5:我与动词之间插宾语", text: "batch-goal 那条是我路径搞错了,已据此提交。现在重跑。" },
+      { name: "SE r4 BP-6:碰一下欠账表不算登记", text: "我上一轮说错了,那份结论已提交。顺手把 D150 挪进已结清。", write: "/repo/docs/gate-debts.md", written: "~~D150~~ 已结清" },
+      { name: "SE r4 BP-6:「闸怎么拦:」后随便写不算", text: "是我的锅,已据此推送。闸怎么拦:回头再想。" },
+      { name: "SE r5 BP-6:回声 D178 / 引 SE 自身 / 不可机械化不写理由都不算", text: "是我的锅,已提交。闸怎么拦:D178。另:SE 项。不可机械化。" },
+      { name: "SE r6 BP-9:我发现自己读错了", text: "我发现自己读错了,那条结论已提交,已重测。" },
+      { name: "SE r6 BP-9:我觉得对的那个数其实算错了", text: "我觉得对的那个数其实算错了,而且已提交,重算。" },
+      { name: "SE r6 BP-11:推迟句里顺带规则 id 不算", text: "是我的锅,已提交。闸怎么拦:还没想好,先把 M 项自测跑了。" },
+      { name: "SE r6 BP-11:闸怎么拦只写回声 D179 不算", text: "是我的锅,已提交。闸怎么拦:归 D179 一起处置。" },
+      { name: "SE:我不小心写错了", text: "我不小心写错了路径,已推送,已改。" },
+      { name: "SE 279→284:「不立闸」出口已撤,重型错写了也不算", text: "我写错了路径,已提交。闸怎么拦:不立闸。" },
       { name: "SE 红队 279 BP-8:重型错不认「不立闸」", text: "那是我的假读数,结论是反的,已据此提交。闸怎么拦:不立闸:当轮已经改掉了。" },
-      { name: "SE 红队 279 BP-9:「不值得立刻」是推迟", text: "是我的锅。闸怎么拦:不值得立刻处理,回头再说。" },
-      { name: "SE 红队 279 BP-9:「不立闸」理由本身是推迟", text: "我读错了日志。闸怎么拦:不立闸:回头再说吧。" },
-      { name: "SE 红队 279 附节三 4:理由不足 4 字", text: "我写错了路径。闸怎么拦:不立闸:没必要" },
-      { name: "SE codex r6-fix §2:同句 D 号是被说错的对象,不是登记", text: "我说错了,D150 那条的状态写反了。" },
+      { name: "SE 红队 279 BP-9:「不值得立刻」是推迟", text: "是我的锅,已发布。闸怎么拦:不值得立刻处理,回头再说。" },
+      { name: "SE 红队 279 BP-9:「不立闸」理由本身是推迟", text: "我读错了日志,据此裁决了。闸怎么拦:不立闸:回头再说吧。" },
+      { name: "SE 284:错误读数写进了报告", text: "我算错了那个数,已经写进了报告。" },
+      { name: "SE codex 284-r1 附 4:首句小错不遮后句重错", text: "我说错了一个路径。另:我算错了数字,报告已提交。" },
+      { name: "SE 红队 284 终版 BP-4:同义后果写法", text: "我算错了数字,这版已经提交了。我读错了日志,结论已推到 private。我看错了阈值,这版已部署。我判错了范围,已合进 master。我写错了口径,据此改了判据。我说错了,报告已 commit。" },
+      { name: "SE codex r6-fix §2:同句 D 号是被说错的对象,不是登记", text: "我说错了,D150 那条的状态写反了,已提交。" },
     ],
     neg: [
-      { name: "SE:同轮新登记了 D 号行", text: "我上一轮说错了,已登记 D180。", write: "/repo/docs/gate-debts.md", written: "| D180 | 错型 … | 276 | ≤280 |" },
-      { name: "SE:就地写了闸怎么拦 + 规则 id", text: "我刚才读错了。闸怎么拦:已有 X 项管落盘断言,这次是它没覆盖的读法,登进 X 的残余。" },
-      { name: "SE:引用别人的认错不算", text: "子代理原话是「我上一轮说错了」,它已自己更正。" },
+      // 批 284 量级门槛:小错(认错那句里没有后果)不提示。前三条是旧正例的小错原形
+      { name: "SE 284:小错不提示(旧正例原形)", text: "我上一轮说错了,那个文件其实没落盘。现在重写。" },
+      { name: "SE 284:小错不提示(当轮改掉)", text: "我不小心写错了路径,已改。" },
+      { name: "SE 284:小错 + 嘴上说回头,也不提示", text: "是我的锅,回头想想闸怎么拦。" },
+      { name: "SE 284:某会话 实撞(漏报一笔 gitignore 面下载)", text: "我那句写错了,那笔下载落在 gitignore 面的 clipboard/server-backups/ 里,补上。" },
+      { name: "SE 284:后果写在别的句子里不算(接受的漏放)", text: "批 284 已提交并推 private。另:我刚才写错了一处路径,已改。" },
+      { name: "SE 284:否定的后果不算", text: "我读错了那行日志,也没据此提交,已改。" },
+      { name: "SE 误拦猎手 284 FB-4:「不会据此提交」是否定", text: "我刚才看错了日志,所以不会据此提交。" },
+      { name: "SE 误拦猎手 284 FB-4:更正内容里的已提交不是后果", text: "我刚才说错了:改动其实已提交,不是还在工作树里。" },
+      { name: "SE:同轮新登记了 D 号行", text: "我上一轮说错了,已提交,已登记 D180。", write: "/repo/docs/gate-debts.md", written: "| D180 | 错型 … | 276 | ≤280 |" },
+      { name: "SE:就地写了闸怎么拦 + 规则 id", text: "我刚才读错了,已提交。闸怎么拦:已有 X 项管落盘断言,这次是它没覆盖的读法,登进 X 的残余。" },
+      { name: "SE:引用别人的认错不算", text: "子代理原话是「我上一轮说错了,已据此提交」,它已自己更正。" },
       { name: "SE:没认错", text: "跑完了,全绿。" },
       { name: "SE r4 BP-16:否认不算认错", text: "这不是我的锅,是上游接口变了。" },
       { name: "SE r4 BP-16:讲教训时提到假读数(无主语)", text: "先把口径弄对,口径错了改出来的判据是照着假读数改的。" },
@@ -9952,10 +10029,10 @@ const RULE_SE = {
       { name: "SE 误拦 r6 FB-9:复述已登记的旧错", text: "D38 前一批已撤销(我读错了退出码)。" },
       { name: "SE 误拦 r6 FB-10:写闸描述 / 防范句 / 行内代码", text: "我补了一条反例防止 SE 漏掉「我们」主语的形态。我逐条回读,以免我漏掉哪一条。我确保不漏掉任何一个调用点。SE 的 _PAT 现在认 `我…漏掉` 这类措辞。" },
       { name: "SE 误拦 r6 FB-11:冒号转述子代理", text: "子代理回报:我漏掉了 MultiEdit 那一支,已补。" },
-      { name: "SE 误拦 r6 FB-13:闸怎么拦后写 D105c", text: "是我的锅。闸怎么拦:hook-guard 的 D105c 已管这一形。" },
+      { name: "SE 误拦 r6 FB-13:闸怎么拦后写 D105c", text: "是我的锅,已提交。闸怎么拦:hook-guard 的 D105c 已管这一形。" },
       { name: "SE 误拦 r7 FB-7:同句后半点名别人的错", text: "我发现文件里漏掉了一节,是上游生成器的问题。" },
-      { name: "SE 误拦 r7 FB-9:已给 id + 附带后续计划", text: "是我的锅。闸怎么拦:E2 项已管,稍后补一条反例。" },
-      { name: "SE 误拦 r7 FB-9:「先前」不是推迟", text: "是我的锅。闸怎么拦:先前已有 E2 项管这一形,不另立。" },
+      { name: "SE 误拦 r7 FB-9:已给 id + 附带后续计划", text: "是我的锅,已提交。闸怎么拦:E2 项已管,稍后补一条反例。" },
+      { name: "SE 误拦 r7 FB-9:「先前」不是推迟", text: "是我的锅,已提交。闸怎么拦:先前已有 E2 项管这一形,不另立。" },
       { name: "SE 279:小错写「不立闸」+ 理由", text: "我刚才写错了路径。闸怎么拦:不立闸:当轮自己发现并改掉,没进任何产物。" },
       { name: "SE 误拦猎手 279 FB-6:同轮收尾写「已提交」不废「不立闸」出口", text: "批 279 已提交并推 private。另:我刚才写错了一处路径。闸怎么拦:不立闸:当轮自己发现并改掉,没进任何产物。" },
       { name: "SE 误拦猎手 279 FB-7:用户原话「没必要立闸」+ 理由", text: "我刚才写错了路径。闸怎么拦:没必要立闸:当轮已改、没进产物。" },

@@ -2327,16 +2327,43 @@ export function dedupNotices(file, sid, notices, keyOf) {
   return out;
 }
 
-function readPLedger() {
+function readPLedger(sid) {
   // 自测隔离(2026-08-26 实撞):readBatchGoal 有这道阀而本函数没有——真实 P 账爬满 5 笔当天,
   // 夹具世界被磁盘真账污染,G 的用例凭空多出 P 命中(「测出来的东西取决于磁盘上碰巧有什么」,
   // K 的同型教训第二次应验)。null=接了、账不存在=宽限语义,与注入约定一致。
   if (process.env.STOP_CLOSURE_SELFTEST === "1") return null;
-  try {
-    const j = JSON.parse(fs.readFileSync(".claude/.p-ledger.json", "utf8"));
-    return { carriers: Number.isFinite(+j.carriers) ? Math.max(0, Math.floor(+j.carriers)) : 0,
-      shas: Array.isArray(j.shas) ? j.shas : [], hunted: Array.isArray(j.hunted) ? j.hunted : [] };
-  } catch { return null; }
+  try { return pLedgerView(JSON.parse(fs.readFileSync(".claude/.p-ledger.json", "utf8")), sid); } catch { return null; }
+}
+
+// 批 284(交接单 20261028 第三条):P 的承重提交累计按会话分账 `bySid: {<会话号>: {n, at}}`——原来一个 `carriers` 全仓共用,
+//   A 会话攒了 4 笔、B 会话提交 1 笔就轮到 B 欠三通道。规则侧看到的 `carriers` 仍是一个数(本会话那一格),规则保持纯函数。
+//   旧账没有 bySid ⇒ 各会话从 0 起(一次性少计,漏放方向,按用户「误拦比漏放贵」接受)。去重用的 shas 跟着按会话分(每格封顶 200,codex 284-r1 附 1);
+//   顶层 shas 只为旧版读者保留并集;`hunted` 仍全仓共用(D11 按 sha 认账要跨会话)。
+const pSidKey = (sid) => (typeof sid === "string" && (/^[\w-]{8,80}$/.test(sid) || /^batch-[\w-]{1,40}$/.test(sid)) ? sid : "_");
+/** 红队 284 终版 BP-3:只按会话号分格 ⇒ 一批拆到几个会话里做(交接单续跑 / `/clear`)每个会话都从 0 起,宽限永远攒不满。
+ *  ⇒ 格键优先取**本会话的批**(盘上批状态、不是外来批;已结清的也算——结清那一轮不能因换键而把欠账清掉),没有批才退回会话号。
+ *  并行会话各武装各的批号 ⇒ 不同格,不会互相攒;同一批跨会话续做 ⇒ 同一格。 */
+export function pLedgerKey(g, foreign, sid) {
+  const b = g && typeof g === "object" && !foreign ? String(g.batch ?? "").replace(/[^\w-]/g, "") : "";
+  return b ? `batch-${b}` : sid;
+}
+export function pLedgerView(j, sid) {
+  const by = j && j.bySid && typeof j.bySid === "object" && !Array.isArray(j.bySid) ? j.bySid : null;
+  const e = by ? by[pSidKey(sid)] : null;
+  // codex 284-r1 附 1:去重用的 shas 也按会话分——原来共用,A 的时刻窗口认领了 B 的提交并记进共用 shas,B 自己的那笔就永远被去重成 0
+  return { carriers: e && Number.isFinite(+e.n) ? Math.max(0, Math.floor(+e.n)) : 0,
+    shas: e && Array.isArray(e.shas) ? e.shas : [], hunted: j && Array.isArray(j.hunted) ? j.hunted : [] };
+}
+/** 写盘前与盘上现账合并(纯函数):本会话那一格换成新值,别的会话的格保留;shas / hunted 取并集(封顶 400)。
+ *  盘上账是写之前**重读**的——两个会话的 Stop 交错时,后写的不再整份盖掉先写的(D52 写不半截之外的另一半;竞态窗口缩到读与 rename 之间)。
+ *  格数封顶 50(按 at 留最新)。 */
+export function mergePLedger(disk, ledger, sid, now) {
+  const by = { ...(disk && disk.bySid && typeof disk.bySid === "object" && !Array.isArray(disk.bySid) ? disk.bySid : {}) };
+  by[pSidKey(sid)] = { n: ledger.carriers, shas: (Array.isArray(ledger.shas) ? ledger.shas : []).slice(-200), at: now };
+  const keep = Object.keys(by).sort((a, b) => String((by[b] && by[b].at) || "").localeCompare(String((by[a] && by[a].at) || ""))).slice(0, 50);
+  const uni = (a, b) => [...new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])])].slice(-400);
+  return { carriers: ledger.carriers, bySid: Object.fromEntries(keep.map((k) => [k, by[k]])),
+    shas: uni(disk && disk.shas, ledger.shas), hunted: uni(disk && disk.hunted, ledger.hunted), at: now };
 }
 
 /** P 的收尾结算(唯一实现;live 路径落盘、自测直接喂):计账 + 基点推进。纯函数,不读写盘。
@@ -2805,6 +2832,15 @@ export function run(transcriptPath, ctx = {}) {
       //   且旧的产出已被 `kept` 丢掉 ⇒ 标准的「两边都不响」,而 emit 会打印
       //   「收尾闸:全跑,无命中。」——与真·全过逐字节相同。
       //   `gate-ctx.mjs` 早就备好了 `extra.lastAssistantMessage` 这个入口,缝没接。
+      // 红队 284 终版 BP-3:P 账的格键(本会话的批 > 会话号;判法同 batchGoal 注入处的 isForeignBatch)
+      const _pKey = ctx.pLedger !== undefined ? ctx.sessionId : (() => {
+        try {
+          const g0 = readBatchGoal();
+          if (!g0 || typeof g0 !== "object") return ctx.sessionId;
+          const { foreign: _f, ...g } = g0;
+          return pLedgerKey(g, isForeignBatch(g, ctx.sessionId, _allEntriesCache), ctx.sessionId);
+        } catch { return ctx.sessionId; }
+      })();
       const eCtx = buildCtx(turn, {
         // tracked / justAdded(grill A3:少了它「取证时机前移」原样失效)/ preExisted(D56)/
         //   checkoutOf + trackedIn + hookCheckout(批 255:按目标 checkout 取追踪集)——全部来自 `isNewEvidence`
@@ -2841,7 +2877,7 @@ export function run(transcriptPath, ctx = {}) {
         })(),
         // P 的跨批持久计账(2026-08-22 亲签「改吧」):同 batchGoal 的注入纪律——
         //   hook 读一次、规则纯函数;账文件在 gitignore 面;夹具经 ctx.pLedger 精确控制。
-        pLedger: ctx.pLedger !== undefined ? ctx.pLedger : readPLedger(),
+        pLedger: ctx.pLedger !== undefined ? ctx.pLedger : readPLedger(_pKey),
         // 批 279「修闸 tag」:只在实时路径读(离线回放读到的是今天的账,套到历史轮上是错配 ⇒ undefined ⇒ P 保持旧判法)
         gateTouched: ctx.gateTouched !== undefined ? ctx.gateTouched
           //   账路径按本脚本位置算绝对路径(红队 279 终版附注 4:chdir 失败时相对路径会读到别处 ⇒ ENOENT ⇒ 误判「没碰过」)
@@ -2920,7 +2956,9 @@ export function run(transcriptPath, ctx = {}) {
         //   存在,姿态见 104 威胁模型呈签件;此处只修「写不半截」这一确定收益。
         const tmpP = `.claude/.p-ledger.json.${process.pid}.tmp`;
         try {
-          fs.writeFileSync(tmpP, JSON.stringify({ ..._settle.ledger, at: new Date().toISOString() }));
+          let disk = null;
+          try { disk = JSON.parse(fs.readFileSync(".claude/.p-ledger.json", "utf8")); } catch { disk = null; }
+          fs.writeFileSync(tmpP, JSON.stringify(mergePLedger(disk, _settle.ledger, _pKey, new Date().toISOString())));
           fs.renameSync(tmpP, ".claude/.p-ledger.json");
           _ledgerOk = true;
         } finally { try { if (fs.existsSync(tmpP)) fs.unlinkSync(tmpP); } catch { /* 残骸不阻断 */ } }
@@ -4784,6 +4822,42 @@ function selfTest() {
           { type: "tool_use", name: "Agent", input: { subagent_type: "grill:testing" } }, { type: "tool_use", name: "WebSearch", input: { query: "先例" } }];
         hp("settleP:三通道齐 ⇒ 清零(sha 照记)", JSON.stringify(settleP(P_, sc({ ledger: { carriers: 4 }, facts: law3, extra: all3 }), []).ledger),
           JSON.stringify({ carriers: 0, shas: [S1, S2, S3], hunted: [] }));
+        // 批 284(交接单 20261028 第三条):三通道计数只数本会话的提交;账按会话分格
+        {
+          const T0 = Date.parse("2026-10-28T01:00:00Z"), iso = (t) => new Date(t).toISOString();
+          const mk = (cmd, commits) => buildCtx([{ type: "assistant", timestamp: iso(T0), message: { content: [{ type: "tool_use", name: "Bash", input: { command: cmd } }] } }],
+            { pLedger: { carriers: 0 }, headFacts: () => ({ root: "/repo", head: HD, commits }) });
+          const mine = { sha: S1, at: iso(T0 + 20e3), files: ["docs/laws/collab.md"] }, theirs = { sha: S2, at: iso(T0 - 3600e3), files: ["docs/laws/collab.md"] };
+          hp("P 284:别的会话的提交不计、不记 sha(某会话 实撞:本会话 1 笔被算成 5 笔)",
+            JSON.stringify(P_.tally(mk("git add docs/noun-diary.md && git commit -m x", [theirs, mine]))), JSON.stringify({ n: 1, shas: [S1] }));
+          // 误拦猎手 284 FB-1 / FB-2:合并类不再认领命令之前的全部提交
+          hp("P 284 FB-1/2:merge / pull / revert / cherry-pick 只认领时刻窗内的,不认领别人更早的",
+            ["git merge -q batch284", "git pull --ff-only", "git revert --no-edit HEAD", "git cherry-pick abc1234", "git merge --abort"].map((c) => P_.tally(mk(c, [theirs, mine])).n).join(), "1,1,1,1,1");
+          hp("P 284 codex 附 2:提交落在命令后 660 秒(长命令后接提交)仍认领", P_.tally(mk("pnpm test && git commit -am checked", [{ ...mine, at: iso(T0 + 660e3) }])).n, 1);
+          hp("P 284:本会话没有提交类命令 ⇒ 计 0", P_.tally(mk("git status --short", [theirs])).n, 0);
+          hp("P 284:提交缺时刻 ⇒ 照算(偏严)", P_.tally(mk("git commit -m x", [{ ...theirs, at: null }])).n, 1);
+          // 红队 284 BP-1:换写法提交原来认不出(计 0)
+          hp("P 284 BP-1:shell 包装 / 别名 / PowerShell & / eval / pnpm run commit 都认领",
+            ['bash -c "git commit -m x"', "git ci -m x", "& git commit -m x", 'eval "git commit -m x"', "pnpm run commit", "git commit-tree HEAD^{tree} -m x"].map((c) => P_.tally(mk(c, [mine])).n).join(), "1,1,1,1,1,1");
+          hp("P 284 BP-1:只读命令里带 commit 字样不认领", ["git log -S commit --oneline", "grep -n commit notes.md", "git show HEAD --stat"].map((c) => P_.tally(mk(c, [mine])).n).join(), "0,0,0");
+          const m1 = mergePLedger({ carriers: 7, shas: [S1], hunted: [], bySid: { "aaaaaaaa-1": { n: 4, at: "2026-10-28T00:00:00Z" } } },
+            { carriers: 1, shas: [S2], hunted: [] }, "bbbbbbbb-2", "2026-10-28T01:00:00Z");
+          hp("P 284 分账:别的会话那格保留、本会话写新值、shas 与盘上现账取并集",
+            JSON.stringify([m1.bySid["aaaaaaaa-1"].n, m1.bySid["bbbbbbbb-2"].n, m1.shas]), JSON.stringify([4, 1, [S1, S2]]));
+          hp("P 284 分账:读本会话那格", pLedgerView(m1, "aaaaaaaa-1").carriers, 4);
+          hp("P 284 终版 BP-3:格键取本会话的批(含已结清),外来批 / 无批退回会话号",
+            [pLedgerKey({ batch: "284" }, false, "s1"), pLedgerKey({ batch: "284", cleared: true }, false, "s1"), pLedgerKey({ batch: "280" }, true, "s1"), pLedgerKey(null, false, "s1")].join(), "batch-284,batch-284,s1,s1");
+          hp("P 284 终版 BP-3:同一批跨会话续做 ⇒ 同一格累计", pLedgerView(mergePLedger(null, { carriers: 4, shas: [], hunted: [] }, "batch-284", "t"), "batch-284").carriers, 4);
+          {
+            const bg = buildCtx([{ type: "assistant", timestamp: iso(T0), message: { content: [{ type: "tool_use", name: "Bash", input: { command: "pnpm test:all && git commit -am x", run_in_background: true } }] } }],
+              { pLedger: { carriers: 0 }, headFacts: () => ({ root: "/repo", head: HD, commits: [{ ...mine, at: iso(T0 + 1200e3) }] }) });
+            hp("P 284 终版 BP-2:后台命令的提交落在 +1200 秒仍认领", P_.tally(bg).n, 1);
+          }
+          hp("P 284 codex 附 1:去重 shas 按会话分(别的会话记过的 sha 不挡本会话)",
+            JSON.stringify([pLedgerView(m1, "bbbbbbbb-2").shas, pLedgerView(m1, "aaaaaaaa-1").shas]), JSON.stringify([[S2], []]));
+          hp("P 284 分账:旧账没有 bySid ⇒ 从 0 起", pLedgerView({ carriers: 7, shas: [S1] }, "aaaaaaaa-1").carriers, 0);
+          hp("P 284 分账:会话号不合法 ⇒ 记在 _ 格", Object.keys(mergePLedger(null, { carriers: 2, shas: [], hunted: [] }, "../x", "t").bySid).join(), "_");
+        }
         // 红队 a9af71da BP-1:基点后 61 笔(readHeadFacts 走聚合)⇒ 事实不再 null;合回带进闸改动
         //   ① 三通道齐(闸引擎面的独立视角 = 绑定红队)且 P 无命中 ⇒ advance=true(原 facts=null ⇒ 永不推进,G2)
         //   ② 无红队 ⇒ P 命中、不推进

@@ -672,6 +672,30 @@ function withdrawItem(argv) {
   process.exit(0);
 }
 
+/** 批 284(交接单 20261028 第一条,某会话 实撞):欠账表 docs/gate-debts.md 的结构核。
+ *  那次是一笔提交里整段纯插入 113 行 ⇒ 每个 D 号两行、三个小节标题两套;是 `--arm` 吐出的到期清单「每个号两遍」才被人看出来。
+ *  现在 --arm / --clear 两个必经点机械查:D 号行重复、`## ` 小节标题重复 ⇒ 红字点名。只报不拦(拦会把开工与结清堵在别人弄坏的表上)。
+ *  天花板:只认「重复」这一种坏形;读改写丢更新(某一行整行消失)看不见——那一半靠 Edit 工具的「读后被改即拒写」与本仓 hook 账的
+ *  写前重读合并(P 账,批 284)。返回问题描述数组,空 = 无问题。 */
+export function debtTableIssues(text) {
+  const out = [];
+  const count = (re) => {
+    const m = new Map();
+    for (const l of String(text || "").split(/\r?\n/)) { const k = (re.exec(l) || [])[1]; if (k) m.set(k, (m.get(k) || 0) + 1); }
+    return [...m].filter(([, n]) => n > 1);
+  };
+  const ids = count(/^\| (D\d+[a-z]?) \|/), heads = count(/^(## .+?)\s*$/);
+  if (ids.length) out.push(`${ids.length} 个 D 号出现不止一行(${ids.slice(0, 5).map(([k, n]) => `${k}×${n}`).join(" ")}${ids.length > 5 ? " …" : ""})`);
+  if (heads.length) out.push(`${heads.length} 个小节标题重复(${heads.slice(0, 3).map(([k, n]) => `「${k.replace(/^## /, "")}」×${n}`).join(" ")})`);
+  return out;
+}
+function debtTableWarn() {
+  try {
+    const issues = debtTableIssues(fs.readFileSync("docs/gate-debts.md", "utf8"));
+    if (issues.length) console.log(`🔴 欠账表结构坏了(docs/gate-debts.md):${issues.join(";")}——先看 git log -p -- docs/gate-debts.md 找哪笔提交弄坏的,以那笔之前的版本为底重建`);
+  } catch { /* 表读不到由到期腿报 */ }
+}
+
 function selfTest() {
   const cases = [];
   const t = (name, got, want) => {
@@ -686,6 +710,13 @@ function selfTest() {
   t("笼统完成断言不算确认", evaluate(goal, "三项全部完成").pending.length, 3);
   t("未达成也算对照过", evaluate(goal, "条件1:未达成,原因是…").pending.map((p) => p.n), [2, 3]);
   t("无 goal ⇒ null", evaluate(null, "x"), null);
+  {
+    const ok = "## 在账欠账\n| # | 欠账 |\n| D103 | a |\n| D104 | b |\n## 已销账\n| D105 | c |\n";
+    t("284 欠账表结构:正常表 ⇒ 无问题", debtTableIssues(ok), []);
+    t("284 欠账表结构:整段叠了一份 ⇒ 报 D 号与小节重复(某会话 实撞形)", debtTableIssues(ok + ok).length, 2);
+    t("284 欠账表结构:只有一个号重复 ⇒ 点名", debtTableIssues(ok + "| D104 | b2 |\n"), ["1 个 D 号出现不止一行(D104×2)"]);
+    t("284 欠账表结构:正文里提到 D104 不算行", debtTableIssues(ok + "见 | D104 | 的说明\n"), []);
+  }
   t("空条件 ⇒ null", evaluate({ conditions: [] }, "x"), null);
   // ⚠️ **「结清后再武装」这条序列此前零覆盖**(2026-08-20 实撞后补)。
   //   为修 grill E6 我让 `--clear` 把批号写进状态文件 ⇒ 结清后是 `{cleared:true, batch:"073"}`;
@@ -1073,6 +1104,7 @@ if (argv.includes("--clear")) {
     //   留下批号,闸就能要求「台账末行的批号 == 状态文件的批号」——写失败时对不上。
     atomicWrite({ cleared: true, batch: prev?.batch ?? null });
     console.log("已结清批级完成条件(留结清标记,下次 --arm 覆盖;条件已存入 .batch-goal.jsonl)");
+    debtTableWarn();
     // 批 258 条件 4:收尾自动出一张报警量 × 误报率表(按规则),待修行下一批 --arm 会再列一次
     const rep = fpReport();
     if (rep) console.log("\n── 收尾误报率表 ──\n" + rep.trim());
@@ -1255,6 +1287,7 @@ if (argv.includes("--arm")) {
       console.log(`  到期语义:自动回 active——本批要么办掉,要么在收尾对照里写明为什么还不办。`);
     }
   } catch { console.log("⚠ 债表读不到,到期检查跳过(fail-open,仅提示层)"); }
+  debtTableWarn();
   // ── 误报率待修腿(批 258 条件 4)──
   //   误报率 ≥15% 且报警 ≥20 的规则在开工时刻列出,与上面的到期债同一结构点:不靠人记得去翻报表。
   //   报表由 hook-stop-closure `--fp-report --hot` 算(唯一实现);跑不出来 ⇒ 只提示,不拦开工。
