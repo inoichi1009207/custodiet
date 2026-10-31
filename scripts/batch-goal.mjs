@@ -736,6 +736,14 @@ export function debtRowCells(line) {
     .map((c) => c.split(P).join("|"));
 }
 
+/** 批 286(D193④,grill 285 外审附报):这一行是不是「已撤销 / 待用户裁」而不追到期——只看**失效期列与出路列**。
+ *  原来按整行查,描述里随口提到这几个字(D159)整行就永不到期提示。切不出 6 列 ⇒ 退回整行(偏松,同旧口径)。 */
+export function debtRowParked(line) {
+  let c = debtRowCells(line);
+  if (c.length !== 6) { const n = String(line).split("|").slice(1, -1); if (n.length === 6) c = n; }
+  return /已撤销|待用户裁/.test(c.length === 6 ? `${c[3]} ${c[5]}` : String(line));
+}
+
 /** 到期腿的逐行判定(批 285 D133 从 --arm 分支抽出)。rows = 债表里 `| Dnn |` 起头的行;cur = 本批号(数)。
  *  返回 { mine, yours, colBad }:到期未结的【我做】/【需你裁】条目,与列数异常被跳过的 D 号。 */
 export function debtDue(rows, cur) {
@@ -798,6 +806,10 @@ function selfTest() {
     const thinRow = "| D904 | 只有三列 | 280 |";
     t("285 D133:正常行切出 6 列", debtRowCells(okRow).length, 6);
     // 批 285 收尾:正文反引号是单数 ⇒ 掩码切错,退回裸竖线切法(D129 实况)
+    // 批 286(D193④):描述列提到「已撤销」不让整行免到期;失效期 / 出路列写了才算停放
+    t("286 D193④:描述里提到已撤销 ⇒ 照追到期", debtRowParked("| D901 | 原判据已撤销,但新问题仍在 | 285 | **≤280** | 来源 | 出路 |"), false);
+    t("286 D193④:失效期列写已撤销 ⇒ 停放", debtRowParked("| D902 | 某事 | 285 | **已撤销** | 来源 | 出路 |"), true);
+    t("286 D193④:出路列写待用户裁 ⇒ 停放", debtRowParked("| D903 | 某事 | 285 | **≤280** | 来源 | 待用户裁:二选一 |"), true);
     t("285 收尾:单数反引号的行退回裸切法,失效期照取",
       debtDue(["| D900 | 某 `x 的说明 | 285 | **≤280** | 来源 | 出路 |"], 286).mine, ["D900(≤280)"]);
     t("285 D133:代码段里的竖线不切列,失效期列取得到", debtRowCells(codeRow)[3].trim(), "**≤281**");
@@ -1371,7 +1383,7 @@ if (argv.includes("--arm")) {
   //   一期只警不拦(拦会把「开工」堵死在还债上——比例归人判);连续多批仍列 ⇒ 升级另议。
   try {
     const rows = fs.readFileSync("docs/gate-debts.md", "utf8").split(/\r?\n/)
-      .filter((l) => /^\| D\d+ \|/.test(l) && !/已撤销|待用户裁/.test(l));
+      .filter((l) => /^\| D\d+ \|/.test(l) && !debtRowParked(l));
     const cur = parseInt(batch, 10);
     // 分诊(2026-08-23 批 099,用户点破「到期腿跑出一堆我看不懂的」):
     //   行含亲签/呈签/归用户/用户裁 ⇒ 【需你裁】,其余 ⇒ 【我做】——用户只须看前一列。

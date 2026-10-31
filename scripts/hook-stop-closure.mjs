@@ -2742,7 +2742,7 @@ import { CARRIER_SURFACE, normPath as normPathC, isCarrierPath as isCarrierPathC
 //   我此前断言「循环依赖是这道缝做不成的唯一技术障碍」——**那是没试就说的**,
 //   探针(scratchpad/cycle-probe)三条全过:两边 import 成功、依赖 PAT 的规则在环里正常命中、
 //   旧实现同进程也正常。**障碍不存在,缝一直做得成。**
-import { RULES, ranClear as ranClearRule, maskQuoted, BG_RUNNING_STATUS } from "./lib/gate-rules.mjs";
+import { RULES, ranClear as ranClearRule, maskQuoted, BG_RUNNING_STATUS, batchGoalOps } from "./lib/gate-rules.mjs";
 // `validateRules` 是 2026-08-20 才接进**生产路径**的 —— 此前它只在 `gate:accept` 里跑,
 // 于是 INV-1..4 对真跑的闸完全不生效(grill:recon 查出,`grep -c` = 0)。
 import { runRules, validateRules } from "./lib/gate-registry.mjs";
@@ -2850,9 +2850,11 @@ export function run(transcriptPath, ctx = {}) {
   _allEntriesCache = entries;      // 供 `_priorWindow()` 取跨轮窗口(见其头注)
   // 批 285 最后一轮(误拦猎手 FB-1):本轮跑没跑过 batch-goal --clear(段首是 node、不是读/打印命令),供 pickBatchDir 选结清态
   try {
-    _turnRanClear = (Array.isArray(turn) ? turn : []).some((e) => ((e && e.message && e.message.content) || []).some((b) =>
-      b && b.type === "tool_use" && /^(Bash|PowerShell)$/.test(String(b.name || "")) &&
-      segments(String((b.input && b.input.command) || "")).some((s) => /^\s*(?:\w+=\S*\s+)*node\b[^\n]*batch-goal\.mjs[^\n]*--clear\b/.test(String(s)))));
+    // 批 286(D193②):原用裸正则、不剥引号 ⇒ `--decision "…再 --clear"` 也算跑过结清,K0 误拦诚实提交。改用 gate-rules 的
+    //   batchGoalOps(剥引号、读/打印段头不算、只认 --clear 子命令;K / K0 同一口径)
+    const turnActs = (Array.isArray(turn) ? turn : []).flatMap((e) => ((e && e.message && e.message.content) || [])
+      .filter((b) => b && b.type === "tool_use" && /^(Bash|PowerShell)$/.test(String(b.name || ""))).map((b) => ({ name: b.name, input: b.input || {} })));
+    _turnRanClear = batchGoalOps({ actions: turnActs }).some((o) => o.op === "clear");
   } catch { _turnRanClear = false; }
   const text = ctx.text !== undefined ? ctx.text : assistantText(turn);
   const tools = toolNames(turn);
@@ -5252,6 +5254,10 @@ function selfTest() {
               pickBatchDir([C(wtA, { batch: "285", armedBy: me, cleared: true, armedAt: "2026-10-28T05:00:00Z" }), C(wtB, { batch: "284", armedBy: me, conditions: ["b"], armedAt: "2026-10-28T03:00:00Z" })], me, [], wtA), wtB);
             hp("285 收口 FB-2:主树 285 未结清 + 会话进 worktree hw 做小批并结清、cwd 留在 hw ⇒ 读主树 285(不误拦)",
               pickBatchDir([C(".", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".claude/worktrees/hw", { batch: "hw-x", armedBy: me, cleared: true, armedAt: "2026-10-28T06:00:00Z" })], me, [], ".claude/worktrees/hw"), ".");
+            // 批 286(D193②):turnRanClear 改用 batchGoalOps——引号里写着 --clear 的 --decision 不算本轮结清;真结清照算
+            hp("286 D193②:--decision 引号里含 --clear ⇒ 不算本轮结清;真 --clear 照算",
+              [batchGoalOps({ actions: [{ name: "Bash", input: { command: 'node scripts/batch-goal.mjs --decision "D3 收尾前先过猎手再 --clear"' } }] }).some((o) => o.op === "clear"),
+                batchGoalOps({ actions: [{ name: "Bash", input: { command: "node --no-warnings scripts/batch-goal.mjs --clear" } }] }).some((o) => o.op === "clear")].join(), "false,true");
             // 最后一轮误拦猎手 FB-1:插做小批并当轮结清 ⇒ 本轮跑过 --clear 时读那份更晚的结清态(K 不误报「结清半路出错」)
             hp("285 末轮 FB-1:主树 285 未结清 + worktree hw 小批当轮结清(本轮跑过 --clear)⇒ 读 hw 结清态",
               pickBatchDir([C(".", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".claude/worktrees/hw", { batch: "hw-x", armedBy: me, cleared: true, armedAt: "2026-10-28T06:00:00Z" })], me, [], ".claude/worktrees/hw", true), ".claude/worktrees/hw");

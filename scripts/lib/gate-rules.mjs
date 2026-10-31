@@ -2751,7 +2751,7 @@ function bgSegIsRead(seg) {
   const head = ((rest.match(/^\s*("[^"]*"|'[^']*'|\S+)/) || [])[1] || "").replace(/^["']|["']$/g, "");
   return BG_READ_HEAD.test(head.replace(/^.*[\\/]/, ""));
 }
-function batchGoalOps(ctx) {
+export function batchGoalOps(ctx) {
   const ops = [];
   for (const a of (ctx.actions || [])) for (const seg of segments(a.input?.command)) {
     if (typeof seg !== "string" || !seg.includes("batch-goal.mjs")) continue;
@@ -4569,6 +4569,17 @@ const RULE_T = {
       .replace(/(?:决定(?:与|和|、)成果|成果(?:与|和|、)决定)都?(?:已)?登记了?(?=[。，,;；\s]|$)/g, " ")
       // 最后一轮误拦猎手 FB-2:原还剔「--fp 后 40 字」,会吃掉同句失效期与收尾反引号(配对错位)⇒ 撤掉那一支,只剔这两个固定写法
       .replace(/(?:已)?记(?:进|入)(?:了)?误报账|记了?(?:一笔)?误报/g, " ")
+      // 批 286(D193①,T 回归 BP-9′):「已用 --fp 登记了 / 用 `--fp` 记了」是记误报账,不是登记缺陷——只剔命令名到紧跟的登记动词,
+      //   不吃后文(285 末轮 FB-2 的教训:剔 40 字会吞掉同句失效期与收尾反引号)
+      //   红队 286 BP-4:原式不看主语,「这个洞已用 --fp 登记了,先不修」也被剔 ⇒ 只在**本句或上一句**提到误报 / 误拦 / 拦错时剔
+      //   (误拦猎手 286 FB-3:只认「同句前面」会把「已用 --fp 登记了这次 T 误拦」「T 拦错了。已用 --fp 登记了」拦回来,D193① 回归)
+      .replace(/(?:已)?用\s*`?--fp`?\s*(?:登记|记账|记)了?/g, (m, off, str) => {
+        const prevEnd = Math.max(...["。", "!", "?", "！", "？", "\n"].map((c) => str.lastIndexOf(c, off - 1)));
+        const prevStart = Math.max(...["。", "!", "?", "！", "？", "\n"].map((c) => str.lastIndexOf(c, prevEnd - 1))) + 1;
+        const nextRel = str.slice(off).search(/[。!?！？\n]/);
+        const span = str.slice(prevEnd >= 0 ? prevStart : 0, nextRel < 0 ? str.length : off + nextRel);
+        return /误报|误拦|拦错/.test(span) ? " " : m;
+      })
       // 否定式「不是 / 并非 / 而非 / 没有 …挂着(不修)」是在否认拖延,不是登记声明(本会话实撞:「不是把缺陷挂着不修」)
       .replace(/(?:不是|并非|而非|没有)[^。\n]{0,12}?挂着(?:不修|没修|不管)?/g, " ");
     const t0 = V.noD160 ? tLa : tLa
@@ -4675,6 +4686,10 @@ const RULE_T = {
       { name: "258 复核附节⑥:登记了成果待验 ⇒ 拦", text: "三条缺陷都登记了成果待验。" },
       // 复核红队二轮 BP-4 / BP-5:剔除式锚到上下文后,下面两句仍是登记声明
       { name: "258 复核二轮 BP-4:已知风险,登记在案用于缺陷 ⇒ 拦", text: "这个漏放是已知风险,登记在案。" },
+      // 批 286(D193① 反向钉,285 第 4 轮红队 BP-1 原形):--fp 只剔到紧跟的登记动词,后面的真登记句照拦
+      { name: "286 D193① 反向钉:跑了 --fp 记一笔 + 这个洞登记了先不修 ⇒ 拦", text: "跑了 --fp 记一笔,这个洞登记了先不修。" },
+      // 红队 286 BP-4:主语是缺陷、不是误报 ⇒ 「已用 --fp 登记了」不剔,照拦
+      { name: "286 红队 BP-4:这个洞已用 --fp 登记了,先不修 ⇒ 拦", text: "这个洞已用 --fp 登记了,先不修。" },
       { name: "258 复核二轮 BP-5:只登记了没装闸 ⇒ 拦", text: "这条误拦只登记了没装闸,回头补。" },
       // 复核红队三轮 BP-2:锚词与「已知风险」之间夹的真登记不得被一并剔掉
       { name: "258 复核三轮 BP-2:锚词与已知风险之间夹真登记 ⇒ 拦", text: "触发层没有,这条先登记了,已知风险,登记在案。" },
@@ -4715,6 +4730,13 @@ const RULE_T = {
       { name: "285 收口:决定和成果都登记了(batch-goal 台账)", text: "决定和成果都登记了。现在只等收口那对猎手。" },
       // 最后一轮误拦猎手 FB-2:--fp 不再连带吃后文(同句失效期、收尾反引号)
       { name: "285 末轮 FB-2:--fp 同句带失效期", text: "P7 已登记未修,误报那笔用 --fp 记了,失效期 ≤290。" },
+      // 批 286(D193①):T 回归 BP-9′
+      { name: "286 D193①:已用 --fp 登记了", text: "S 那次是误报,已用 --fp 登记了。" },
+      { name: "286 D193①:已用 `--fp` 登记了(反引号)", text: "这条 T 误拦已用 `--fp` 登记了。" },
+      // 误拦猎手 286 FB-3:误报 / 误拦写在后半句或上一句也认
+      { name: "286 FB-3:误拦写在后半句", text: "已用 --fp 登记了这次 T 误拦。" },
+      { name: "286 FB-3:拦错写在上一句", text: "T 拦错了。已用 --fp 登记了。" },
+      { name: "286 FB-3:括号里写误拦", text: "这条已用 `--fp` 登记了(误拦)。" },
       { name: "285 末轮 FB-2:反引号 --fp 后引闸原话", text: "这条误拦已用 `--fp` 记账。闸报的原话 `已登记未修` 不是我的处置声明。" },
       { name: "285 收口:记进误报账 + 否认挂着不修", text: "这次 T 误拦已记进误报账。上一条我说的是用 `batch-goal --decision` / `--outcome` 把本批的两个决定和成果写进了批台账，本批结清时 `--clear` 会核这几条，不是把缺陷挂着不修。" },
       { name: "285 D158⑤:普查器行首标签原样贴出", text: "普查器输出:\n装了没登记  bins: rg 14.1\n登记了已不在 plugins: foo" },
@@ -9365,7 +9387,11 @@ export const RULE_O = {
     if (!RULE_O._CUE_RE.test(t)) return [];
     const { got, wild } = RULE_O._fetched(ctx, opt);
     if (wild) return [];
-    const cited = RULE_O._cited(t, opt);
+    // 批 286(开工时误报率表:O 35 报 7 误,20%):本机回环 / 私网地址不是外部引文——是配置读数或被检服务地址,取页也取不到
+    //   (fp 台账 10-22 两笔「http://127.0.0.1:3000」)。只剔这一类;OAuth 授权链接、自建 PR 链接等其余误报形态未动,收尾写明。
+    //   代价(漏放,接受):真把私网页面当出处时不追。V.keepLocal 只给变异用
+    const LOCAL = /^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?::\d+)?(?:[\/?#]|$)/i;
+    const cited = RULE_O._cited(t, opt).filter((u) => opt.keepLocal || !LOCAL.test(u));
     // 变异用的抽样口径(253b 已撤回):取过其中一个就全放行。
     if (opt.sample) return cited.some((u) => got.has(RULE_O._norm(u, opt))) ? [] : cited;
     return cited.filter((u) => !got.has(RULE_O._norm(u, opt)));
@@ -9405,6 +9431,8 @@ export const RULE_O = {
 ` +
     `      天花板:取页闸只证「这串字符在取到的页面文本里出现/未出现」,不证该页权威、不证它支持结论。`,
   mutations: [
+    // 批 286:证人 = neg「286:本机回环地址不是外部引文」
+    { name: "286 退回:本机回环 / 私网地址也当外部引文", apply: (r) => ({ ...r, detect: (ctx) => RULE_O._detect(ctx, { keepLocal: true }) }) },
     { name: "去掉动作面要求(说一句『已核』就放行)", apply: (r) => ({ ...r, detect: (ctx) => {
       const t = String(ctx.text || "");
       if (!/https?:\/\//.test(t)) return [];
@@ -9534,6 +9562,9 @@ export const RULE_O = {
         bash: "curl -sL \"https://x.test/a?id=1\"" },                                                               // 34
     ],
     neg: [
+      // 批 286(fp 台账 10-22 两笔原形):本机回环 / 私网地址是配置读数或被检服务地址,不是外部引文
+      { name: "286:本机回环地址不是外部引文", text: "依据:服务器进程环境变量里 LACUNA_AUTH_DELEGATE_URL=http://127.0.0.1:3000/auth,出处是 ssh 实读。" },
+      { name: "286:私网地址不是外部引文", text: "出处:内网面板 http://192.168.1.20:8080/status 显示已同步。" },
       // 真取过页
       { text: "出处:https://example.test/paper。", bash: "node scripts/fetch-quote-check.mjs https://example.test/paper \"某句\"" },
       // 批 253b BP-9:整条脚本路径住在引号里(去引号串上脚本名会整个消失)
@@ -10743,7 +10774,15 @@ const RULE_SE = {
     { say: "补一节「闸怎么拦」并往本仓 docs/gate-debts.md 新登记 D 号行:错型归族 / 候选闸(机械判据)/ 仪器 / 失效条件",
       sample: { write: "/repo/docs/gate-debts.md", written: "| D180 | 错型 … 候选闸 … | 276 | ≤280 | … | … |" } },
     { say: "就地写 ⟪闸怎么拦:⟫ + 已有规则 id(如「X 项」)/ D 号 / 「不可机械化」及理由", sample: { text: "闸怎么拦:已有 E2 项管这一形,不另立。" } },
+    // 批 286(交接单 20261031,用户 10-27 / 10-31 两次「SE 过犹不及」):认错多发生在对话中途、用户正等答案时,前两条出路都要当场做几百字元工作
+    //   ⇒ 加一条一行出路:记下错型、挂到收尾补;结清那一轮由本项查承诺补了没有(见 detect 的 _PROMISE 核对)
+    { say: "**先回答用户的问题**;认错这一轮只写一行 ⟪错型:⟫ + 一句话 + ⟪→ 收尾补⟫,闸留到收尾再设计(结清那一轮本项会查补了没有)",
+      sample: { text: "错型:客户端自限当成服务端边界 → 收尾补闸" },
+      // 正例 21(结清时承诺没补)本就是在追这条出路留下的承诺,再记一行承诺解不开它 ⇒ 不对它自证
+      forPos: [...Array.from({ length: 21 }, (_, i) => i), 22] },
   ],
+  //   批 286 一行出路:「错型:<≥4 字> … 收尾补」(冒号全半角、箭头可省);理由不足 4 个非空白字不算
+  _PROMISE: /错型\s*[:：]\s*([^\n]*?\S[^\n]*?)\s*(?:→|->|=>|⇒|[,，;；])?\s*收尾补(?:闸|齐|上)?/g,
   //   批 284 量级门槛:认错那一句里要有可观测后果才提示;排除否定(「也没据此提交」,误拦猎手 279 FB-6)
   //   误拦猎手 284 FB-4:否定补「不会 / 不 / 别」(「所以不会据此提交」)
   //   红队 284 终版 BP-4 / 4b92c89 BP-3 曾补十余种同义写法(已部署 / 合进 master / 据此改了 / 已 commit…);误拦猎手 284 终版 FB-2 实测
@@ -10791,55 +10830,88 @@ const RULE_SE = {
     }
     return null;
   },
+  /** 文本里的一行出路承诺(错型理由 ≥4 个非空白字);返回理由数组。 */
+  promises(text) {
+    return [...String(text || "").matchAll(new RegExp(RULE_SE._PROMISE.source, "g"))]
+      .map((x) => x[1].replace(/[⟪⟫「」*]/g, "").trim()).filter((r) => r.replace(/\s/g, "").length >= 4);
+  },
+  /** 一组动作 / 命令里有没有往本仓 docs/gate-debts.md 新登记 D 号行(出路①与收尾核对共用)。
+   *  新登记 = 写入里出现了 old_string 里没有的 D 号(r5 BP-4:改既有行的状态不算新登记)。 */
+  registeredRow(acts, bashCmds, bashDialects) {
+    const H = RULE_SE, norm = (p) => String(p || "").replace(/\\/g, "/");
+    const ids = (s) => new Set(String(s || "").match(/\bD\d{3}\b/g) || []);
+    const newRow = (a) => {
+      const before = ids(a.input?.old_string ?? ""), after = String(a.input?.content ?? a.input?.new_string ?? "");
+      return [...(after.match(/\|\s*(D\d{3})\s*\|/g) || [])].map((x) => x.match(/D\d{3}/)[0]).some((d) => !before.has(d));
+    };
+    if ((acts || []).filter((a) => /^(Write|Edit|MultiEdit|NotebookEdit)$/.test(a.name)).some((a) => H._DEBTS(norm(a.input?.file_path)) && newRow(a))) return true;
+    return (bashCmds || []).some((cmd, i) => { try { return bashWriteTargets(cmd, /docs\/gate-debts\.md/i, { dialect: bashDialects?.[i] }).some((x) => H._DEBTS(norm(x))); } catch { return false; } });
+  },
+  /** 文本里有没有合格的「闸怎么拦:」交代(出路②;收尾核对也认它)。
+   *  闸怎么拦:后跟规则 id / D 号 / 不可机械化+理由;回声 SE 自身与 D178 不算(r5 BP-6)
+   *  r6 BP-11:推迟句(还没想好 / 回头 / 先…)里顺带的 id 不算;回声 D179 同剔;D 号容后缀字母(误拦 r6 FB-13)
+   *    逐处判,每处的值截到句末(一句推迟不连累同轮另一句真交代)
+   *  误拦 r7 FB-9:推迟词只在它出现在第一个交代(id / D 号 / 不可机械化)之前才作废;「先前」不是推迟
+   *  批 279 的「不立闸:<理由>」出口已随批 284 的量级门槛撤掉(红队 279 BP-8);批 285(D179 r9):D 号认两位 */
+  answeredHow(t) {
+    for (const g of String(t || "").matchAll(/闸怎么拦[:：]([^\n。]{0,80})/g)) {
+      const v = g[1].replace(/\bD17[89]\b|\bSE\s*项|\bRULE_SE\b/g, "");
+      const okRe = /\bD\d{2,4}[a-z]?\b|\b[A-Z][A-Z0-9]{0,2}\s*项|RULE_[A-Z0-9]+|不可机械化\s*[:：,,]?\s*\S.{3,}/;
+      const DEFER = /还没想好|没想好|回头|以后再|稍后|待定|再说|懒得|^\s*先(?!前)/;
+      const ok = v.search(okRe), late = v.search(DEFER);
+      if (ok >= 0 && (late < 0 || late > ok)) return true;
+    }
+    return false;
+  },
   detect: (ctx, V = {}) => {
     const H = RULE_SE;
     //   误拦 r6 FB-10:行内代码与代码围栏里复述判据词不算
     const raw = String(ctx.text || "").replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
     const t = V.noMask ? raw : maskQuoted(raw);
+    // 批 286 收尾核对:本轮跑了 batch-goal --clear,而本批窗口 ∪ 本轮写过「错型:… → 收尾补」承诺,却没新登记 D 号行、也没合格的「闸怎么拦」⇒ 提示一次
+    //   (承诺是出路③的代价:认错那轮省下的元工作,在结清这一轮补上)。窗口取不到 ⇒ 只看本轮(偏松)。V.noPromiseCheck 只给变异用
+    if (!V.noPromiseCheck) {
+      let ops = []; try { ops = batchGoalOps(ctx); } catch { ops = []; }
+      if (ops.some((o) => o.op === "clear")) {
+        let w = null; try { w = ctx.window(); } catch { w = null; }
+        const allText = `${(w && w.text) || ""}\n${ctx.text || ""}`;
+        // 误拦猎手 286 FB-1:认承诺也用同一套剥法(去代码围栏 / 反引号、剥引文),并排除模板占位「一句话」——复述交接单、出路原文、样例都不是承诺。
+        //   代价(漏放,接受):用 ⟪⟫ 包起来的真承诺若被剥引文吃掉,结清时不追
+        const ps = H.promises(maskQuoted(allText.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " "))).filter((r) => !/一句话/.test(r));
+        if (ps.length) {
+          // 红队 286 BP-1:「闸怎么拦」与正常路径同口径——先去代码围栏 / 反引号、再剥引文(反引号里、引号里、照抄出路行的不算补)
+          const howText = maskQuoted(allText.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(new RegExp(H._PROMISE.source, "g"), " "));
+          //   接受的漏放(红队 286 BP-2 / BP-3,SE 只提示):补没补只看「本批有没有新登记 D 号行 / 合格的闸怎么拦」,不把登记内容与承诺的错型对上;
+          //   承诺滚出 400 条窗口(或换会话结清)后不再追。逐条对上要给承诺编号建账,对提示项不值;失效条件:出现一次承诺落空且后来撞出真实损失 ⇒ 重开
+          const done = H.registeredRow([...((w && w.actions) || []), ...(ctx.actions || [])], [...((w && w.bashCmds) || []), ...(ctx.bashCmds || [])],
+            [...((w && w.bashDialects) || []), ...(ctx.bashDialects || [])]) || H.answeredHow(howText);
+          if (!done) return [`收尾补:${ps.slice(0, 2).join(" / ")}${ps.length > 2 ? ` 等 ${ps.length} 条` : ""}`];
+        }
+      }
+    }
     const hit = H.firstAdmission(t, !V.noGate, V);
     if (!hit) return [];
+    // 批 286 出路③:同轮写了一行「错型:… → 收尾补」⇒ 放行(先答用户;闸留到收尾)。看未剥引号的原文(⟪⟫ 包起来也认)
+    if (!V.noEscapes && H.promises(raw).length) return [];
     const m = [hit];
     // 批 284(交接单 20261028 第四条,用户 10-27「SE 有点过犹不及……再给他去立个闸有点没必要」):量级门槛反过来做——
     //   只有认错那一句带**可观测后果**(假读数 / 推翻了 / 据此提交·推送·发布·裁决 / 已提交 / 已发布 / 已推送 / 进了报告或产物)才提示;
     //   当轮自己发现、口头更正的小错一律不提示。原来是「默认提示、小错写『不立闸:理由』才放过」,成本仍压在认错上。
     //   代价(漏放方向,按用户「误拦比漏放贵」接受):后果写在别的句子里(「我读错了。……那份报告已提交」)不提示
     if (V.noEscapes) return [m[0]];
-    const norm = (p) => String(p || "").replace(/\\/g, "/");
-    const ids = (s) => new Set(String(s || "").match(/\bD\d{3}\b/g) || []);
-    const acts = (ctx.actions || []).filter((a) => /^(Write|Edit|MultiEdit|NotebookEdit)$/.test(a.name));
-    // 新登记 = 写入里出现了 old_string 里没有的 D 号(r5 BP-4:改既有行的状态不算新登记)
-    const newRow = (a) => {
-      const before = ids(a.input?.old_string ?? ""), after = String(a.input?.content ?? a.input?.new_string ?? "");
-      return [...(after.match(/\|\s*(D\d{3})\s*\|/g) || [])].map((x) => x.match(/D\d{3}/)[0]).some((d) => !before.has(d));
-    };
-    if (acts.some((a) => H._DEBTS(norm(a.input?.file_path)) && newRow(a))) return [];
-    if ((ctx.bashCmds || []).some((cmd, i) => { try { return bashWriteTargets(cmd, /docs\/gate-debts\.md/i, { dialect: ctx.bashDialects?.[i] }).some((x) => H._DEBTS(norm(x))); } catch { return false; } })) return [];
-    // 闸怎么拦:后跟规则 id / D 号 / 不可机械化+理由;回声 SE 自身与 D178 不算(r5 BP-6)
-    // r6 BP-11:推迟句(还没想好 / 回头 / 先…)里顺带的 id 不算;回声 D179 同剔;D 号容后缀字母(误拦 r6 FB-13)
-    //   逐处判,每处的值截到句末(一句推迟不连累同轮另一句真交代)
-    for (const g of t.matchAll(/闸怎么拦[:：]([^\n。]{0,80})/g)) {
-      const v = g[1].replace(/\bD17[89]\b|\bSE\s*项|\bRULE_SE\b/g, "");
-      //   误拦 r7 FB-9:推迟词只在它出现在第一个交代(id / D 号 / 不可机械化)之前才作废;「先前」不是推迟
-      // 批 279(交接单 20261027 第二追加节,用户 10-27:「SE 有点过犹不及……这个东西再给他去立个闸有点没必要」):
-      //   错的量级不进判据 ⇒ 小错也被逼着现场设计一道闸,成本压在认错上。加一条出口「不立闸:<理由>」(量级小、当轮已改正、
-      //   没进产物等),理由至少 4 字;只是让「不值得」能说出口,不再逼出低价值候选闸。
-      //   红队 279 BP-8 / BP-9:「不立闸」必写全「闸」、后跟冒号、理由 ≥4 个非空白字;理由里有推迟词就作废(不看先后);
-      //   认的是重型错(假读数 / 推翻了别人 / 据此提交)时不认这个出口
-      //   批 285(D179 r9):D 号认两位(D55 / D82 这类老号同样在册)
-      const okRe = /\bD\d{2,4}[a-z]?\b|\b[A-Z][A-Z0-9]{0,2}\s*项|RULE_[A-Z0-9]+|不可机械化\s*[:：,,]?\s*\S.{3,}/;
-      const DEFER = /还没想好|没想好|回头|以后再|稍后|待定|再说|懒得|^\s*先(?!前)/;
-      //   批 279 的「不立闸:<理由>」出口已随批 284 的量级门槛撤掉:小错根本不提示,能走到这里的都是重型错,而重型错本就不认那条出口
-      //   (红队 279 BP-8)。重型判据挪到 _HEAVY(误拦猎手 279 FB-6:只看认错那一句,排除否定)
-      const ok = v.search(okRe), late = v.search(DEFER);
-      if (ok >= 0 && (late < 0 || late > ok)) return [];
-    }
+    // 出路①(新登记 D 号行)与出路②(闸怎么拦:…)的判法批 286 抽进 registeredRow / answeredHow,与收尾核对共用;历史注释随之迁过去
+    if (H.registeredRow(ctx.actions, ctx.bashCmds, ctx.bashDialects)) return [];
+    if (H.answeredHow(t)) return [];
     return [m[0]];
   },
   exempts: [],
-  message: (hits) =>
-    `**本轮认了一个带后果的错(「${hits[0]}」,认错那句里有假读数 / 已提交 / 已发布 / 推翻了这类后果),却没写「闸怎么拦」**(用户 2026-09-04 要求:自己发现自己锅了要主动想闸怎么修;D178。没有后果的小错本项不提示,批 284)。\n` +
-    `${renderEscapes(RULE_SE.escapes)}\n` +
-    `      天花板:措辞锚,换说法认错仍会漏;只证登记,不证候选闸写得对。`,
+  message: (hits) => /^收尾补:/.test(String(hits[0] || ""))
+    ? `**本批记过「错型 → 收尾补」,结清时还没补**(${String(hits[0]).slice(4)})。\n` +
+      `      出路:往本仓 docs/gate-debts.md 新登记 D 号行(错型归族 / 候选闸 / 仪器 / 失效条件),或写 ⟪闸怎么拦:⟫ + 已有规则 id / D 号 / 「不可机械化」及理由。\n` +
+      `      这是批 286 一行出路的代价:认错那轮省下的元工作在结清这一轮补上;本项只提示不阻断。`
+    : `**本轮认了一个带后果的错(「${hits[0]}」)**——先把用户在等的那个问题答完。认错只需一行 ⟪错型:<一句话> → 收尾补⟫,闸留到收尾(D178;没有后果的小错本项不提示,批 284)。\n` +
+      `${renderEscapes(RULE_SE.escapes)}\n` +
+      `      天花板:措辞锚,换说法认错仍会漏;只证登记,不证候选闸写得对。`,
   mutations: [
     { name: "去掉两条出路(登记了也照提示)", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noEscapes: true }) }) },
     { name: "不剥引文(引用别人的「我说错了」也提示)", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noMask: true }) }) },
@@ -10847,6 +10919,8 @@ const RULE_SE = {
     { name: "去掉量级门槛(小错也提示)", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noGate: true }) }) },
     // 批 285 第二轮复核(红队第 2 份 BP-4):证人 = pos「SE 285 二轮 红队 2 BP-4」
     { name: "285 二轮退回:登记语境认裸「撤销」", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { bareRevoke: true }) }) },
+    // 批 286:去掉收尾核对 ⇒ 承诺了「收尾补」结清时也不追。证人 = pos「SE 286:结清时承诺没补」
+    { name: "286 退回:不查「收尾补」承诺", apply: (r) => ({ ...r, detect: (ctx) => RULE_SE.detect(ctx, { noPromiseCheck: true }) }) },
   ],
   cases: {
     // 批 284 量级门槛:正例的认错那一句都带后果(已提交 / 已发布 / 据此… / 假读数);同形的小错版本在 neg「SE 284」
@@ -10874,8 +10948,29 @@ const RULE_SE = {
       { name: "SE codex r6-fix §2:同句 D 号是被说错的对象,不是登记", text: "我说错了,D150 那条的状态写反了,已提交。" },
       // 批 285 第二轮复核(红队第 2 份 BP-4):撤销是动作(撤那笔提交)不是账目状态 ⇒ 照提示
       { name: "SE 285 二轮 红队 2 BP-4:同句 D 号 + 「这就撤销那笔提交」不是复述旧账", text: "我读错了 D150 的退出码,结论已提交,这就撤销那笔提交重做。" },
+      // 批 286(序号 21 / 22,出路③的 forPos 依赖这两个位置)
+      { name: "SE 286:结清时承诺没补", text: "条件1:达成。条件2:达成。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+        prior: [{ text: "我拿前端自限推翻了我之前的结论。错型:客户端自限当成服务端边界 → 收尾补闸" }] },
+      { name: "SE 286:错型理由不足 4 字不算出路", text: "我读错了日志,结论已提交。错型:错了 → 收尾补" },
+      // 红队 286 BP-1:结清轮「闸怎么拦」写在反引号里 / 否定句里不算补(与正常路径同口径)
+      { name: "SE 286 红队 BP-1:反引号里的闸怎么拦不算补", text: "条件1:达成。照例写 `闸怎么拦:K 项` 这种格式。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+        prior: [{ text: "我拿前端自限推翻了我之前的结论。错型:客户端自限当成服务端边界 → 收尾补闸" }] },
     ],
     neg: [
+      // 批 286 出路③:一行错型 + 收尾补即放行(用户 10-31 实撞原形:推翻了结论、用户正在等答案)
+      { name: "SE 286 出路③:一行错型收尾补", text: "图像通道指的是 vision 接口。另:我拿前端自限推翻了我之前的结论,写进了报告。错型:客户端自限当成服务端边界 → 收尾补闸" },
+      { name: "SE 286 出路③:⟪⟫ 包起来也认", text: "我算错了那个数,已经写进了报告。⟪错型:读数没对齐口径就下结论 → 收尾补⟫" },
+      { name: "SE 286 收尾核对:承诺已补(新登记 D 号行)", text: "条件1:达成。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+        write: "/repo/docs/gate-debts.md", written: "| D194 | 客户端自限当成服务端边界 … 候选闸 … | 286 | ≤290 | … | … |",
+        prior: [{ text: "我拿前端自限推翻了我之前的结论。错型:客户端自限当成服务端边界 → 收尾补闸" }] },
+      { name: "SE 286 收尾核对:承诺已补(闸怎么拦)", text: "条件1:达成。闸怎么拦:已有 E2 项管这一形,不另立。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+        prior: [{ text: "我拿前端自限推翻了我之前的结论。错型:客户端自限当成服务端边界 → 收尾补闸" }] },
+      // 误拦猎手 286 FB-1:复述交接单 / 出路原文 / 引号样例不算承诺
+      { name: "SE 286 复述:反引号里的出路样例不算承诺", text: "条件1:达成。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+        prior: [{ text: "交接单:SE 加一行出路 `错型:<一句话> → 收尾补`。" }] },
+      { name: "SE 286 复述:出路原话(含「一句话」占位)不算承诺", text: "条件1:达成。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
+        prior: [{ text: "SE 现在的出路是写一行 ⟪错型:⟫ + 一句话 + ⟪→ 收尾补⟫。" }] },
+      { name: "SE 286 收尾核对:没跑 --clear 的轮次不追承诺", text: "继续改。", prior: [{ text: "我拿前端自限推翻了我之前的结论。错型:客户端自限当成服务端边界 → 收尾补闸" }] },
       // 批 284 量级门槛:小错(认错那句里没有后果)不提示。前三条是旧正例的小错原形
       { name: "SE 284:小错不提示(旧正例原形)", text: "我上一轮说错了,那个文件其实没落盘。现在重写。" },
       // 批 285(D179 r9)
