@@ -4,7 +4,7 @@
 
 主题：**闸与工作流脚本整套同步进来，安装器可以覆盖安装；示例规矩换成两份的新结构；README 按新方向重写**。
 - **脚本同步**：`scripts/` 从 23 个文件增到 58 个。此前公开树停在 0.9.14 那次同步，还缺收尾钩子与开批脚本静态依赖的五个文件（`lib/write-state`、`lib/install-config`、`lib/obligations`、`lib/debt-schema`、`lib/write-checks`）。这次连同开工面钩子 `hook-start-gate`、另外四个钩子脚本、规矩文件索引核对 `verify-laws`、windowsHide 检查等工作流工装一起带进来；规则文件里的 `law:` 字段随之落到新结构。仍不带的：远端推送守卫四件、直写守卫 `hook-guard`、判活探针三件，以及静态依赖判活探针的 `tplan-gate`。规则判据没有改动，条数仍是 31（会拦 7 / 只提示 7 / 只记账 17）。从源项目同步时，项目专属的名字换成了中性名；其中进了运行逻辑的一处是环境变量 `GATE_HOOK_GUARD_SELFTEST`（写入检查的台账改道开关），`constraint-events --backfill` 缺省扫的转录目录改为按本 checkout 的根换算。
-- **验收**：`npm run gate:accept` 现在跑到每个带自测的脚本（新增 `gate:self-test:workflow`）。其中 windowsHide 检查要解析依赖，跑验收前先 `npm --prefix scripts/gate-deps install`。三条读源项目环境的自测用例（仓根的 `gate-install.json`、某一批的审计件、约束事件台账）在环境不在时跳过并打一行说明。
+- **验收**：`npm run gate:accept` 现在跑到每个带自测的脚本（承重面里的几件并进 `gate:self-test`，其余工作流工装在新增的 `selftest:workflow`）。其中 windowsHide 检查要解析依赖，跑验收前先 `npm --prefix scripts/gate-deps install`。三条读源项目环境的自测用例（仓根的 `gate-install.json`、某一批的审计件、约束事件台账）在环境不在时跳过并打一行说明。
 - **安装器**：拷贝清单覆盖 `scripts/` 下全部闸与工作流件（只有安装器自己和私有标识扫描不拷），示例规矩换成新结构（仓规矩、闸规矩、归档目录里仍被 `law:` 指针引用的三件）；除收尾钩子外的钩子只拷不接线。写安装清单用的「闸引擎文件」口径改为直接 import 规则 P 的那一份——原来手抄的正则少认 12 个文件，装闸提交里带着它们时不会被认作原样装入。新增 `--overwrite`：`scripts/` 下已存在且内容不同的文件直接替换，替换前核这些路径在目标仓的 git 工作区是干净的，不干净就以退出码 7 拒绝、一个字节都不写；规矩文件和 agent 定义不受这个开关影响，照旧落旁件。安装器有了自测（`--self-test`）。
 - **示例规矩文件换结构**：根目录 `AGENTS.md` 改成示例仓规矩（红线、批与验证、部署、工具），开头写明换成自己的项目时改哪些；新增 `docs/gate/AGENTS.md`（闸规矩：设计原则、规则怎么进来、怎么改闸、授权、改代码时必须同步的地方、收尾回执）。
 - **旧示例归档**：原 `AGENTS.md`（示例宪法）移到 `docs/archive/laws-2026-11/constitution-2026-11-04.md`，`docs/laws/` 下三份示例法典移到同一目录，`docs/laws/` 不再存在。归档件不是现行规矩；一部分规则的 `law:` 指针仍落在那里，所以文件留着。
