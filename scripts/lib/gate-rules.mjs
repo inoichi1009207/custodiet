@@ -4516,7 +4516,7 @@ const RULE_T = {
   //   ① 装机台账(INSTALLED.md / 装机台账 / tool-register / 工具台账)当处所或去向的「登记」:那是**已做完**的装机落账
   //     (批 257 实撞「装机台账登记了新管的这批载体」被要失效期);只剔「台账名 + 登记」或「登记进 + 台账名」这几个字,句子其余照判。
   //     欠账台账(gate-debts / 欠账表)不在表里——「这个洞登记进欠账表」正是 T 要管的登记。
-  //   ② 普查器(E:/dotfiles-claude/census.mjs)自己的输出格式:**行首**类别名「装了没登记 / 登记了已不在 / 登记了没装」后接空白或冒号,
+  //   ② 普查器(E:/my-dotfiles/census.mjs)自己的输出格式:**行首**类别名「装了没登记 / 登记了已不在 / 登记了没装」后接空白或冒号,
   //     以及类别名后紧跟计数(「登记了没装工具 1 条」)。批 259 撤掉的是**自由文本里猜**类别名;这里只认行首标签与「类别名 + 数字」两种格式,
   //     裸写「这条只登记了没装上」「只登记了没装闸」照拦(cases.pos 钉着)。
   //   代价(漏放面,按用户取舍接受):有人把缺陷「登记进 tool-register」或在行首以普查标签起句写真登记,T 不再响;出现一次真实漏放损失即重开。
@@ -5364,7 +5364,7 @@ const RULE_P = {
      *    认不出的 cd 外壳 / PS cd 失败原地 / pushd 栈跨调用整套):本批为它连修五轮(0aa11fd、afdd279、52779ec、620e556、f7306ec),
      *    每轮复核红队都在跨调用边界上找出新形态,而这些形态在语料里全是 0 次(派出方自统计,本机 182 份主转录:PS 1346 次调用、
      *    变量形 cd 0、Push/Pop-Location 0、回置声明 825 条里命令无 cd 类词 0 条、PS「上一次切目录、下一次不带 cd 提交」1 次);
-     *    52779ec 的语料回放显示「只靠跨调用状态判别处」的提交修后 0 个,真实他仓提交都是同一调用形(`cd /d/dotfiles-claude && … git commit`)。
+     *    52779ec 的语料回放显示「只靠跨调用状态判别处」的提交修后 0 个,真实他仓提交都是同一调用形(`cd /d/my-dotfiles && … git commit`)。
      *  让出的面(登记):
      *    · PowerShell 在一次调用里 `Set-Location` 他仓、下一次调用不带 cd 直接提交 ⇒ 判本仓(PS 跨调用若保持 cwd 即漏放;语料 1 次);
      *    · Bash 上一次调用 cd 进根内子目录(CC 对根内 cd 跨调用保持)、本次 `cd ..` 后本仓提交失败 ⇒ 起点按根算、`..` 解出根外 ⇒
@@ -6236,7 +6236,7 @@ const RULE_P = {
         headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:00:30Z" }] } },
       { name: "279 末笔探针:先在别的仓提交、再回本仓整树提交,30 秒后落改闸提交 ⇒ 照要猎手",
         text: "提交。", pLedger: { carriers: 0 }, gateTouched: false,
-        bash: ["cd E:/cbot && git commit -am a; cd /repo && git add -A && git commit -m b"], at: "2026-10-26T02:00:00Z",
+        bash: ["cd E:/proj-d && git commit -am a; cd /repo && git add -A && git commit -m b"], at: "2026-10-26T02:00:00Z",
         headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:00:30Z" }] } },
       { name: "279 修闸 tag:账说没有、本轮提交后 30 秒落了改闸提交(脚本写的闸)⇒ 照要猎手",
         text: "提交。", pLedger: { carriers: 0 }, gateTouched: false,
@@ -6598,7 +6598,7 @@ const RULE_P = {
         batchGoal: { armedAt: "2026-10-10T08:00:00Z", conditions: ["甲"] },
         bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
         prior: [{ text: "红队", at: "2026-10-10T10:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
-                { text: "他仓提交", at: "2026-10-10T10:10:00Z", bash: "cd /d/dotfiles-claude && git add -A && git commit -m x" },
+                { text: "他仓提交", at: "2026-10-10T10:10:00Z", bash: "cd /d/my-dotfiles && git add -A && git commit -m x" },
                 { text: "改提交信息", at: "2026-10-10T10:20:00Z", bash: "git commit --amend --no-edit" }],
         headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-10T10:30:00Z" }], engineAnchorAt: "2026-10-10T10:15:00Z" } },
       // ══ 红队 a2a9f58b 的拦截侧 ═══════════════════════════════════════════════════════════════════
@@ -6902,22 +6902,22 @@ const RULE_P = {
         bash: ["git add docs/a.md && git commit -m a"], at: "2026-10-26T02:00:00Z",
         headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:03:00Z" }] } },
       // 误拦猎手收窄版 FB-5 / FB-6、codex 279-r2 附 2:作用在别的仓的 git(相对路径、整树提交、同名闸文件路径)不算本会话碰闸
-      { name: "279 收窄版 FB-5:git -C ../cbot pull ⇒ 不要猎手",
+      { name: "279 收窄版 FB-5:git -C ../proj-d pull ⇒ 不要猎手",
         text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
-        bash: ["git -C ../cbot pull"], at: "2026-10-26T01:30:00Z",
+        bash: ["git -C ../proj-d pull"], at: "2026-10-26T01:30:00Z",
         headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
       { name: "279 收窄版 FB-6:别的仓整树提交,300 秒内本仓落别人的改闸提交 ⇒ 不要猎手",
         text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
-        bash: ["git -C E:/cbot commit -am x"], at: "2026-10-26T02:00:00Z",
+        bash: ["git -C E:/proj-d commit -am x"], at: "2026-10-26T02:00:00Z",
         headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-26T02:00:30Z" }] } },
       { name: "279 codex r2 附 2:git -C 别的仓 add 同名闸文件 ⇒ 不要猎手",
         text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
-        bash: ["git -C E:/cbot add scripts/lib/gate-rules.mjs"], at: "2026-10-26T01:30:00Z",
+        bash: ["git -C E:/proj-d add scripts/lib/gate-rules.mjs"], at: "2026-10-26T01:30:00Z",
         headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-25T02:14:00Z" }] } },
       // 末笔误拦猎手 FB-2:子 shell cd 他仓后本仓写 AGENTS.md、只提交 docs ⇒ 不算他仓承重写入
       { name: "279 末笔 FB-2:子 shell cd 他仓后本仓写 AGENTS.md、只提交 docs ⇒ 不触发",
         text: "做完了。", pLedger: { carriers: 4 }, hookCheckout: "/repo",
-        bash: ["(cd E:/cbot && git pull); echo x >> AGENTS.md; git add docs/a.md && git commit -m a"], at: "2026-10-26T02:00:00Z",
+        bash: ["(cd E:/proj-d && git pull); echo x >> AGENTS.md; git add docs/a.md && git commit -m a"], at: "2026-10-26T02:00:00Z",
         headFacts: { root: "/repo", commits: [{ sha: "e".repeat(40), files: ["docs/a.md"], at: "2026-10-26T02:00:05Z" }] } },
       // 误拦猎手 279 终版 FB-3:只读 git 动作不算碰闸
       { name: "279 FB-3:只跑 git stash list / restore --staged ⇒ 不要猎手",
@@ -7425,7 +7425,7 @@ const RULE_P = {
         bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
         prior: [{ text: "红队", at: "2026-10-10T10:00:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
                 { text: "误拦猎手", at: "2026-10-10T10:00:30Z", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } },
-                { text: "他仓提交", at: "2026-10-10T10:10:00Z", bash: "cd /d/dotfiles-claude && git add -A && git commit -m x" },
+                { text: "他仓提交", at: "2026-10-10T10:10:00Z", bash: "cd /d/my-dotfiles && git add -A && git commit -m x" },
                 { text: "改提交信息", at: "2026-10-10T10:20:00Z", bash: "git commit --amend --no-edit" }],
         headFacts: { root: "/repo", commits: [{ files: ["scripts/lib/gate-rules.mjs"], at: "2026-10-10T10:30:00Z" }], engineAnchorAt: "2026-10-10T09:00:00Z" } },
       // 量化 a00051d BP-3:上一批改闸并红队,新批武装后只提交 src/ ⇒ 不触发(两个面)
@@ -9569,7 +9569,7 @@ export const RULE_O = {
     ],
     neg: [
       // 批 286(fp 台账 10-22 两笔原形):本机回环 / 私网地址是配置读数或被检服务地址,不是外部引文
-      { name: "286:本机回环地址不是外部引文", text: "依据:服务器进程环境变量里 LACUNA_AUTH_DELEGATE_URL=http://127.0.0.1:3000/auth,出处是 ssh 实读。" },
+      { name: "286:本机回环地址不是外部引文", text: "依据:服务器进程环境变量里 PROJ_C_AUTH_DELEGATE_URL=http://127.0.0.1:3000/auth,出处是 ssh 实读。" },
       { name: "286:私网地址不是外部引文", text: "出处:内网面板 http://192.168.1.20:8080/status 显示已同步。" },
       // 真取过页
       { text: "出处:https://example.test/paper。", bash: "node scripts/fetch-quote-check.mjs https://example.test/paper \"某句\"" },
@@ -9881,7 +9881,7 @@ const DP_UNWRAP = (seg, wrap, depth = 0) => {
 // heredoc 喂 shell(`bash <<'EOF' … git push private … EOF`):切段前要剥 heredoc,正文里的推送会跟着丢(D161⑫)。
 //   含 heredoc 的整条命令先交语法树看一眼,看到推送就把整条命令作为该命令的第一段放进去(段序不变,其后的探针照常算在推送之后)
 //   (批 285:原 DP_SEGS 并入下方 DP_SEGS_T,切段 / 剥壳 / heredoc 处理不变,另给每段带「确知在别的仓」标记)
-// 批 285(D161①,误拦):DP 原来只看远端名、不看在哪个仓里推——`cd /d/lacuna && git push private main`、别的仓里先 cd 再裸 `git push`
+// 批 285(D161①,误拦):DP 原来只看远端名、不看在哪个仓里推——`cd /d/proj-c && git push private main`、别的仓里先 cd 再裸 `git push`
 //   都被当成推 本仓私仓(语料实见)。现在跟踪**本命令里**的去向,确知落在 git-common-dir 与本仓不同的别的仓时,该段推送不计:
 //   ① 命令**第一段**是 `cd|pushd|sl|Set-Location <字面绝对路径>`,且其后接 `&&` / `;` / 换行;
 //   ② 段内 `git -C <路径>`(绝对路径重新定起点,相对路径接在已知起点后)。
@@ -10505,7 +10505,7 @@ const RULE_AD = {
  *    值认:仓内文件路径(scripts/ docs/ .claude/ AGENTS.md、绝对路径与 ~ 亦可;memory 目录与 MEMORY.md 不算)、规则 id(「M 项」/ RULE_X)、
  *    `npm run <脚本>`、D 号(欠账表里登记了候选闸);或 `不可机械化:<理由>`。写「无 / 暂无」须后跟 D 号。
  *    读法:Stop 时**读盘上那条 memory 的全文**(既有笔记只追加一句时,原有的执行面行照认——误拦猎手 r5 FB-12);读不到退回本次写入正文。
- *  触发:写了 `type: feedback` 或 `type: user` 的 memory(项目 memory 或 dotfiles-claude 全局 memory;索引 MEMORY.md 除外)。
+ *  触发:写了 `type: feedback` 或 `type: user` 的 memory(项目 memory 或 my-dotfiles 全局 memory;索引 MEMORY.md 除外)。
  *    不再按措辞词表触发(r5 误拦猎手 FB-1 / FB-8 / FB-9:「必须 / 每次 / always」在纯事实型 project memory 里常见)。
  *  天花板:① 规则写在 project / reference 类正文里的不触发(普查实见 11 条,D179 残余);② 经 Bash 写 memory 不认;
  *    ③ 只证那一行在,不证它指的东西真在查这条规则(写一行假执行面即可绕过,属故意伪造)。
@@ -10524,7 +10524,7 @@ const RULE_MF = {
         written: "---\nname: esc2\nmetadata:\n  type: feedback\n---\n说话别绕。\n不可机械化:这条要判语气,无动作面可查。" } },
   ],
   //   r6 BP-7:agent 持久记忆目录(.claude/agent-memory*/<名>/)同管
-  _MEM: /(^|\/)(?:\.claude\/projects\/[^/]+\/memory|dotfiles-claude\/memory|\.claude\/agent-memory[^/]*)\/(?:[^/]+\/)*[^/]+\.md$/i,
+  _MEM: /(^|\/)(?:\.claude\/projects\/[^/]+\/memory|my-dotfiles\/memory|\.claude\/agent-memory[^/]*)\/(?:[^/]+\/)*[^/]+\.md$/i,
   //   索引只认 memory 根(或 agent-memory 的 <名>/)下那一份;子目录里叫 Memory.md 的照管(r6 BP-7)
   _INDEX: /(?:^|\/)(?:memory|agent-memory[^/]*\/[^/]+)\/MEMORY\.md$/i,
   /** frontmatter 里的 type 值(只认文件开头 --- 段;容 `type : x` 与全角冒号——r6 BP-8 / 误拦 r6 FB-3:正文里复述「type: feedback」不算)。 */
@@ -10659,7 +10659,7 @@ const RULE_MF = {
       { name: "MF:写 feedback memory,正文没执行面", text: "记下了,以后都这样做。",
         write: "C:/Users/u/.claude/projects/example-project/memory/reply-style.md", written: "---\nname: reply-style\nmetadata:\n  type: feedback\n---\n回复先给结论。" },
       { name: "MF:全局 memory 同样管", text: "已存进全局记忆。",
-        write: "E:/dotfiles-claude/memory/x-rule.md", written: "---\nname: x\nmetadata:\n  type: feedback\n---\n先查 ADR 再动手。" },
+        write: "E:/my-dotfiles/memory/x-rule.md", written: "---\nname: x\nmetadata:\n  type: feedback\n---\n先查 ADR 再动手。" },
       { name: "MF v3:回复里说了执行面不算(只认笔记正文)", text: "已存。执行面:scripts/lib/gate-rules.mjs:8668(ND 项)。",
         write: "C:/Users/u/.claude/projects/example-project/memory/reply-style2.md", written: "---\nname: reply-style2\nmetadata:\n  type: feedback\n---\n回复先给结论。" },
       { name: "MF r5 BP-1:正文顺带提到路径不算(不在执行面行)", text: "记下了。",
@@ -10669,7 +10669,7 @@ const RULE_MF = {
       { name: "MF r5 BP-3:执行面写「暂无」不附 D 号不算", text: "记下了。",
         write: "C:/Users/u/.claude/projects/example-project/memory/r3.md", written: "---\nname: r3\nmetadata:\n  type: feedback\n---\n回复先给结论。\n执行面:暂无,先记在 r3.md" },
       { name: "MF r5 BP-7:user 类同样管", text: "记下了。",
-        write: "E:/dotfiles-claude/memory/u.md", written: "---\nname: u\nmetadata:\n  type: user\n---\n以后回复先给结论,结论放第一行。" },
+        write: "E:/my-dotfiles/memory/u.md", written: "---\nname: u\nmetadata:\n  type: user\n---\n以后回复先给结论,结论放第一行。" },
       { name: "MF codex r6-fix 附 2:user 类「默认…」是指令", text: "已存。",
         write: "C:/Users/u/.claude/projects/example-project/memory/u-def.md", written: "---\nname: n\nmetadata:\n  type: user\n---\n默认用中文回复。" },
       { name: "MF r6 BP-1:执行面只写回声 D179 不算", text: "已存。",
@@ -10703,7 +10703,7 @@ const RULE_MF = {
     ],
     neg: [
       { name: "MF:正文带执行面路径", text: "已存。",
-        write: "E:/dotfiles-claude/memory/z.md", written: "---\nname: z\nmetadata:\n  type: feedback\n---\n先查 ADR。\n执行面:scripts/batch-goal.mjs" },
+        write: "E:/my-dotfiles/memory/z.md", written: "---\nname: z\nmetadata:\n  type: feedback\n---\n先查 ADR。\n执行面:scripts/batch-goal.mjs" },
       { name: "MF FB-7:memory 模板的加粗标签", text: "已存。",
         write: "C:/Users/u/.claude/projects/example-project/memory/x.md", written: "---\nname: x\nmetadata:\n  type: feedback\n---\n先查 ADR。\n\n**执行面:** scripts/batch-goal.mjs:487\n" },
       { name: "MF FB-1:迁进法条、执行面指法典", text: "两条工艺迁进 collab.md「四之二」。",
@@ -10715,7 +10715,7 @@ const RULE_MF = {
       { name: "MF:执行面写「无」但附了 D 号", text: "已存。",
         write: "C:/Users/u/.claude/projects/example-project/memory/d.md", written: "---\nname: d\nmetadata:\n  type: feedback\n---\n先查 ADR。\n执行面:无,候选闸见 D180" },
       { name: "MF:声明不可机械化", text: "已存。",
-        write: "E:/dotfiles-claude/memory/v.md", written: "---\nname: v\nmetadata:\n  type: feedback\n---\n说话别绕。\n不可机械化:这条要判语气,无动作面可查。" },
+        write: "E:/my-dotfiles/memory/v.md", written: "---\nname: v\nmetadata:\n  type: feedback\n---\n说话别绕。\n不可机械化:这条要判语气,无动作面可查。" },
       { name: "MF r5 FB-1/FB-8:project 类事实(含「必须 / 每次」)不管", text: "记下了工具事实。",
         write: "C:/Users/u/.claude/projects/example-project/memory/headroom.md", written: "---\nname: headroom\nmetadata:\n  type: project\n---\n改完环境变量必须重开会话才生效;verify-prod 每次跑约 40 秒。" },
       { name: "MF r5 FB-7:只改索引 MEMORY.md 不管", text: "清了一条过期索引。",
