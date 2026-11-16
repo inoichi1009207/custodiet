@@ -76,6 +76,8 @@ const FILES = [
   "scripts/lib/write-checks.mjs",
   "scripts/lib/write-checks.selftest.mjs",
   "scripts/lib/debt-facts.mjs",
+  // 批 305:开批脚本静态 import 的主尺 / 指令定位
+  "scripts/lib/batch-ruler.mjs",
   "scripts/gate-deps/package.json",
   "scripts/gate-deps/package-lock.json",
   // 自签误报的 codex 盲审;batch-goal --clear 在场才后台发车。它经 scripts/codex-run.mjs 调本机 codex CLI(只读沙箱);
