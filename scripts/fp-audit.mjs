@@ -232,7 +232,7 @@ export function buildTask(items) {
     "下面每一条都是一个仓库的收尾闸的一次报警,执行方事后声称「拦错了」。",
     "**执行方给的理由不在这里**——请你只凭闸的提示原文、当轮动作与规则定义,独立判这一次报警对不对。",
     "**只读当前目录里的文件**(这是专为本审准备的快照),不要读其他目录:每条 ITEM 标了它用的规则快照目录 `rules/<版本>/`,",
-    "里面是**报警当时**那一版的 `scripts/lib/gate-rules.mjs`(搜 `id: \"<规则 id>\"`)与 `AGENTS.md`、`docs/laws/*.md`(规则的 law 字段指向它们)。",
+    "里面是**报警当时**那一版的 `scripts/lib/gate-rules.mjs`(搜 `id: \"<规则 id>\"`)与 `AGENTS.md`、`docs/gate/AGENTS.md`、`docs/archive/laws-2026-11/*.md`(2026-11-05 前的快照是 `docs/laws/*.md`;规则的 law 字段指向它们)。",
     "规则后来可能被改过,按报警当时那一版判,不按你对现行规则的印象判。",
     "",
     "判词只有三个:",
@@ -273,7 +273,7 @@ export function projectDir(cwd) {
   return path.join(os.homedir(), ".claude", "projects", String(cwd).replace(/[^A-Za-z0-9]/g, "-"));
 }
 
-/** 规则快照:报警时刻之前最后一个提交里的 gate-rules.mjs + AGENTS.md + docs/laws/*.md,写进 <snap>/rules/<sha8>/。
+/** 规则快照:报警时刻之前最后一个提交里的 gate-rules.mjs + AGENTS.md + docs/gate/AGENTS.md + docs/archive/laws-2026-11/*.md(旧提交里是 docs/laws/*.md),写进 <snap>/rules/<sha8>/。
  *  codex 在 <snap> 里跑:看得到当时的规则与法条,看不到误报台账、以往盲审结果和执行方理由(grill 259 F2 / F5a)。 */
 function git(args) {
   // windowsHide:本进程由 batch-goal 以 detached 起(Node 文档:detached 子进程自带控制台,windowsHide 默认 false);
@@ -290,7 +290,7 @@ function snapshotRules(snap, at) {
   if (fs.existsSync(dir)) return sha8;
   // 连同规则引擎依赖的 scripts/lib/* 一起(codex 259-final-r1 附节 3:原先只带 gate-rules.mjs,write-effects 等判据实现缺席)。
   //   天花板:按「报警时刻之前最后一个提交」取,未提交的规则改动、别的分支对不上
-  const files = git(["ls-tree", "-r", "--name-only", sha, "--", "scripts/lib", "AGENTS.md", "docs/laws"]).split("\n").filter(Boolean);
+  const files = git(["ls-tree", "-r", "--name-only", sha, "--", "scripts/lib", "AGENTS.md", "docs/laws", "docs/gate", "docs/archive/laws-2026-11"]).split("\n").filter(Boolean);
   for (const f of files) {
     const dst = path.join(dir, f);
     fs.mkdirSync(path.dirname(dst), { recursive: true });

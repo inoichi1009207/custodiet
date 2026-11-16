@@ -30,8 +30,14 @@ export function toolPresent(rel) {
 /** Q:推面出批而无实打实阻断。法条早有、触发层 2026-08-19 才建。 */
 export const RULE_Q = {
   id: "Q",
-  blocking: true,
-  law: "AGENTS.md#执行共识",
+  // 批 292:措辞类改不阻断、只检测只记账(287 设计附录 A;用户 11-05「措辞相关……躲不开查措辞就一律改成非阻断」)。
+  //   有意降低保护:推面出批的句子当轮不再拦。批 292 前一版(分支 worktree-agent-a8b759ca976fd2c3d)试过给 Q 补放行条件,
+  //   codex 292-a-review-r1 判「写过同名文件 + 正文出现期限」不等于真实转债,作废。
+  //   「只记账」= 287 设计 2.8「Q:推面出批 ⇒ 只记账」:命中写进候选台账 `.claude/.gate-candidates.jsonl`,**对模型零输出**
+  //   (只改不阻断仍会以提示注入上下文,用户 11-06「只是改成只提醒不阻断的话会不会依然继续污染上下文?」)。
+  blocking: false,
+  logOnly: true,
+  law: "docs/archive/laws-2026-11/constitution-2026-11-04.md#执行共识",
   detect: (ctx) => {
     // 批 278(误拦猎手 某会话 FB-2):「朋友在 PR 里写了留待审阅」——「留待」后接外部流程的状态词(审阅/审核/评审/合并/review)
     //   是在转述别人那件事的状态,不是我推迟自己的活 ⇒ 不算。红队 278 BP-4 否掉了另一条修法(realBlock 加「由你定」:
@@ -99,10 +105,11 @@ export const RULE_Q = {
 export const RULE_D = {
   id: "D",
   blocking: false,
+  logOnly: true,   // 批 292:287 设计附录 A「只检测、只记账」——命中进候选台账,对模型零输出
   // codex 092 复审逮到:D14 首修按旧锚**字符串**机械重指到「完成靠核对」,语义归属错——
   // collab.md 四之二明写「观测仪器=D 项(强制项被降级成征询)」,法源是那条。
   // 锚点自测的天花板也由此写明:它只证**可解析**,不证**语义归属**(语义要人/跨模型核)。
-  law: "docs/laws/collab.md#授权内直接做,不请示",
+  law: "docs/archive/laws-2026-11/collab.md#授权内直接做,不请示",
   detect: (ctx) => {
     // ⚠️ 用 `PAT.downgrade` 而不是手抄。原实现我手打了三条模式,**漏了
     //   `/需要(我)?(的话|再)/`**(codex 060 §1.1 给出可复现输入「交叉验证需要的话再做。」
@@ -196,7 +203,7 @@ const gWin = (ctx) => { try { return ctx.window(); } catch { return null; } };
 export const RULE_G = {
   id: "G",
   blocking: false,
-  law: "docs/laws/reporting.md#关账前自审一遍",
+  law: "docs/archive/laws-2026-11/reporting.md#关账前自审一遍",
   detect: (ctx) => {
     if (!ctx.didCommit()) return [];
     const win = gWin(ctx);
@@ -335,7 +342,8 @@ const unfulfilledOn = (lines, evidence) => lines.filter((line) => {
 export const RULE_B = {
   id: "B",
   blocking: false,
-  law: "docs/laws/collab.md#委派与承诺必闭环",
+  logOnly: true,   // 批 292:287 设计附录 A「只检测、只记账」——命中进候选台账,对模型零输出
+  law: "docs/archive/laws-2026-11/collab.md#委派与承诺必闭环",
   detect: (ctx) => unfulfilledOn(matchAny(ctx.text, PAT.promise), actionText(ctx)),
   exempts: [],
   message: (hits) =>
@@ -438,7 +446,8 @@ const defectText = (ctx) => {
 export const RULE_C = {
   id: "C",
   blocking: false,
-  law: "AGENTS.md#恒定条款",
+  logOnly: true,   // 批 292:287 设计附录 A「只检测、只记账」——命中进候选台账,对模型零输出
+  law: "docs/archive/laws-2026-11/constitution-2026-11-04.md#恒定条款",
   detect: (ctx, opt = {}) => {
     const all = matchAny(defectText(ctx), PAT.defect, ctx.text);
     // 批 285(D152 d-C,误拦):写在 ⏸ 段里的缺件是**摊给用户裁**的那件事本身(宪法唯一通用等待标识),
@@ -546,7 +555,8 @@ export const RULE_C = {
 export const RULE_H = {
   id: "H",
   blocking: false,
-  law: "docs/laws/collab.md#授权内直接做,不请示",
+  logOnly: true,   // 批 292:287 设计附录 A「只检测、只记账」——命中进候选台账,对模型零输出
+  law: "docs/archive/laws-2026-11/collab.md#授权内直接做,不请示",
   detect: (ctx) => {
     if (ctx.writes.length) return [];
     return unfulfilledOn(matchAny(ctx.text, PAT.canDo), actionText(ctx));
@@ -577,7 +587,8 @@ export const RULE_H = {
 export const RULE_F = {
   id: "F",
   blocking: false,
-  law: "docs/laws/reporting.md#完成性断言须与未覆盖栏一致",
+  logOnly: true,   // 批 292:287 设计附录 A「只检测、只记账」——命中进候选台账,对模型零输出
+  law: "docs/archive/laws-2026-11/reporting.md#完成性断言须与未覆盖栏一致",
   detect: (ctx) => {
     const done = matchAny(ctx.text, PAT.done);
     const owed = matchAny(ctx.text, PAT.owed);
@@ -727,7 +738,7 @@ const detectL = (ctx, { segScoped = true, censusExempt = true, requireManual = t
 export const RULE_L = {
   id: "L",
   blocking: false,
-  law: "docs/laws/collab.md#五之二、造物两约束",
+  law: "docs/archive/laws-2026-11/collab.md#五之二、造物两约束",
   // ⚠️ 批 253(2026-09-17,窄例外③「判据过重」自签;fp 台账 L 8/37=21.6%)收窄触发面,两刀一补:
   //   ① **用 `ls` 核具体文件在不在,不算清点**(台账 09-16/09-17 同形:
   //      `ls scripts/hook-precommit-gate.mjs`、`ls scripts/fetch-quote-check.mjs scripts/quote-check.mjs`)。
@@ -911,8 +922,10 @@ export const RULE_L = {
 /** N:把命令归入「只能用户亲手下」却没核它拉起几个 agent。 */
 export const RULE_N = {
   id: "N",
+  // 义务已随 2026-11-05 宪法大改退役,P0 时决定删除或重写(law 指存档原文;blocking 降为 false)
   blocking: false,
-  law: "docs/laws/collab.md#成品大工作流命令只能用户亲手下",
+  logOnly: true,   // 批 292:287 设计附录 A「只检测、只记账」——命中进候选台账,对模型零输出
+  law: "docs/archive/laws-2026-11/collab.md#成品大工作流命令只能用户亲手下",
   detect: (ctx) => {
     const handoff = /(只能(你|用户)亲手下|递给(你|用户)|不得自行发起|得你亲手下)/;
     if (!handoff.test(ctx.text)) return [];
@@ -972,6 +985,10 @@ import { stripQuoted, segments } from "./gate-cmd.mjs";
 const CARRIER_RE = CREATION_SURFACE;
 // 批 259(红队 a391d46c BP-5):锚到路径边界、不分大小写(NTFS)——`/tmp/AGENTS.md.bak`、`docs/laws/x.md.orig` 不是法条。
 //   不用 `$`:退回旧判法时它还要在整段命令文本里找(`sed -i … AGENTS.md 2>/dev/null`)
+// 批 290 合并后红队 BP-5(`docs/gate/*.md` 通配、`checkout -- docs/gate` 整目录写法 J 不响):5797f2b 试过认未解出形状
+//   `docs/gate/X.md`,**已撤回**——复核误拦猎手 FB-21/24/25(for 字面词表改非规矩文件、touch 刷时间戳、真名 x.md 被拦)
+//   与红队 BP-10~12(PowerShell / for / find / rm -rf 等形照样漏)两头都不成立。J 在命令文本上认写法到此为天花板,
+//   这一族的兜底是提交那一步 P 按 git 真实文件名判(D196 ⑭,P0 用真 hook 证)。
 const LAW_RE = /(?:^|[\\/\s'"`=(])(?:AGENTS\.md|docs[\\/]laws[\\/][\w-]+\.md)(?![\w.-])/i;
 // 批 285(D159⑪ 误拦):LAW_RE 不锚仓根 ⇒ `cp a /tmp/AGENTS.md`、往 scratchpad(…/AppData/Local/Temp/…)放一份宪法草稿 / 副本
 //   被 J 判「改宪法」。临时目录里的同名文件不是任何仓的法条 ⇒ J 的路径谓词剔掉**以临时目录开头**的路径(仅此一处收窄)。
@@ -1101,8 +1118,10 @@ function touched(ctx, pathRe, onlyNew) {
 /** I:新建载体未留「工具面已扫」痕迹(纪律 32)。 */
 export const RULE_I = {
   id: "I",
-  blocking: true,
-  law: "docs/laws/collab.md#五之二、造物两约束",
+  // 批 292:改提醒、不阻断(287 设计附录 A「I、L、G、ND ⇒ 提醒」;用户 11-05「措辞相关……躲不开就一律非阻断」)。
+  //   有意降低保护:造新载体前没交代「工具面已扫」当轮不再拦,只提示。
+  blocking: false,
+  law: "docs/archive/laws-2026-11/collab.md#五之二、造物两约束",
   // 批 285(D157③):判据最后一次改动的时刻 = 7de7678(批 260,touched 换写入效果分析的收口;`git log -L` 量 RULE_I 段所得)。
   //   `--fp-report` 的误报率表只数此刻之后的报警与自签(此前 17 笔自签全部早于 10-10)。**改 I 的判据时同步改这里**;忘了改 ⇒ 窗口偏宽,退回全量口径。
   criteriaSince: "2026-10-12T02:28:08+08:00",
@@ -1388,8 +1407,14 @@ RULE_I.cases.pos.push({
 /** J:立/改法未交代触发层。 */
 export const RULE_J = {
   id: "J",
-  blocking: true,
-  law: "AGENTS.md#承重规则的载体门槛",
+  // 法条已随 2026-11-05 宪法大改进存档,P0 时决定删除或重写(law 指存档原文)。
+  // 阻断保留(批 290 红队 BP-1):它是改规矩文件的提交上唯一逐笔阻断的一道,降级后改宪法正文一路无拦;
+  //   新宪法「改正文要用户逐字审」还没有闸接,P0 补上之前不降保护。
+  // 批 301(287 设计 2.2 J 行;D196 ⑩ FB-8 / ⑫ BP-6):拒绝点挪到写入与关账(scripts/lib/write-checks.mjs:写前按改后全文跑 verify-laws、
+  //   关账对本批改过的规矩文件跑 verify-laws),「正文里出现触发层 / verify-laws 字样就放行」这条文字出路随之撤掉——本条改只记账。
+  blocking: false,
+  logOnly: true,
+  law: "docs/archive/laws-2026-11/constitution-2026-11-04.md#承重规则的载体门槛",
   // ⚠️ 声明写进**法条正文**同样算数(ctx.written),不只认对话——
   //   对话是易失的,法条才是权威载体。旧实现只扫 assistant 文本,于是
   //   「写进文件了但没在对话里复述」被判违规(2026-08-19 实撞)。
@@ -1458,7 +1483,7 @@ export const RULE_J = {
       // 批 259 红队(a391d46c)
       { name: "259 红队二轮 BP-1:读模板写到插值法条路径 ⇒ 拦", text: "改了法典。", tracked: ["scripts/x.mjs"],
         bash: "python -c \"from pathlib import Path; t=open('tmpl.md').read(); p=Path(f'{root}/docs/laws/collab.md'); p.write_text(t)\"" },
-      { name: "259 红队二轮(b):拷进已有法典目录(不带尾斜杠)⇒ 拦", text: "改了法典。", tracked: ["scripts/x.mjs"], bash: "cp /tmp/collab.md docs/laws" },
+      { name: "259 红队二轮(b):拷进已有规矩目录(不带尾斜杠)⇒ 拦(2026-11-05 docs/laws/ 退役,夹具改用磁盘上真在的 docs/gate)", text: "改了法典。", tracked: ["scripts/x.mjs"], bash: "cp /tmp/AGENTS.md docs/gate" },
       { name: "259 红队二轮(b):cp -t . 落成宪法 ⇒ 拦", text: "改了宪法。", tracked: ["scripts/x.mjs"], bash: "cp -t . /tmp/AGENTS.md" },
       { name: "259 红队二轮(b):git checkout 整个法典目录 ⇒ 拦", text: "回滚了。", tracked: ["scripts/x.mjs"], bash: "git checkout HEAD~1 -- docs/laws/" },
       { name: "259 红队二轮(b):花括号展开改法典 ⇒ 拦", text: "改了法典。", tracked: ["scripts/x.mjs"], bash: "sed -i 's/a/b/' docs/laws/{collab,production}.md" },
@@ -1486,6 +1511,11 @@ export const RULE_J = {
       { name: "285 二轮 红队 1:Edit E:/Windows/Temp/../../test/AGENTS.md ⇒ 拦", text: "改了宪法。", write: "E:/Windows/Temp/../../test/AGENTS.md" },
       { name: "285 二轮 红队 1:Edit /tmp/../test/AGENTS.md ⇒ 拦", text: "改了宪法。", write: "/tmp/../test/AGENTS.md" }],
     neg: [
+      // FB-6 口径 + 290 复核 FB-21/24/25(BP-5 撤回后):docs/gate/ 下有名有姓的别的文件、for 字面词表、touch 通配都不是改法
+      { name: "290 FB-6:sed -i 改 docs/gate/routing.md 不算改法", text: "改了路由表。", tracked: ["scripts/x.mjs"], bash: "sed -i 's/a/b/' docs/gate/routing.md" },
+      { name: "290 FB-21:for 字面词表改 docs/gate 非规矩文件不算改法", text: "改了路由表。", tracked: ["scripts/x.mjs"], bash: "for f in routing notes; do sed -i 's/a/b/' docs/gate/$f.md; done" },
+      { name: "290 FB-24:touch 通配刷时间戳不算改法", text: "刷了时间戳。", tracked: ["scripts/x.mjs"], bash: "touch docs/gate/*.md" },
+      { name: "290 FB-25:真名 docs/gate/x.md 不算改法", text: "记了笔记。", write: "/repo/docs/gate/x.md" },
       // 批 285 D159⑪(误拦):LAW_RE 不锚仓根,临时目录里的副本 / 草稿被判改宪法
       { name: "285 D159:cp 宪法副本到 /tmp 不算改法", text: "备份了一份。", tracked: ["scripts/x.mjs"], bash: "cp AGENTS.md /tmp/AGENTS.md" },
       // 批 285 第二轮复核(误拦猎手第 1 份 FB-1):家目录写法的临时目录
@@ -1671,8 +1701,11 @@ function mRemovedAfterWrite(rawCmd, t, V = {}) {
 
 export const RULE_M = {
   id: "M",
-  blocking: true,
-  law: "docs/laws/reporting.md#「完成」靠核对不靠断言",
+  // 批 301(287 设计 2.2 M 行 / 附录 A):拒绝点挪到关账——PreToolUse 记解析得出的写目标的写前哈希,`--clear` 时
+  //   「哈希变了 / 写后 Read 过」才清(scripts/lib/write-checks.mjs write-readback)。本条改只记账(检测照跑、进候选台账)。
+  blocking: false,
+  logOnly: true,
+  law: "docs/archive/laws-2026-11/reporting.md#「完成」靠核对不靠断言",
   detect: (ctx, V = {}) => {
     const targets = [];
     for (const cmd of ctx.bashCmds) {
@@ -1933,7 +1966,7 @@ function xProbed(ctx, segs, { base, full }) {
 export const RULE_X = {
   id: "X",
   blocking: true,
-  law: "docs/laws/reporting.md#「完成」靠核对不靠断言",
+  law: "docs/archive/laws-2026-11/reporting.md#「完成」靠核对不靠断言",
   detect: (ctx) => {
     const fpBases = new Set();
     for (const c of ctx.bashCmds) if (/--fp\s+X\b/.test(c)) for (const m of String(c).matchAll(X_FILE)) fpBases.add(m[0].replace(/\\/g, "/").split("/").pop());
@@ -2262,8 +2295,13 @@ export function renderEscapes(escapes, { indent = "      " } = {}) {
 /** E2(阻断):没问过「有没有机械判据」。自标不豁免本项。 */
 export const RULE_E2 = {
   id: "E2",
-  blocking: true,
-  law: "docs/laws/reporting.md#未被机器直证的因果断言过独立复核",
+  // 批 292:只记账(287 设计 2.8「E0 / E2:聊天里的因果断言阻断 ⇒ 只记账」;附录 A;用户 11-05「措辞相关……躲不开就一律非阻断」、
+  //   11-06「只是改成只提醒不阻断的话会不会依然继续污染上下文」)。命中进候选台账,对模型零输出。
+  //   有意降低保护:聊天里没根据的根因判断当轮不再拦。批 292 前一版试过换出口(跨模型复核即放行),codex 292-a-review-r1 判
+  //   `ranBash` 只是命令串子串匹配、连「发起过复核」都保证不了,作废。
+  blocking: false,
+  logOnly: true,
+  law: "docs/archive/laws-2026-11/reporting.md#未被机器直证的因果断言过独立复核",
   detect: (ctx) => {
     const f = eFacts(ctx);
     if (!f.hits.length) return [];
@@ -2388,8 +2426,11 @@ export const RULE_E2 = {
 /** E0(阻断):裸因果断言——既没复核、也没自标。 */
 export const RULE_E0 = {
   id: "E0",
-  blocking: true,
-  law: "docs/laws/reporting.md#未被机器直证的因果断言过独立复核",
+  // 批 292:聊天部分只记账(287 设计 2.8 与附录 A「E0:只查写进文件的根因与因果断言;聊天部分只记账」)。命中进候选台账,对模型零输出。
+  //   设计里的另一半——写进报告 / 债表 / 提交信息的因果句在 `batch-goal --clear` 拒关账——还没建,登记为待建流水线(批 292 债表 D200)。
+  blocking: false,
+  logOnly: true,
+  law: "docs/archive/laws-2026-11/reporting.md#未被机器直证的因果断言过独立复核",
   detect: (ctx) => {
     const f = eFacts(ctx);
     if (!f.hits.length || f.hedged) return [];
@@ -2543,7 +2584,8 @@ export const RULE_E0 = {
 export const RULE_E1 = {
   id: "E1",
   blocking: false,
-  law: "docs/laws/reporting.md#未被机器直证的因果断言过独立复核",
+  logOnly: true,   // 批 292:287 设计附录 A「只检测、只记账」——命中进候选台账,对模型零输出
+  law: "docs/archive/laws-2026-11/reporting.md#未被机器直证的因果断言过独立复核",
   detect: (ctx, V = {}) => {
     const f = eFacts(ctx);
     if (!f.hits.length || f.hedged) return [];
@@ -2894,7 +2936,7 @@ const RULE_K = {
   // 刻意放弃的还有:批中途提交不要求逐条对照(一批多次提交是常态);「未达成」不再须配 ⏸。
   // 复核:codex `clipboard/codex/250-k-slim-review-r1.md`、_gate-bypass-hunter 红队(本批),口径写明误拦诚实行为同等计价。
   blocking: true,
-  law: "AGENTS.md#恒定条款",
+  law: "AGENTS.md#真正动手的批",
   requires: ["batchGoal"],
   detect: (ctx) => RULE_K._detect(ctx),
   _detect: (ctx) => {
@@ -3386,7 +3428,7 @@ const RULE_K0 = {
   },
   // 批 250:关账轮也阻断——分两轮关账时,只结清的那一轮没有提交,原判据只认提交就只剩提示。
   blocking: (ctx) => ctx.didCommit() || (() => { try { return ranClear(ctx); } catch { return false; } })(),
-  law: "AGENTS.md#恒定条款",
+  law: "AGENTS.md#真正动手的批",
   requires: ["batchGoal"],
   // 判据取**最结构化的近似**:本轮动了工作面(写文件/提交)就该先有完成条件。
   // 纯问答、纯调查没有写动作 ⇒ 不触发,本项不会退化成仪式。
@@ -4086,8 +4128,12 @@ const SAID_NEXT_LIST_AT_START = new RegExp(`${SAID_NEXT_LIST_HEAD}${SAID_NEXT_VE
 const SAID_NEXT_LIST_258 = /(下一步|接下来|随后)[:：][ \t]*\r?\n[ \t]*(?:\d+[.、)）]|[-*])[ \t]*(?![^。\n]*?(?:了|过|无需|没有|不再|不用|不必))(?:先|再|然后|接着|去)?(做|办|干|修|迁|跑|查|补|写|验|证|核|审|测|试|量|调|清|结|读|扫|推|发|建|改|加|删|候|等|盯|守|收|判|裁|派)/;
 const RULE_S = {
   id: "S",
-  blocking: true,          // 用户常设授权:「新增阻断项一律授权自动化」
-  law: "AGENTS.md#执行共识",
+  // 批 292:只检测、只记账(287 设计 2.8「S:停工没交代(两支)⇒ 只检测、只记账;『批已武装却零推进』那一支也不再阻断」)。
+  //   命中进候选台账,对模型零输出;`batch-goal --clear` 结清时汇总一行。有意降低保护:停工没说下一步、推回用户没标 ⏸ 当轮不再拦。
+  //   原注「用户常设授权:新增阻断项一律授权自动化」是立项时的授权,本批按用户 11-05 方向(措辞类躲不开就非阻断)改档。
+  blocking: false,
+  logOnly: true,
+  law: "docs/archive/laws-2026-11/constitution-2026-11-04.md#执行共识",
   // 第二参只给 mutations 注入变异开关(引擎只传 ctx,默认值即真判据;同 ND 的写法)。
   detect: (ctx, V = {}) => {
     // ⚠️ **剥引号**(2026-08-20 grill:error-handling §4.3,它跑代码复现了):
@@ -4371,17 +4417,18 @@ const RULE_S = {
         text: "I will not run any commands. Back then we would run the checks manually. The phrase \"I will run the tests\" is only an example.",
         batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
       // 批 258 S-b 反向钉(批 285 D155 改):原钉「隔一个空行」,现放宽到容许一个空行(该条翻入 neg);隔两个空行仍不认
-      { name: "285 D155 反向钉:下一步冒号后隔两个空行才是列表 ⇒ 不算", expectBlock: true,
+      // 批 292:S 改「只记账」⇒ 这四条反向钉仍须**命中**(检测不退),阻断级钉成 false(D128④ 的断言键照用,方向随档位翻)
+      { name: "285 D155 反向钉:下一步冒号后隔两个空行才是列表 ⇒ 不算", expectBlock: false,
         text: "回件处置完了。\n\n下一步:\n\n\n1. 跑迁移检查",
         batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
       // 批 285(D155)反向钉:新认的排版写法不外溢——完成体 / 否定照拦(258 BP-3 与 codex r2 的教训)
-      { name: "285 D155 反向钉:加粗下一步 + 已做事项", expectBlock: true,
+      { name: "285 D155 反向钉:加粗下一步 + 已做事项", expectBlock: false,
         text: "**下一步**:\n1. 跑了迁移检查,全绿", read: "docs/x.md",
         batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
-      { name: "285 D155 反向钉:标题下一步 + 无需再跑", expectBlock: true,
+      { name: "285 D155 反向钉:标题下一步 + 无需再跑", expectBlock: false,
         text: "处置完了。\n\n## 下一步\n\n- 无需再跑,本批到此", read: "docs/x.md",
         batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
-      { name: "285 D155 反向钉:中文序号首项是否定", expectBlock: true,
+      { name: "285 D155 反向钉:中文序号首项是否定", expectBlock: false,
         text: "下一步:\n一、暂不检查任何内容。", read: "docs/x.md",
         batchGoal: { armedAt: "2026-09-06T00:00:00Z", conditions: ["甲", "乙"] } },
       // codex 258-cond2-r1 断言 2:列表标记后不许跨行;否定的「不做」不是下一步
@@ -4509,8 +4556,11 @@ const RULE_S = {
 //   触发这串修补的盲审误拦(「用 --outcome 登记了本批成果」「登记可见成果。登记了,…」两形)登记为让出面,见 docs/gate-debts.md D171⑧。
 const RULE_T = {
   id: "T",
-  blocking: true,          // 用户常设授权：「新增阻断项一律授权自动化」
-  law: "AGENTS.md#执行共识",
+  // 批 301(287 设计 2.2 T 行 / 2.8):拒绝点挪到写债表那一刻(写前按改后全文校验)与关账(本批改过债表 ⇒ 整份校验每条在账行失效期非空),
+  //   见 scripts/lib/debt-schema.mjs、write-checks.mjs。措辞检测撤掉阻断(D195 两形随之不再拦),改只记账;「已登记」由收尾回执批接回。
+  blocking: false,
+  logOnly: true,
+  law: "docs/archive/laws-2026-11/constitution-2026-11-04.md#执行共识",
   // 第二参只给 mutations 注入变异开关(引擎只传 ctx,默认值即真判据;同 ND 的写法)。
   // 批 285(D139③ / D158⑤,误拦;只剔不加,不会多拦一句):两种「登记」不是处置声明——
   //   ① 装机台账(INSTALLED.md / 装机台账 / tool-register / 工具台账)当处所或去向的「登记」:那是**已做完**的装机落账
@@ -4703,7 +4753,8 @@ const RULE_T = {
       { name: "285 D160④ 对照:登记了决定(`之后再看`)⇒ 拦", text: "这个漏放登记了决定(`之后再看`)。" },
       { name: "285 D160④ 对照:没有子命令名的「登记了 2 个成果(之后再验)」⇒ 拦", text: "两条缺陷登记了 2 个成果(之后再验)。" },
       // 批 285(D156②)反向钉:容许夹编号不外溢——后看不变,「登记了 D149 的决定下批再看」仍是登记声明
-      { name: "285 D156② 反向钉:登记了 D149 的决定下批再看 ⇒ 拦", expectBlock: true, text: "这个洞登记了 D149 的决定下批再看。" },
+      // 批 301:T 改只记账 ⇒ 仍须命中(检测照跑、进候选台账),阻断级为假
+      { name: "285 D156② 反向钉:登记了 D149 的决定下批再看 ⇒ 命中(批 301 起只记账,不阻断)", expectBlock: false, text: "这个洞登记了 D149 的决定下批再看。" },
       // 批 285 贴边:剔的只是台账名那几个字 / 行首普查标签,同一回合别处的真登记照拦
       { name: "285 D139③ 贴边:装机台账落账 + 另一句真登记 ⇒ 拦", text: "装机台账登记了新管的载体。那个超时 bug 先登记下来。" },
       { name: "285 贴边:欠账台账不在装机台账名表里 ⇒ 拦", text: "欠账台账里登记了这个洞,回头看。" },
@@ -4794,7 +4845,7 @@ const RULE_T = {
 const RULE_U = {
   id: "U",
   blocking: true,          // 用户常设授权：「新增阻断项一律授权自动化」
-  law: "docs/laws/collab.md#四之三",
+  law: "docs/archive/laws-2026-11/collab.md#四之三",
   detect: (ctx) => {
     // 本轮调用的 skill 不算——它正在跑。管的是**窗口里发过、至今无下文**的。
     let win = null;
@@ -4903,11 +4954,9 @@ const RULE_U = {
 //   `Read {"file_path": "…codex-run.mjs"}` —— **只是读了一眼那个脚本**。
 //   这些全在**工具入参**上,所以「换成结构化 ctx」并不能消灭它们。
 //   故本条再收一层:**只认工具名 + 命令的参数面段首**。
-//     · `codex` 那条:工具名含 codex(MCP 通路),或某个**段首是 node/npx** 的段
-//       把 `codex-run.mjs` 当**脚本参数**执行且带 `--task|--poll|--resume`。
-//       段用 `segments()` 切、用 `stripQuoted()` 只留参数面 ⇒
-//       `echo "node codex-run.mjs --task t.md"`(引号内)与 `node -e "…"`(`-e` 不是脚本参数)
-//       双双落空。已逐条探针核实。
+//     · `codex` 那条:工具名含 codex(MCP 通路),或 **codex-run 自己写的作业记录**(批 297 起,D203;
+//       判据见 `_p.codexJobHits` 头注)。原「段首 node + codex-run.mjs 当脚本参数」的命令解析已撤:
+//       命令文本只作触发、不作证据(闸规矩第一节 2 条),形状表补了三轮补不完。
 //     · 子代理那条:直接读 Agent/Task 动作的 `subagent_type` 入参(258 起 ctx 不再有 `agents` 字段),要求 `grill:` / `_` 前缀。
 //     · 联网那条:只认工具名 `WebSearch|WebFetch`。
 //
@@ -4946,24 +4995,35 @@ const swapP = (patch) => (r) => ({ ...r, detect: (ctx) => {
   try { return r.detect(ctx); } finally { Object.assign(H, save); }
 } });
 
+// 批 297(D203)夹具零件:一条合格的 codex-run 作业记录(startedAt 晚于本轮时刻 P_T0 五秒 ⇒ 落在窗口里),
+//   `pOnlyCodex` = 只缺跨模型那一格的底座(非闸引擎承重提交=法典;独立视角 grill、外部先例 web 都在),单变量对照用。
+const P_T0 = "2026-11-07T08:00:00Z";
+//   r2:记录带 endedAt / resultAt(终态与写过结果件)、top(cwd 所在 git 顶层,取数方算);pJobs 带 upper(Stop 此刻)。
+const pJob = (o = {}) => ({ id: "J297", state: "done", startedAt: "2026-11-07T08:00:05Z", endedAt: "2026-11-07T08:05:00Z", resultAt: "2026-11-07T08:04:59Z",
+  cwd: "/repo", top: "/repo", threadId: "019a5f2e-thread", exitCode: 0, ...o });
+const pJobs = (...jobs) => ({ root: "/repo", upper: "2026-11-07T09:00:00Z", jobs });
+const pOnlyCodex = (name, o = {}) => ({ name, text: "法典改完并提交。", at: P_T0, agent: "grill:testing", web: "先例", ...o,
+  bash: [...(o.bash || []), "git add -A docs/laws/collab.md && git commit -m x"] });
+
 const RULE_P = {
   id: "P",
-  blocking: true,          // 用户常设授权:「新增阻断项一律授权自动化」
-  law: "docs/laws/reporting.md#承重面三通道必跑",
+  // 用户常设授权:「新增阻断项一律授权自动化」。批 297 r2(误拦猎手 FB-1):条件阻断——命中里只剩「跨模型格通道不可用」(soft)时
+  //   降为提示(收尾报告须登记欠账),其余照旧阻断。判据与 detect 同一份;自己抛错 ⇒ 引擎按阻断算(isBlocking)。
+  //   用 `this.detect`:变异副本(`{...r, detect}`)的阻断级跟着它自己的 detect 走(isBlocking 以 `r.blocking(ctx)` 方法调用)。
+  blocking(ctx) { return (this && typeof this.detect === "function" ? this.detect : RULE_P.detect)(ctx).some((h) => !h.soft); },
+  law: "docs/gate/AGENTS.md#三、怎么改闸",
 
   /** 判据零件。挂在规则对象上而不是模块作用域,是为了让 `mutations` 的
    *  `apply: (r) => ({...r, detect})` 能复用同一批零件——变异要拧的是**判据内部**,
    *  不是把整条判据换成一个恒真/恒假的壳(那种变异构造性恒真,已被 codex 060 判死)。 */
   _p: {
     GIT: /^(\w+=\S+\s+)*git\b/,
-    /** `codex-run.mjs` 必须是**脚本参数**:node/npx 之后、只允许 `--flag` 形式的前置参数。
-     *  `-e` / `-p` 是单横杠 ⇒ 匹配不上 ⇒ `node -e "…codex-run.mjs --task…"` 落空。 */
-    NODE_CODEX: /^(\w+=\S+\s+)*(node|npx|bun|pnpm)\s+(--[\w-]+(=\S+)?\s+)*[^\s]*codex-run\.mjs(\s|$)/,
-    CODEX_ARG: /\s--(task|poll|resume)(\s|=|$)/,
+    // (批 297:原 `NODE_CODEX` / `CODEX_ARG` 两条命令形状正则随「跨模型格改认作业记录」删除,见 `codexJobHits` 头注。)
     /** 真实失败痕迹。**只在通道调用自己的入参上**看,不在别处看(见 exempts 头注)。 */
     FAIL_MARK: /rate.?limit|quota|\b429\b|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|配额(已)?耗尽|限流/i,
 
-    rearm() { return Number(process.env.STOP_CLOSURE_P_REARM || 5) || 5; },
+    // 2026-11-08 用户签「那就10吧」(ADR 0041,300-D1):阈值 5 → 10;D11(闸引擎两猎手)不受影响
+    rearm() { return Number(process.env.STOP_CLOSURE_P_REARM || 10) || 10; },
 
     /** 切段 + 只留参数面。引号里的东西一律不算参数(gate-cmd 的唯一实现)。 */
     segs(cmd) { return segments(cmd).map(stripQuoted); },
@@ -5005,10 +5065,14 @@ const RULE_P = {
     // 批 276(D171③):远端守卫 hook-remote-check 并入闸引擎面(五处同步:ENGINE_REL / ENGINE_PATHSPECS / ENGINE_PATH_RE /
     //   GATE_ENGINE / hunterBound);只认 `scripts/hook-remote-check.mjs`,它的 `.selftest.mjs` 不算
     // 批 276b(红队 BP-7):远端守卫的另两件——装 git 钩子的 `scripts/install-git-hooks.mjs` 与钩子本体 `scripts/git-hooks/*.mjs`——同样纳入
-    ENGINE_REL: /^scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check|install-git-hooks)\.mjs$|^scripts\/git-hooks\/[^/]*\.mjs$|^scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|^scripts\/gate-deps\/package(?:-lock)?\.json$/i,
+    // 2026-11-08 P0 退回收口(红队 p0-close BP-1/BP-2;codex p0-close r2 ②:66ed078 只扩了 GATE_ENGINE 一处,这四处没跟上 ⇒ 补齐):
+    //   新拒绝点所在的 hook-start-gate / batch-goal / verify-laws / codex-run 与 lib 下 write-checks / write-state / debt-schema / obligations / install-config
+    ENGINE_REL: /^scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check|install-git-hooks|hook-start-gate|batch-goal|verify-laws|codex-run)\.mjs$|^scripts\/git-hooks\/[^/]*\.mjs$|^scripts\/lib\/(?:gate-[\w-]+|write-effects|write-checks|write-state|debt-schema|obligations|install-config)\.mjs$|^scripts\/gate-deps\/package(?:-lock)?\.json$/i,
     /** 与 ENGINE_REL 同一口径的 git pathspec(hook 取「上一次带闸改动的提交」时用;改一处必改另一处,自测钉着)。 */
     ENGINE_PATHSPECS: ["scripts/hook-stop-closure.mjs", "scripts/hook-guard.mjs", "scripts/fp-audit.mjs", "scripts/gate-replay.mjs", "scripts/hook-remote-check.mjs", "scripts/install-git-hooks.mjs", ":(glob)scripts/git-hooks/*.mjs", ":(glob)scripts/lib/gate-*.mjs",
-      "scripts/lib/write-effects.mjs", "scripts/gate-deps/package.json", "scripts/gate-deps/package-lock.json"],
+      "scripts/lib/write-effects.mjs", "scripts/gate-deps/package.json", "scripts/gate-deps/package-lock.json",
+      "scripts/hook-start-gate.mjs", "scripts/batch-goal.mjs", "scripts/verify-laws.mjs", "scripts/codex-run.mjs",
+      "scripts/lib/write-checks.mjs", "scripts/lib/write-state.mjs", "scripts/lib/debt-schema.mjs", "scripts/lib/obligations.mjs", "scripts/lib/install-config.mjs"],
     /** 聚合项(readHeadFacts 范围超 CAP=60)缺 `count` 时的计数下限 = CAP+1(范围至少这么多笔)。 */
     AGG_MIN: 61,
     /** 语法回退面的闸引擎路径:锚定文件名结尾,裸名只在路径**开头**认(`cd scripts/lib` 之后的相对形)。
@@ -5016,7 +5080,7 @@ const RULE_P = {
     // 批 260(红队 a700dedc (b)-10):第四处口径——git 事实取不到时的回退面,与 ENGINE_REL 同步纳入 D160⑥ 的三类文件
     //   批 276c(误拦猎手 FB-5):`install-git-hooks.mjs` / `git-hooks/*.mjs` 是通用约定名,别的仓里同名文件不是本仓闸 ⇒
     //   这两支只认**仓相对形**(本仓内的绝对路径在调用前已化成仓相对形),不认任意前缀、不认裸名
-    ENGINE_PATH_RE: /(?:^|\/)scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check)\.mjs$|^scripts\/(?:install-git-hooks\.mjs|git-hooks\/[^/]*\.mjs)$|(?:^|\/)scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs$|(?:^|\/)scripts\/gate-deps\/package(?:-lock)?\.json$|^(?:hook-stop-closure|hook-guard|fp-audit|hook-remote-check|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs$/i,
+    ENGINE_PATH_RE: /(?:^|\/)scripts\/(?:hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check|hook-start-gate|batch-goal|verify-laws|codex-run)\.mjs$|^scripts\/(?:install-git-hooks\.mjs|git-hooks\/[^/]*\.mjs)$|(?:^|\/)scripts\/lib\/(?:gate-[\w-]+|write-effects|write-checks|write-state|debt-schema|obligations|install-config)\.mjs$|(?:^|\/)scripts\/gate-deps\/package(?:-lock)?\.json$|^(?:hook-stop-closure|hook-guard|fp-audit|hook-remote-check|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier))\.mjs$/i,
     WORKTREE_AREA: /(^|\/)\.claude\/worktrees\//i,
     /** root = hook 所在 checkout 根(ctx.hookCheckout):落在它下面的绝对路径先化成仓相对形再判区域——
      *  在 worktree 里开的会话,自己的闸文件路径本就含 `.claude/worktrees/`,不得当成别人的副本。 */
@@ -5563,7 +5627,8 @@ const RULE_P = {
       // 批 260(红队 a700dedc BP-5):绑定词表与引擎面同源——D160⑥ 纳入的文件名、欠账号(D160 这类)也算绑定
       // 批 276(D171③):远端守卫入引擎面后,点名它的红队也算绑定(它的 .selftest 不算)
       //   批 276b(BP-7):装钩子脚本与钩子目录同样算绑定
-      return /hook-stop-closure|hook-guard|hook-remote-check(?!\.selftest)|install-git-hooks|git-hooks\/[\w.-]+\.mjs|gate-[\w-]+\.mjs|write-effects|fp-audit|gate-deps|\.diff\b|规则 ?id|rule ids?|\bRULE_[A-Z0-9]+\b|批 ?\d{3}|\bD\d{3}\b/i.test(p);
+      // P0 收口(codex p0-close r2 ②):新纳入引擎面的九个文件名同样算绑定(各自的 .selftest 不算)
+      return /hook-stop-closure|hook-guard|hook-remote-check(?!\.selftest)|install-git-hooks|git-hooks\/[\w.-]+\.mjs|gate-[\w-]+\.mjs|write-effects|fp-audit|gate-deps|(?:hook-start-gate|batch-goal|verify-laws|codex-run|write-checks|write-state|debt-schema|obligations|install-config)(?!\.selftest)\.mjs|\.diff\b|规则 ?id|rule ids?|\bRULE_[A-Z0-9]+\b|批 ?\d{3}|\bD\d{3}\b/i.test(p);
     },
     /** 旧整串正则(口径与本条同源;P 自己改用上面三件)。批 285(D145):hook-start-gate 已改用 `startGateHit`(锚定口径),不再引用它;
      *  另有 gate-rules 文件头的承重面判据(约 168 行)仍在用。 */
@@ -5572,7 +5637,9 @@ const RULE_P = {
     //   被 hook-start-gate / G④ 当成闸引擎。右界改为 `(?![\w-]|\.\w)`:后面不能再接词字符或「.+词字符」;句末标点 `.`、空白、引号照认
     //   (不用分诊草图的 `(?![\w.])`,它会让「改了 scripts/hook-guard.mjs。」之外的英文句号结尾也失配,换成漏放)。
     //   代价:无——备份件不被任何会话当闸加载;失效条件:自测「D160:GATE_ENGINE 备份件」翻红。
-    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check)\.mjs(?![\w-]|\.\w)|(?:^|[\s"'=])scripts\/(?:install-git-hooks\.mjs|git-hooks\/[\w.-]+\.mjs)(?![\w-]|\.\w)|scripts\/lib\/(?:gate-[\w-]+|write-effects)\.mjs(?![\w-]|\.\w)|scripts\/gate-deps\/package(?:-lock)?\.json(?![\w-]|\.\w)|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|fp-audit|hook-remote-check|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier|replay))\.mjs(?![\w-]|\.\w)/i,
+    // 2026-11-08 P0 退回收口(红队 p0-close BP-1/BP-2):批 301 把 J / T / MF / M 的拒绝点挪进 write-checks / debt-schema / batch-goal / verify-laws,
+    //   批 302 把 P 跨模型格出路的分类挪进 codex-run;义务账 / 写入三态 / 安装方配置 / 开工闸同属闸代码——一并列入,D11 两猎手管到它们
+    GATE_ENGINE: /scripts\/(hook-stop-closure|hook-guard|fp-audit|gate-replay|hook-remote-check|hook-start-gate|batch-goal|verify-laws|codex-run)\.mjs(?![\w-]|\.\w)|(?:^|[\s"'=])scripts\/(?:install-git-hooks\.mjs|git-hooks\/[\w.-]+\.mjs)(?![\w-]|\.\w)|scripts\/lib\/(?:gate-[\w-]+|write-effects|write-checks|write-state|debt-schema|obligations|install-config)\.mjs(?![\w-]|\.\w)|scripts\/gate-deps\/package(?:-lock)?\.json(?![\w-]|\.\w)|(?:^|[\s/"'=])(?:hook-stop-closure|hook-guard|fp-audit|hook-remote-check|write-effects|gate-(?:rules|ctx|carriers|registry|cmd|slice|difftier|replay))\.mjs(?![\w-]|\.\w)/i,
 
     /** 本批提交是否**带进了闸引擎改动**(D11 收紧的适用面)。
      *  · git 事实在 ⇒ **只认** `基点..HEAD` 上被带进的提交里有没有本仓闸引擎文件(派出方 a27628dd 口径①:
@@ -5756,47 +5823,154 @@ const RULE_P = {
       return prior.concat(own);
     },
 
-    /** 段是否被**短路守卫**保护:`false && X` / `true || X` 里的 X 根本不执行。
-     *  2026-08-20 codex 报、本机实测:`false && node …codex-run.mjs --task` 当时判「跑过」⇒
-     *  **三个字符就能关掉这条闸**。切段器只按 `&&`/`||` 切,丢掉了控制流语义。
-     *  静态判不出真假 ⇒ **凡带条件连接符的段一律不计数**(fail-closed:
-     *  代价是 `X && echo done` 这种真调用也不算,我白重跑一次;反向的代价是闸恒不响)。 */
-    guarded(cmd, idx) { return idx > 0 && /(\&\&|\|\|)/.test(String(cmd)); },
-
-    /** 剥掉**引号字符**(不是引号内容),只用于「这条命令的头是不是 node」这类判断。
-     *  与 `segs` 的 stripQuoted 分工:那个防的是 `echo '…'` 把正文当参数;
-     *  这个救的是 `node "C:/…/codex-run.mjs" --task`——真调用却因带引号而判不出。 */
-    unquote(s) { return String(s).replace(/["']/g, ""); },
-
-    /** 拆包装器:`bash -lc "node … --task"` / `sh -c '…'` 里真正跑的是引号里那条。
-     *  2026-08-20 实测:包装器形态当时被判「没跑」⇒ 真调用误拦。 */
-    unwrap(cmd) {
-      const m = String(cmd).match(/^(\w+=\S+\s+)*(ba|z|k)?sh\s+(-[a-z]*c[a-z]*)\s+(['"])([\s\S]*)\4\s*$/);
-      return m ? m[5] : null;
+    // ══ 跨模型格:认 codex-run 自己写的作业记录(批 297,D203)══════════════════════════════════════
+    // 病史:原判据解析命令文本(段首 node + `codex-run.mjs` 当脚本参数 + `--task|--poll|--resume`,外加短路守卫、
+    //   去引号、拆 `bash -c` 包装三件补丁)。批 293 实撞 `cd <路径> && node …codex-run.mjs` 被短路守卫误拦;
+    //   批 296 给它剥 `cd` 前缀(分支 worktree-agent-a6ce555a894b4dc2d,保留作反例),codex 296-review-r1 实测放回
+    //   5 类新漏放(`cd⏎false && …`、`cd # && …`、大写 `CD`、双引号转义、PS 5.1 `cd . && …`)——命令形状表补不完,
+    //   与批 291 同族。闸规矩第一节 2 条:命令文本只作触发,不作证据或出口 ⇒ 停止补形状,改认 codex-run 的 worker
+    //   自己写的作业记录(`<os.tmpdir()>/codex-run-jobs/<id>.json`)。
+    // 判据(各腿同时成立才算一次「调用过」;`codexJobHits` 数的就是这种记录;r2 = 批 297 三路复审回件的修法):
+    //   ① 下界:startedAt ≥ `codexSince`。r2 改用**时间锚**(红队 BP-1 / 误拦猎手 FB-3 同一个病:原取 400 条池里最早的
+    //      时间戳,长会话可回溯几百小时、上一批 / 别的会话的作业能抵本批;发起那条滚出窗口、只剩 --poll 时诚实被拦):
+    //      r3(红队 r2 BP-1 / codex r2 §3)= **最晚的可信锚**:max(当前批状态的 armedAt——不论是否已结清(正常收尾顺序是
+    //      「提交 → --clear → Stop」,结清后批仍是本批),但 `foreign:true`(别的会话武装)的一律跳过;P 账上次结清时刻 settledAt
+    //      (settleP 写账时记));两者都没有才退回原窗口最早时间戳 `winStartAt`;全取不到 ⇒ 缺。
+    //   ② 上界(r2,红队 BP-3/BP-4、codex §3/§4):startedAt 与终态时刻(endedAt,没有就 resultAt)都 ≤ 取数方给的 `upper`
+    //      ——实时 = Stop 此刻,离线 / --audit = 本轮结束(本轮取不到时间戳 ⇒ upper=null ⇒ 一条都不认)。2099 年的手写记录不再永久生效。
+    //   ③ 归属(r2,误拦猎手 FB-2/FB-7):cwd 所在的 git 顶层(取数方从 cwd 往上找第一个含 `.git` 的祖先,不起 git;
+    //      剥 `\\?\` 前缀、能 realpath 就 realpath)是本仓根或本仓 `.claude/worktrees/<名>`。本仓普通子目录认,嵌套仓自然排除;
+    //   ④ threadId 非空(codex 真起了会话);
+    //   ⑤ state === "done" 且 exitCode === 0(codex 296-r1:`running` 是发起方先于 worker 写的,有意不认;
+    //      `done` 不看退出码——codex-run 对「退出码非 0 而正文非空」照记 done);
+    //   ⑥ resultAt 非空(r2,误拦猎手 FB-5:原在 Stop 时刻现 stat 结果件,结果件被挪 / worktree 删掉后诚实被拦;
+    //      worker 写结果件前记 resultAt,记录里有它即证写过)。
+    // **通道不可用的出路**(r2,误拦猎手 FB-1,D127 重演;批 302 D205 改取证面):①②③ 成立、state=failed 或 exitCode≠0,且作业记录带
+    //   codex-run 从**完整事件流**写的结构化字段 `unavailable.reason`(配额 / 429 / rate limit / 网络终态错误;分类唯一实现在 codex-run
+    //   `classifyUnavailable`,只看顶层 error / turn.failed 事件与 stderr 完整行,配置告警与超时不算)。原「取数方从日志尾窗抽 failLines + 本处 UNAVAIL 正则」已撤(D205 ①)。
+    //   `binSource=env`(CODEX_BIN 替身)的记录不计(D205 ②)。
+    //   `# TIMEOUT` 与裸 `timed out` **一律不算**:超时只说明作业超时(`--timeout-ms 1` 立刻就有),任务太大也会超时——出路是拆小重跑。
+    //   ⇒ 本格不阻断,改一行提示「通道不可用,收尾报告须登记欠账」(hit.soft;`blocking(ctx)` 只在有非 soft 命中时为真)。
+    //   这是工具输出里的事实,不是模型措辞(闸规矩第一节 2 条不受影响)。计账清零不认它(channelsMet 照旧算缺 ⇒ 账不清)。
+    // 只证「调用过」,不证「审过 / 被采纳」——P 的语义不变,只换取证面。
+    // 取数走注入:`ctx.codexJobs(since)` ⇒ `{ root, upper, jobs }`(生产 hook 经 liveCodexEnv().listJobs 读盘,目录集与 A 规则同一套:
+    //   hook 自己的作业目录 ∪ 转录里 CODEX_LOG 指出的目录;夹具键 `codexJobs`)。
+    //   未接(undefined)/ 取不到(null)/ 抛错 / 记录缺字段 ⇒ 不计,偏严,不抛(不得拖垮整个 Stop)。
+    // CEILING(已接受,派出方 297 r2 裁定):①作业记录不带会话号——同仓并行会话的作业会互相抵账;
+    //   ②随手跑一个与本批无关的短作业也能凑满这一格(只证调用过;「审的是不是这一批」归按批审,不归 P);
+    //   ③手写 json 伪造一条记录(ADR 0009 蓄意档,不防;上界已把它的持久性收窄到「写入时刻之前」);
+    //   ④子代理跑的 codex 也算(记录不分谁发车;此前子代理的命令根本不进主转录,D60);
+    //   ⑤作业目录被系统清理 ⇒ 记录没了 ⇒ 缺(误拦侧;codex-run 自己不清);
+    //   ⑥MCP 通路(`mcp__codex-cli__codex`)不经 codex-run、没有作业记录,保留原判据(工具名);
+    //   ⑦回放(gate-replay)里 codexJobs 冻结为未接 ⇒ 本格在回放里是盲的;
+    //   ⑧(r3,红队 r2 BP-4 / codex r2 §4 末)soft 之后「收尾报告须登记欠账」**没有机器核验**——归收尾回执那一批;
+    //   ⑨(r3,codex r2 §4)git 顶层归属按 Stop 时刻的**当前磁盘**算(cwd 往上找 .git),不是发起那一刻的快照——
+    //     发起后 worktree 被删 / 目录被挪 / 新建了 .git,归属会跟着变。
+    // 批 297 同时撤掉一个出口:原「真发起过 codex-run 且命令入参里带 429 字样 ⇒ 本格豁免」是命令文本当出口。
+    //   该豁免只长在窗口式老路(pLedger 未接)上,生产 hook 恒接 pLedger,早已不走那一支;MCP 通路的豁免代码照旧留在老路上。
+    winStartAt(ctx) {
+      let m = null;
+      for (const a of RULE_P._p.scopeActions(ctx)) if (a && Number.isFinite(a.at) && (m === null || a.at < m)) m = a.at;
+      return m;
+    },
+    /** 下界与它的来历:`{ at, how }`,how ∈ batch / ledger / window;全取不到 ⇒ null。 */
+    codexSince(ctx) {
+      const H = RULE_P._p, g = ctx && ctx.batchGoal, cands = [];
+      // r3:批状态的 armedAt 不论结清与否都算(结清态另有 clearedArmedAt 兜底);别的会话武装的(foreign)跳过
+      if (g && typeof g === "object" && g.foreign !== true) {
+        const t = Date.parse(String(g.armedAt || g.clearedArmedAt || ""));
+        if (Number.isFinite(t)) cands.push({ at: t, how: "batch" });
+      }
+      const s = ctx && ctx.pLedger && ctx.pLedger.settledAt;
+      if (Number.isFinite(s)) cands.push({ at: s, how: "ledger" });
+      if (cands.length) return cands.reduce((a, b) => (b.at > a.at ? b : a));
+      const w = H.winStartAt(ctx);
+      return w === null ? null : { at: w, how: "window" };
+    },
+    normDir(p) { return String(p || "").trim().replace(/\\/g, "/").replace(/^\/\/\?\//, "").replace(/\/+$/, "").toLowerCase(); },
+    /** 本仓主根:取数方给的 checkout 根;它本身是 `<主根>/.claude/worktrees/<名>` 时剥成主根。 */
+    repoMain(root) {
+      const r = RULE_P._p.normDir(root);
+      if (!r) return null;
+      const m = r.match(/^(.+)\/\.claude\/worktrees\/[^/]+$/);
+      return m ? m[1] : r;
+    },
+    /** 作业的 git 顶层(`top`)是不是本仓根或本仓 `.claude/worktrees/<名>`。 */
+    jobInRepo(top, main) {
+      const c = RULE_P._p.normDir(top), pre = main + "/.claude/worktrees/";
+      if (!c || !main) return false;
+      return c === main || (c.startsWith(pre) && /^[^/]+$/.test(c.slice(pre.length)));
+    },
+    jobInWindow(startedAt, since) { return Number.isFinite(startedAt) && Number.isFinite(since) && startedAt >= since; },
+    /** 上界:startedAt 与终态时刻(endedAt,没有就 resultAt)都不晚于 upper;upper 取不到 ⇒ 不认。 */
+    jobBeforeUpper(j, upper) {
+      const end = Number.isFinite(j.endedAt) ? j.endedAt : j.resultAt;
+      return Number.isFinite(upper) && Number.isFinite(j.startedAt) && j.startedAt <= upper && Number.isFinite(end) && end <= upper;
+    },
+    jobThreaded(j) { return typeof j.threadId === "string" && j.threadId.trim() !== ""; },
+    jobFinished(j) { return j.state === "done" && j.exitCode === 0; },
+    jobHasResult(j) { return Number.isFinite(j.resultAt); },
+    /** 通道不可用类失败。批 302(D205 ①):只读 codex-run 写的结构化字段 `unavailable.reason`;没有这个字段 ⇒ 不给出路(偏严)。 */
+    jobUnavailable(j) {
+      const failed = j.state === "failed" || (Number.isFinite(j.exitCode) && j.exitCode !== 0);
+      return failed && !!(j.unavailable && typeof j.unavailable.reason === "string" && j.unavailable.reason);
+    },
+    /** 批 302(D205 ②):`CODEX_BIN` 替身跑出的记录不计(既不算合格,也不给不可用出路)。没有 binSource 的旧记录照计。 */
+    jobRealBin(j) { return j.binSource !== "env"; },
+    /** 作业记录的整份评估(detect、消息、计账同用):
+     *  `{ ok, unavailable: [J], seen: [{ id, why }] }`——ok=合格记录数;seen=窗口内、本仓、但没过某条腿的记录(消息里列,最多 5 条)。
+     *  任何一步取不到 ⇒ ok=0(偏严),不抛。 */
+    codexJobsEval(ctx) {
+      const H = RULE_P._p, out = { ok: 0, unavailable: [], seen: [], since: null };
+      try {
+        if (!ctx || typeof ctx.codexJobs !== "function") return out;
+        const since = H.codexSince(ctx);
+        if (!since) return out;
+        out.since = since;
+        const got = ctx.codexJobs(since.at);
+        if (!got || !Array.isArray(got.jobs)) return out;
+        const main = H.repoMain(got.root);
+        if (!main) return out;
+        for (const j of got.jobs) {
+          try {
+            if (!j || typeof j !== "object" || !H.jobInWindow(j.startedAt, since.at) || !H.jobInRepo(j.top, main)) continue;
+            const id = String(j.id || "?");
+            if (!H.jobRealBin(j)) { out.seen.push({ id, why: "CODEX_BIN 替身跑的(binSource=env),不计" }); continue; }
+            // 还在跑的先说(r2 误拦猎手 FB-4):它没有终态时刻,放到上界那条会被说成「时刻晚于此刻」,出路就丢了
+            if (j.state === "running") { out.seen.push({ id, why: `仍在跑:\`node ~/.claude/scripts/codex-run.mjs --poll ${id} --wait-ms 600000\` 等它结束再收尾` }); continue; }
+            if (!H.jobBeforeUpper(j, got.upper)) { out.seen.push({ id, why: "时刻晚于此刻 / 本轮结束(或终态时刻缺)" }); continue; }
+            if (H.jobThreaded(j) && H.jobFinished(j) && H.jobHasResult(j)) { out.ok++; continue; }
+            if (H.jobUnavailable(j)) { out.unavailable.push(id); out.seen.push({ id, why: "通道不可用类失败" }); continue; }
+            // 批 302 误拦 FB-5:记录里没有 binSource ⇒ 旧版 user 级 runner 跑的,它不写 unavailable 字段,通道不可用也给不了出路
+            const oldRunner = !Object.prototype.hasOwnProperty.call(j, "binSource")
+              ? "——记录缺 binSource / unavailable 字段,是旧版 user 级 runner 跑的:仓内版合回主干后跑 `node scripts/codex-entry-sync.mjs --install` 再重跑" : "";
+            out.seen.push({ id, why: (!H.jobFinished(j) ? `没有正常结束(state=${j.state},exitCode=${j.exitCode})`
+              : !H.jobThreaded(j) ? "没有 threadId" : "没有 resultAt(结果件没写成)") + (H.jobFinished(j) ? "" : oldRunner) });
+          } catch { /* 坏记录跳过 */ }
+        }
+      } catch { out.ok = 0; }
+      return out;
+    },
+    codexJobHits(ctx) { return RULE_P._p.codexJobsEval(ctx).ok; },
+    /** 某条通道在取值池上的计数:过谓词的动作数;跨模型格(`jobs: true`)另加合格作业记录数。detect、计账清零同用。 */
+    chCount(ctx, ch, pool) {
+      const n = (pool || []).filter((a) => { try { return ch.test(a, ctx); } catch { return false; } }).length;
+      return ch.jobs ? n + RULE_P._p.codexJobHits(ctx) : n;
+    },
+    /** 把 detect 的跨模型命中标上作业诊断;通道不可用 ⇒ soft(不阻断)。其余命中原样。 */
+    markCodex(ctx, out) {
+      const H = RULE_P._p, ch0 = H.CH.find((c) => c.jobs);
+      if (!out.some((h) => h.ch === ch0.key)) return out;
+      const ev = H.codexJobsEval(ctx);
+      return out.map((h) => (h.ch !== ch0.key ? h
+        : { ...h, jobs: ev.seen.slice(0, 5), since: ev.since, ...(ev.unavailable.length ? { soft: true, unavailable: ev.unavailable } : {}) }));
     },
 
-    execsCodexRun(input) {
-      const H = RULE_P._p;
-      const cmd = String((input && input.command) || "");
-      if (!cmd) return false;
-      const inner = H.unwrap(cmd);
-      if (inner) return H.execsCodexRun({ command: inner });
-      // ⚠️ 这里**不能**用 `segs`(它的 stripQuoted 把引号内容整段删掉,
-      //   `node "C:/…/codex-run.mjs" --task` 会变成 `node  --task`,路径没了)。
-      //   用**原始段**,只去掉引号**字符**。安全性由 NODE_CODEX 的 `^` 锚提供:
-      //   `echo 'node …codex-run.mjs --task'` 去引号后头仍是 `echo`,锚不上 ⇒ 不算。
-      return segments(cmd).some((s, i) => {
-        if (H.guarded(cmd, i)) return false;
-        const u = H.unquote(s).trim();
-        return H.NODE_CODEX.test(u) && H.CODEX_ARG.test(u);
-      });
-    },
-
-    /** 三条通道。谓词的入参是**一次工具调用**(`{name, input}`),不是文本。 */
+    /** 三条通道。谓词的入参是**一次工具调用**(`{name, input}`),不是文本。
+     *  跨模型格的动作谓词只剩 MCP 通路(工具名含 codex);codex-run 那条走作业记录(`jobs: true` ⇒ `chCount` 另加)。 */
     CH: [
-      { key: "跨模型(codex:判「我说的对不对」)",
-        test: (a) => /codex/i.test(String(a.name || "")) ||
-          (/^(Bash|PowerShell)$/.test(String(a.name || "")) && RULE_P._p.execsCodexRun(a.input)) },
+      { key: "跨模型(codex:判「我说的对不对」)", jobs: true,
+        test: (a) => /codex/i.test(String(a.name || "")) },
       // ⚠️ D11 收紧(2026-09-06 用户亲签;法条 reporting.md#承重面三通道必跑 同批改):本批提交触及
       //   **闸引擎文件**时,本通道只认红队 agent `_gate-bypass-hunter`——181 批双审证明闸修法的自测
       //   全绿证明不了不漏放,而 grill 的通用视角没有「怎样绕过这条判据」这一专门问法。
@@ -5926,7 +6100,7 @@ const RULE_P = {
     channelsMet(ctx) {
       const H = RULE_P._p;
       return H.CH.map((ch) => (ch === H.hunterCh() && H.gateEngineTouched(ctx)) ? H.hunterMet(ctx)
-        : H.channelPool(ctx, ch).some((a) => { try { return ch.test(a, ctx); } catch { return false; } }));
+        : H.chCount(ctx, ch, H.channelPool(ctx, ch)) > 0);
     },
 
     /** 每累计 K 次承重面提交,义务重新武装一次 ⇒ 各需 ceil(承重提交数 / K) 遍。
@@ -5946,8 +6120,8 @@ const RULE_P = {
     //    条数窗口把几轮前的通道调用挤出视野,不是 armedAt——机制以此注为准)──
     //    `ctx.pLedger` 三态:undefined=通道没接 ⇒ 走下面的窗口式老路(夹具兼容);
     //    null=首跑无账 ⇒ 计 0;{carriers:n}=自上轮三通道后累计承重提交数。
-    //    语义:**每 5 次承重提交欠一轮三通道**——累计+本轮 < 5 ⇒ 宽限放行;
-    //    ≥ 5 ⇒ 各通道欠 1 遍,照旧只认动作面。计数落账在 hook 侧(规则纯函数)。
+    //    语义:**每 N 次承重提交欠一轮三通道**(N = H.rearm(),2026-11-08 起缺省 10,原为 5)——累计+本轮 < N ⇒ 宽限放行;
+    //    ≥ N ⇒ 各通道欠 1 遍,照旧只认动作面。计数落账在 hook 侧(规则纯函数)。
     // ── D11 独立于宽限(2026-09-07 用户「你自行判断」,我判:独立)────────────────
     //   举例:宽限=每 5 次承重提交武装一次三通道;承重面多数是法典/agent/文档,四次里漏一次审代价可控。
     //   闸引擎不同:181/182 两批**四轮复核每轮都抓出 High**(两句英文就过 S、目录记成已存在、退出码 3 吞成 null、
@@ -5972,11 +6146,10 @@ const RULE_P = {
           if (hunterMissing) out.push({ ch: ch.key, got: 0, need: 1, commits: effective, every: H.rearm(), missing: H.hunterMissingWhich(ctx) });
           continue;
         }
-        const chActs = acts.filter((a) => { try { return ch.test(a, ctx); } catch { return false; } });   // 带 ctx:D11 闸引擎面收紧
-        if (chActs.length >= 1) continue;
+        if (H.chCount(ctx, ch, acts) >= 1) continue;   // 带 ctx:D11 闸引擎面收紧;跨模型格另认作业记录(批 297)
         out.push({ ch: ch.key, got: 0, need: 1, commits: effective, every: H.rearm() });
       }
-      return H.tierFilter(ctx, out);
+      return H.tierFilter(ctx, H.markCodex(ctx, out));   // 批 297 r2:跨模型命中带作业诊断;通道不可用 ⇒ soft
     }
     const { commits, need } = H.needRuns(ctx);
     const acts = H.scopeActions(ctx);
@@ -5986,7 +6159,7 @@ const RULE_P = {
       if (engine && ch === hunterCh) { if (hunterMissing) out.push({ ch: ch.key, got: 0, need: 1, commits, every: H.rearm(), missing: H.hunterMissingWhich(ctx) }); continue; }
       const pool = (engine && ch === hunterCh) ? hunterPool : acts;   // 红队凭证只认本批
       const mine = pool.filter((a) => { try { return ch.test(a, ctx); } catch { return false; } });   // 带 ctx:D11 闸引擎面收紧
-      const got = mine.length;
+      const got = H.chCount(ctx, ch, pool);   // 跨模型格另认作业记录(批 297);豁免仍只看动作 mine(MCP 那条)
       if (got >= need) continue;
       // **豁免按通道分账**(2026-08-20 修,grill:testing 报 CRITICAL、本机实测复现):
       //   原来豁免是**规则级的一个布尔**——任一条通道的一次垃圾调用只要入参里带失败词,
@@ -5997,7 +6170,7 @@ const RULE_P = {
       const excused = mine.some((a) => H.FAIL_MARK.test(JSON.stringify((a && a.input) || {})));
       if (!excused) out.push({ ch: ch.key, got, need, commits, every: H.rearm() });
     }
-    return H.tierFilter(ctx, out);
+    return H.tierFilter(ctx, H.markCodex(ctx, out));
   },
 
   // ⚠️ **唯一合法豁免:通道本身不可用,且有动作证据。**
@@ -6031,18 +6204,31 @@ const RULE_P = {
         `      处置:${who},` +
         `prompt 里带上本批闸文件名 / 规则 id / diff 文件(空 prompt 不算,上一批的调用不抵账);误拦猎手派单里**只写一个** \`--base <sha>\`(只认 --base 参数,说明文字里的 base: 不算;写了多个不同的 --base——哪怕是「别用 --base HEAD」的提醒——也不认),sha 要早于 P 范围(本会话上次 P 结清以来)里第一笔改闸提交(不能填 HEAD,也不能填那一笔及之后的提交——那样回放恒为零新增;有疑问就填开工前的提交 sha)。回件处置后再提交或关账。grill 在此格**不充分**。`;
     }
+    // 批 297 r2(误拦猎手 FB-1):只剩「跨模型格通道不可用」⇒ 一行提示(本项此时不阻断,见 blocking)
+    const hard = hits.filter((h) => !h.soft);
+    const soft = hits.filter((h) => h.soft);
+    const softLine = soft.length ? `      跨模型格**通道不可用**(codex 作业 ${soft.flatMap((h) => h.unavailable || []).join("、")} 以不可用类错误失败:配额 / 429 / rate limit / 网络终态错误;超时不算)⇒ 本格放行,` +
+      `**收尾报告须登记欠账**(写明作业号与失败原因,通道恢复后补跑)。\n` : "";
+    if (!hard.length) return `承重面批次三通道:跨模型格通道不可用,本格不阻断(提示)。\n${softLine}`;
+    const sinceTxt = (s) => (!s ? "窗口起点取不到(本批没武装、P 账没结清过、窗口里也没有时间戳)⇒ 一条记录都不认"
+      : `窗口 = ${s.how === "batch" ? "本批武装以来" : s.how === "ledger" ? "上次 P 账结清以来(本批没武装)" : "跨轮窗口里最早一条动作以来(本批没武装、P 账没结清过)"}(${new Date(s.at).toISOString()} 起)`);
+    const codexHit = hard.find((h) => /跨模型/.test(String(h.ch)));
+    const jobLines = codexHit ? (`      跨模型格认的是 codex-run **自己写的作业记录**(<系统临时目录>/codex-run-jobs/<J>.json),不看命令怎么写;${sinceTxt(codexHit.since)}。\n` +
+      `      合格 = 窗口内发起、cwd 所在 git 顶层是本仓根或本仓 .claude/worktrees/<名>、state=done 且 exitCode=0、threadId 非空、resultAt 非空、` +
+      `startedAt 与终态时刻不晚于此刻;MCP 通路(mcp__codex-cli__codex)照旧按工具调用算。\n` +
+      (Array.isArray(codexHit.jobs) && codexHit.jobs.length
+        ? `      窗口内看到的本仓记录(最多 5 条)各卡在:${codexHit.jobs.map((j) => `${j.id} ${j.why}`).join(";")}。\n`
+        : `      窗口内没看到本仓的作业记录 ⇒ 用 \`node ~/.claude/scripts/codex-run.mjs --task <任务文件>\` 跑一次跨模型复核。\n`)) : "";
     return `承重面批次三通道未跑够(本会话 ${h0.commits} 次承重面提交 ⇒ 各需 ${h0.need} 遍,` +
-      `每 ${h0.every} 次重新武装一次)。缺:${hits.map((h) => `${h.ch} ${h.got}/${h.need}`).join(" / ")}\n` +
-      (hits.some((h) => /闸引擎面每批必跑|独立视角/.test(String(h.ch))) && RULE_P._p ?
-        `      （闸引擎面的「独立视角」要 \`_gate-bypass-hunter\` 与 \`_gate-false-block-hunter\` 两者都在,且入参绑定闸文件/规则 id;误拦猎手派单里只写一个 \`--base <sha>\`(早于 P 范围里第一笔改闸提交;多个不同的 --base 不认)${(() => { const ms = hits.flatMap((h) => Array.isArray(h.missing) ? h.missing : []); return ms.length === 1 ? `;**本次缺的是 \`${ms[0]}\`**` : ""; })()};grill 在该格不充分——D11。）\n` : "") +
+      `每 ${h0.every} 次重新武装一次)。缺:${hard.map((h) => `${h.ch} ${h.got}/${h.need}`).join(" / ")}\n` +
+      (hard.some((h) => /闸引擎面每批必跑|独立视角/.test(String(h.ch))) && RULE_P._p ?
+        `      （闸引擎面的「独立视角」要 \`_gate-bypass-hunter\` 与 \`_gate-false-block-hunter\` 两者都在,且入参绑定闸文件/规则 id;误拦猎手派单里只写一个 \`--base <sha>\`(早于 P 范围里第一笔改闸提交;多个不同的 --base 不认)${(() => { const ms = hard.flatMap((h) => Array.isArray(h.missing) ? h.missing : []); return ms.length === 1 ? `;**本次缺的是 \`${ms[0]}\`**` : ""; })()};grill 在该格不充分——D11。）\n` : "") +
+      jobLines + softLine +
       `      **「本轮不需要」不是豁免**——当日自审第⑤⑥⑦问六次全答「不需要」、零次触发行动,\n` +
       `      而同日一跑三通道:codex 判死我 4/5 条诊断,grill 报出 97 条变异里 40 条在「全绿」下存活。\n` +
       `      (本批承重面改动若**全是测试文件**——*.test.* / *.spec.* / *.selftest.mjs / .nlpm-test/——跨模型与联网两条自动免,\n` +
       `      独立视角照欠;注释与文案不分档;法条 reporting.md「按 diff 事实分档」,只认 git 改动清单,不认说法。)\n` +
-      `      除此之外唯一合法豁免=**通道本身不可用**,且须有动作证据:真发起过那条通道,\n` +
-      `      且那次调用的入参里留着限流/配额/429/站点不可达的痕迹。**说一句不算**\n` +
-      `      (纯文本豁免 2026-08-20 已撤:一句话曾能一次关掉三条通道,连引用本报错都行)。\n` +
-      `      计数只认动作面:正文、写进文件的正文、被读文件的内容、提交信息里写出这些字面量,\n` +
+      `      计数只认动作面与作业记录:正文、写进文件的正文、被读文件的内容、提交信息里写出这些字面量,\n` +
       `      **一次都不算**(全语料实测:306 次旧命中里只有 16 次是真调用)。\n` +
       `      grill 六个单 agent(architecture/security/testing/error-handling/edge-cases/recon)\n` +
       `      属只读子代理,宪法恒定条款 8 已常设授权,**不必用户点名**。`;
@@ -6051,6 +6237,40 @@ const RULE_P = {
   // ⚠️ 变异必须动**判据内部**再跑原用例,不能换成恒真/恒假的壳(codex 060 判死过那种)。
   //   这四条各自复现一种「历史上真出现过或差点写成」的错法,证人已逐条核实。
   mutations: [
+    // ── 批 297(D203):作业记录判据五条腿各钉一条放宽向 + 两条归一 + 回退旧判据(证人 = pos / neg 里「297:」各条)──
+    { name: "297 跨模型格回到解析命令文本(段首 node + codex-run.mjs --task 即算)", apply: swapP({ codexJobHits: () => (ctx) =>
+      (ctx.bashCmds || []).filter((c) => /(^|[\s;&|(])node\s+\S*codex-run\.mjs\s+--(task|poll)/.test(String(c))).length }) },
+    { name: "297 不看 threadId", apply: swapP({ jobThreaded: () => () => true }) },
+    { name: "297 不看退出码(只要 state=done)", apply: swapP({ jobFinished: () => (j) => j.state === "done" }) },
+    { name: "297 不看 state(只要退出码 0)", apply: swapP({ jobFinished: () => (j) => j.exitCode === 0 }) },
+    { name: "297 不看结果件", apply: swapP({ jobHasResult: () => () => true }) },
+    { name: "297 不看窗口起点", apply: swapP({ jobInWindow: () => () => true }) },
+    { name: "297 不看 cwd", apply: swapP({ jobInRepo: () => () => true }) },
+    { name: "297 cwd 按前缀认(子目录 / 同名前缀目录也算)", apply: swapP({ jobInRepo: () => (cwd, main) => RULE_P._p.normDir(cwd).startsWith(main) }) },
+    { name: "297 根不剥 worktree(hook 在 worktree 里跑时,主根与兄弟 worktree 的作业都不认)", apply: swapP({ repoMain: () => (r) => RULE_P._p.normDir(r) || null }) },
+    { name: "297 路径不归一大小写", apply: swapP({ normDir: () => (p) => String(p || "").trim().replace(/\\/g, "/").replace(/^\/\/\?\//, "").replace(/\/+$/, "") }) },
+    { name: "297 r2 路径不剥 \\\\?\\ 前缀", apply: swapP({ normDir: () => (p) => String(p || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() }) },
+    { name: "297 窗口起点取不到 ⇒ 不设下界(按 0)", apply: swapP({ winStartAt: (orig) => (ctx) => { const v = orig(ctx); return v === null ? 0 : v; } }) },
+    // r2 ①:下界时间锚三向
+    { name: "297 r2 下界退回 400 条池里最早时间戳(不认批武装 / 账结清)", apply: swapP({ codexSince: () => (ctx) => { const w = RULE_P._p.winStartAt(ctx); return w === null ? null : { at: w, how: "window" }; } }) },
+    // r3 ①:已结清不作锚(r2 口径)/ 外来批也作锚 / 两锚不取最晚(批优先)
+    { name: "297 r3 已结清的批不作锚(退回 r2 口径)", apply: swapP({ codexSince: (orig) => (ctx) => orig(ctx && ctx.batchGoal && ctx.batchGoal.cleared ? { ...ctx, batchGoal: null } : ctx) }) },
+    { name: "297 r3 外来批也作锚", apply: swapP({ codexSince: (orig) => (ctx) => orig(ctx && ctx.batchGoal && ctx.batchGoal.foreign ? { ...ctx, batchGoal: { ...ctx.batchGoal, foreign: false } } : ctx) }) },
+    { name: "297 r3 两锚不取最晚(有批就用批)", apply: swapP({ codexSince: (orig) => (ctx) => {
+      const g = ctx && ctx.batchGoal, t = g && g.foreign !== true ? Date.parse(String(g.armedAt || g.clearedArmedAt || "")) : NaN;
+      return Number.isFinite(t) ? { at: t, how: "batch" } : orig(ctx); } }) },
+    // r3 ②:不可用出路收窄三向
+    // 批 302(D205):分类挪到 codex-run(完整事件流);P 这一侧的反向探针改钉「替身不计」与「外置 worktree 同仓身份」
+    { name: "302 CODEX_BIN 替身照计(binSource=env 不排除)", apply: swapP({ jobRealBin: () => () => true }) },
+    { name: "297 r2 不认 P 账结清时刻", apply: swapP({ codexSince: (orig) => (ctx) => orig(ctx && ctx.pLedger ? { ...ctx, pLedger: { ...ctx.pLedger, settledAt: null } } : ctx) }) },
+    // r2 ②③:上界三向
+    { name: "297 r2 不设上界", apply: swapP({ jobBeforeUpper: () => () => true }) },
+    { name: "297 r2 上界只看 startedAt(不看终态时刻)", apply: swapP({ jobBeforeUpper: () => (j, upper) => Number.isFinite(upper) && Number.isFinite(j.startedAt) && j.startedAt <= upper }) },
+    { name: "297 r2 上界取不到 ⇒ 当无上界", apply: swapP({ jobBeforeUpper: (orig) => (j, upper) => (Number.isFinite(upper) ? orig(j, upper) : true) }) },
+    // r2 ⑦:不可用出路三向
+    { name: "297 r2 不可用出路关掉(429 失败也阻断)", apply: swapP({ jobUnavailable: () => () => false }) },
+    { name: "297 r2 任何失败都算通道不可用", apply: swapP({ jobUnavailable: () => (j) => j.state === "failed" || (Number.isFinite(j.exitCode) && j.exitCode !== 0) }) },
+    { name: "297 r2 soft 命中吞掉同轮的硬缺口(有一格不可用就整条不阻断)", apply: (r) => ({ ...r, blocking(ctx) { const hs = this.detect(ctx); return hs.length > 0 && hs.every((h) => !h.soft); } }) },
     // ── 红队 a27628dd 轮的新分支各钉一条(swapP:临时换掉 _p 里的零件,跑完还原)────────────────────
     { name: "git 事实不接(恒回退语法判据:merge/cherry-pick 合回看不见)", apply: swapP({ facts: () => () => null }) },
     // 批 279「修闸 tag」两向:恒算碰过(误拦复发)/ 只看账、不看窗口与提交邻近兜底(漏放)
@@ -6224,6 +6444,73 @@ const RULE_P = {
   cases: {
     // 正例 = **四种已知文本伪造形态**各一条(全部必须照拦)+ 一条写入面伪造。
     pos: [
+      // ── 批 297(D203):跨模型格只认合格的 codex-run 作业记录。下列各条命令照常(或长成 D203 的反形),
+      //   但没有合格记录 ⇒ 跨模型格缺(另两格齐,单变量)。每条对应 codexJobsEval 判据的一条腿,也是对应变异的证人。
+      pOnlyCodex("297:作业记录 threadId 空 ⇒ 缺", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs(pJob({ threadId: "" })) }),
+      pOnlyCodex("297:作业记录 exitCode 非 0(codex-run 对正文非空照记 done)⇒ 缺", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs(pJob({ exitCode: 1 })) }),
+      { ...pOnlyCodex("297 r2:作业还在跑(state=running)⇒ 缺,消息给 --poll J --wait-ms 600000", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"],
+        codexJobs: pJobs(pJob({ id: "Jrun", state: "running", endedAt: undefined, resultAt: undefined })) }), expectBlock: true },
+      pOnlyCodex("297:state=failed 而退出码 0(空正文 empty-body)⇒ 缺", { codexJobs: pJobs(pJob({ state: "failed", exitCode: 0, failLines: ["ledger: codex 退出码 0 但最终消息为空", "ledger: empty-body"] })) }),
+      pOnlyCodex("297:作业失败(普通失败,不是不可用类)⇒ 缺", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"],
+        codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, failLines: ["ledger: codex 退出码 1 且无最终消息", "ledger: empty-body", "stderr: Not inside a trusted directory and --skip-git-repo-check was not specified."] })) }),
+      pOnlyCodex("297 r2:没有 resultAt(结果件没写成)⇒ 缺", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs(pJob({ resultAt: undefined })) }),
+      pOnlyCodex("297:startedAt 早于窗口起点(上一段会话的作业)⇒ 缺", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs(pJob({ startedAt: "2026-11-07T07:59:00Z" })) }),
+      // r2 ①(红队 BP-1):下界改用批武装时刻——上一批的作业在 400 条窗口里,但早于本批武装 ⇒ 不抵本批
+      pOnlyCodex("297 r2:上一批的作业(在跨轮窗口里、早于本批武装)⇒ 缺",
+        { batchGoal: { armedAt: "2026-11-07T07:55:00Z", conditions: ["甲"] }, codexJobs: pJobs(pJob({ startedAt: "2026-11-07T07:10:05Z" })),
+          prior: [{ text: "上一批跨模型", at: "2026-11-07T07:10:00Z", bash: "node ~/.claude/scripts/codex-run.mjs --task old.md" }] }),
+      pOnlyCodex("297 r2:本批没武装、P 账上次结清之后才有作业——结清之前那条不算 ⇒ 缺",
+        { pLedger: { carriers: 4, settledAt: "2026-11-07T07:00:00Z" }, codexJobs: pJobs(pJob({ startedAt: "2026-11-07T06:50:00Z" })),
+          prior: [{ text: "更早", at: "2026-11-07T06:40:00Z", bash: "ls" }] }),
+      // r2 ②(红队 BP-3):上界——2099 年的手写记录 / 终态时刻晚于此刻 / 终态时刻缺 ⇒ 缺
+      pOnlyCodex("297 r2:startedAt 晚于此刻(2099 年的伪造记录)⇒ 缺", { codexJobs: pJobs(pJob({ startedAt: "2099-01-01T00:00:00Z", endedAt: "2099-01-01T00:05:00Z", resultAt: "2099-01-01T00:04:00Z" })) }),
+      pOnlyCodex("297 r2:endedAt 晚于此刻 ⇒ 缺", { codexJobs: pJobs(pJob({ endedAt: "2026-11-07T10:00:00Z" })) }),
+      pOnlyCodex("297 r2:上界取不到(离线、本轮无时间戳 ⇒ upper=null)⇒ 一条都不认", { codexJobs: { root: "/repo", jobs: [pJob()] } }),
+      // r2 ⑤(误拦猎手 FB-2):归属看 cwd 所在 git 顶层
+      pOnlyCodex("297:作业 git 顶层是别的仓 ⇒ 缺", { bash: ["cd E:/test5 && node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs(pJob({ cwd: "E:/test5", top: "E:/test5" })) }),
+      pOnlyCodex("297:作业 git 顶层是同名前缀的别的仓(/repo-old)⇒ 缺", { codexJobs: pJobs(pJob({ cwd: "/repo-old", top: "/repo-old" })) }),
+      pOnlyCodex("297:作业 git 顶层是 fp-audit 临时仓 ⇒ 缺", { codexJobs: pJobs(pJob({ cwd: "C:/Users/x/AppData/Local/Temp/fp-audit-28BtUu", top: "C:/Users/x/AppData/Local/Temp/fp-audit-28BtUu" })) }),
+      pOnlyCodex("297 r2:作业在本仓里的嵌套仓发起(git 顶层 = clipboard/oss/public-repo)⇒ 缺",
+        { codexJobs: pJobs(pJob({ cwd: "/repo/clipboard/oss/public-repo/src", top: "/repo/clipboard/oss/public-repo" })) }),
+      pOnlyCodex("297 r2:cwd 往上找不到 .git(top=null)⇒ 缺", { codexJobs: pJobs(pJob({ cwd: "E:/scratch", top: null })) }),
+      pOnlyCodex("297:命令照常、作业目录里一条记录都没有 ⇒ 缺", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs() }),
+      pOnlyCodex("297:命令照常、作业记录通道没接 ⇒ 缺(不再读命令文本)", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"] }),
+      { name: "297:窗口里没有任何时间戳、没武装、账没结清(下界取不到)⇒ 即便有合格记录也缺",
+        text: "法典改完并提交。", agent: "grill:testing", web: "先例", codexJobs: pJobs(pJob()),
+        bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A docs/laws/collab.md && git commit -m x"] },
+      // r2 ⑦(误拦猎手 FB-1)通道不可用的出路;批 302(D205):只读 codex-run 从完整事件流写的结构化字段 `unavailable{reason}`,
+      //   不再解析日志尾窗(failLines 撤掉)。超时、配置告警、只在台账 error 里的 429 由 codex-run 那一层判(不写 unavailable)。
+      { ...pOnlyCodex("302 D205:作业失败且 unavailable.reason=rate-limit ⇒ 本格不阻断,提示登记欠账",
+        { codexJobs: pJobs(pJob({ id: "J429", state: "failed", exitCode: 1, threadId: "t", resultAt: undefined, unavailable: { reason: "rate-limit" } })) }), expectBlock: false },
+      { ...pOnlyCodex("302 D205:unavailable.reason=network ⇒ 本格不阻断",
+        { codexJobs: pJobs(pJob({ id: "Jnet", state: "failed", exitCode: 1, unavailable: { reason: "network" } })) }), expectBlock: false },
+      { ...pOnlyCodex("302 D205:作业失败、没有 unavailable 字段(超时 / 旧记录;日志里有 429 也一样)⇒ 不给出路,照阻断",
+        { codexJobs: pJobs(pJob({ id: "Jto", state: "failed", exitCode: null, resultAt: "2026-11-07T08:00:06Z", failLines: ["event: 429 Too Many Requests"] })) }), expectBlock: true },
+      { name: "297 r2:通道不可用只免跨模型格——独立视角也缺 ⇒ 照阻断", text: "法典改完并提交。", at: P_T0, web: "先例", expectBlock: true,
+        codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, unavailable: { reason: "rate-limit" } })),
+        bash: ["git add -A docs/laws/collab.md && git commit -m x"] },
+      { ...pOnlyCodex("297 r2:429 失败的作业在别的仓 ⇒ 不给出路,照阻断",
+        { codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, cwd: "E:/test5", top: "E:/test5", unavailable: { reason: "rate-limit" } })) }), expectBlock: true },
+      // 批 302(D205 ②):`CODEX_BIN` 替身跑出的记录(binSource=env)不计——既不算合格,也不给不可用出路
+      pOnlyCodex("302 D205:binSource=env 的合格记录 ⇒ 不计,缺", { codexJobs: pJobs(pJob({ binSource: "env" })) }),
+      { ...pOnlyCodex("302 D205:binSource=env 且 unavailable ⇒ 也不给出路,照阻断", { codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, binSource: "env", unavailable: { reason: "rate-limit" } })) }), expectBlock: true },
+      // r3 ①(红队 r2 BP-1 / codex r2 §3):下界 = max(批 armedAt(结清也算、外来跳过), settledAt)
+      pOnlyCodex("297 r3:正常收尾顺序「提交 → --clear → Stop」——已结清的本会话批仍作锚,上一批的作业不抵 ⇒ 缺",
+        { batchGoal: { armedAt: "2026-11-07T07:55:00Z", conditions: [], cleared: true }, codexJobs: pJobs(pJob({ startedAt: "2026-11-07T07:10:05Z" })),
+          prior: [{ text: "上一批跨模型", at: "2026-11-07T07:10:00Z", bash: "node ~/.claude/scripts/codex-run.mjs --task old.md" }] }),
+      pOnlyCodex("297 r3:两锚取最晚——批 06:00 武装、P 账 07:30 结清,07:00 的作业不抵 ⇒ 缺",
+        { batchGoal: { armedAt: "2026-11-07T06:00:00Z", conditions: ["甲"] }, pLedger: { carriers: 4, settledAt: "2026-11-07T07:30:00Z" },
+          codexJobs: pJobs(pJob({ startedAt: "2026-11-07T07:00:00Z", endedAt: "2026-11-07T07:05:00Z", resultAt: "2026-11-07T07:04:00Z" })),
+          prior: [{ text: "更早", at: "2026-11-07T06:10:00Z", bash: "ls" }] }),
+      // D203 列的五类反形(codex 296-review-r1 实测:批 296 的 CD_PREFIX 把它们判成「跑过」;实际 codex 一次没起)——没有记录 ⇒ 缺
+      pOnlyCodex("297 D203 反形①:cd⏎false && …(短路守卫被跨行吞掉)⇒ 缺", { bash: ["cd\nfalse && node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs() }),
+      pOnlyCodex("297 D203 反形②:cd # && …(&& 之后是注释)⇒ 缺", { bash: ["cd # && node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs() }),
+      pOnlyCodex("297 D203 反形③:大写 CD(bash 下 command not found)⇒ 缺", { bash: ["CD . && node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs() }),
+      pOnlyCodex("297 D203 反形④:cd \"x\\\" && …(双引号未闭合)⇒ 缺", { bash: ["cd \"x\\\" && node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs() }),
+      pOnlyCodex("297 D203 反形⑤:PowerShell 5.1 下 cd . && …(InvalidEndOfLine)⇒ 缺", { ps: ["cd . && node C:/Users/x/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs() }),
+      // 原窗口式老路的「codex-run 命令里带 429 ⇒ 本格豁免」是命令文本当出口,批 297 撤:没有记录 ⇒ 缺(原 neg 同形挪来)
+      pOnlyCodex("297:codex-run 命令里写着 429 rate-limit、没有作业记录 ⇒ 缺(命令文本出口已撤)",
+        { bash: ["node ~/.claude/scripts/codex-run.mjs --poll --job J1 # 上次 429 rate-limit 退回"], codexJobs: pJobs() }),
       // 批 279「修闸 tag」控制组:账里有 tag / 账说没有但窗口里看得见闸写入 / 提交命令后 300 秒内落的改闸提交 ⇒ 照要猎手
       { name: "279 修闸 tag:账里有本会话 ⇒ 照要猎手",
         text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: true,
@@ -7464,7 +7751,7 @@ const RULE_P = {
       //   它红了不是「少过一条」,是「本条判据是不是一律拦」没人测了。
       //   D11 收紧后(2026-09-06):这条提交的是**闸引擎文件**,独立视角须是红队 agent;grill 的接受侧证人
       //   挪到下一条(法典提交)——两条合起来才证「收紧只作用于闸引擎面」。
-      { text: "承重面改完并提交,三通道各跑一遍。",
+      { text: "承重面改完并提交,三通道各跑一遍。", at: P_T0, codexJobs: pJobs(pJob()),
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A scripts/hook-stop-closure.mjs && git commit -m x"],
         agent: { type: "_gate-bypass-hunter", prompt: "红队本批对 scripts/hook-stop-closure.mjs 的改动,规则 id K/S" }, web: "业界先例",
         prior: [{ text: "误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放本批 scripts/hook-stop-closure.mjs 的改动 --base 1234567" } }] },
@@ -7492,7 +7779,7 @@ const RULE_P = {
                 { text: "本批红队", agent: { type: "_gate-bypass-hunter", prompt: "红队本批 scripts/lib/gate-rules.mjs 的改动" } },
                 { text: "本批误拦猎手", agent: { type: "_gate-false-block-hunter", prompt: "回放本批 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } }] },
       { name: "D11 边界:非闸引擎的承重提交,grill 仍充分",
-        text: "法典改完并提交,三通道各跑一遍。",
+        text: "法典改完并提交,三通道各跑一遍。", at: P_T0, codexJobs: pJobs(pJob()),
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A docs/laws/collab.md && git commit -m x"],
         agent: "grill:testing", web: "业界先例" },
       // 同上,但跨模型走的是 **MCP 工具**而非 `node codex-run.mjs` ⇒ 同样放行。
@@ -7506,27 +7793,61 @@ const RULE_P = {
       { text: "改的是业务代码。", bash: ["git add -A src/app/page.tsx && git commit -m x"] },
       // 改了承重件但**没提交** ⇒ 不触发(P 的触发点是提交,不是修改)
       { text: "改了闸的机件,还没提交。", write: "scripts/hook-stop-closure.mjs" },
-      // 合法豁免:**真发起过** codex 且那次调用的入参留着限流痕迹,**且另两条通道真跑了** ⇒ 放行。
-      //   ⚠️ 2026-08-20 改:原写法只有 codex 一条(另两条一次没跑)却期望放行
-      //   —— 那**编码的是刚修掉的 bug**(规则级豁免关掉三条通道)。同一输入已挪进 pos 当回归证人。
-      { text: "codex 通道限流了,另两条照跑。",
-        bash: ["node ~/.claude/scripts/codex-run.mjs --poll --job J1 # 上次 429 rate-limit 退回",
-               "git add -A AGENTS.md && git commit -m x"],
-        agent: "grill:testing", web: "业界先例" },
+      // (原「合法豁免:codex-run 命令入参带 429 + 另两条照跑 ⇒ 放行」一条,批 297 撤:命令文本当出口,同形挪进 pos。
+      //   MCP 通路的豁免判据未动,但夹具 `mcp` 键的入参恒为 {prompt:"x"},带失败痕迹的 MCP 调用写不出来——已知缺口,报告里列。)
       // 真调用在**窗口**里(上几轮跑的),本轮只提交 ⇒ 放行。
       //   2026-08-20 补,grill:testing 报:`scopeActions` 的「窗口 ∪ 本轮」合并
       //   **零变异零用例**——把合并整个删掉,9 条用例一条都不翻面。
       //   夹具的 `prior` 通道是为这件事加的(第六次同族),却从没在 P 自己的用例里用过。
       //   「看着像修好了、其实从没被跑过」比坏掉更危险。
-      { text: "上几轮跑完了三条通道,本轮收尾提交。",
+      //   批 297:跨模型那格改认作业记录 ⇒ 记录的 startedAt 在**上几轮**(早于本轮、晚于窗口起点)也算——同一窗口 ∪ 本轮口径。
+      { text: "上几轮跑完了三条通道,本轮收尾提交。", at: P_T0,
+        codexJobs: pJobs(pJob({ startedAt: "2026-11-07T07:30:05Z" })),
         bash: ["git add -A docs/laws/collab.md && git commit -m x"],
-        prior: [{ text: "跨模型", bash: "node ~/.claude/scripts/codex-run.mjs --task t.md" },
-                { text: "独立视角", agent: "grill:testing" },
-                { text: "外部先例", web: "先例" }] },
-      // 真调用带引号路径 / 包装器 ⇒ 仍须计数(codex 2026-08-20 报的误报族)。
-      { text: "路径带引号地跑。", agent: "grill:testing", web: "先例",
+        prior: [{ text: "跨模型", at: "2026-11-07T07:30:00Z", bash: "node ~/.claude/scripts/codex-run.mjs --task t.md" },
+                { text: "独立视角", at: "2026-11-07T07:40:00Z", agent: "grill:testing" },
+                { text: "外部先例", at: "2026-11-07T07:50:00Z", web: "先例" }] },
+      // 真调用带引号路径 ⇒ 仍须计数(codex 2026-08-20 报的误报族);批 297 起命令怎么写不再影响判定,有合格记录即齐。
+      { text: "路径带引号地跑。", agent: "grill:testing", web: "先例", at: P_T0, codexJobs: pJobs(pJob()),
         bash: ["node \"C:/Users/x/.claude/scripts/codex-run.mjs\" --task t.md",
                "git add -A docs/laws/lawmaking.md && git commit -m x"] },
+      // ── 批 297(D203):有合格作业记录 ⇒ 跨模型格齐,不看命令长什么样(批 293 误拦原形、包装器、后台、子代理代跑)──
+      pOnlyCodex("297:cd <仓根> && node …codex-run(批 293 误拦原形)+ 合格记录 ⇒ 齐",
+        { bash: ["cd /repo && node ~/.claude/scripts/codex-run.mjs --task clipboard/codex/t.md"], codexJobs: pJobs(pJob()) }),
+      pOnlyCodex("297:bash -c 包装 + 合格记录 ⇒ 齐",
+        { bash: ["bash -c \"cd /repo && node scripts/codex-run.mjs --task clipboard/codex/t.md\""], codexJobs: pJobs(pJob()) }),
+      pOnlyCodex("297:后台发起(& 丢进后台,事后才 done)+ 合格记录 ⇒ 齐",
+        { bash: ["(node ~/.claude/scripts/codex-run.mjs --task t.md --wait-ms 1000 > /dev/null 2>&1 &)", "node ~/.claude/scripts/codex-run.mjs --poll J297"], codexJobs: pJobs(pJob()) }),
+      pOnlyCodex("297:PowerShell 发起 + 合格记录 ⇒ 齐",
+        { ps: ["Set-Location \\repo; node C:\\Users\\x\\.claude\\scripts\\codex-run.mjs --task clipboard\\codex\\t.md"], codexJobs: pJobs(pJob()) }),
+      pOnlyCodex("297:子代理代跑 codex(主转录里没有 codex-run 命令)+ 合格记录 ⇒ 齐", { codexJobs: pJobs(pJob()) }),
+      // 批 302(D205):binSource=vendor / path 照计;done、exit 0 的作业带 unavailable(中途 429 重试成功)照常合格
+      pOnlyCodex("302 D205:binSource=vendor / path 的合格记录 ⇒ 照计,齐", { codexJobs: pJobs(pJob({ binSource: "vendor" }), pJob({ id: "J2", binSource: "path" })) }),
+      pOnlyCodex("302 D205:done、exit 0 的作业带 unavailable(中途 429 重试成功)⇒ 照常合格,齐", { codexJobs: pJobs(pJob({ unavailable: { reason: "rate-limit" } })) }),
+      pOnlyCodex("297 r2:作业在本仓某个 worktree 里发起,hook 在另一个 worktree(大小写、反斜杠、尾斜杠归一)⇒ 齐",
+        { codexJobs: { root: "/repo/.claude/worktrees/agent-y", upper: "2026-11-07T09:00:00Z", jobs: [pJob({ cwd: "\\REPO\\.claude\\worktrees\\agent-x\\scripts", top: "\\REPO\\.claude\\worktrees\\agent-x\\" })] } }),
+      pOnlyCodex("297 r2:git 顶层是本仓根(盘符大小写 / 反斜杠 / `\\\\?\\` 前缀不同)⇒ 齐", { codexJobs: { root: "e:\\test\\", upper: "2026-11-07T09:00:00Z", jobs: [pJob({ cwd: "E:\\Test", top: "//?/E:/Test" })] } }),
+      pOnlyCodex("297 r2:在本仓普通子目录发起(cwd=scripts,git 顶层仍是本仓根)⇒ 齐(误拦猎手 FB-2)", { codexJobs: pJobs(pJob({ cwd: "/repo/scripts", top: "/repo" })) }),
+      pOnlyCodex("297:几条不合格记录里有一条合格的 ⇒ 齐",
+        { codexJobs: pJobs(pJob({ id: "Ja", state: "running" }), pJob({ id: "Jb", cwd: "E:/test5", top: "E:/test5" }), pJob({ id: "Jc" }), pJob({ id: "Jd", threadId: "" })) }),
+      pOnlyCodex("297:跨批计账满(pLedger 4 + 本轮 1)+ 合格记录 ⇒ 齐", { pLedger: { carriers: 4 }, codexJobs: pJobs(pJob()) }),
+      // r2 ①(误拦猎手 FB-3):本批武装后发起、发起那条已滚出 400 条窗口(窗口里只剩 --poll)⇒ 照认
+      pOnlyCodex("297 r2:本批武装后发起、发起条已滚出窗口 ⇒ 齐",
+        { batchGoal: { armedAt: "2026-11-07T06:00:00Z", conditions: ["甲"] }, codexJobs: pJobs(pJob({ startedAt: "2026-11-07T06:30:00Z", endedAt: "2026-11-07T06:45:00Z", resultAt: "2026-11-07T06:44:00Z" })),
+          prior: [{ text: "轮询", at: "2026-11-07T07:30:00Z", bash: "node ~/.claude/scripts/codex-run.mjs --poll J297 --wait-ms 600000" }] }),
+      pOnlyCodex("297 r2:本批没武装 ⇒ 退回 P 账上次结清时刻;结清之后、窗口之前的作业照认",
+        { pLedger: { carriers: 4, settledAt: "2026-11-07T06:00:00Z" }, codexJobs: pJobs(pJob({ startedAt: "2026-11-07T06:30:00Z", endedAt: "2026-11-07T06:45:00Z", resultAt: "2026-11-07T06:44:00Z" })),
+          prior: [{ text: "别的活", at: "2026-11-07T07:30:00Z", bash: "ls" }] }),
+      // r3(红队 r2 BP-1):原「批已结清 ⇒ 不拿它的 armedAt」改成相反口径——已结清的本会话批仍作锚,本批内的作业照认
+      pOnlyCodex("297 r3:已结清的本会话批仍作锚;本批武装之后的作业 ⇒ 齐",
+        { batchGoal: { armedAt: "2026-11-07T07:55:00Z", conditions: [], cleared: true }, codexJobs: pJobs(pJob()),
+          prior: [{ text: "上一批", at: "2026-11-07T07:10:00Z", bash: "ls" }] }),
+      // r3(codex r2 §3):别的会话武装的批(foreign)不作锚 ⇒ 退回 settledAt;settledAt 之后的作业照认(原口径会拿 07:55 误拦)
+      pOnlyCodex("297 r3:外来批不作锚、退回 P 账结清时刻 ⇒ 齐",
+        { batchGoal: { armedAt: "2026-11-07T07:55:00Z", conditions: ["甲"], foreign: true }, pLedger: { carriers: 4, settledAt: "2026-11-07T07:00:00Z" },
+          codexJobs: pJobs(pJob({ startedAt: "2026-11-07T07:10:05Z", endedAt: "2026-11-07T07:20:00Z", resultAt: "2026-11-07T07:19:00Z" })),
+          prior: [{ text: "别的活", at: "2026-11-07T07:30:00Z", bash: "ls" }] }),
+      pOnlyCodex("297 r2:离线记录没有 endedAt、resultAt 不晚于本轮结束 ⇒ 齐", { codexJobs: pJobs(pJob({ endedAt: undefined })) }),
       // **提交信息里提到承重路径 ≠ 承重提交**(CEILING 的回归证人,与下面 pos 的引号暂存配对):
       //   真提交的是业务码,-m 里顺嘴提了闸文件 ⇒ 不触发。谁把 message 剥离撤了,这条就红。
       { text: "提交业务代码。",
@@ -7537,7 +7858,7 @@ const RULE_P = {
       { text: "小修提交。", pLedger: { carriers: 3 },
         bash: ["git add -A docs/laws/collab.md && git commit -m x"] },
       // 账满且通道齐 ⇒ 放行(与 pos 的「账满无通道 ⇒ 拦」配对)
-      { text: "第五笔,通道跑齐。", pLedger: { carriers: 4 },
+      { text: "第五笔,通道跑齐。", pLedger: { carriers: 4 }, at: P_T0, codexJobs: pJobs(pJob()),
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md",
                "git add -A docs/laws/collab.md && git commit -m x"],
         agent: "grill:testing", web: "先例" },
@@ -7559,7 +7880,7 @@ const RULE_P = {
 export const RULE_W = {
   id: "W",
   blocking: (ctx) => { try { return ranClear(ctx); } catch { return true; } },
-  law: "docs/laws/reporting.md#交付物四眼",
+  law: "AGENTS.md#对外发布、或会成为后续依据的文档",
   // 出路即数据(批 117)。三条通路逐字取自法条 reporting.md:161-163。
   //   ⚠️ 本条的 sample 必须**同时**带上交付物名——法条要求「入参须提及交付物名」,
   //   所以 sample 里的命令行里就写着 pos[0] 那个交付物,这本身就是自证的一部分。
@@ -8746,8 +9067,10 @@ RULE_W.cases.pos.push({
  *  与 I 的「工具面已扫」同形);②K/S 的 ⏸ 停工语不触发(锚定呼签词,不锚 ⏸)。 */
 export const RULE_V = {
   id: "V",
+  // 义务已随 2026-11-05 宪法大改退役,P0 时决定删除或重写(law 指存档原文;blocking 降为 false)
   blocking: false,
-  law: "AGENTS.md#决策边界",
+  logOnly: true,   // 批 292:287 设计附录 A「只检测、只记账」——命中进候选台账,对模型零输出
+  law: "docs/archive/laws-2026-11/constitution-2026-11-04.md#决策边界",
   detect: (ctx) => {
     if (!RULE_V._calls(ctx.text)) return [];
     if (/免签例外已核/.test(ctx.text)) return [];
@@ -9076,7 +9399,7 @@ const O_REFDEF = "[ \\t]*\\[[^\\]\\n]{1,40}\\]:[ \\t]*<?https?:\\/\\/";
 export const RULE_O = {
   id: "O",
   blocking: false,
-  law: "AGENTS.md#永久红线",
+  law: "docs/archive/laws-2026-11/constitution-2026-11-04.md#永久红线",
   // ── 批 253 改判据(窄例外③,判据过重自签;D117);批 253b 按红队第二轮回件重修 ─────────
   //   旧判据(b9986f7 之前):本轮**任意一次** WebFetch / 动作面提到 fetch-quote-check ⇒ 全文 URL 全豁免;
   //   Bash `curl` 真取页却不认(fp 台账 08-29、09-16 两笔)。头注「判据」段描述的是旧判据,以本段为准。
@@ -9653,7 +9976,9 @@ const ND_Q = /((?:到底)?(?<!报的|出的)(?:是什么|是啥)(?!原因|问题
 const ND_Q_258 = /((?:到底)?(?:是什么|是啥)(?!原因|问题|情况|回事|时候)|什么意思|啥意思|什么东西)/;
 const RULE_ND = {
   id: "ND",
-  blocking: true,   // 2026-08-31 用户亲签:「日记要不要加闸项——加了吧」
+  // 批 292:改提醒、不阻断(287 设计附录 A「I、L、G、ND ⇒ 提醒」;用户 11-05「措辞相关……躲不开查措辞就一律改成非阻断」——
+  //   ND 判的是「用户问句的措辞」,属这一类;此前 2026-08-31 用户签的是「加闸项」,本批按其后的方向改档,不删检测)。
+  blocking: false,
   law: "docs/noun-diary.md#名词日记",
   requires: ["userText"],
   escapes: [
@@ -10207,7 +10532,7 @@ const DP_DETECT = (ctx, { ordered = true, useWindow = true, wrap = DP_WRAP, prob
 const RULE_DP = {
   id: "DP",
   blocking: true,   // 生产法三新条款明写「触发层:收尾闸……即拦」;实现已签法条属窄例外④明确适用
-  law: "docs/laws/production.md#三、部署欠账",
+  law: "AGENTS.md#收尾清部署欠账不用问",
   escapes: [
     // 跑探针 ⇒ 探针自己刷新标记(事实路径)/ 命令里出现真探针(解析路径);样例两面都表达
     { say: "推完跑欠账探针:node --no-warnings scripts/verify-prod.mjs --debt-only(不需要任何 session),查到欠账按生产法三即清只报",
@@ -10446,7 +10771,7 @@ const adDetect = (opts = {}) => (ctx) => {
 const RULE_AD = {
   id: "AD",
   blocking: false,
-  law: "docs/laws/reporting.md#开工先立完成条件",
+  law: "AGENTS.md#改既有机制、推翻既有决定之前",
   detect: adDetect(),
   exempts: [],
   // 批 285(D184 FB-3):去重身份 = 批号。原来去重按首行,首行带「最新命中引文 + 等 N 条提交」,
@@ -10512,7 +10837,10 @@ const RULE_AD = {
  *  失效条件:连续 20 批零命中 ⇒ 复议;「不可机械化」占命中 >80% ⇒ 它成了仪式,复议。 */
 const RULE_MF = {
   id: "MF",
-  blocking: true,   // 2026-10-24 用户签(签单第 2 项,276-D4)
+  // 2026-10-24 用户签为阻断(签单第 2 项,276-D4)。批 301(287 设计 2.2 MF 行):阻断挪到写入(写前按改后全文)与关账
+  //   (memoryDirs 里本批改过的 memory 整份校验,含 shell 写入——原天花板②),见 scripts/lib/write-checks.mjs;本条改只记账。
+  blocking: false,
+  logOnly: true,
   law: "docs/gate-debts.md#在账欠账",
   requires: [],
   escapes: [
@@ -10539,6 +10867,22 @@ const RULE_MF = {
   //   代价(漏放侧,接受):「用户每次说 X 时都要先 Y」这类借用户主语写的指令,若别处没有措辞词,不再触发。
   //   批 279:小改的改动段里不许出现的指令措辞(宽:含单字「不 / 要 / 应 / 别 / 只 / 先 / 再」,误伤只是多查一次)
   _RULE_CUE: /以后|今后|每次|一律|必须|总是|永远|默认|禁止|务必|不|要|应|别|只|须|先|再|\b(?:always|never|must|should|only|don'?t|do not|by default)\b/i,   // 英文按整词(误拦猎手 279 FB-3:commonly 里的 only)
+  /** 批 279「小改的 Edit 不查」:一对 old/new 去掉公共前后缀后两边改动段都 ≤24 字、不是新句子、指令词多重集合相同 ⇒ 小改。
+   *  批 301 从 detect 闭包抽出,写前层(scripts/lib/write-checks.mjs)复用同一份。 */
+  _smallEdit(e) {
+    const MID = 24;
+    const o = e?.old_string, n = e?.new_string;
+    if (typeof o !== "string" || typeof n !== "string") return false;   // 夹具形 / 异常调用 ⇒ 当新内容查
+    let i = 0; while (i < o.length && i < n.length && o[i] === n[i]) i++;
+    let j = 0; while (j < o.length - i && j < n.length - i && o[o.length - 1 - j] === n[n.length - 1 - j]) j++;
+    const om = o.slice(i, o.length - j), nm = n.slice(i, n.length - j);
+    // 只放「替换」:改动段里带句末标点 / 换行 = 写了新句子,照查(红队 279 BP-7);纯插入只放 ≤2 字的补字(误拦猎手 279 FB-3「给论→给结论」)
+    if (om.length > MID || nm.length > MID || /[。！？!?;；\n]/.test(nm)) return false;
+    if (!om.length && nm.length > 2) return false;
+    // 指令词:两边改动段的指令词多重集合相同才放(误拦猎手 279 FB-3「在次→再次」类仍拦——单字「再」进了新串;「必须→不必」照拦,红队 BP-6)
+    const bag = (s) => (s.match(new RegExp(RULE_MF._RULE_CUE.source, "gi")) || []).map((x) => x.toLowerCase()).sort().join("|");
+    return bag(om) === bag(nm);
+  },
   // 执行面行:取标签后到行尾的值判
   faceOk(body, V = {}) {
     const ids = new Set(RULES.map((r) => r.id));   // 调用时 RULES 已定义(r6 BP-3:规则 id 须真实存在)
@@ -10599,20 +10943,7 @@ const RULE_MF = {
     //   且两边改动段里都没有指令措辞(_RULE_CUE,含「不 / 要 / 应 / 别」这类单字)。其余 Edit 与一切 Write 照旧查。
     //   首版按「新串指令词比旧串多」判,红队 279 BP-6(同数替换换掉规则)/ BP-7(无指令词的规则句)/ BP-10(史料里的「先…再」误拦)
     //   ⇒ 换成这个更窄的口径:只放改错别字、改日期、改编号这一类。CEILING:≤24 字、不含指令词的改动改变规则含义(如改一个路径)会漏。
-    const MID = 24;
-    const smallEdit = (e) => {
-      const o = e?.old_string, n = e?.new_string;
-      if (typeof o !== "string" || typeof n !== "string") return false;   // 夹具形 / 异常调用 ⇒ 当新内容查
-      let i = 0; while (i < o.length && i < n.length && o[i] === n[i]) i++;
-      let j = 0; while (j < o.length - i && j < n.length - i && o[o.length - 1 - j] === n[n.length - 1 - j]) j++;
-      const om = o.slice(i, o.length - j), nm = n.slice(i, n.length - j);
-      // 只放「替换」:改动段里带句末标点 / 换行 = 写了新句子,照查(红队 279 BP-7);纯插入只放 ≤2 字的补字(误拦猎手 279 FB-3「给论→给结论」)
-      if (om.length > MID || nm.length > MID || /[。！？!?;；\n]/.test(nm)) return false;
-      if (!om.length && nm.length > 2) return false;
-      // 指令词:两边改动段的指令词多重集合相同才放(误拦猎手 279 FB-3「在次→再次」类仍拦——单字「再」进了新串;「必须→不必」照拦,红队 BP-6)
-      const bag = (s) => (s.match(new RegExp(H._RULE_CUE.source, "gi")) || []).map((x) => x.toLowerCase()).sort().join("|");
-      return bag(om) === bag(nm);
-    };
+    const smallEdit = (e) => H._smallEdit(e);   // 批 301:抽成 RULE_MF._smallEdit(写前层复用同一份),行为不变
     const addsRule = (a) => {
       if (a.name !== "Edit" && a.name !== "MultiEdit") return true;
       const pairs = a.name === "MultiEdit" && Array.isArray(a.input?.edits) ? a.input.edits : [a.input || {}];
@@ -10774,6 +11105,7 @@ const RULE_MF = {
 const RULE_SE = {
   id: "SE",
   blocking: false,
+  logOnly: true,   // 批 292:287 设计附录 A「只检测、只记账」——命中进候选台账,对模型零输出
   law: "docs/gate-debts.md#在账欠账",
   requires: [],
   escapes: [
@@ -11023,7 +11355,7 @@ const RULE_SE = {
 const RULE_PF = {
   id: "PF",
   blocking: false,
-  law: "AGENTS.md#恒定条款",
+  law: "docs/gate/AGENTS.md#三、怎么改闸",
   requires: [],
   detect: (ctx) => {
     const P = RULE_P._p, f = P.facts(ctx);

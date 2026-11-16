@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/core/schema/stryker-schema.json",
+  "_comment": "闸引擎变异测试 · 目标 2:gate-ctx.mjs 的 buildCtx 函数(mutate 区间 = `export function buildCtx` 到其收尾 `}`;其后是 selfTest,不变异)。区间随源文件漂移,`coverage-check.mjs --self-test`(gate:self-test 链)当场比对,漂了即红(批 258 D149⑲)。仓外安装、沙箱不改主树,理由同 gate-difftier.stryker.json。",
+  "testRunner": "command",
+  "commandRunner": { "command": "node --no-warnings scripts/lib/gate-ctx.mjs --self-test" },
+  "coverageAnalysis": "off",
+  "disableTypeChecks": false,
+  "inPlace": false,
+  "ignorePatterns": ["/*", "!/scripts", "!/package.json"],
+  "mutate": ["scripts/lib/gate-ctx.mjs:168-768"],
+  "concurrency": 4,
+  "timeoutMS": 10000,
+  "reporters": ["clear-text", "progress", "json"],
+  "jsonReporter": { "fileName": "reports/mutation/gate-ctx.json" },
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": true
+}

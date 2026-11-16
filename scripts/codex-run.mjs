@@ -333,9 +333,11 @@ export function renderOutcome(job, { kind = "poll", id, log, waitExpired = false
 // ── codex 定位 ──────────────────────────────────────────────────────────
 
 /** Windows 上 npm 垫片不可直接 spawn ⇒ 优先找原生 vendor bin(battle.md 步骤 3 括注)。 */
+//   批 302(D205 ②):另返回结构化来源 `source` ∈ env / vendor / path,worker 写进作业记录 `binSource`;
+//   收尾闸 P 只读这个字段(`binSource=env` 的记录不计),不再看日志头 `# bin=…`。
 export function resolveCodexBin() {
   if (process.env.CODEX_BIN && fs.existsSync(process.env.CODEX_BIN)) {
-    return { bin: process.env.CODEX_BIN, shell: false, how: "env CODEX_BIN" };
+    return { bin: process.env.CODEX_BIN, shell: false, how: "env CODEX_BIN", source: "env" };
   }
   const roots = [
     path.join(path.dirname(process.execPath), "node_modules", "@openai", "codex"),
@@ -353,12 +355,98 @@ export function resolveCodexBin() {
       for (const triple of fs.readdirSync(vendor)) {
         for (const name of ["codex.exe", "codex"]) {
           const cand = path.join(vendor, triple, "bin", name);
-          if (fs.existsSync(cand)) return { bin: cand, shell: false, how: "native vendor bin" };
+          if (fs.existsSync(cand)) return { bin: cand, shell: false, how: "native vendor bin", source: "vendor" };
         }
       }
     }
   }
-  return { bin: "codex", shell: true, how: "PATH(shell)" };
+  return { bin: "codex", shell: true, how: "PATH(shell)", source: "path" };
+}
+
+// ── 批 302(D205 ①④):从**完整事件流**写结构化字段 ───────────────────────────────
+// 病史(D205 ①):「通道不可用」原由收尾闸从日志**尾窗**里抽失败行再分类,三轮各冒新形态——尾窗切点恰在行首、
+//   来源前缀挤占字数预算、stdout 的 item 行写到一半插进 stderr 被标成 stderr。都是「事后从日志拼回结构」的病。
+// 现在:worker 自己逐行读子进程的 stdout / stderr(跨 chunk 拼成整行再判),只看
+//   ① stdout 里 codex 的**顶层** `error` / `turn.failed` 事件(item 事件——codex 读到的文件内容——一律不看,
+//      债表里引用的 429 原文不会冒充失败);② stderr 的完整行(`codex_models_manager` 刷新模型列表的报错不算,成功作业里也常见)。
+// 分类(外部工具报错串的分类,不是模型措辞;沿用 ADR 0039 的 UNAVAIL 口径,唯一实现在这里):
+//   rate-limit = 429 / rate limit / too many requests;quota = usage limit / quota;network = 网络终态 errno。
+//   配置告警(unrecognized configuration / configuration setting)不算;超时不算(任务太大也会超时)。
+//   BP-5(Rust 版 codex 的断网报错串对不上 Node errno 名)是词表覆盖问题,不在本层结构里解决。
+// 只有作业最终 failed 或退出码非 0 时才写 `unavailable`(中途 429 重试成功的作业不算不可用);否则 null。
+export const UNAVAIL_RULES = [
+  ["rate-limit", /rate.?limit|too many requests|\b429\b/i],
+  ["quota", /usage limit|quota/i],
+  ["network", /ENOTFOUND|ECONNREFUSED|ECONNRESET|EAI_AGAIN|getaddrinfo/i],
+];
+const UNAVAIL_SKIP = /unrecognized configuration|configuration setting/i;
+/** 不带原因的传输层失败事件(真因在 stderr)。 */
+const GENERIC_TRANSPORT = /^\s*(?:stream error|stream disconnected|error sending request|connection (?:closed|reset|error)|transport error|request failed)\b/i;
+/** 一行报错串 ⇒ reason 或 null。 */
+export function classifyUnavailable(text) {
+  const s = String(text || "");
+  if (!s.trim() || UNAVAIL_SKIP.test(s)) return null;
+  for (const [reason, re] of UNAVAIL_RULES) if (re.test(s)) return reason;
+  return null;
+}
+
+/** 子进程输出的逐行扫描器:stdout / stderr 各自缓冲半行,`end()` 冲掉残行。 */
+export function makeStreamScanner() {
+  const buf = { out: "", err: "" };
+  const cands = [];          // { source, text } 不可用候选(顶层错误事件 / stderr 行)
+  const nonItem = [];        // hooks 告警的扫描面:stderr 全部行 + stdout 里不是 JSON 事件的行(D205 ④)
+  const onLine = (kind, raw) => {
+    const line = raw.replace(/\r$/, "");
+    if (!line.trim()) return;
+    if (kind === "err") {
+      if (nonItem.length < 2000) nonItem.push(line);
+      if (!/codex_models_manager/.test(line)) cands.push({ source: "stderr", text: line });
+      return;
+    }
+    let o = null;
+    if (line.trimStart().startsWith("{")) { try { o = JSON.parse(line); } catch { o = null; } }
+    if (!o || typeof o !== "object") { if (nonItem.length < 2000) nonItem.push(line); return; }
+    if (o.type === "error" || o.type === "turn.failed") {
+      const msg = String(o.message || (o.error && o.error.message) || "");
+      cands.push({ source: "event", text: msg });
+      if (nonItem.length < 2000) nonItem.push(msg);   // 顶层错误事件不是 item,hooks 解析失败报在这里也要认
+    }
+  };
+  const skip = { out: false, err: false };   // 正在丢一条超长行的剩余部分
+  const feed = (kind, chunk) => {
+    buf[kind] += String(chunk);
+    let k;
+    while ((k = buf[kind].indexOf("\n")) >= 0) {
+      if (skip[kind]) skip[kind] = false; else onLine(kind, buf[kind].slice(0, k));
+      buf[kind] = buf[kind].slice(k + 1);
+    }
+    // 超长无换行(>4 MB):丢弃这段、不判(批 302 r1 外审第 7 条:不完整的行不能拿来分类),直到下一个换行再接着收,防内存涨
+    if (buf[kind].length > 4 * 1024 * 1024) { buf[kind] = ""; skip[kind] = true; }
+  };
+  return {
+    out: (c) => feed("out", c),
+    err: (c) => feed("err", c),
+    end() { for (const k of ["out", "err"]) { if (buf[k] && !skip[k]) onLine(k, buf[k]); buf[k] = ""; skip[k] = false; } },
+    /** 作业失败时才给:第一个命中的候选 ⇒ { reason, source, text≤200 }。
+     *  timedOut(worker 的硬截止杀掉了 codex)⇒ 一律 null:超时不算不可用,哪怕更早出现过一次 429 重试(r1 外审第 7 条)。 */
+    unavailable(failed, timedOut = false) {
+      if (!failed || timedOut) return null;
+      // 2026-11-08(红队 p0-close BP-4):codex 自己的顶层错误事件优先——有事件就只看事件,
+      //   stderr 里 codex 内部 exec 子命令留下的 ENOTFOUND / 429(与本次失败无关)不再冒充通道不可用;没有事件才看 stderr
+      // 2026-11-16(红队 b302 增量 BP-1,误拦):「有个配置项不认识」这类告警事件不算「事件明说了别的原因」——
+      //   本机 28 份作业日志里 25 份带它,不剔掉的话下面两条看 stderr 的路都走不到,真断网 / 限流时判不出通道不可用。
+      const events = cands.filter((c) => c.source === "event" && !UNAVAIL_SKIP.test(c.text));
+      const pick = (list) => { for (const c of list) { const reason = classifyUnavailable(c.text); if (reason) return { reason, source: c.source, text: c.text.slice(0, 200) }; } return null; };
+      if (!events.length) return pick(cands);
+      const ev = pick(events);
+      if (ev) return ev;
+      // codex p0-close r2 ③:事件只是泛化的传输层失败(stream error / disconnected / error sending request …)、本身不带原因
+      //   ⇒ 真因多半在 stderr(先打网络错、再发泛化 turn.failed),回退看 stderr;事件明说了别的原因(配置错误等)⇒ 仍不看 stderr(BP-4)
+      if (events.every((c) => GENERIC_TRANSPORT.test(c.text) || !c.text.trim())) return pick(cands.filter((c) => c.source === "stderr"));
+      return null;
+    },
+    nonItemText: () => nonItem.join("\n") + (nonItem.length ? "\n" : ""),
+  };
 }
 
 // ── job 台账 ────────────────────────────────────────────────────────────
@@ -403,7 +491,8 @@ async function runWorker(jobId) {
     }
 
     const lastMsgFile = path.join(JOB_ROOT, `${jobId}.last.txt`);
-    const { bin, shell, how } = resolveCodexBin();
+    const { bin, shell, how, source: binSource } = resolveCodexBin();
+    writeJob({ ...readJob(jobId), binSource });   // 批 302(D205 ②):来源进记录,P 只读字段
     const args = buildCodexArgs({
       cwdForCodex: job.cwd,
       model: job.model,
@@ -424,23 +513,26 @@ async function runWorker(jobId) {
     });
 
     let jsonl = "";
-    let errHead = "";   // 批 285 D131②:stderr 前 256KB 留一份扫 hooks 配置解析失败(该错出在启动期,不必全留)
+    const scan = makeStreamScanner();   // 批 302(D205 ①④):完整事件流逐行扫,不再事后从日志尾窗拼
     child.stdout.on("data", (d) => {
       jsonl += d.toString();
+      scan.out(d.toString());
       logStream.write(d);
     });
     child.stderr.on("data", (d) => {
-      if (errHead.length < 262144) errHead += d.toString();
+      scan.err(d.toString());
       logStream.write(d);
     });
     child.stdin.write(stdinPayload);
     child.stdin.end();
 
+    let timedOut = false;   // 批 302:硬截止杀掉 codex ⇒ 不写 unavailable(超时不算通道不可用)
     const heartbeat = setInterval(() => {
       logStream.write(`# heartbeat ${new Date().toISOString()}\n`);
     }, 30 * 1000);
 
     const deadline = setTimeout(() => {
+      timedOut = true;
       logStream.write(`# TIMEOUT ${job.timeoutMs}ms — SIGTERM\n`);
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 5000);
@@ -461,15 +553,20 @@ async function runWorker(jobId) {
     //   拿 endedAt 当界会把夹缝里的完整读判掉
     writeJob({ ...readJob(jobId), resultAt: new Date().toISOString() });
     fs.writeFileSync(job.result, header + body, "utf8");
+    scan.end();
 
     const outcome = classifyOutcome({ code, body });
     // 批 285 D131②:hooks 配置解析失败只提示、不改判定;没命中就不写 warn 键(台账形状照旧)
-    const warn = hooksConfigWarn(jsonl) || hooksConfigWarn(errHead);
+    //   批 302(D205 ④):只扫 stderr 与 stdout 里不是 JSON 事件的行 + 顶层错误事件——item 事件里 codex 读到的
+    //   文件原文(例:债表引用的「failed to parse hooks config」)不再触发误报
+    const warn = hooksConfigWarn(scan.nonItemText());
     const warnExtra = warn ? { warn } : {};
+    const failed = outcome.state === "failed" || code !== 0;
+    const structured = { binSource, unavailable: scan.unavailable(failed, timedOut) };
     if (outcome.state === "failed") {
-      finish("failed", { threadId, exitCode: code, errorCode: outcome.errorCode, error: outcome.error, ...warnExtra });
+      finish("failed", { threadId, exitCode: code, errorCode: outcome.errorCode, error: outcome.error, ...warnExtra, ...structured });
     }
-    finish("done", { threadId, exitCode: code, ...warnExtra });
+    finish("done", { threadId, exitCode: code, ...warnExtra, ...structured });
   } catch (e) {
     // 写 R 之前就失败 ⇒ R 还是发起时的占位行:删掉,别在 clipboard 留一份写着「运行中」的残件(v7,红队附二-6)
     try { if (job.result && isPlaceholder(fs.readFileSync(job.result, "utf8"))) fs.rmSync(job.result, { force: true }); } catch { /* 读不到就不动 */ }

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/core/schema/stryker-schema.json",
+  "_comment": "闸引擎变异测试 · 目标 1:gate-difftier.mjs 第 1–68 行(69 行起是 selfTest,不变异)。Stryker 10.0.0 装在仓外(E:/my-dotfiles/tools/stryker/),本仓不装任何依赖。inPlace=false + ignorePatterns 只放 scripts/ 进沙箱:变异体只出现在 .stryker-tmp/ 里的副本,主树正在生效的闸文件不被改写。判据=自测退出码(command runner:0 存活,非 0 杀死)。",
+  "testRunner": "command",
+  "commandRunner": { "command": "node --no-warnings scripts/lib/gate-difftier.mjs --self-test" },
+  "coverageAnalysis": "off",
+  "disableTypeChecks": false,
+  "inPlace": false,
+  "ignorePatterns": ["/*", "!/scripts", "!/package.json"],
+  "mutate": ["scripts/lib/gate-difftier.mjs:1-68"],
+  "concurrency": 4,
+  "timeoutMS": 10000,
+  "reporters": ["clear-text", "progress", "json"],
+  "jsonReporter": { "fileName": "reports/mutation/mutation.json" },
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": true
+}
