@@ -539,7 +539,8 @@ export async function runSelfTest({ self }) {
     g(["init", "-q"]);
     const libSrc = path.join(path.dirname(self), "lib");
     for (const f of ["obligations.mjs", "ledger-chain.mjs"]) fs.copyFileSync(path.join(libSrc, f), path.join(repo, "scripts", "lib", f));   // 装了闸的仓:旧版会在这里双写公共目录
-    fs.writeFileSync(path.join(repo, "task.md"), "x\n");
+    // 批 305:发车前查任务书 ⇒ 这里的任务书用骨架本身(顺带钉住「骨架能过真实发车那道检查」)
+    fs.writeFileSync(path.join(repo, "task.md"), typeof S.taskbookSkeleton === "function" ? S.taskbookSkeleton("design") : "x\n");
     const env = { ...process.env, CODEX_BIN: process.execPath, GIT_CEILING_DIRECTORIES: lab };
     const r = spawnSync(process.execPath, [self, "--task", path.join(repo, "task.md"), "--out", path.join(lab, "r.md"), "--cwd", repo, "--wait-ms", "60000"], { encoding: "utf8", windowsHide: true, env, cwd: repo });
     const J = (/CODEX_JOB=(\S+)/.exec(r.stdout || "") || [])[1];
@@ -557,7 +558,225 @@ export async function runSelfTest({ self }) {
       const p = spawnSync(process.execPath, [self, "--poll", J], { encoding: "utf8", windowsHide: true, env, cwd: repo });
       if (!/CODEX_STATE=failed/.test(p.stdout || "")) throw new Error(p.stdout + p.stderr);
     });
+    // 批 305:--no-taskbook-check 整体豁免——不合格的任务书照发,结果件头部记一行「任务书检查:跳过」
+    fs.writeFileSync(path.join(repo, "bare.md"), "x\n");
+    const r2 = spawnSync(process.execPath, [self, "--task", path.join(repo, "bare.md"), "--no-taskbook-check", "--out", path.join(lab, "skip.md"), "--cwd", repo, "--wait-ms", "60000"], { encoding: "utf8", windowsHide: true, env, cwd: repo });
+    t("305 --no-taskbook-check:不合格的任务书照发(有 CODEX_JOB),结果件头部记「任务书检查:跳过」", () => {
+      if (!/^CODEX_JOB=\S+/m.test(r2.stdout || "")) throw new Error(`没发车:${(r2.stdout || "") + (r2.stderr || "")}`);
+      const head = fs.readFileSync(path.join(lab, "skip.md"), "utf8");
+      if (!/^任务书检查:跳过/m.test(head)) throw new Error(`头部没记:${JSON.stringify(head.slice(0, 400))}`);
+    });
+    t("305【反向】正常过检的发起:结果件头部没有「任务书检查」行(头部仍是 8 行)", () => {
+      const head = fs.readFileSync(path.join(lab, "r.md"), "utf8");
+      if (/任务书检查/.test(head)) throw new Error(JSON.stringify(head.slice(0, 400)));
+      eq(head.split("\n")[7], "---", "第 8 行应是收尾的 ---");
+    });
     try { fs.rmSync(lab, { recursive: true, force: true }); } catch { /* worker 可能还占着日志 */ }
+  }
+
+  // ── 批 305 乙包:发车前查任务书 / 出骨架 / 第二轮起提示先派方向复核 ─────────────────────────
+  // 防的失败:任务书没写用途和完成标准、结论选项里没有「不用再审」⇒ 审查者越审越多(同一份稿子审五轮,
+  //   第五轮报 27 条、逐条看 0 条要改)。改进办法写在备忘里到不了发车的人眼前,所以接在发车这个必经点上。
+  //   检查只看形(有没有这几段、有多长),不判内容。
+  {
+    const S = selfMod;
+    const need = (name) => { if (typeof S[name] === "undefined") throw new Error(`codex-run.mjs 没导出 ${name}`); return S[name]; };
+    // 一份合格的设计类任务书(5 行有内容);over 里给 null 就去掉那一行,extra 是插在中间的行
+    const TB = (over = {}) => {
+      const p = { purpose: "用途:合并前确认安装器不会覆盖用户文件;我会拿结论当合并依据。", done: "完成标准:**照 README 走普通安装,不会丢掉目标仓里的东西。**",
+        ask: "请读 diff,先回答一个是非题:**完成标准成立吗?**", last: "最后一行三选一:`可以合并,不用再审` / `有会翻转的,要改` / `判不了`。", extra: [], ...over };
+      return ["# 审一个提交(只读)", "", p.purpose, "", p.done, "", p.ask, "", ...p.extra, "", p.last, ""].filter((l) => l != null).join("\n");
+    };
+    const failed = (res) => res.items.filter((i) => !i.ok).map((i) => i.key).join("");
+    const chk = (text, o) => need("checkTaskbook")(text, o);
+
+    t("305 任务书四条齐 ⇒ 过", () => { const r = chk(TB()); eq(r.ok, true, JSON.stringify(r.items)); eq(failed(r), ""); });
+    t("305【反向】缺用途 ⇒ 不过,只缺 a", () => { const r = chk(TB({ purpose: null })); eq(r.ok, false); eq(failed(r), "a"); });
+    t("305【反向】缺完成标准 ⇒ 不过,只缺 b", () => { const r = chk(TB({ done: null, ask: "请读 diff,判断有没有问题。" })); eq(r.ok, false); eq(failed(r), "b"); });
+    t("305【反向】结论选项里没有「不用再审」⇒ 不过,只缺 c", () => {
+      const r = chk(TB({ last: "最后一行三选一:`可以合并` / `要改` / `判不了`。" })); eq(r.ok, false); eq(failed(r), "c");
+    });
+    t("305【反向】「用途」「完成标准」只在句子中间出现、不是一段的开头 ⇒ 不算", () => {
+      const r = chk(TB({ purpose: "这份稿子的用途以后再说。", done: "请判断完成标准成立吗。" }));
+      eq(failed(r), "ab");
+    });
+    t("305 「用途」「完成标准」写成标题 / 加粗 / 列表项 ⇒ 认", () => {
+      eq(chk(TB({ purpose: "## 用途\n拿结论当合并依据。", done: "**完成标准**:照 README 安装不丢文件。" })).ok, true);
+      eq(chk(TB({ purpose: "- 用途:拿结论当合并依据。", done: "> 完成标准:照 README 安装不丢文件。" })).ok, true);
+    });
+    const qs = (n) => Array.from({ length: n }, (_, i) => [`${i + 1}. 第 ${i + 1} 处的顺序对吗?`, `(${"abcdefgh"[i]}) 第 ${i + 1} 节是否自洽`, `${i + 1}) 这一步有没有漏掉条件`][i % 3]);
+    t("305 d:编号问题 5 个 ⇒ 过", () => { const r = chk(TB({ extra: qs(5) })); eq(r.ok, true, JSON.stringify(r.items)); eq(r.questions.length, 5); });
+    t("305【反向】d:编号问题 6 个 ⇒ 不过,只缺 d,且报出是哪几行", () => {
+      const r = chk(TB({ extra: qs(6) })); eq(failed(r), "d"); eq(r.questions.length, 6);
+      const d = r.items.find((i) => i.key === "d");
+      if (!/6 个/.test(d.detail) || !/第 \d+/.test(d.detail)) throw new Error(d.detail);
+    });
+    t("305 d:带编号但不是问题的行(已知差异、被审文件清单)不计入 ⇒ 7 条也过", () => {
+      const known = Array.from({ length: 7 }, (_, i) => `${i + 1}. 第 ${i + 1} 处差异是有意的:夹具里的名字换成了中性写法。`);
+      const r = chk(TB({ extra: ["已知差异(有意的,不用报):", ...known] })); eq(r.ok, true, JSON.stringify(r.items)); eq(r.questions.length, 0);
+    });
+    const filler = (n) => Array.from({ length: n }, (_, i) => `- 第 ${i + 1} 条已知的局限,不用报。`);
+    t("305 d:有内容的行刚好到上限 ⇒ 过;空行不计", () => {
+      const max = need("TASKBOOK_MAX_LINES");
+      const r = chk(TB({ extra: filler(max - 5) })); eq(r.lines, max); eq(r.ok, true, JSON.stringify(r.items));
+    });
+    t("305【反向】d:有内容的行超上限 1 行 ⇒ 不过,只缺 d,报错里写明上限那个数", () => {
+      const max = need("TASKBOOK_MAX_LINES");
+      const r = chk(TB({ extra: filler(max - 4) })); eq(r.lines, max + 1); eq(failed(r), "d");
+      if (!r.items.find((i) => i.key === "d").detail.includes(String(max))) throw new Error("报错里没写上限");
+    });
+    t("305 --fact-check:核事实类豁免 d(又长又多问也过)", () => {
+      const long = TB({ extra: [...qs(8), ...filler(30)] });
+      eq(failed(chk(long)), "d", "不带 --fact-check 应卡在 d");
+      const r = chk(long, { factCheck: true }); eq(r.ok, true, JSON.stringify(r.items));
+    });
+    t("305【反向】--fact-check 不豁免 a、b、c", () => {
+      eq(failed(chk(TB({ purpose: null, done: null, ask: "请比对两份文件。", last: "最后一行二选一:一致 / 不一致。" }), { factCheck: true })), "abc");
+    });
+    t("305 英文等价写法(Purpose / Done when / no further review needed)⇒ 过", () => {
+      const en = ["# Review one commit (read-only)", "", "Purpose: decide whether this branch can be merged.", "", "Done when: a normal install never deletes files in the target repo.",
+        "", "First answer one yes/no question: does the completion criterion hold?", "", "Last line, pick one: `mergeable, no further review needed` / `must change` / `cannot tell`.", ""].join("\n");
+      eq(chk(en).ok, true, JSON.stringify(chk(en).items));
+      eq(chk(en.replace("Done when:", "Completion criteria:")).ok, true);
+      eq(failed(chk(en.replace(", no further review needed", ""))), "c");
+    });
+    t("305 CRLF 与 BOM 的任务书照常判", () => { eq(chk("﻿" + TB().replace(/\n/g, "\r\n")).ok, true); });
+    t("305 新退出码 4,与现有退出码(0 / 1 / 2 / 3)不冲突", () => {
+      eq(need("TASKBOOK_CHECK_EXIT"), 4);
+      if ([0, 1, 2, S.POLL_EXPIRED_EXIT].includes(S.TASKBOOK_CHECK_EXIT)) throw new Error("撞了现有退出码");
+    });
+
+    // 骨架:开头几行稳定逐字;骨架自己必须能过检查
+    const FIXED = ["用途:", "完成标准:", "先回答一个是非题:**完成标准成立吗?**", "- 成立:一句话说你怎么验的", "- 不成立:列出会让答案翻转的发现,**至多 5 条**",
+      "只收会翻转答案的。", "两类错的代价:", "拿不准的报出来,并写明拿不准在哪。", "最后一行三选一:", "不用再审"];
+    t("305 骨架 design:稳定句逐字在场,且自己能过设计类检查", () => {
+      const sk = need("taskbookSkeleton")("design");
+      for (const s of FIXED) if (!sk.includes(s)) throw new Error(`骨架缺「${s}」`);
+      const r = chk(sk); eq(r.ok, true, JSON.stringify(r.items));
+    });
+    t("305 骨架 fact:稳定句逐字在场,带 --fact-check 能过", () => {
+      const sk = need("taskbookSkeleton")("fact");
+      for (const s of FIXED) if (!sk.includes(s)) throw new Error(`骨架缺「${s}」`);
+      eq(chk(sk, { factCheck: true }).ok, true);
+    });
+    t("305 --skeleton:只打骨架到 stdout、退出 0、不发车(缺省 = design)", () => {
+      const a = run(["--skeleton"]), b = run(["--skeleton", "design"]), c = run(["--skeleton", "fact"]);
+      for (const r of [a, b, c]) { eq(r.status, 0); if (/CODEX_JOB=/.test(r.stdout)) throw new Error("出骨架不该发车"); }
+      eq(a.stdout, b.stdout, "缺省应等于 design");
+      eq(b.stdout, need("taskbookSkeleton")("design")); eq(c.stdout, S.taskbookSkeleton("fact"));
+      if (b.stdout === c.stdout) throw new Error("两类骨架不该相同");
+    });
+    t("305【反向】--skeleton 给了不认识的类型 ⇒ 非零退出,不打骨架", () => {
+      const r = run(["--skeleton", "essay"]);
+      if (r.status === 0 || /用途/.test(r.stdout)) throw new Error(`应拒:${r.status} ${r.stdout}`);
+      if (!/design \| fact/.test(r.stderr)) throw new Error(r.stderr);
+    });
+
+    // 子进程:只判不发的入口与真实发车那道检查
+    const tbDir = fs.mkdtempSync(path.join(sandbox, "tb-"));
+    const put = (name, text) => { const p = path.join(tbDir, name); fs.writeFileSync(p, text, "utf8"); return p; };
+    const good = put("good-task.md", TB());
+    const MARK = "SELFTEST-MARKER-7f3a";
+    const bad = put("bad-task.md", `# 任务:找问题\n\n请仔细审这份稿子,漏报代价很高。${MARK}\n`);
+    const longQ = put("long-task.md", TB({ extra: [...qs(8), ...filler(30)] }));
+    t("305 --check-taskbook:合格 ⇒ 退出 0,四条逐条打出,不发车", () => {
+      const r = run(["--check-taskbook", good]);
+      eq(r.status, 0, r.stderr);
+      for (const k of ["a ", "b ", "c ", "d "]) if (!new RegExp(`^\\s*${k}`, "m").test(r.stdout)) throw new Error(`没列 ${k}:${r.stdout}`);
+      if (/CODEX_JOB=/.test(r.stdout)) throw new Error("只判不发");
+    });
+    t("305【反向】--check-taskbook:不合格 ⇒ 退出 4,逐条标出哪条不过", () => {
+      const r = run(["--check-taskbook", bad]);
+      eq(r.status, 4);
+      if (!/a [^\n]*不过/.test(r.stdout) || !/b [^\n]*不过/.test(r.stdout) || !/c [^\n]*不过/.test(r.stdout)) throw new Error(r.stdout);
+    });
+    t("305 --check-taskbook --fact-check:长任务书 d 豁免 ⇒ 0;不带 ⇒ 4", () => {
+      eq(run(["--check-taskbook", longQ, "--fact-check"]).status, 0);
+      eq(run(["--check-taskbook", longQ]).status, 4);
+    });
+    t("305【反向】--check-taskbook 文件不存在 ⇒ 退出 1(不是 4)", () => { eq(run(["--check-taskbook", path.join(tbDir, "none.md")]).status, 1); });
+    // 发车类用例一律带 CODEX_BIN 替身(node 本身,必失败)+ 短等待:检查哪怕退化成放行,也只会红在这里,不会真调 codex
+    //   (本批先红阶段实撞:没带替身、检查还没接线时,这两条把占位任务书真发了出去)
+    const runStub = (args) => spawnSync(process.execPath, [self, ...args, "--wait-ms", "20000"], { windowsHide: true, encoding: "utf8", env: { ...process.env, CODEX_BIN: process.execPath } });
+    const outBad = path.join(tbDir, "bad-out.md");
+    const launchBad = runStub(["--task", bad, "--cwd", tbDir, "--out", outBad]);
+    t("305【反向】发车:任务书不过 ⇒ 退出 4、不发车(stdout 没有 CODEX_JOB、结果件槽位没被占)", () => {
+      eq(launchBad.status, 4, launchBad.stderr);
+      if (/CODEX_JOB=/.test(launchBad.stdout)) throw new Error("不该发车");
+      if (fs.existsSync(outBad)) throw new Error("不该占结果件槽位");
+    });
+    t("305 发车被拦时 stderr:写明缺哪条 + 四条要求原文 + 怎么补(骨架命令)", () => {
+      const e = launchBad.stderr;
+      for (const s of ["没有发车", "缺 a", "缺 b", "缺 c"]) if (!e.includes(s)) throw new Error(`stderr 缺「${s}」:${e}`);
+      if (/缺 d/.test(e)) throw new Error("这份不长,不该报 d");
+      for (const req of need("TASKBOOK_REQUIREMENTS")) if (!e.includes(req)) throw new Error(`四条要求原文没打全:缺「${req.slice(0, 20)}…」`);
+      eq(S.TASKBOOK_REQUIREMENTS.length, 4);
+      if (!e.includes("--skeleton")) throw new Error("没告诉怎么补");
+    });
+    t("305【反向】报错文字不劝人绕过(不提 --no-taskbook-check)、不回显任务书内容", () => {
+      if (/--no-taskbook-check/.test(launchBad.stderr)) throw new Error("报错里不该递绕过旗标");
+      if ((launchBad.stderr + launchBad.stdout).includes(MARK)) throw new Error("回显了任务书内容");
+    });
+    t("305【反向】发车:设计类过长 ⇒ 退出 4 且只报 d;报错里指到 --fact-check", () => {
+      const r = runStub(["--task", longQ, "--cwd", tbDir, "--out", path.join(tbDir, "long-out.md")]);
+      eq(r.status, 4);
+      if (!/缺 d/.test(r.stderr) || /缺 [abc]/.test(r.stderr)) throw new Error(r.stderr);
+      if (!r.stderr.includes("--fact-check")) throw new Error("没指到 --fact-check");
+    });
+    t("305 哪些入口查任务书:只有不带 --resume、不带 --no-taskbook-check 的 --task 发车", () => {
+      const mode = need("taskbookMode");
+      eq(mode(S.parseArgs(["--task", "a.md"])), "check");
+      eq(mode(S.parseArgs(["--task", "a.md", "--fact-check"])), "check");
+      eq(mode(S.parseArgs(["--task", "a.md", "--resume", "tid"])), "resume");
+      eq(mode(S.parseArgs(["--task", "a.md", "--no-taskbook-check"])), "skipped");
+      eq(S.parseArgs(["--task", "a.md", "--fact-check"]).factCheck, true);
+    });
+    t("305 --poll 不受任务书检查影响(缺失作业照旧退出 1,不是 4)", () => { eq(run(["--poll", `selftest-305-${process.pid}`]).status, 1); });
+    t("305 结果件头部:跳过检查才多一行「任务书检查:跳过」;缺省仍是 8 行(收尾闸按第 9 行认正文)", () => {
+      const skip = S.resultHeader({ codexVersion: "v", taskbookCheck: "skipped" }, "t");
+      if (!/\n任务书检查:跳过[^\n]*\n---\n$/.test(skip)) throw new Error(skip);
+      const dft = S.resultHeader({ codexVersion: "v" }, "t");
+      if (/任务书检查/.test(dft)) throw new Error(dft);
+      eq(dft.split("\n").length, 9, "缺省头部 8 行 + 收尾换行");
+    });
+
+    // 第二轮起:--poll 取到 done 时提示先派方向复核
+    const files2 = { "/c/x-r1.md": "---\n---\n一轮\n", "/c/x-r2.md": "---\n---\n二轮\n", "/c/x-r12.md": "---\n---\n十二轮\n", "/c/l.log": "boom\n" };
+    const rf2 = (p) => (p in files2 ? files2[p] : null);
+    const hintOf = (n) => `这是同一份东西的第 ${n} 轮回件:分拣之前先派 \`_direction-judge\`,只给它用户原话、完成标准、现状、回件,不写你的倾向。`;
+    t("305 第 2 轮 poll done ⇒ BODY 块之后、末行之前多一行固定提示;机器块与末行格式不变", () => {
+      const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r2.md" }, { kind: "poll", readFile: rf2 });
+      eq(r.code, 0);
+      const ls = r.out.trimEnd().split("\n");
+      eq(ls[ls.length - 1], "done /c/x-r2.md", "末行保持旧口径");
+      eq(ls[ls.length - 2], hintOf(2));
+      eq(ls[ls.length - 3], "CODEX_BODY_END=J1");
+      if (!r.out.startsWith("CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=/c/x-r2.md\nCODEX_END=J1\nCODEX_BODY_BEGIN=J1\n")) throw new Error(`机器块被打断:${JSON.stringify(r.out)}`);
+      if (/^CODEX_/.test(hintOf(2))) throw new Error("提示行不能以 CODEX_ 开头(会被当成机器字段)");
+    });
+    t("305 轮次取文件名里的 n(r12 ⇒ 第 12 轮)", () => {
+      const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r12.md" }, { kind: "poll", readFile: rf2 });
+      if (!r.out.includes(hintOf(12) + "\n")) throw new Error(r.out);
+    });
+    t("305【反向】第 1 轮 ⇒ 不加提示", () => {
+      const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r1.md" }, { kind: "poll", readFile: rf2 });
+      if (/_direction-judge/.test(r.out)) throw new Error(r.out);
+      eq(r.out, "CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=/c/x-r1.md\nCODEX_END=J1\nCODEX_BODY_BEGIN=J1\n---\n---\n一轮\nCODEX_BODY_END=J1\ndone /c/x-r1.md\n", "第 1 轮输出与改前逐字相同");
+    });
+    t("305 前台立即结束的发起带结果、第 2 轮 ⇒ 同样提示(在 BODY 块之后)", () => {
+      const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r2.md" }, { kind: "launch", readFile: rf2 });
+      const ls = r.out.trimEnd().split("\n");
+      eq(ls[ls.length - 1], hintOf(2)); eq(ls[ls.length - 2], "CODEX_BODY_END=J1");
+    });
+    t("305【反向】第 2 轮但还在跑 / 失败 / 结果件读不到 / 文件名不带 r<n> ⇒ 都不加提示", () => {
+      const outs = [
+        S.renderOutcome({ id: "J1", state: "running", result: "/c/x-r2.md" }, { kind: "poll", readFile: rf2 }),
+        S.renderOutcome({ id: "J1", state: "failed", error: "x", log: "/c/l.log", result: "/c/x-r2.md" }, { kind: "poll", readFile: rf2 }),
+        S.renderOutcome({ id: "J1", state: "done", result: "/c/gone-r2.md" }, { kind: "poll", readFile: rf2 }),
+        S.renderOutcome({ id: "J1", state: "done", result: "/r.md" }, { kind: "poll", readFile: rf }),
+      ];
+      for (const o of outs) if (/_direction-judge/.test(o.out)) throw new Error(o.out);
+    });
   }
 
   fs.rmSync(sandbox, { recursive: true, force: true });

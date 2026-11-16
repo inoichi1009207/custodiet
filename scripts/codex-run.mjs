@@ -30,6 +30,12 @@
 //   最终消息 `trim()` 为空 ⇒ failed + `CODEX_ERROR_CODE=empty-body`(台账同记 errorCode),不论退出码;
 //   **退出码非 0 但正文非空 ⇒ 仍判 done**——现存分支,本批照旧未改(台账记 exitCode,读者自行核)。
 //
+// 发车前查任务书(批 305):`--task` 发车那一刻读任务书判四条(用途 / 完成标准 / 结论选项里有「不用再审」/ 审设计类不过长),
+//   任一条不过 ⇒ 不取号、不占结果件槽位、不起 worker,退出码 4,stderr 写明缺哪条并打出四条要求原文。
+//   `--fact-check` 免「不过长」;`--no-taskbook-check` 整体跳过(给脚本生成的任务书用,结果件头部记「任务书检查:跳过」);
+//   `--resume` / `--poll` / `--doctor` / `--self-test` 不查。`--skeleton [design|fact]` 出骨架,`--check-taskbook <文件>` 只判不发。
+//   第二轮起(结果文件 `<slug>-r<n>.md` 的 n ≥ 2)done 的输出在 BODY 块之后多一行提示:分拣前先派 `_direction-judge`。
+//
 // 凭据纪律:与 AGENTS.md 恒定条款②同一套,不复述、不放宽。本壳不打印子进程环境,
 // 不回显任务文件内容,stdout 与结果件均不得出现凭据。
 //
@@ -112,6 +118,19 @@ export function parseArgs(argv) {
       case "--resume": out.resume = next(); break;
       case "--poll": out.poll = next(); break;
       case "--with-repo-brief": out.withRepoBrief = true; break;
+      // 批 305:发车前查任务书(见下方 checkTaskbook)
+      case "--fact-check": out.factCheck = true; break;
+      case "--no-taskbook-check": out.noTaskbookCheck = true; break;
+      case "--check-taskbook": out.checkTaskbook = next(); break;
+      case "--skeleton": {
+        // 值可省(缺省 design);下一个词是旗标或没有 ⇒ 不吞
+        const v = argv[i + 1];
+        if (v === undefined || /^-/.test(v)) { out.skeleton = "design"; break; }
+        i++;
+        if (!SKELETON_KINDS.includes(v)) { const err = new Error(`--skeleton 只接受 design | fact,得到「${v}」`); err.exitCode = 1; throw err; }
+        out.skeleton = v;
+        break;
+      }
       case "--doctor": out.doctor = true; break;
       case "--self-test": out.selfTest = true; break;
       case "--_worker": out.worker = next(); break;
@@ -164,7 +183,127 @@ export function resultHeader(job, threadId) {
     "network: on(codex 自带通道;2026-08-09 实测 read-only 下四客户端全 200)",
     `repo_brief: ${job.repoBrief || "(none)"}`,
     `复看: codex resume ${threadId || "(未取到 thread-id)"}`,
+    // 批 305:只有 --no-taskbook-check 发起的才多这一行(缺省头部仍是 8 行;收尾闸优先按第二个 `---` 定位正文,
+    //   它的「第 9 行」常量只在第 1 行没读到时兜底——跳过检查的结果件正文从第 10 行起)
+    ...(job.taskbookCheck === "skipped" ? ["任务书检查:跳过(--no-taskbook-check)"] : []),
     "---",
+    "",
+  ].join("\n");
+}
+
+// ── 批 305:发车前查任务书 / 出骨架 ───────────────────────────────────────
+// 病史:任务书只写「找问题」、把漏报的代价写得很重,又没写这次审查拿去干什么、什么算完成 ⇒ 审查者越审越多
+//   (同一份稿子审五轮,第五轮报 27 条,事后逐条看 0 条要改);结论选项里没有「不用再审」⇒ 审查者不会说停。
+//   改进办法写在备忘里到不了发车的人眼前——发车的人每次都是直接调本脚本,所以检查接在这里(必经点)。
+// 只看任务书的**形**(有没有这几段、有多长),不判内容好坏。拿不准偏松:宁可放过一份写得一般的,不拦一份写得对的
+//   (拦错了,发车的人要么干不了活,要么学会加 --no-taskbook-check,那就等于没有检查)。
+// 天花板:d 的「编号问题」只数**行首带编号且带疑问标记**的行;带编号的祈使句(「1. 核对 X。」)不计,只受行数上限约束。
+export const TASKBOOK_CHECK_EXIT = 4;      // 任务书检查不过、没发车(0 成 / 1 出错 / 2 越权旗标 / 3 --wait-ms 到期仍在跑)
+export const TASKBOOK_MAX_QUESTIONS = 5;
+// 25 的由来(批 305):按新写法写的三份设计类任务书是 14 / 17 / 18 行有内容的行(连空行 22–27 行);
+//   越审越多的那几份是 31 / 32 / 37 / 42 行。25 两头都留了余量。
+export const TASKBOOK_MAX_LINES = 25;
+export const SKELETON_KINDS = ["design", "fact"];
+/** 四条要求的原文(检查不过时逐字打出)。 */
+export const TASKBOOK_REQUIREMENTS = [
+  "a. 写了用途:有以「用途」开头的一段或一行,说明这次审查的结果拿去干什么(英文 Purpose)。",
+  "b. 写了完成标准:有以「完成标准」开头的一段(英文 Done when / Completion criteria)。",
+  "c. 结论选项里有「不用再审」:全文出现这四个字(英文 no further review needed)。",
+  `d. 审设计类的任务书不过长:带编号的问题(行首 1.、2.、(a) 这类,列给审查者回答的)不超过 ${TASKBOOK_MAX_QUESTIONS} 个,` +
+    `且有内容的行(不算空行)不超过 ${TASKBOOK_MAX_LINES} 行。核事实类(比副本、核引文、核读数)加 --fact-check 免这一条。`,
+];
+// 段首:允许 Markdown 前缀(标题 # / 引用 > / 列表 - * + / 加粗 ** __)和一个序号
+const TB_LEAD = String.raw`^[\s>#*_+\-]*(?:\d{1,2}[.、)]\s*)?[*_]*`;
+const TB_PURPOSE_RE = new RegExp(TB_LEAD + String.raw`(?:用途|purpose\b)`, "i");
+const TB_DONE_RE = new RegExp(TB_LEAD + String.raw`(?:完成标准|done[\s-]+when\b|completion\s+criteri(?:a|on)\b)`, "i");
+const TB_NO_MORE_RE = /不用再审|no\s+further\s+review\s+(?:is\s+)?needed/i;
+const TB_NUMBERED_RE = /^\s*(?:[-*+]\s+)?[*_]*(?:\d{1,2}(?:[.)]\s|、)|[((][0-9A-Za-z]{1,2}[))]|[A-Za-z][.)]\s)/;
+const TB_QUESTION_RE = /[??]|是否|有没有|能否|会不会|对不对|吗|\bwhether\b/i;
+
+/** 判一份任务书(纯函数)。返回 { ok, items:[{key,name,ok,exempt,detail,fix}], lines, questions:[行号] }。
+ *  detail / fix 里只出现行号与计数,不回显任务书内容(本壳的凭据纪律:不回显任务文件)。 */
+export function checkTaskbook(text, { factCheck = false } = {}) {
+  const lines = String(text ?? "").replace(/^﻿/, "").split(/\r?\n/);
+  const at = (re) => { const k = lines.findIndex((l) => re.test(l)); return k < 0 ? 0 : k + 1; };
+  const a = at(TB_PURPOSE_RE), b = at(TB_DONE_RE), c = at(TB_NO_MORE_RE);
+  const content = lines.filter((l) => l.trim()).length;
+  const questions = [];
+  lines.forEach((l, k) => { if (TB_NUMBERED_RE.test(l) && TB_QUESTION_RE.test(l)) questions.push(k + 1); });
+  const tooMany = questions.length > TASKBOOK_MAX_QUESTIONS, tooLong = content > TASKBOOK_MAX_LINES;
+  const dParts = [
+    `编号问题 ${questions.length} 个(上限 ${TASKBOOK_MAX_QUESTIONS}${tooMany ? `;计入的是第 ${questions.join("、")} 行` : ""})`,
+    `有内容的行 ${content} 行(上限 ${TASKBOOK_MAX_LINES})`,
+  ];
+  const items = [
+    { key: "a", name: "用途", ok: !!a, detail: a ? `第 ${a} 行` : "没有以「用途」开头的一段",
+      fix: "加一行「用途:<这次审查的结果拿去干什么>」" },
+    { key: "b", name: "完成标准", ok: !!b, detail: b ? `第 ${b} 行` : "没有以「完成标准」开头的一段",
+      fix: "加一行「完成标准:<一句可判真假的话>」(只在句子中间提到不算)" },
+    { key: "c", name: "不用再审", ok: !!c, detail: c ? `第 ${c} 行` : "全文没有「不用再审」",
+      fix: "结论选项里加一档,例:最后一行三选一:`可以用,不用再审` / `有会翻转的,要改` / `判不了`" },
+    { key: "d", name: "不过长", ok: factCheck || (!tooMany && !tooLong), exempt: factCheck,
+      detail: (factCheck ? "豁免(--fact-check);" : "") + dParts.join(";"),
+      fix: [tooMany ? `把编号问题收到 ${TASKBOOK_MAX_QUESTIONS} 个以内(改成一个是非题「完成标准成立吗?」;不是问题的清单把行里的疑问词去掉或不编号)` : "",
+        tooLong ? `压到 ${TASKBOOK_MAX_LINES} 行有内容的行以内` : "",
+        "若这是核事实类(比副本、核引文、核读数),发车时加 --fact-check"].filter(Boolean).join(";") },
+  ];
+  return { ok: items.every((i) => i.ok), items, lines: content, questions };
+}
+
+/** 逐条判定表(--check-taskbook 打到 stdout;发车被拦时进 stderr)。 */
+export function formatTaskbookReport(res, { file = "", factCheck = false } = {}) {
+  const out = [`任务书检查:${file || "(未给文件名)"}(${factCheck ? "按核事实类判,--fact-check" : "按审设计类判"})`];
+  for (const i of res.items) out.push(`  ${i.key} ${i.name}:${i.ok ? "过" : "不过"}(${i.detail})`);
+  out.push(`结论:${res.ok ? "过" : "不过"}`);
+  return out.join("\n") + "\n";
+}
+
+/** 不过时的说明:缺哪条、怎么补、四条要求原文、骨架命令。**不提跳过旗标**——报错里递绕过办法,检查就等于没有。 */
+export function taskbookFailText(res) {
+  const out = [];
+  for (const i of res.items) if (!i.ok) out.push(`  缺 ${i.key} ${i.name}:${i.detail}。补法:${i.fix}。`);
+  out.push("任务书的四条要求:");
+  for (const r of TASKBOOK_REQUIREMENTS) out.push(`  ${r}`);
+  out.push("现成骨架:node scripts/codex-run.mjs --skeleton design(核事实类:--skeleton fact,发车时加 --fact-check)");
+  out.push("只判不发:node scripts/codex-run.mjs --check-taskbook <文件> [--fact-check]");
+  return out.join("\n") + "\n";
+}
+
+/** 这次调用查不查任务书:`--resume` 续跑不查(任务文件是追问,不是任务书);`--no-taskbook-check` 整体豁免。 */
+export function taskbookMode(opts) {
+  if (opts.resume) return "resume";
+  if (opts.noTaskbookCheck) return "skipped";
+  return "check";
+}
+
+/** 任务书骨架(`--skeleton [design|fact]`)。尖括号处由发车的人填;其余句子稳定逐字,自测钉住「骨架自己能过检查」。 */
+export function taskbookSkeleton(kind = "design") {
+  const fact = kind === "fact";
+  return [
+    fact ? "# 核事实:<核什么>(只读;禁止写任何文件,结果只作为你的最终回复)"
+      : "# 审<什么>:<一句话说清对象与范围>(只读;禁止写任何文件,结果只作为你的最终回复)",
+    "",
+    "用途:<这次审查的结果拿去干什么——合并 / 发布 / 给人看 / 当后续工作的依据;之后谁会照着它做>",
+    "",
+    fact ? "完成标准:**<一句可判真假的话,例:文档里写的事实和各自的出处一致 / 副本和原件除下列差异外逐行相同>**"
+      : "完成标准:**<一句可判真假的话:什么成立,这件东西就算可以用>**",
+    "",
+    fact ? "请直接比对 <被核文件> 与 <出处>,先回答一个是非题:**完成标准成立吗?**"
+      : "请读 <文件 / 提交 / diff 范围>,先回答一个是非题:**完成标准成立吗?**",
+    "",
+    fact ? "- 成立:一句话说你怎么验的(核了哪几项)。" : "- 成立:一句话说你怎么验的。",
+    fact ? "- 不成立:列出会让答案翻转的发现,**至多 5 条**,每条给文件与行、写的是什么、出处实际是什么。"
+      : "- 不成立:列出会让答案翻转的发现,**至多 5 条**,每条给文件、行号、一个最小的反例或复现。",
+    "",
+    fact ? "只收会翻转答案的。只核事实,不审内容;措辞、结构、还能补充什么都不算,不要报。取不到的出处写「取页失败」,不要拿记忆顶替。"
+      : "只收会翻转答案的。「可以做得更好」类的建议不算发现,不要报。下面这些我已经知道,不用报:",
+    ...(fact ? [] : ["- <已知的局限或有意的取舍;没有就连上一句的后半句一起删掉>"]),
+    "",
+    fact ? "两类错的代价:漏掉一处<写错的事实>,<后果:谁会照着错的做>;多报一条其实对得上的,<我要花的核对成本>。拿不准的报出来,并写明拿不准在哪。"
+      : "两类错的代价:漏掉一处<真会出事的是什么>,<后果>;多报一条不成立的,<我要花的核对成本>。拿不准的报出来,并写明拿不准在哪。",
+    "",
+    fact ? "最后一行三选一:`事实对得上,不用再审` / `有对不上的,要改` / `核不了`。"
+      : "最后一行三选一:`可以用,不用再审` / `有会翻转的,要改` / `判不了`。",
     "",
   ].join("\n");
 }
@@ -301,9 +440,20 @@ export function formatDelimited(kind, id, text) {
 export const POLL_EXPIRED_EXIT = 3;
 const readText = (p) => { try { return fs.readFileSync(p, "utf8"); } catch { return null; } };
 
+/** 批 305:结果文件名 `<slug>-r<n>.md` 里的轮次 n ≥ 2(同一个 slug 的第二轮及以后)⇒ 一行固定提示;否则空串。
+ *  只读代理 `_direction-judge` 专判「不改它,完成标准还成立吗」,原先只靠人想起来才调;取回件是必经点,提示接在这里。
+ *  提示行**不以 `CODEX_` 开头**(收尾闸按该前缀解析机器字段),位置在 BODY 块之后、末行状态之前:
+ *  机器块、BODY 块与末行(`| tail -1` 的轮询循环)都不变。显式 `--out` 的文件名不带 r<n> ⇒ 不提示。 */
+export function roundHint(resultPath) {
+  const m = /-r(\d+)\.md$/i.exec(String(resultPath || ""));
+  const n = m ? Number(m[1]) : 0;
+  if (!(n >= 2)) return "";
+  return `这是同一份东西的第 ${n} 轮回件:分拣之前先派 \`_direction-judge\`,只给它用户原话、完成标准、现状、回件,不写你的倾向。\n`;
+}
+
 /**
  * 一次发起结束 / 一次 --poll 的完整 stdout 与退出码(v5,纯函数,读文件注入)。
- *   done   ⇒ 机器块 + BODY 块(结果件全文)[+ poll 末行 `done <路径>`],0;结果件读不到 ⇒ 不打 BODY、err 说明、1
+ *   done   ⇒ 机器块 + BODY 块(结果件全文)[+ 第 2 轮起一行 `roundHint`][+ poll 末行 `done <路径>`],0;结果件读不到 ⇒ 不打 BODY、err 说明、1
  *   failed ⇒ 机器块 + FAIL 块(日志末 40 行)[+ poll 末行 `failed <原因>`],1
  *   running⇒ 机器块 [+ poll 末行 `running`];waitExpired(--wait-ms 到期)⇒ 3,否则 0
  *   台账缺失(poll)⇒ failed job-missing 机器块 + 末行,1;不打 FAIL 块(没有日志可给)。
@@ -319,7 +469,7 @@ export function renderOutcome(job, { kind = "poll", id, log, waitExpired = false
   if (job.state === "done") {
     const body = job.result ? readFile(job.result) : null;
     if (body == null) return { out: out + (poll ? `done ${job.result}\n` : ""), code: 1, err: `结果件读不到:${job.result}` };
-    return { out: out + formatDelimited("BODY", job.id, body) + (poll ? `done ${job.result}\n` : ""), code: 0 };
+    return { out: out + formatDelimited("BODY", job.id, body) + roundHint(job.result) + (poll ? `done ${job.result}\n` : ""), code: 0 };
   }
   const lg = log || job.log;
   const raw = lg ? readFile(lg) : null;
@@ -635,12 +785,20 @@ const HELP = `codex-run.mjs — /codex 通用入口薄壳(沙箱缺省 read-only
   --wait-ms <n>          前台等待上限,缺省 120000;超期转后台并打印交接块。
                          与 --poll 同用:等到终态或超时再报(上限 600000);到期仍 running ⇒ 退出码 3
   --with-repo-brief      附仓库简报**指针**(不注全文)
-  --resume <thread>      续跑
+  --resume <thread>      续跑(不查任务书)
   --poll <job-id>        幂等只读查询:先 CODEX_JOB/CODEX_STATE 机器块,done 时结果件全文夹在
                          CODEX_BODY_BEGIN/END=<id> 之间、failed 时日志尾部夹在 CODEX_FAIL_BEGIN/END=<id> 之间,
-                         末行 running / done <路径> / failed <原因>(前台立即结束的发起同样带 BODY / FAIL 块)
+                         末行 running / done <路径> / failed <原因>(前台立即结束的发起同样带 BODY / FAIL 块)。
+                         结果文件是 <slug>-r<n>.md 且 n ≥ 2 时,done 的 BODY 块之后多一行提示:先派 _direction-judge
   --doctor               只探不发:PATH / 认证 / 版本 / 副本漂移
   --self-test            全离线自测(含反向用例)
+
+  发车前查任务书(只看形,不判内容;不过 ⇒ 不发车,退出码 ${TASKBOOK_CHECK_EXIT},stderr 写明缺哪条):
+${TASKBOOK_REQUIREMENTS.map((r) => "    " + r).join("\n")}
+  --skeleton [design|fact]   只打印一份任务书骨架(缺省 design),不发车
+  --check-taskbook <文件>    只判不发:逐条打印过没过(可叠 --fact-check);不过 ⇒ 退出码 ${TASKBOOK_CHECK_EXIT}
+  --fact-check               核事实类任务(比副本、核引文、核读数):免 d,a、b、c 照查
+  --no-taskbook-check        整体跳过(给脚本生成的任务书用);结果件头部会记一行「任务书检查:跳过」
 
   沙箱缺省 read-only:codex 可读仓库、可联网;本机实测 read-only 未必拦得住写入(D141),要禁写就在任务书里写明;
   --sandbox workspace-write 放开写(只在用户点名时用)。
@@ -661,8 +819,25 @@ async function main() {
     process.exit(0);
   }
   if (opts.worker) return runWorker(opts.worker);
+  // 批 305:出骨架——只打印,不发车
+  if (opts.skeleton) {
+    process.stdout.write(taskbookSkeleton(opts.skeleton));
+    process.exit(0);
+  }
 
   const cwd = path.resolve(opts.cwd || process.cwd());
+  // 批 305:只判不发——逐条打印过没过;不过 ⇒ 退出 4(与发车被拦同码)
+  if (opts.checkTaskbook) {
+    const file = path.resolve(cwd, opts.checkTaskbook);
+    if (!fs.existsSync(file)) {
+      process.stderr.write(`任务文件不存在:${opts.checkTaskbook}\n`);
+      process.exit(1);
+    }
+    const res = checkTaskbook(fs.readFileSync(file, "utf8"), { factCheck: !!opts.factCheck });
+    process.stdout.write(formatTaskbookReport(res, { file: path.basename(file), factCheck: !!opts.factCheck }));
+    if (!res.ok) process.stderr.write(taskbookFailText(res));
+    process.exit(res.ok ? 0 : TASKBOOK_CHECK_EXIT);
+  }
 
   if (opts.selfTest) {
     const { runSelfTest } = await import("./codex-run.selftest.mjs");
@@ -684,6 +859,16 @@ async function main() {
     process.exit(1);
   }
 
+  // 批 305:发车前查任务书。必须在取号、占结果件槽位、起 worker **之前**——不过就什么都不留下。
+  const tbMode = taskbookMode(opts);
+  if (tbMode === "check") {
+    const res = checkTaskbook(fs.readFileSync(taskPath, "utf8"), { factCheck: !!opts.factCheck });
+    if (!res.ok) {
+      process.stderr.write(`任务书检查不过,没有发车(退出码 ${TASKBOOK_CHECK_EXIT}):${path.basename(taskPath)}\n` + taskbookFailText(res));
+      process.exit(TASKBOOK_CHECK_EXIT);
+    }
+  }
+
   const slug = deriveSlug(taskPath, opts.slug);
   const id = `${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
   const { file: result, fellBack } = resolveResultPath({ cwd, slug, explicitOut: opts.out, id });
@@ -698,6 +883,8 @@ async function main() {
     model: opts.model || null, modelLabel: opts.model ? null : codexDefaultModel(),
     effort: opts.effort, resume: opts.resume, sandbox: opts.sandbox || "read-only",
     timeoutMs: opts.timeoutMs, codexVersion: codexVersion(),
+    // 批 305:只有 --no-taskbook-check 才多这一键(worker 据它在结果件头部记「任务书检查:跳过」);其余发起记录形状照旧
+    ...(tbMode === "skipped" ? { taskbookCheck: "skipped" } : {}),
   });
 
   // worker 起成 detached:父进程退出不带走它,这样「转后台」才真的成立。
