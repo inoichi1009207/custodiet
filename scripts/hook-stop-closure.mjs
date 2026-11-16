@@ -356,6 +356,10 @@ export function fpRightNotManual(ledger) {
 /** 误报率分母口径(fpTable 与 --fp-report 表头共用,红队 a30a87d8 BP-3):只数主 Stop 通道、不数 UNKNOWN。 */
 export const fpRowCounted = (a) => !!a && a.channel !== "SubagentStop";
 export const fpIdsOf = (a) => ((a && a.ids) || []).filter((id) => id !== "UNKNOWN");
+/** 批 305:误报表的口径句,`--fp-report`(含 `--hot`)首行印出;batch-goal 结清时整表转出、开批列待修行时单独转出这一行。
+ *  为什么要有:表里的「误报」只数自签申诉过的那些拦截,没人申诉的拦截(无论拦对拦错)不在分子里——
+ *  不写明,读表的人会把「误报率低」读成「拦得准」。自测钉着它在首行。 */
+export const FP_SCOPE_NOTE = "口径:只统计被申诉过的拦截,不是全部拦截的准确率;没人申诉的拦截不在这张表里。";
 // 批 285(D157③):`since` = {规则 id: 毫秒} —— 该规则**最后一次改判据**的时刻(取自规则对象的 `criteriaSince`)。
 //   给了 ⇒ 该规则的报警、自签与撤回只数此刻之后的(撤回 / 盲审行按其指向那笔自签的时刻归窗,指不到再看自己的 ts),
 //   「待修」按窗口内的数判,全量数挂在 `all` 上照列。没给 ⇒ 逐字是原表。
@@ -4969,6 +4973,28 @@ function selfTest() {
       sc("D45:崩溃不隐身(additionalContext 求救行)", out.includes("收尾闸自身未完成"), true);
       sc("D45:崩溃到达用户(systemMessage)", out.includes("自身崩了"), true);
     }
+    // ── 批 305:误报表首行的口径句(子进程真跑 `--fp-report`;空目录 ⇒ 不读真台账)──
+    //   这张表只数「被申诉过的拦截」,没有这句,读表的人会把它当成全部拦截的准确率。
+    //   `--hot` 形态(batch-goal 开批时读)首行同样带;batch-goal 在列待修行时把它转出。
+    {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "fp-scope-st-"));
+      const rep = (extra) => {
+        try {
+          return execFileSync(process.execPath, ["--no-warnings", process.argv[1], "--fp-report", ...extra], {
+            cwd: tmp, encoding: "utf8", timeout: 30_000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
+          });
+        } catch (e) { return "ERR:" + String(e.stdout || ""); }
+      };
+      const WANT = "口径:只统计被申诉过的拦截,不是全部拦截的准确率;没人申诉的拦截不在这张表里。";
+      const full = rep([]);
+      sc("305 误报表:--fp-report 首行是口径句", full.split("\n")[0], WANT);
+      sc("305 误报表:口径句只出一次", full.split(WANT).length - 1, 1);
+      sc("305 误报表:原有内容照旧在(报警分母行、RECALL 行、表头)",
+        [/^报警分母: /m, /^RECALL=UNKNOWN/m, /^规则  报警  误报  误报率/m].map((re) => (re.test(full) ? 1 : 0)).join(""), "111");
+      sc("305 误报表:--hot 形态首行同样是口径句", rep(["--hot"]).split("\n")[0], WANT);
+      sc("305 误报表:导出常量与印出的一致", FP_SCOPE_NOTE, WANT);
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 清不掉不影响 */ }
+    }
   }
 
   // ── 零件用例:把审计结果做成**资产**而不是一次性探针 ────────────────────────
@@ -6150,6 +6176,7 @@ if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
       }
       return { rows, bad };
     };
+    console.log(FP_SCOPE_NOTE);   // 批 305:首行口径句(`--hot` 同样带;原有内容从第二行起不变)
     // D1/批 102:报表前先验链——断链不瞒报,红行打在报表头(完整性告警的默认路径)
     for (const lf of [".claude/.gate-alerts.jsonl", LEDGER]) {
       try {

@@ -1640,6 +1640,16 @@ console.log(JSON.stringify(cmd === "create" ? { id: r.result.id } : r.result));
     return [noReason, wd, wo, /已撤 309-D2/.test(stat) && /已撤 O1/.test(stat), id3, rows.map((o) => o.reason), c];
   }), [2, 0, 0, true, "309-D3", ["登记错了,不是决定", "纯调查无成果"], 0]);
   oblSelfTest(t, sandbox);
+  // 批 305:开批列「误报率待修」时带上误报表的口径句(整表不印,口径句单独转出);没有待修行 ⇒ 不印口径句
+  {
+    const NOTE = "口径:只统计被申诉过的拦截,不是全部拦截的准确率;没人申诉的拦截不在这张表里。";
+    const hotOut = [NOTE, "🔴 台账链违例:x", "待修 S       20     3   15.0%             0  ← 下一批待修", ""].join("\n");
+    t("305 待修腿:有待修行 ⇒ 告警行、标题、口径句、待修行(去掉标记)依次转出", hotLegLines(hotOut),
+      ["🔴 台账链违例:x", "⚠ **误报率待修的规则 1 条**(误报率 ≥15% 且报警 ≥20;本批要么修判据,要么在收尾对照里写明为什么不修):", "  " + NOTE, "  S       20     3   15.0%             0"]);
+    t("305 待修腿:没有待修行 ⇒ 口径句不单独出现(只转告警行)", hotLegLines([NOTE, "⚠ 台账坏行:alerts 1 / ledger 0(已跳过)——下面的数字按缺损读", ""].join("\n")), ["⚠ 台账坏行:alerts 1 / ledger 0(已跳过)——下面的数字按缺损读"]);
+    t("305 待修腿:报表没带口径句(旧版 hook)⇒ 照旧只列待修行", hotLegLines("待修 K       30     9   30.0%             2  ← 下一批待修\n").length, 2);
+    t("305 待修腿:报表跑不出来(空串)⇒ 什么都不印", hotLegLines(""), []);
+  }
   CONFIG_OVERRIDE = null;
   const pass = cases.filter(Boolean).length;
   console.log(`\n自测 ${pass}/${cases.length}`);
@@ -2898,15 +2908,25 @@ if (argv.includes("--arm")) {
   //   误报率 ≥15% 且报警 ≥20 的规则在开工时刻列出,与上面的到期债同一结构点:不靠人记得去翻报表。
   //   报表由 hook-stop-closure `--fp-report --hot` 算(唯一实现);跑不出来 ⇒ 只提示,不拦开工。
   fpAuditLast();
-  const hotRep = fpReport(["--hot"]);
-  // 报表自己的完整性告警(台账断链 / 坏行)原样转出——开批只留「待修」行会把它们滤掉(codex 258-cond34-r1 附节)
-  for (const l of hotRep.split("\n")) if (/^(🔴|⚠)/.test(l)) console.log(l);
-  const hot = hotRep.split("\n").filter((l) => l.startsWith("待修 "));
-  if (hot.length) {
-    console.log(`⚠ **误报率待修的规则 ${hot.length} 条**(误报率 ≥15% 且报警 ≥20;本批要么修判据,要么在收尾对照里写明为什么不修):`);
-    for (const l of hot) console.log("  " + l.replace(/^待修 /, "").replace(/\s*← 下一批待修\s*$/, ""));
-  }
+  for (const l of hotLegLines(fpReport(["--hot"]))) console.log(l);
   process.exit(0);
+}
+
+/** 开批时「误报率待修」那一段要印的行(纯函数,自测直接调)。入参 = `hook-stop-closure --fp-report --hot` 的 stdout。
+ *  · 报表自己的完整性告警(台账断链 / 坏行)原样转出——开批只留「待修」行会把它们滤掉(codex 258-cond34-r1 附节);
+ *  · 批 305:有待修行时把报表首行的口径句(「口径:」开头)也转出一行——待修行是那张表的摘录,口径跟着走;
+ *    没有待修行 ⇒ 不印口径句(没有表可注);报表没带口径句(旧版 hook)⇒ 照旧只列待修行。 */
+export function hotLegLines(hotRep) {
+  const lines = String(hotRep || "").split("\n");
+  const out = lines.filter((l) => /^(🔴|⚠)/.test(l));
+  const hot = lines.filter((l) => l.startsWith("待修 "));
+  if (hot.length) {
+    out.push(`⚠ **误报率待修的规则 ${hot.length} 条**(误报率 ≥15% 且报警 ≥20;本批要么修判据,要么在收尾对照里写明为什么不修):`);
+    const scope = lines.find((l) => l.startsWith("口径:"));
+    if (scope) out.push("  " + scope);
+    for (const l of hot) out.push("  " + l.replace(/^待修 /, "").replace(/\s*← 下一批待修\s*$/, ""));
+  }
+  return out;
 }
 
 /** 批 292 红队 BP-1:候选台账由 Stop hook 写在**主树**(`$CLAUDE_PROJECT_DIR` 即主 checkout)的 `.claude/` 下;
