@@ -8052,7 +8052,7 @@ export const RULE_W = {
     //     `(Get-Content scripts/write-node.mjs).Count`)走 `isReadSeg` 读类表,本批不动 ⇒ 仍误拦,走 fp;
     //     ④PowerShell 方法调用括号(`.Replace("a","b")`)内层判不出段头 ⇒ 按执行,误拦向;
     //     ⑤数据 heredoc 写进无扩展名文件再由壳执行(`cat > runme <<EOF` 后 `bash runme`)⇒ 漏放,罕见。
-    QUOTED_PATH: /^[^\s"']*(?:write-node|prod-lib|bulk[-_]?create[\w-]*|deploy-prod)\.(?:mjs|cjs|js|ts|ps1)$/i,
+    QUOTED_PATH: /^[^\s"']*(?:write-node|prod-lib|bulk[-_]?create[\w-]*|deploy-[\w-]+)\.(?:mjs|cjs|js|ts|ps1)$/i,
     HEREDOC_EXEC_HEAD: /^(?:python\d*(?:\.\d+)?|py|perl|ruby|php|osascript)$/i,
     /** 引号串内容列表(与 `tok` 同一套引号/转义口径)。 */
     quotedSpans(seg) {
@@ -10258,7 +10258,8 @@ const dpSegOps = (cmd) => {
 /** 一段(已剥壳)推送的去向是否确知落在别的仓。base = 本命令第一段 cd 落定的别仓目录(null = 本仓)。 */
 const dpSegAway = (u, base, awayOf) => {
   const s = String(u);
-  if (/app-private/i.test(s) || /\bGIT_(?:DIR|WORK_TREE|COMMON_DIR)\b|--git-dir|--work-tree/i.test(s)) return false;
+  // 0.10.0:私仓名认 `<名>-private` 这一形(原来写死一个具体仓名)——命令里点了私仓名的推送不判成「推去了别仓」。
+  if (/[\w.-]+-private\b/i.test(s) || /\bGIT_(?:DIR|WORK_TREE|COMMON_DIR)\b|--git-dir|--work-tree/i.test(s)) return false;
   const ts = DP_RAW_TOKS(s);
   const gi = ts.map((t, i) => (/^(?:\S*[\\/])?git(?:\.exe)?$/i.test(t) ? i : -1)).filter((i) => i >= 0);
   if (gi.length > 1) return false;
@@ -10852,7 +10853,7 @@ const RULE_MF = {
         written: "---\nname: esc2\nmetadata:\n  type: feedback\n---\n说话别绕。\n不可机械化:这条要判语气,无动作面可查。" } },
   ],
   //   r6 BP-7:agent 持久记忆目录(.claude/agent-memory*/<名>/)同管
-  _MEM: /(^|\/)(?:\.claude\/projects\/[^/]+\/memory|my-dotfiles\/memory|\.claude\/agent-memory[^/]*)\/(?:[^/]+\/)*[^/]+\.md$/i,
+  _MEM: /(^|\/)(?:\.claude\/projects\/[^/]+\/memory|[\w.-]*dotfiles[\w.-]*\/memory|\.claude\/agent-memory[^/]*)\/(?:[^/]+\/)*[^/]+\.md$/i,
   //   索引只认 memory 根(或 agent-memory 的 <名>/)下那一份;子目录里叫 Memory.md 的照管(r6 BP-7)
   _INDEX: /(?:^|\/)(?:memory|agent-memory[^/]*\/[^/]+)\/MEMORY\.md$/i,
   /** frontmatter 里的 type 值(只认文件开头 --- 段;容 `type : x` 与全角冒号——r6 BP-8 / 误拦 r6 FB-3:正文里复述「type: feedback」不算)。 */
