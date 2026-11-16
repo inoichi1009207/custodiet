@@ -3,7 +3,7 @@
 //
 // 两层模式:
 //   ① 通用模式(写在本文件里,可以公开):真实用户目录、Claude 项目目录名、邮箱、不在允许清单里的站点、
-//      私仓样式的 GitHub 引用。只收「形态本身就说明是本机 / 私有」的,拿不准会误伤的一律不收。
+//      公网地址、私仓样式的 GitHub 引用。
 //   ② 本机清单(不入任何仓):环境变量 CUSTODIET_PRIVATE_DENYLIST 指向的文件,一行一条。
 //      · `#` 开头是注释,空行跳过;
 //      · `/正则/旗标` 形态按正则(旗标只认 i / u / s);
@@ -17,7 +17,11 @@
 //   node scripts/check-private-identifiers.mjs --verbose  命中行尾追加命中的原文(缺省不打:日志常被贴出去)
 //   node scripts/check-private-identifiers.mjs --self-test
 // 输出:每条命中一行 `文件:行号:模式名`(路径名本身命中记行号 0;本机清单的模式名是 `denylist:L<清单行号>`)。
-// 退出码:0 无命中;1 有命中;2 用法或本机清单写坏了(正则编不过——坏清单不能当成「没有清单」放过去)。
+//   没扫内容的文件逐个列出来(二进制扩展名、已跟踪但工作区里没有的);扫不了的文件逐个列出来并算失败。
+// 退出码:0 无命中;1 有命中;2 没法下结论——用法错、本机清单写坏了(正则编不过)、有文件读不了或解不成文本。
+//
+// 扫的是**工作区**里的内容,不是提交里的。已跟踪文件有未提交改动时会打一行提示(退出码不变):
+//   推送前请在干净的工作区重跑,否则「命中 0」证明不了待推的提交是干净的。
 //
 // 被允许清单拦了一个确实公开的站点时:把它的主机名加进下面的 PUBLIC_HOSTS(这是本检查唯一需要人维护的面)。
 // 失效条件:通用模式连续误伤(每次都靠加例外过)⇒ 那条模式判据太宽,删掉它而不是继续加例外。
@@ -59,6 +63,7 @@ const PUBLIC_HOSTS = [
 /** 邮箱形态里被当成「顶级域」的常见文件扩展名(`icon@2x.png` 不是邮箱)。 */
 const FILE_EXT_TLD = /^(?:png|jpe?g|gif|svg|webp|ico|md|mjs|cjs|js|jsx|ts|tsx|json|ya?ml|txt|html?|css|sh|ps1|py|lock|log)$/i;
 
+/** 确属二进制的扩展名:内容不扫(路径名照扫),但每次都在输出里列出来。 */
 const BINARY_EXT = /\.(?:png|jpe?g|gif|ico|webp|pdf|woff2?|ttf|otf|zip|gz|tgz|mp[34]|wav)$/i;
 
 function hostAllowed(host) {
@@ -69,14 +74,15 @@ function hostAllowed(host) {
   return PUBLIC_HOSTS.some((p) => h === p || h.endsWith("." + p));
 }
 
-/** IPv4 是否属于本机 / 内网 / 文档专用段(这些不算泄漏)。 */
-function ipIsLocal(ip) {
+/** IPv4 是否放行:回环、私网、链路本地、文档保留段、全零、广播。写不成合法地址的(某段大于 255)不判。
+ *  别的一律拦——组播、子网掩码、运营商级 NAT 段也在拦的那边(拿不准的地址形态按泄漏算)。 */
+function ipAllowed(ip) {
   const p = ip.split(".").map(Number);
-  if (p.some((n) => n > 255)) return true;                                  // 不是合法地址,不判
+  if (p.some((n) => n > 255)) return true;
   const [a, b, c] = p;
-  return a === 0 || a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
+  return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
     (a === 169 && b === 254) || (a === 192 && b === 0 && c === 2) || (a === 198 && b === 51 && c === 100) ||
-    (a === 203 && b === 0 && c === 113) || a >= 224;
+    (a === 203 && b === 0 && c === 113) || p.every((n) => n === 0) || p.every((n) => n === 255);
 }
 
 const userOk = (name) => PLACEHOLDER_USERS.has(String(name).toLowerCase().replace(/\.+$/, ""));
@@ -96,11 +102,13 @@ export const GENERIC = [
   { name: "email",
     re: /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+([A-Za-z]{2,}))(?![A-Za-z0-9-])/g,
     ok: (m) => hostAllowed(m[1]) || FILE_EXT_TLD.test(m[2]) || /^\d+\.\d/.test(m[1]) },
-  { name: "url-host",             // 带协议头的链接,主机不在允许清单里
-    re: /\b(?:https?|wss?|ftp|ssh|git):\/\/(?:[^\s\/@"'`<>]*@)?([A-Za-z0-9.-]+)/g,
+  { name: "url-host",             // 带协议头的链接(协议头不分大小写),主机不在允许清单里;主机是 IPv4 的归 public-ipv4 判
+    re: /\b(?:https?|wss?|ftp|ssh|git):\/\/(?:[^\s\/@"'`<>]*@)?([A-Za-z0-9.-]+)/gi,
     ok: (m) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(m[1]) || hostAllowed(m[1]) },
-  { name: "url-public-ip",        // 带协议头的链接直接写公网地址
-    re: /\b(?:https?|wss?|ftp|ssh|git):\/\/(?:[^\s\/@"'`<>]*@)?(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])/g, ok: (m) => ipIsLocal(m[1]) },
+  { name: "public-ipv4",          // 公网 IPv4,带不带协议头都算;前面紧挨字母数字或点、后面还接着「.数字」的不是地址(v1.2.3.4、五段数字)
+    re: /(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?!\w|\.\d)/g, ok: (m) => ipAllowed(m[1]) },
+  { name: "url-ipv6",             // 链接里带方括号的 IPv6 字面量;只放行回环 ::1
+    re: /\b(?:https?|wss?|ftp|ssh|git):\/\/(?:[^\s\/@"'`<>]*@)?\[([0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*(?:%[\w.-]+)?)\]/gi, ok: (m) => m[1] === "::1" },
   { name: "github-private-repo",  // github.com/<拥有者>/<…-private|…-internal>
     re: /github\.com[\/:]([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9._-]+)/g,
     ok: (m) => !/[-_.](?:private|internal)$/i.test(m[2].replace(/\.git$/i, "")) || PLACEHOLDER_OWNERS.has(m[1].toLowerCase()) },
@@ -150,11 +158,38 @@ export function scanText(text, extra = []) {
   return hits;
 }
 
+/** 文件内容 ⇒ 要扫的文本(一份或两份);解不成 ⇒ null。
+ *  · 没有 NUL 字节:按 UTF-8。
+ *  · 有 NUL 字节:① 按 UTF-16LE 解得通(UTF-16 存的文本)就扫这一份;
+ *    ② 同时是严格合法的 UTF-8(源码里夹着零星字面 NUL)就再扫一份去掉 NUL 的——大端 UTF-16 存的 ASCII 内容也落在这一份里。
+ *    两份都不成立 ⇒ null:由调用方记成失败,不当二进制悄悄放过去。 */
+export function decodeTexts(buf) {
+  if (!buf.includes(0)) return [buf.toString("utf8")];
+  const out = [];
+  const le = utf16le(buf);
+  if (le !== null) out.push(le);
+  try { out.push(new TextDecoder("utf-8", { fatal: true }).decode(buf).replace(/\0/g, "")); } catch { /* 不是合法 UTF-8 */ }
+  return out.length ? out : null;
+}
+
+/** 按 UTF-16LE 解;解不成 ⇒ null:字节数为奇数、是大端(FE FF 开头,或 NUL 多落在偶数位)、有落单的代理项、解完还有 NUL。 */
+function utf16le(buf) {
+  if (buf.length % 2) return null;
+  if (buf[0] === 0xfe && buf[1] === 0xff) return null;
+  let even = 0, odd = 0;
+  for (let i = 0; i < buf.length; i++) if (buf[i] === 0) { if (i % 2) odd++; else even++; }
+  if (even > odd) return null;
+  const s = buf.toString("utf16le").replace(/^\uFEFF/, "");
+  if (/\0|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(s)) return null;
+  return s;
+}
+
+/** 要扫的文件清单 ⇒ { files, git }。git:true 表示清单来自 git ls-files(已跟踪的文件)。 */
 function listFiles(root) {
   try {
     const out = execFileSync("git", ["-C", root, "ls-files", "-z"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     const files = out.split("\0").filter(Boolean);
-    if (files.length) return files;
+    if (files.length) return { files, git: true };
   } catch { /* 不在 git 仓里 ⇒ 走目录遍历 */ }
   const acc = [];
   const walk = (dir, rel) => {
@@ -165,23 +200,61 @@ function listFiles(root) {
     }
   };
   walk(root, "");
-  return acc.sort();
+  return { files: acc.sort(), git: false };
 }
 
-/** 扫一棵树 ⇒ { files: 扫过的文本文件数, hits: [{ file, line, name, text }] }。 */
-export function scanTree(root, extra = []) {
-  const hits = [];
+/** 已跟踪文件相对提交有几条未提交的改动(暂存的也算);git 跑不了 ⇒ null。 */
+function dirtyCount(root) {
+  try {
+    const out = execFileSync("git", ["-C", root, "status", "--porcelain", "--untracked-files=no", "--", "."],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    return out.split("\n").filter(Boolean).length;
+  } catch { return null; }
+}
+
+/** 扫一棵树 ⇒ { files: 扫过内容的文件数, hits, skipped: [{ file, why }], failed: [{ file, why }], dirty }。
+ *  `io` 只给自测注入用:list(root) / read(绝对路径) / dirty(root)。 */
+export function scanTree(root, extra = [], io = {}) {
+  const { files: all, git } = (io.list || listFiles)(root);
+  const read = io.read || ((p) => fs.readFileSync(p));
+  const hits = [], skipped = [], failed = [];
   let files = 0;
-  for (const f of listFiles(root)) {
+  for (const f of all) {
     for (const h of scanText(f, extra)) hits.push({ file: f, ...h, line: 0 });          // 路径名本身
-    if (BINARY_EXT.test(f)) continue;
+    if (BINARY_EXT.test(f)) { skipped.push({ file: f, why: "二进制扩展名" }); continue; }
     let buf;
-    try { buf = fs.readFileSync(path.join(root, f)); } catch { continue; }               // 已跟踪但工作树里删了
-    if (buf.subarray(0, 8192).includes(0)) continue;                                     // 二进制
+    try { buf = read(path.join(root, f)); } catch (e) {
+      // 已跟踪但工作区里没有 = 一条未提交的删除:归「工作区与提交不一致」那行提示管,列出来、不算失败。别的读失败都算失败。
+      if (git && e && e.code === "ENOENT") skipped.push({ file: f, why: "已跟踪但工作区里没有(未提交的删除)" });
+      else failed.push({ file: f, why: `读不了(${(e && e.code) || "未知错误"})` });
+      continue;
+    }
+    const texts = decodeTexts(buf);
+    if (texts === null) { failed.push({ file: f, why: "含 NUL 字节,既解不成 UTF-16LE 也不是合法 UTF-8(确属二进制的话,把扩展名加进 BINARY_EXT)" }); continue; }
     files++;
-    for (const h of scanText(buf.toString("utf8"), extra)) hits.push({ file: f, ...h });
+    const seen = new Set();                                                              // 两份文本扫到同一处只报一次
+    for (const text of texts) for (const h of scanText(text, extra)) {
+      const k = `${h.line}:${h.name}`;
+      if (!seen.has(k)) { seen.add(k); hits.push({ file: f, ...h }); }
+    }
   }
-  return { files, hits };
+  const dirty = io.dirty ? io.dirty(root) : git ? dirtyCount(root) : null;
+  return { files, hits, skipped, failed, dirty };
+}
+
+/** 扫描结果 ⇒ { out: 要打印的行, code: 退出码 }。 */
+export function summarize(res, dl, verbose = false) {
+  const out = [];
+  for (const h of res.hits) out.push(`${h.file}:${h.line}:${h.name}${verbose ? `  ${h.text}` : ""}`);
+  for (const f of res.failed) out.push(`扫不了:${f.file}  ${f.why}`);
+  if (res.skipped.length) {
+    out.push(`跳过 ${res.skipped.length} 个文件(没扫内容,路径名照扫):`);
+    for (const s of res.skipped) out.push(`  ${s.file}  (${s.why})`);
+  }
+  if (res.dirty) out.push(`提示:工作区与提交不一致(${res.dirty} 个已跟踪文件有未提交改动),扫的是工作区;推送前请在干净的工作区重跑。`);
+  const src = dl.loaded ? `本机清单 ${dl.patterns.length} 条` : "没有加载本机清单(CUSTODIET_PRIVATE_DENYLIST 没设或文件不存在),只跑通用模式";
+  out.push(`check-private-identifiers:扫了 ${res.files} 个文本文件,跳过 ${res.skipped.length} 个,扫不了 ${res.failed.length} 个;通用模式 ${GENERIC.length} 条;${src};命中 ${res.hits.length}`);
+  return { out, code: res.failed.length ? 2 : res.hits.length ? 1 : 0 };
 }
 
 function selfTest() {
@@ -194,6 +267,8 @@ function selfTest() {
   const names = (s, extra) => scanText(s, extra).map((h) => h.name);
   const who = j("zq", "wex");                            // 造出来的「真名」,不是任何人的
   const U = j("Us", "ers");
+  const pub4 = j("8.8", ".8.8");                         // 公网地址样例(公共 DNS)
+  const pub6 = j("2606:4700:", "4700::1111");
 
   // —— 正例:该命中 ——
   t("盘符用户目录(正斜杠)", names(j("C:/", U, "/", who, "/x.md")), ["win-user-home"]);
@@ -210,10 +285,27 @@ function selfTest() {
   t("链接里带口令 ⇒ 站点与邮箱形态都报", names(j("https:", "//u:p@", who, ".dev/x")).sort(), ["email", "url-host"]);
   t("ssh 协议头的私有主机(用户名@主机 同时是邮箱形态)", names(j("ssh:", "//git@git.", who, ".dev/r.git")).sort(), ["email", "url-host"]);
   t("ssh 协议头、不带用户名", names(j("ssh:", "//git.", who, ".dev/r.git")), ["url-host"]);
-  t("链接里的公网地址", names(j("http:", "//8.8.", "8.8:8080/s")), ["url-public-ip"]);
   t("私仓样式的 GitHub 引用", names(j("git@github.com:", who, "/app-priv", "ate.git")), ["github-private-repo"]);
   t("私仓样式(-internal)", names(j("https://github.com/", who, "/tools-inter", "nal")), ["github-private-repo"]);
   t("行号从 1 起、每行各报", scanText(j("ok\n", "C:/", U, "/", who, "\nok\n/c/", U, "/", who)).map((h) => `${h.line}:${h.name}`), ["2:win-user-home", "4:msys-user-home"]);
+
+  // —— 回修 1:公网地址,带不带协议头都拦 ——
+  t("回修1:不带协议头的公网 IPv4", names(j("server = \"", pub4, "\"")), ["public-ipv4"]);
+  t("回修1:带协议头的公网 IPv4(只报一次)", names(j("http:", "//", pub4, ":8080/s")), ["public-ipv4"]);
+  t("回修1:用户名@公网 IPv4", names(j("ssh root@", pub4)), ["public-ipv4"]);
+  t("回修1:公网网段写法", names(j("allow ", pub4.replace(/\d+$/, "0"), "/24")), ["public-ipv4"]);
+  t("回修1:组播与子网掩码不在放行段里 ⇒ 拦", [names(j("224.0", ".0.1")), names(j("mask 255.255", ".255.0"))], [["public-ipv4"], ["public-ipv4"]]);
+  t("回修1:IPv6 字面量链接", names(j("http:", "//[", pub6, "]/")), ["url-ipv6"]);
+  t("回修1:IPv6 字面量链接带端口与用户名", names(j("https:", "//u@[", pub6, "]:8443/x")), ["url-ipv6"]);
+  for (const s of ["127.0.0.1", "10.0.0.1", "172.16.5.4", "172.31.255.1", "192.168.1.20", "169.254.1.1", "192.0.2.7", "198.51.100.7", "203.0.113.7",
+    "0.0.0.0", "255.255.255.255", "bind 0.0.0.0:8080", "http://[::1]:3000/", "v1.2.3.4", "pkg 1.2.3.4.5", "999.1.1.1", "1.2.3", "arr[1:2]"])
+    t(`回修1 反例:${s}`, names(s), []);
+
+  // —— 回修 2:协议头不分大小写 ——
+  t("回修2:大写协议头 + 公网 IPv4", names(j("HTTP:", "//", pub4, "/")), ["public-ipv4"]);
+  t("回修2:大写协议头 + 不在清单里的站点", names(j("HTTPS:", "//", who, ".dev/x")), ["url-host"]);
+  t("回修2:大小写混写的协议头 + IPv6 字面量", names(j("Http:", "//[", pub6, "]/")), ["url-ipv6"]);
+  t("回修2 反例:大写协议头 + 保留域", names("HTTPS://X.TEST/a"), []);
 
   // —— 反例:不该命中 ——
   for (const s of [
@@ -243,6 +335,57 @@ function selfTest() {
   t("清单:没设变量 ⇒ 未加载", loadDenylist({}).loaded, false);
   t("清单:文件不存在 ⇒ 未加载", loadDenylist({ CUSTODIET_PRIVATE_DENYLIST: path.join(path.sep, "no-such-dir-check-private", "x.txt") }).loaded, false);
 
+  // —— 回修 3 / 4 / 5:扫一棵树(文件清单、读文件、改动条数都注入,不碰磁盘)——
+  const R = path.resolve(path.sep, "virtual-root");
+  const tree = (files, opt = {}) => scanTree(R, dl.patterns, {
+    list: () => ({ files: Object.keys(files), git: opt.git !== false }),
+    read: (p) => { const v = files[path.relative(R, p).replace(/\\/g, "/")]; if (v instanceof Error) throw v; return v; },
+    dirty: () => opt.dirty ?? 0,
+  });
+  const err = (code) => Object.assign(new Error(code), { code });
+  const view = (r) => [r.files, r.hits.map((h) => `${h.file}:${h.line}:${h.name}`), r.skipped.map((s) => s.file), r.failed.map((f) => f.file)];
+  const loaded = { loaded: true, patterns: dl.patterns };
+  const u16 = (s, bom = true) => Buffer.from((bom ? "\ufeff" : "") + s, "utf16le");
+  const u16be = (s) => { const b = Buffer.from("\ufeff" + s, "utf16le"); b.swap16(); return b; };
+
+  t("回修3:UTF-16LE 存的文本(带 BOM)照常扫、行号对", view(tree({ "note.txt": u16(`ok\r\ncd E:/${lit}\r\n`) })), [1, ["note.txt:2:denylist:L3"], [], []]);
+  t("回修3:UTF-16LE 不带 BOM 也照常扫", view(tree({ "note.md": u16(`cd E:/${lit}\n`, false) })), [1, ["note.md:1:denylist:L3"], [], []]);
+  t("回修3:UTF-16LE 里的通用模式也照常扫", view(tree({ "a.txt": u16(j("server = ", pub4, "\n")) })), [1, ["a.txt:1:public-ipv4"], [], []]);
+  t("回修3:二进制扩展名不扫内容,但列进跳过清单", view(tree({ "doc/a.pdf": Buffer.from(lit), "img/b.jpg": Buffer.from([0xff, 0xd8, 0, 1]) })), [0, [], ["doc/a.pdf", "img/b.jpg"], []]);
+  t("回修3:二进制扩展名的路径名照扫", view(tree({ [`img/${lit}.png`]: Buffer.from([1]) })), [0, [`img/${lit}.png:0:denylist:L3`], [`img/${lit}.png`], []]);
+  t("回修3:UTF-16LE 不带 BOM 的 ASCII 内容两份文本都解得通 ⇒ 同一处只报一次", view(tree({ "two.txt": u16(`ok\ncd E:/${lit}\n`, false) })), [1, ["two.txt:2:denylist:L3"], [], []]);
+  t("回修3:UTF-8 源码里夹一个字面 NUL ⇒ 照 UTF-8 扫,不算失败", view(tree({ "src.mjs": Buffer.concat([Buffer.from("const sep = \""), Buffer.from([0]), Buffer.from(`";\ncd E:/${lit}\n`)]) })), [1, ["src.mjs:2:denylist:L3"], [], []]);
+  t("回修3:含 NUL、既解不成 UTF-16LE 也不是合法 UTF-8 ⇒ 失败", view(tree({ "x.dat": Buffer.from([0xff, 0, 0x62]) })), [0, [], [], ["x.dat"]]);
+  t("回修3:大端 UTF-16(带 BOM)⇒ 失败,不当成文本乱扫", view(tree({ "be.txt": u16be(lit) })), [0, [], [], ["be.txt"]]);
+  t("回修3:大端 UTF-16(不带 BOM)的 ASCII 内容 ⇒ 去掉 NUL 那一份照样拦得到", view(tree({ "be2.txt": u16be(lit).subarray(2) })), [1, ["be2.txt:1:denylist:L3"], [], []]);
+  t("回修3:大端 UTF-16(不带 BOM)的非 ASCII 内容 ⇒ 失败", view(tree({ "be3.txt": u16be(j("这", "是\n")).subarray(2) })), [0, [], [], ["be3.txt"]]);
+  t("回修3:落单的代理项 ⇒ 失败", view(tree({ "s.txt": Buffer.from([0x61, 0, 0x00, 0xd8, 0x62, 0]) })), [0, [], [], ["s.txt"]]);
+  {
+    const s = summarize(tree({ "ok.md": Buffer.from("ok\n"), "img/b.jpg": Buffer.from([0]), "x.dat": Buffer.from([0xff, 0, 0x62]) }), loaded);
+    t("回修3:输出里写明跳过了几个、各是什么;解不成 ⇒ 退出 2", [s.code, s.out.filter((l) => /跳过 1 个文件|^ {2}img\/b\.jpg {2}\(二进制扩展名\)|^扫不了:x\.dat/.test(l)).length, /扫了 1 个文本文件,跳过 1 个,扫不了 1 个/.test(s.out.at(-1))], [2, 3, true]);
+  }
+
+  t("回修4:读文件失败(EACCES)⇒ 记失败、不当成安全跳过", view(tree({ "note.md": err("EACCES"), "ok.md": Buffer.from("ok\n") })), [1, [], [], ["note.md"]]);
+  {
+    const s = summarize(tree({ "note.md": err("EACCES") }), loaded);
+    t("回修4:读文件失败 ⇒ 打印路径、退出 2", [s.code, s.out.some((l) => l === "扫不了:note.md  读不了(EACCES)")], [2, true]);
+    const both = summarize(tree({ "note.md": err("EIO"), "hit.md": Buffer.from(lit) }), loaded);
+    t("回修4:失败与命中并存 ⇒ 命中照打、退出 2", [both.code, both.out.includes("hit.md:1:denylist:L3")], [2, true]);
+  }
+  t("回修4:目录遍历模式下文件不见了 ⇒ 也算失败", view(tree({ "gone.md": err("ENOENT") }, { git: false })), [0, [], [], ["gone.md"]]);
+
+  {
+    const dirtyRun = tree({ "ok.md": Buffer.from("ok\n") }, { dirty: 3 });
+    const s = summarize(dirtyRun, loaded);
+    t("回修5:已跟踪文件有未提交改动 ⇒ 打一行提示、退出码不变", [s.code, s.out.filter((l) => /^提示:工作区与提交不一致\(3 个已跟踪文件有未提交改动\),扫的是工作区;推送前请在干净的工作区重跑。$/.test(l)).length], [0, 1]);
+    const hitRun = summarize(tree({ "hit.md": Buffer.from(lit) }, { dirty: 1 }), loaded);
+    t("回修5:有改动又有命中 ⇒ 提示照打、退出码仍是 1", [hitRun.code, hitRun.out.some((l) => l.startsWith("提示:工作区与提交不一致"))], [1, true]);
+    const clean = summarize(tree({ "ok.md": Buffer.from("ok\n") }), loaded);
+    t("回修5 反例:工作区干净 ⇒ 不打提示", clean.out.some((l) => l.startsWith("提示:")), false);
+    const gone = tree({ "gone.md": err("ENOENT"), "ok.md": Buffer.from("ok\n") }, { dirty: 1 });
+    t("回修5:已跟踪但工作区里删了 ⇒ 列进跳过清单、不算失败、提示照打", [view(gone), summarize(gone, loaded).code, summarize(gone, loaded).out.some((l) => l.startsWith("提示:"))], [[1, [], ["gone.md"], []], 0, true]);
+  }
+
   // —— 本文件自己不带样例字面量(通用模式扫自己 0 命中)——
   t("本文件自己过通用模式", scanText(fs.readFileSync(fileURLToPath(import.meta.url), "utf8")).map((h) => `${h.line}:${h.name}`), []);
 
@@ -262,11 +405,9 @@ function main(argv) {
   if (!fs.existsSync(root)) { console.error("要扫的目录不存在"); return 2; }
   const dl = loadDenylist();
   if (dl.errors.length) { for (const e of dl.errors) console.error(`本机清单${e}`); return 2; }
-  const { files, hits } = scanTree(root, dl.patterns);
-  for (const h of hits) console.log(`${h.file}:${h.line}:${h.name}${verbose ? `  ${h.text}` : ""}`);
-  const src = dl.loaded ? `本机清单 ${dl.patterns.length} 条` : "没有加载本机清单(CUSTODIET_PRIVATE_DENYLIST 没设或文件不存在),只跑通用模式";
-  console.log(`check-private-identifiers:扫了 ${files} 个文本文件;通用模式 ${GENERIC.length} 条;${src};命中 ${hits.length}`);
-  return hits.length ? 1 : 0;
+  const { out, code } = summarize(scanTree(root, dl.patterns), dl, verbose);
+  for (const l of out) console.log(l);
+  return code;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) process.exit(main(process.argv.slice(2)));
