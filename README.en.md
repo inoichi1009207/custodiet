@@ -32,6 +32,82 @@ The data behind this, and its scope, are in [False-block data](#false-block-data
 | Record data | Alert ledger, false-block ledger with blind review, replay tool | One summary row per batch; sampling of blocks nobody appealed |
 | Maintain rules | False-block claims with blind review; the red-team and false-block-hunter agents | Deleting the 17 log-only rules after a replay confirms nothing is lost; re-testing each rule when the model changes |
 
+## Flowcharts
+
+Solid boxes exist in the repo today (partly built); dashed boxes are planned. Rounded boxes are where a human steps in.
+
+### Version 1: one instruction → one execution session → runs itself to close-out
+
+```mermaid
+flowchart TD
+    U(["Your one instruction"]) --> T{"0 Triage<br/>rules first, then a cheap model"}
+    T -->|"touches live content / public surface / irreversible"| P1["Full plan<br/>with adversarial review"]
+    T -->|"clear, and checks can be written"| P2["Completion criteria and a finish line only"]
+    T -->|"small and unambiguous"| P3["Just do it"]
+    P1 -->|"needs a sign-off"| H1(["⏸ Waits for you"])
+    H1 --> A
+    P1 --> A
+    P2 --> A
+    P3 --> A
+    A["1 Open the batch<br/>completion criteria · executable checks · finish line · limits<br/>record which instruction started it"] --> L["2 Launch<br/>mechanical checks, then a headless session<br/>own worktree, turn and cost limits"]
+    L --> V{"3 Accept<br/>① re-run the checks registered at opening<br/>② judge against the completion criteria"}
+    V -->|"fail: fix<br/>same session, at most 3 rounds"| L
+    V -->|"cannot tell"| S(["Stop, write down where it is stuck<br/>hand to you"])
+    V -->|"pass"| C["4 Close out<br/>verdict per criterion → record outcomes and decisions<br/>→ commit → push → debt probe"]
+    C -->|"irreversible / money, credentials, copyright / public release"| H2(["⏸ Waits for you"])
+    C --> D["5 Record one row<br/>triage verdict · how many times you spoke · acceptance rounds<br/>watch · blocks and blind review · cost · model"]
+    D --> R["6 Between sessions: rules learn themselves<br/>spot corrections → compare with existing rules<br/>→ become a reminder / compile into a check / prune what is no longer needed"]
+    W["Watch · throughout<br/>turns, time or cost hit the limit<br/>or the same error keeps repeating"] -.-> L
+    W -.->|"stop"| S
+    J["Direction check · when needed<br/>a read-only agent that has not seen the reasoning<br/>asks only: without this, do the criteria still hold?"] -.-> V
+    J -.->|"off course, or should stop"| S
+
+    classDef planned stroke-dasharray: 6 4
+    class T,P1,P2,P3,L,D,R,W,J planned
+```
+
+One number is measured: from that instruction to close-out, how many times the human spoke, and how many of those were sign-offs.
+
+### Version 2: one instruction fans out to several sessions (planned, no code yet)
+
+The architecture follows DeepSeek's article on its super-agent: a resident Router that only dispatches, Workers with separate contexts working in parallel, and an independent Watchdog. The whole of version 1 is what happens inside one Worker.
+
+```mermaid
+flowchart TD
+    subgraph SRC["Event sources"]
+        E1["Your one instruction"]
+        E2["Timers"]
+        E3["A debt expiring"]
+        E4["A sign-off given"]
+        E5["Changes in the repo"]
+    end
+    SRC --> F1["Filter 1<br/>program rules drop the irrelevant"]
+    F1 --> F2{"Filter 2<br/>a model, with context,<br/>decides whether to act"}
+    F2 -->|"no need"| Q["Silent by default<br/>says nothing"]
+    F2 -->|"act"| RT["Router · resident<br/>dispatches and keeps global context only<br/>can be a cheap model"]
+    RT --> AD{"Admission<br/>auto mode and a rule matches?"}
+    AD -->|"no"| OB["Observe mode<br/>only logs 'would have taken this'"]
+    AD -->|"yes: open a ticket"| TK[("Ticket store<br/>state machine, shared by sessions")]
+    TK --> W1["Worker A<br/>own context + worktree<br/>runs the whole of version 1"]
+    TK --> W2["Worker B"]
+    TK --> W3["Worker …"]
+    SRC -.->|"Subscription pass-through: later events about a job<br/>go straight to the Worker that took it, not via the Router"| W1
+    WD["Watchdog · independent<br/>is there progress, is it spinning<br/>tries a fix first"] -.-> W1
+    WD -.-> W2
+    WD -.-> W3
+    WD -->|"cannot fix"| HM(["Comes to you"])
+    W1 -->|"stuck or failed"| HM
+    W1 -->|"surfaces only with a result"| DONE["Accept → close out → record one row"]
+    W2 --> DONE
+    W3 --> DONE
+    PN["Panel<br/>what is running, what waits for a human"] --- TK
+
+    classDef planned stroke-dasharray: 6 4
+    class F1,F2,Q,RT,AD,OB,TK,W1,W2,W3,WD,DONE,PN planned
+```
+
+What version 1 leaves ready for version 2: triage already has the two-filter shape; a headless session with a worktree and limits is one Worker; the watch only stops, and the "try a fix" half waits for version 2; the batch state file and data ledger are the forerunners of the ticket store; lanes is the forerunner of the panel.
+
 ## Why
 
 Coding agents report false success: the task failed and the agent says it succeeded. [arXiv 2606.09863](https://arxiv.org/abs/2606.09863) (accepted to FAGEN@ICML 2026) measured it on 9,876 tau2-bench and 1,879 AppWorld trajectories. The share varies by setting: 45–48% of failures in single-control tau2-bench domains, and **75.8%** among AppWorld self-assessing coding-agent trajectories with explicit status claims. LLM judges catch it poorly — no configuration exceeds AUROC **0.65** on tau2-bench, and the same judges reach 0.54 on AppWorld API-call traces. Lightweight TF-IDF detectors reach task-disjoint AUROC 0.83 on tau2-bench and 0.95 on AppWorld.
