@@ -32,6 +32,8 @@
 //   node --no-warnings scripts/batch-goal.mjs --clear [--verdict "N=达成|未达成|不适用[:理由]"]…   (批 298:逐条裁决,可选)
 //        (批 305:成功时多打一行主尺并记进 clear 行——从指令到关账,转录里人亲口说了几条;量不出写明原因)
 //   node --no-warnings scripts/batch-goal.mjs --ruler              ⇒ 只读:现算主尺(未结清)或打关账时记下的那份(批 305)
+//   node --no-warnings scripts/batch-goal.mjs --handoff [--out <路径>] ⇒ 只读:交接从事实生成(分支 / 工作树 / 批 / 外部作业 / 到期欠账;批 305)
+//        (批 305:git worktree 里的 --arm / --clear 另记一行进主 checkout 的 .claude/.batch-goal.worktrees.jsonl,主树 --history 并进来显示)
 //   node --no-warnings scripts/batch-goal.mjs --context            ⇒ 一行摘要 + 状态文件路径 + 内容哈希(批 298)
 //   node --no-warnings scripts/batch-goal.mjs --settle [<义务 id>]  ⇒ 卡住(连续判不了 ≥3 次)的义务转欠账(批 298)
 //   node --no-warnings scripts/batch-goal.mjs --repair-obligations ⇒ 按台账重建义务账状态文件(批 298;不改结论)
@@ -2939,6 +2941,81 @@ Promise.all(jobs.map(run)).then((codes) => { console.log(JSON.stringify(codes));
     const rows = b.rowsOf(SHARED(b.repo)).filter((x) => x.action);
     return [arms, clears, rows.filter((x) => x.action === "arm").map((x) => x.batch).sort(), rows.filter((x) => x.action === "clear").map((x) => x.batch).sort(), verifyChainOk(SHARED(b.repo))];
   }), ["[0,0,0,0]", "[0,0,0,0]", ["530", "531", "532", "533"], ["530", "531", "532", "533"], true]);
+  // ── ④ --handoff:交接文件从事实生成 ──
+  const DEBT = "## 在账欠账\n| # | 欠账 | 批 | 失效期 | 复核来源 | 出路 |\n|---|---|---|---|---|---|\n| D900 | 甲事 | 530 | **≤535** | r | o |\n| D901 | 乙事待用户裁 | 530 | **≤536** | r | o |\n| D902 | 丙事 | 530 | **≤560** | r | o |\n";
+  const sec = (txt, h) => { const i = txt.indexOf(`## ${h}`); if (i < 0) return null; const j = txt.indexOf("\n## ", i + 3); return txt.slice(i, j < 0 ? undefined : j); };
+  t("305 ④ 正例:实跑 --handoff(带远端、工作树、批、作业、欠账)⇒ 首行写生成时间与「由工具从事实生成」;每段都是查得到的事实", box305((b) => {
+    const J = path.join;
+    // 远端起名 up(不是 origin):核「远端名从 git 配置读、不写死」
+    const bare = J(b.tmp, "remote.git"); b.g(b.tmp, "init", "-q", "--bare", bare);
+    b.g(b.repo, "remote", "add", "up", bare); b.g(b.repo, "push", "-q", "-u", "up", "HEAD:refs/heads/main");
+    const br = String(b.g(b.repo, "symbolic-ref", "--short", "HEAD").stdout).trim();
+    if (br !== "main") { b.g(b.repo, "branch", "-q", "-m", br, "main"); b.g(b.repo, "branch", "-q", "-u", "up/main"); }
+    b.w(b.repo, "docs/gate-debts.md", DEBT); b.w(b.repo, "b.txt", "b\n"); b.commit(b.repo, "本地一笔");
+    const wt = addWt(b, "wt-h"); b.cliAt(wt, SIDE, "--arm", "540", "--cond", "工作树的批");
+    b.w(b.repo, "dirty.txt", "未跟踪\n");
+    // 作业目录:子进程的系统临时目录指到夹具里
+    const TMPD = J(b.tmp, "systmp"), JOBS = J(TMPD, "codex-run-jobs"); fs.mkdirSync(JOBS, { recursive: true });
+    const now = Date.now(), iso = (d) => new Date(now + d).toISOString();
+    const R1 = J(b.repo, "clipboard", "codex", "t-r1.md"), R2 = J(b.repo, "clipboard", "codex", "t-r2.md");
+    b.w(b.repo, "clipboard/codex/t-r1.md", "---\nx\n---\n读过的回件正文\n"); b.w(b.repo, "clipboard/codex/t-r2.md", "---\nx\n---\n没读的回件正文\n");
+    const job = (id, o) => fs.writeFileSync(J(JOBS, `${id}.json`), JSON.stringify({ id, task: J(b.repo, "t.md"), cwd: b.repo, timeoutMs: 900000, ...o }));
+    job("JREAD", { state: "done", startedAt: iso(-50 * 60e3), endedAt: iso(-40 * 60e3), resultAt: iso(-40 * 60e3), result: R1 });
+    job("JPEND", { state: "done", startedAt: iso(-30 * 60e3), endedAt: iso(-20 * 60e3), resultAt: iso(-20 * 60e3), result: R2 });
+    job("JRUN", { state: "running", startedAt: iso(-2 * 60e3), result: J(b.repo, "clipboard", "codex", "t-r3.md") });
+    job("JOTHER", { state: "running", startedAt: iso(-60e3), cwd: J(b.tmp, "elsewhere"), result: "x" });
+    const call = (id, name, input, out, d) => [{ type: "assistant", uuid: `a-${id}`, timestamp: iso(d), cwd: b.repo, message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } },
+      { type: "user", uuid: `r-${id}`, timestamp: iso(d + 500), cwd: b.repo, message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: out }] } }];
+    const launch = (id, J0, st, R, d) => call(id, "Bash", { command: "node scripts/codex-run.mjs --task t.md" }, `CODEX_JOB=${J0}\nCODEX_STATE=${st}\nCODEX_RESULT=${R}\nCODEX_END=${J0}\n`, d);
+    const f = fx305(now - 3 * 3600_000);
+    b.transcript(SID, [f.H(INS, 10), ...launch("toolu_l1", "JREAD", "done", R1, -45 * 60e3), ...call("toolu_r1", "Read", { file_path: R1 }, "1\t---\n2\tx\n3\t---\n4\t读过的回件正文", -35 * 60e3),
+      ...launch("toolu_l2", "JPEND", "done", R2, -25 * 60e3), ...launch("toolu_l3", "JRUN", "running", J(b.repo, "clipboard", "codex", "t-r3.md"), -60e3)]);
+    b.cli(SIDE, "--arm", "541", "--cond", "主树的批", "--check", "node -e \"console.log('okay')\"", "--expect", "okay", "--instruction", INS, "--finish-line", "测过就停", "--cap-usd", "5");
+    b.cli(SIDE, "--decision", "改用另一份台账"); b.cli(SIDE, "--outcome", "交接可生成");
+    const out = J(b.tmp, "out", "handoff.md");
+    const r = b.cli({ ...SIDE, TEMP: TMPD, TMP: TMPD, TMPDIR: TMPD }, "--handoff", "--out", out);
+    const txt = r.stdout, file = fs.existsSync(out) ? fs.readFileSync(out, "utf8") : null;
+    const s1 = sec(txt, "当前分支与工作区") || "", s2 = sec(txt, "全部 git worktree") || "", s3 = sec(txt, "批状态") || "", s4 = sec(txt, "在跑或未读的外部作业") || "", s5 = sec(txt, "到期未结的欠账") || "";
+    const first = txt.split("\n")[0];
+    return [r.status, first.startsWith("# 交接(生成于 ") && first.endsWith("——本文件由工具从事实生成,不含叙述") && Number.isFinite(Date.parse(first.slice(first.indexOf("于 ") + 2, first.indexOf("——") - 1))), file === txt,
+      s1.includes("分支:main"), /HEAD:[0-9a-f]{12} 本地一笔/.test(s1), s1.includes("工作区:不干净(已跟踪文件改动 0 个,未跟踪 1 个)"), s1.includes("未推送的提交:1(相对上游 up/main"),
+      s2.includes("(当前):分支 main"), /wt-h:分支 br-wt-h;HEAD [0-9a-f]{12};工作区 干净;批状态 批 540 未结清/.test(s2),
+      s3.includes("批号:541"), s3.includes("指令:「把开批脚本加上记指令这一项」"), s3.includes("终点线:测过就停"), s3.includes("花费 ≤ 5 美元"), s3.includes("1. 主树的批"), s3.includes("判据:$ node -e"),
+      s3.includes("541-D1「改用另一份台账」"), s3.includes("O1「交接可生成」"), s3.includes("主尺:人亲口说了 1 条"),
+      s4.includes("本会话发起的 codex 作业:3 个"), s4.includes("JPEND:已产出待读;结果件 "), s4.includes("JRUN:运行中"), !s4.includes("JREAD:"), s4.includes("另 1 个已读回"), !s4.includes("JOTHER"),
+      s5.includes("按批号 541 算") && s5.includes("2 条——【我做】D900(≤535);【需你裁】D901(≤536)"), !s5.includes("D902"),
+      !txt.includes("取不到")];
+  }), [0, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]);
+  t("305 ④ 反例:非 git 目录、没有会话号、没有批、没有债表 ⇒ 每一段都写「取不到(原因)」或事实状态,不留空、不编;退出 0", box305((b) => {
+    const ng = path.join(b.tmp, "plain"); fs.mkdirSync(ng);
+    const r = b.cliAt(ng, {}, "--handoff");
+    const txt = r.stdout;
+    const heads = ["当前分支与工作区", "全部 git worktree", "批状态", "在跑或未读的外部作业", "到期未结的欠账"];
+    const bodies = heads.map((h) => (sec(txt, h) || "").split("\n").slice(1).filter((l) => l.trim()));
+    return [r.status, txt.split("\n")[0].includes("本文件由工具从事实生成"), bodies.map((x) => x.length > 0), txt.includes("## 当前分支与工作区\n- 取不到("), txt.includes("## 全部 git worktree\n- 取不到("),
+      txt.includes("未武装(没有批状态文件)"), txt.includes("本会话发起的 codex 作业:取不到("), txt.includes("## 到期未结的欠账\n- 取不到(债表 ")];
+  }), [0, true, [true, true, true, true, true], true, true, true, true, true]);
+  t("305 ④ 反例:没配远端 / 多个远端都没配上游 / 远端上没有同名分支 ⇒ 未推送数写取不到并说清为什么(不猜推到哪个)", box305((b) => {
+    const un = (git) => unpushedOf(b.repo, "main", git);
+    const fake = (m) => (a) => { const k = a.join(" "); for (const [p, v] of m) if (k.startsWith(p)) return v; return { status: 1, stdout: "", stderr: "" }; };
+    const none = un(fake([["remote", { status: 0, stdout: "" }]]));
+    const many = un(fake([["remote", { status: 0, stdout: "a\nb\n" }]]));
+    const noRef = un(fake([["config --get branch.main.remote", { status: 0, stdout: "up\n" }]]));
+    const cfgd = un(fake([["config --get remote.pushDefault", { status: 0, stdout: "pub\n" }], ["rev-parse --verify -q refs/remotes/pub/main", { status: 0, stdout: "x" }], ["rev-list --count refs/remotes/pub/main..HEAD", { status: 0, stdout: "3\n" }]]));
+    return [none, many.includes("有 2 个远端(a、b),不猜"), noRef.includes("远端 up(配置)上没有 main 的跟踪引用"), cfgd.startsWith("3(相对 pub/main,远端名取自配置"), unpushedOf(b.repo, null)];
+  }), ["取不到(本仓没配远端)", true, true, true, "取不到(分离 HEAD,没有分支)"]);
+  t("305 ④ 反例:作业在本会话转录里取不到(没有会话号)⇒ 只列作业目录里本仓的作业与结果路径,写明「是否读过:未判」", box305((b) => {
+    const J = path.join, TMPD = J(b.tmp, "systmp"), JOBS = J(TMPD, "codex-run-jobs"); fs.mkdirSync(JOBS, { recursive: true });
+    fs.writeFileSync(J(JOBS, "JDONE.json"), JSON.stringify({ id: "JDONE", state: "done", startedAt: new Date(Date.now() - 60e3).toISOString(), cwd: b.repo, result: J(b.repo, "r.md"), task: "t.md" }));
+    const r = b.cli({ TEMP: TMPD, TMP: TMPD, TMPDIR: TMPD }, "--handoff");
+    const s4 = sec(r.stdout, "在跑或未读的外部作业") || "";
+    return [r.status, s4.includes("本会话发起的 codex 作业:取不到(取不到本会话的会话号"), s4.includes("JDONE:state=done;结果件 ") && s4.includes("r.md") && s4.includes("是否读过:未判")];
+  }), [0, true, true]);
+  t("305 ④ --out:写到的文件与打印的逐字相同;--out 指向一个目录 / 缺值 / 多余参数 ⇒ 退出 2,不写", box305((b) => {
+    const d = path.join(b.tmp, "adir"); fs.mkdirSync(d);
+    const a = b.cli(SIDE, "--handoff", "--out", d), c = b.cli(SIDE, "--handoff", "--out"), e = b.cli(SIDE, "--handoff", "多余");
+    return [a.status, /--out/.test(a.stderr), c.status, e.status];
+  }), [2, true, 2, 2]);
 }
 const verifyChainOk = (f) => { try { return verifyFileChain(f).ok; } catch { return false; } };
 
@@ -3383,6 +3460,29 @@ if (argv.includes("--ruler")) {
   process.exit(0);
 }
 
+if (argv.includes("--handoff")) {
+  // 批 305:交接文件从事实生成(只读;--out 写一个文件,写后回读核对)。各段的取数与「取不到」口径见 buildHandoff 头注。
+  const i = argv.indexOf("--handoff");
+  const rest = argv.filter((_, k) => k !== i);
+  let out = null;
+  if (rest.length) {
+    if (rest[0] !== "--out" || rest.length !== 2 || !String(rest[1] || "").trim() || /^--/.test(rest[1])) { console.error("用法: --handoff [--out <路径>]"); process.exit(2); }
+    out = path.resolve(rest[1]);
+    try { if (fs.statSync(out).isDirectory()) { console.error(`--out 指向的是一个目录:${out}——给一个文件路径`); process.exit(2); } } catch { /* 不存在 ⇒ 新建 */ }
+  }
+  const text = await buildHandoff();
+  process.stdout.write(text);
+  if (out) {
+    try {
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      fs.writeFileSync(out, text, "utf8");
+      if (fs.readFileSync(out, "utf8") !== text) throw new Error("回读与写入的内容不一致");
+      console.error(`已写入 ${out}(${Buffer.byteLength(text, "utf8")} 字节,已回读核对)`);
+    } catch (e) { console.error(`--out 写不进去:${out}(${e.code || e.message})`); process.exit(2); }
+  }
+  process.exit(0);
+}
+
 if (argv.includes("--arm")) {
   const batch = argv[argv.indexOf("--arm") + 1];
   let conds, checks;
@@ -3735,6 +3835,6 @@ if (argv.includes("--history")) {
 // ⚠️ 被 import 时到此**什么都不做**。原实现在这里无条件 `exit(2)`,
 //   于是守卫算对了也没用——调用方照样被这句用法错误杀掉(实测复现)。
 if (IS_MAIN) {
-  console.error("用法: --arm <批号> --cond \"…\" [--check \"命令\" [--expect \"子串\" | --expect-re \"正则\"]] [--force] | --decision \"<决定>\" | --no-decision \"<为什么本批没有决定>\" | --outcome \"<成果>\" | --withdraw <批号-Dn | On | 批号:On> --reason \"<理由>\" | --status | --context | --dry-check | --clear [--verdict \"N=达成|未达成|不适用[:理由]\"]… | --settle [<义务 id>] | --repair-obligations | --history [n] | --self-test");
+  console.error("用法: --arm <批号> --cond \"…\" [--check \"命令\" [--expect \"子串\" | --expect-re \"正则\"]] [--force] [--instruction \"<原话>\" [--instruction-session <会话号>] [--instruction-at <时刻>]] [--finish-line \"<终点线>\"] [--cap-usd <美元>] [--deadline <时刻>] | --ruler | --handoff [--out <路径>] | --decision \"<决定>\" | --no-decision \"<为什么本批没有决定>\" | --outcome \"<成果>\" | --withdraw <批号-Dn | On | 批号:On> --reason \"<理由>\" | --status | --context | --dry-check | --clear [--verdict \"N=达成|未达成|不适用[:理由]\"]… | --settle [<义务 id>] | --repair-obligations | --history [n] | --self-test");
   process.exit(2);
 }
