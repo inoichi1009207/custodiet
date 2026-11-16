@@ -184,11 +184,13 @@ node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
 
 它做的事:
 
-- 把闸件(`scripts/hook-stop-closure.mjs`、`scripts/batch-goal.mjs`、`scripts/lib/` 下的引擎件)、示例规矩文件(仓规矩 `AGENTS.md`、闸规矩 `docs/gate/AGENTS.md`,以及 `docs/archive/laws-2026-11/` 下仍被规则引用的归档示例)、`docs/noun-diary.md`、`docs/gate-debts.md`、红队 agent `.claude/agents/_gate-bypass-hunter.md` 拷进目标仓，并生成 `CLAUDE.md`(内容为 `@AGENTS.md`)。
-- 把 `Stop` 与 `SubagentStop` 两个 hook 合并进目标的 `.claude/settings.json`(按命令去重)。
+- 把 `scripts/` 下的闸与工作流脚本(收尾钩子 `hook-stop-closure.mjs`、开批脚本 `batch-goal.mjs`、`scripts/lib/` 下的引擎件、其余钩子脚本、验收与工作流工装；只有本安装器和 `check-private-identifiers.mjs` 不拷)、示例规矩文件(仓规矩 `AGENTS.md`、闸规矩 `docs/gate/AGENTS.md`,以及 `docs/archive/laws-2026-11/` 下仍被规则引用的归档示例)、`docs/noun-diary.md`、`docs/gate-debts.md`、红队 agent `.claude/agents/_gate-bypass-hunter.md` 与误拦猎手 `.claude/agents/_gate-false-block-hunter.md` 拷进目标仓，并生成 `CLAUDE.md`(内容为 `@AGENTS.md`)。
+- 把 `Stop` 与 `SubagentStop` 两个 hook 合并进目标的 `.claude/settings.json`(按命令去重)。其余钩子脚本(`hook-start-gate.mjs` 等)只拷不接，要用的自己加进 `settings.json`,接在哪个事件上见各脚本头注。
 - 把闸的运行时台账路径追加进目标的 `.gitignore`。
 - 生成《闸用语》`docs/gate-phrasebook.md`,在 `CLAUDE.md` 末尾加一段首尾标记圈住的托管块引用它(重跑只换标记之间的内容)。
-- 拷贝件已存在时不覆盖：内容不同时写旁件 `<名>.custodiet<扩展名>`,在 stdout 末行的 JSON 清单里逐个报出。`.claude/settings.json`、`.gitignore`、`CLAUDE.md` 是追加/合并，不是整文件替换。不提交、不联网、不碰 `~/.claude/`。
+- 拷贝件已存在时缺省不覆盖：内容不同时写旁件 `<名>.custodiet<扩展名>`,在 stdout 末行的 JSON 清单里逐个报出(这时目标仓里旧的那份仍是生效的那份)。
+- 加 `--overwrite` 做覆盖安装:`scripts/` 下已存在且内容不同的同名文件直接替换，清单里标 `replaced`,顶层 `overwrite.replaced` 列出全部被替换的路径。替换前先核这些路径在目标仓的 git 工作区是干净的：改了没提交、暂存了没提交、未跟踪、被 `.gitignore` 忽略，有任何一种就以退出码 7 拒绝并逐个列出，一个字节都不写。规矩文件(`AGENTS.md`、`docs/` 下的)和 `.claude/agents/` 下的不受这个开关影响，照旧只落旁件。
+- `.claude/settings.json`、`.gitignore`、`CLAUDE.md` 是追加/合并，不是整文件替换。不提交、不联网、不碰 `~/.claude/`。
 - 加 `--observe` 装成观察档：只记账、不阻断、不对模型输出(调试变量 `STOP_CLOSURE_STDOUT=1` 例外);示例仓规矩只落旁件 `AGENTS.custodiet.md`,`CLAUDE.md` 不引入它(《闸用语》照挂)。把 `.claude/custodiet-mode` 提交后**新开的会话**才进观察档，装闸的这个会话照常阻断。适合先在一个在用的仓里攒数据。切回阻断档：删掉 `.claude/custodiet-mode` 并提交，再不带 `--observe` 重跑一次安装器(示例仓规矩才落到根目录、`CLAUDE.md` 才引入它)。
 
 装完以后:
@@ -200,7 +202,7 @@ node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
 限制:
 
 - `/plugin install custodiet` 还装不了,`--mode plugin` 会以退出码 5 拒绝。
-- 开发件 `scripts/coverage-check.mjs`、`scripts/gate-migrate-check.mjs`、`scripts/lib/ledger-anchor.mjs` 不随安装器拷出，只在本仓里用。
+- `scripts/custodiet-init.mjs` 与 `scripts/check-private-identifiers.mjs` 不随安装器拷出，只在本仓里用。
 
 #### lanes(插件市场)
 
@@ -226,7 +228,7 @@ claude plugin install lanes --marketplace inoichi1009207/custodiet
 |---|---|---|
 | 收尾闸 | Stop 时对本轮的工具调用记录跑 31 条引擎规则(会拦的 7 条)和另外三样检查(A、R、DRIFT;A、R 也会拦),命中会拦的就不让本轮结束 | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
 | 批级完成条件 | 开工先立可核的验收条件，可带机器判据;`--clear` 时自己跑判据，不过就拒清 | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "成片已出" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
-| 规则验收 | 每条规则的正反例 + 变异验收，变异杀不死的用例不许上线(在本仓里跑) | `npm run gate:accept` |
+| 规则验收 | 每条规则的正反例 + 变异验收，变异杀不死的用例不许上线(在本仓里跑；先 `npm --prefix scripts/gate-deps install`,其中 windowsHide 检查要解析依赖) | `npm run gate:accept` |
 | 台账完整性链 | 三份台账带行级 hash 链，改写 / 插行 / 删中间行会红 | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
 | 外部锚(本仓内) | 把台账前缀指纹快照到 `~/.custodiet/`,锚点之前的改写或截断会红 | `node scripts/lib/ledger-anchor.mjs snapshot` |
 | 逃生口 | 每条阻断规则可单独关(P 项没有) | `STOP_CLOSURE_BLOCK_<id>=0` |

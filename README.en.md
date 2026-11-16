@@ -184,11 +184,13 @@ node custodiet/scripts/custodiet-init.mjs --target <your repo root> --mode copy
 
 What it does:
 
-- Copies the gate files (`scripts/hook-stop-closure.mjs`, `scripts/batch-goal.mjs`, the engine files under `scripts/lib/`), the sample rule files (repo rules `AGENTS.md`, gate rules `docs/gate/AGENTS.md`, and the archived samples under `docs/archive/laws-2026-11/` that rules still point to), `docs/noun-diary.md`, `docs/gate-debts.md` and the red-team agent `.claude/agents/_gate-bypass-hunter.md` into the target, and creates `CLAUDE.md` (content: `@AGENTS.md`).
-- Merges the `Stop` and `SubagentStop` hooks into the target's `.claude/settings.json` (deduplicated by command).
+- Copies the gate and workflow scripts under `scripts/` (the closing hook `hook-stop-closure.mjs`, the batch script `batch-goal.mjs`, the engine files under `scripts/lib/`, the other hook scripts, and the acceptance and workflow tools; only this installer and `check-private-identifiers.mjs` are left out), the sample rule files (repo rules `AGENTS.md`, gate rules `docs/gate/AGENTS.md`, and the archived samples under `docs/archive/laws-2026-11/` that rules still point to), `docs/noun-diary.md`, `docs/gate-debts.md` the red-team agent `.claude/agents/_gate-bypass-hunter.md` and the false-block hunter `.claude/agents/_gate-false-block-hunter.md` into the target, and creates `CLAUDE.md` (content: `@AGENTS.md`).
+- Merges the `Stop` and `SubagentStop` hooks into the target's `.claude/settings.json` (deduplicated by command). The other hook scripts (`hook-start-gate.mjs` and so on) are copied but not wired; add the ones you want to `settings.json` yourself — each script's header says which event it attaches to.
 - Appends the gate's runtime ledger paths to the target's `.gitignore`.
 - Generates the gate phrasebook `docs/gate-phrasebook.md` and appends a marker-delimited managed block to `CLAUDE.md` that imports it (re-runs only replace what is between the markers).
-- Never overwrites copied files: when contents differ it writes a sibling `<name>.custodiet<ext>` and lists each one in the JSON manifest on the last line of stdout. `.claude/settings.json`, `.gitignore` and `CLAUDE.md` are appended to or merged, not replaced. No commits, no network, no changes under `~/.claude/`.
+- By default it does not overwrite copied files: when contents differ it writes a sibling `<name>.custodiet<ext>` and lists each one in the JSON manifest on the last line of stdout (the older copy in the target stays the one in effect).
+- With `--overwrite`, files under `scripts/` that already exist with different contents are replaced; the manifest marks them `replaced` and the top-level `overwrite.replaced` lists every replaced path. Before replacing anything it checks that those paths are clean in the target's git working tree: modified, staged, untracked or ignored by `.gitignore` — any of these makes it refuse with exit code 7, list each path, and write nothing. Rule files (`AGENTS.md` and everything under `docs/`) and the files under `.claude/agents/` are not affected by this switch; they still only get a sibling file.
+- `.claude/settings.json`, `.gitignore` and `CLAUDE.md` are appended to or merged, not replaced. No commits, no network, no changes under `~/.claude/`.
 - With `--observe` it installs in observe mode: alerts are logged, nothing is blocked and nothing is shown to the model (except under the debug variable `STOP_CLOSURE_STDOUT=1`); the sample repo rules go to the sibling `AGENTS.custodiet.md` and `CLAUDE.md` does not import it (the phrasebook is still imported). Observe mode applies only to sessions started after `.claude/custodiet-mode` is committed; the session that installs the gate is still blocked as usual. Use it to collect data in a repo already in use. To switch back to blocking: delete `.claude/custodiet-mode`, commit, and re-run the installer without `--observe` (that places the sample repo rules at the root and imports them from `CLAUDE.md`).
 
 After installing:
@@ -200,7 +202,7 @@ After installing:
 Limits:
 
 - `/plugin install custodiet` does not work yet; `--mode plugin` refuses with exit code 5.
-- The dev files `scripts/coverage-check.mjs`, `scripts/gate-migrate-check.mjs` and `scripts/lib/ledger-anchor.mjs` are not copied by the installer; they work only inside this repo.
+- `scripts/custodiet-init.mjs` and `scripts/check-private-identifiers.mjs` are not copied by the installer; they are used only inside this repo.
 
 #### lanes (plugin marketplace)
 
@@ -226,7 +228,7 @@ Or in two steps: `/plugin marketplace add inoichi1009207/custodiet`, then `/plug
 |---|---|---|
 | Stop gate | At Stop, runs 31 engine rules (7 blocking) and three more checks (A, R, DRIFT; A and R also block) over the turn's tool-call record; a blocking hit keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
 | Batch completion conditions | Set checkable acceptance conditions up front, optionally with a check command; `--clear` runs the checks and refuses on failure | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "render done" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
-| Rule acceptance | Positive/negative cases + mutation acceptance per rule; cases that do not kill their mutations cannot ship (run in this repo) | `npm run gate:accept` |
+| Rule acceptance | Positive/negative cases + mutation acceptance per rule; cases that do not kill their mutations cannot ship (run in this repo; first `npm --prefix scripts/gate-deps install` — the windowsHide check in it needs the parser) | `npm run gate:accept` |
 | Ledger integrity chain | Three ledgers with per-line hash chains; rewrite / insert / delete-middle turns red | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
 | External anchor (in this repo) | Snapshots ledger prefix fingerprints into `~/.custodiet/`; rewriting or truncating before the anchor turns red | `node scripts/lib/ledger-anchor.mjs snapshot` |
 | Escape hatches | Each blocking rule can be switched off on its own (P has none) | `STOP_CLOSURE_BLOCK_<id>=0` |
