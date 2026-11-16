@@ -2831,6 +2831,14 @@ import { ledgerAppend, verifyFile as ledgerVerify } from "./lib/ledger-chain.mjs
 import { readTouched, selfTest as touchSelfTest } from "./lib/gate-touch.mjs";   // 批 279「修闸 tag」
 // 批 299 / 299b:写入三态观测(287 设计 2.5;判法见 299b-design)。本文件只把观测落账(.claude/.write-state.jsonl),不改任何规则的判决
 import { observeWrites, collectInterval, ledgerRow as writeStateRow, selfTest as writeStateSelfTest } from "./lib/write-state.mjs";
+// 批 305:安装方名单(gate-install.json 的 deployScripts / privateRepos)。hook 读一次、注入 ctx.installNames;规则不自读磁盘。
+import { readInstallConfig, installNames as installNamesOf, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
+/** 读**本脚本所在 checkout 根**的那份配置里的两份名单(不取进程 cwd:配置随仓走,会话可能停在别的目录)。
+ *  没有这份文件 / 读不了 / 解析坏 / 键写错 ⇒ 对应名单为空(闸不因配置坏而多拦;配置坏由 batch-goal 那边出声)。readFile 可注入(自测)。 */
+export function readInstallNames(root = fileURLToPath(new URL("..", import.meta.url)), readFile = (f) => fs.readFileSync(f, "utf8")) {
+  return installNamesOf(readInstallConfig((f) => readFile(path.join(root, f)), INSTALL_CONFIG_FILE));
+}
+let _installNamesMemo;
 
 /** 反推「闸机件」清单:凡**改了它就可能改变闸的行为**的文件。
  *
@@ -3120,6 +3128,13 @@ export function run(transcriptPath, ctx = {}) {
         //   自测进程不注入(否则新装闸、还没立过批的仓,自测里 K0 全部静音而红;公开树 gate:accept 实撞)
         //   红队 a363e144 BP-1:按 ctx.live 门控(离线 --audit / --dry-run 读的是现在的盘面,套到历史轮上是错配)
         batchEverArmed: ctx.batchGoal !== undefined || !ctx.live || process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : batchEverArmedHere(),
+        // 批 305:安装方名单(W 的部署脚本文件名、DP 的私仓仓名)。同一注入纪律——hook 读一次(进程内缓存)、规则纯函数。
+        //   调用方注入了就用注入的(夹具 / 回放器:回放器读一次、两版共用);自测进程(STOP_CLOSURE_SELFTEST=1,回放同此)不读盘
+        //   ⇒ undefined ⇒ 两个空名单(测出来的东西不得取决于仓根碰巧有没有那份配置)。
+        //   实时与离线(--audit / --dry-run)都读:名单是随仓提交的安装方事实,不是逐轮变化的状态;
+        //   离线读到的是今天的名单——历史轮里部署脚本若叫过别的名字,那几轮的 W 读数偏松(照实写的天花板)。
+        installNames: ctx.installNames !== undefined ? ctx.installNames
+          : (process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : (_installNamesMemo ??= readInstallNames())),
         // 批 258:实时路径给批状态补 `turnBatchStart`(本轮开始时正开着的那一批的起点;W 按它切交付物)
         batchGoal: ctx.batchGoal !== undefined ? ctx.batchGoal : (() => {
           const g0 = readBatchGoal();
@@ -4860,6 +4875,32 @@ function selfTest() {
     const aBlock = (fs2) => fs2.some((f) => f.id === "A" && f.block);
     sc("未迁的 A 在引擎接管下仍阻断", aBlock(aOn), true);
     sc("且与回退旧实现完全一致", aBlock(aOn) === aBlock(aOff), true);
+
+    // 批 305:安装方名单这条通道真的从 run() 接到了规则手里(造了通道不接线是本仓的老毛病,见上方 priorEntries 那段)
+    {
+      const turnD = [{ type: "assistant", message: { content: [
+        { type: "text", text: "部署完收工。" },
+        { type: "tool_use", name: "Bash", input: { command: "pwsh -File scripts/deploy-prod.ps1" } },
+        { type: "tool_use", name: "Bash", input: { command: "node --no-warnings scripts/batch-goal.mjs --clear" } },
+      ] } }];
+      const wHit = (extra) => run(null, { text: "部署完收工。", turn: turnD, ...extra }).some((f) => f.id === "W");
+      sc("305 名单通道:run() 把注入的 installNames 交到规则手里——配了部署脚本名 ⇒ W 响",
+        wHit({ installNames: { deployScripts: ["deploy-prod.ps1"], privateRepos: [] } }), true);
+      sc("305 名单通道:自测进程不读盘(没注入 ⇒ 空名单)/ 注入空名单 ⇒ 部署脚本那一支不响",
+        [wHit({}), wHit({ installNames: { deployScripts: [], privateRepos: [] } })].join(), "false,false");
+      // 读盘那一半(readInstallNames,假读文件):有配置 / 没有文件 / 解析坏 / 键写错
+      const rd = (text, code) => JSON.stringify(readInstallNames("/repo", () => { if (code) { const e = new Error(code); e.code = code; throw e; } return text; }));
+      const EMPTY = '{"deployScripts":[],"privateRepos":[]}';
+      sc("305 名单读盘:配置里两键都写了 ⇒ 原样取到",
+        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: ["deploy-prod.ps1"], privateRepos: ["app-private"] })), '{"deployScripts":["deploy-prod.ps1"],"privateRepos":["app-private"]}');
+      sc("305 名单读盘:没有配置文件 / 读不了 / 不是 JSON / 有未知键(整份判坏)⇒ 两个空名单,不抛",
+        [rd("", "ENOENT"), rd("", "EBUSY"), rd("{oops"), rd(JSON.stringify({ format: "gate-install/v1", deployScript: ["x.ps1"] }))].join(""), EMPTY.repeat(4));
+      sc("305 名单读盘:一个键形状不对 ⇒ 只那一个归空,另一个照取",
+        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: "deploy-prod.ps1", privateRepos: ["app-private"] })), '{"deployScripts":[],"privateRepos":["app-private"]}');
+      let asked = null;
+      readInstallNames("/repo/x", (f) => { asked = String(f).replace(/\\/g, "/"); return "{}"; });
+      sc("305 名单读盘:读的是给定根下的 gate-install.json(不是进程 cwd)", asked, "/repo/x/gate-install.json");
+    }
 
     // ⚠️ **干净通过时 stdout 必须是空的**(2026-08-20 实撞)。
     //   `hookSpecificOutput.additionalContext` 的官方语义是「**keep the turn going**」

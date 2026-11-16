@@ -1226,8 +1226,11 @@ function debtTableWarn() {
 }
 
 // 自测用的安装方配置:HostApp 的取值,写成字面量(不读 cwd 那份,自测在哪跑都一样)。沙盒仓里写同一份进 gate-install.json。
+//   批 305:两份名单键(deployScripts / privateRepos)用**中性占位名**——真名是安装方的私有事实,不进闸仓;
+//   所以「仓里那份与字面量逐项相等」那条只比路径四项,名单两项只核形状(解析得出、没有告警),不比名字。
 const TEST_INSTALL_JSON = JSON.stringify({ format: "gate-install/v1", diary: "docs/product-diary.md", adrDir: "docs/adr", debtTable: "docs/gate-debts.md",
-  loadBearingExtra: ["^docs/gate/AGENTS\\.md$", "^docs/laws/", "^docs/archive/laws-[^/]+/(?:collab|reporting|constitution-[\\w-]+)\\.md$", "^scripts/verify-prod\\.mjs$", "^docs/(?:constraint|tool)-register\\.md$"] }, null, 2) + "\n";
+  loadBearingExtra: ["^docs/gate/AGENTS\\.md$", "^docs/laws/", "^docs/archive/laws-[^/]+/(?:collab|reporting|constitution-[\\w-]+)\\.md$", "^scripts/verify-prod\\.mjs$", "^docs/(?:constraint|tool)-register\\.md$"],
+  deployScripts: ["deploy-prod.ps1"], privateRepos: ["app-private"] }, null, 2) + "\n";
 
 function selfTest() {
   const cases = [];
@@ -1656,6 +1659,34 @@ function oblSelfTest(t, sandbox) {
   const K = parseInstallConfig(TEST_INSTALL_JSON);
   t("298 配置:HostApp 那份解析成功、取值照旧", [K.found, K.diary, K.adrDir, K.debtTable, K.loadBearingExtra.length], [true, "docs/product-diary.md", "docs/adr", "docs/gate-debts.md", 5]);
   t("298 配置:仓里那份 gate-install.json 与自测字面量逐项相等(仓里没有这份文件 ⇒ 不比)", (() => { const f = fileURLToPath(new URL("../gate-install.json", import.meta.url)); if (!fs.existsSync(f)) return [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]; const r = parseInstallConfig(fs.readFileSync(f, "utf8")); return [r.diary, r.adrDir, r.debtTable, r.loadBearingSrc]; })(), [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]);
+  // ── 批 305:两份名单键(部署脚本文件名 / 私仓仓名)──
+  t("305 配置:字面量里的两份名单解析得出、没有告警", [K.deployScripts, K.privateRepos, K.warnings], [["deploy-prod.ps1"], ["app-private"], []]);
+  t("305 配置:仓里那份 gate-install.json 的两份名单形状对(解析不坏、没有告警;名字是安装方的事,不与字面量比;仓里没有这份文件 ⇒ 不核)", (() => {
+    const f = fileURLToPath(new URL("../gate-install.json", import.meta.url)); if (!fs.existsSync(f)) return [true, true, []];
+    const r = parseInstallConfig(fs.readFileSync(f, "utf8")); return [Array.isArray(r.deployScripts), Array.isArray(r.privateRepos), r.warnings || [r.error]]; })(), [true, true, []]);
+  {
+    const pc = (o) => parseInstallConfig(JSON.stringify({ format: "gate-install/v1", ...o }));
+    t("305 配置:缺键 / null ⇒ 空名单、无告警、不判坏", [{}, { deployScripts: null, privateRepos: null }].map((o) => { const r = pc(o); return [r.error || null, r.deployScripts, r.privateRepos, r.warnings]; }), [[null, [], [], []], [null, [], [], []]]);
+    t("305 配置:没有配置文件 ⇒ 两个空名单", (() => { const r = readInstallConfig(() => { const e = new Error("no"); e.code = "ENOENT"; throw e; }); return [r.deployScripts, r.privateRepos, r.warnings]; })(), [[], [], []]);
+    t("305 配置:值类型不对(字符串 / 对象 / 含数字 / 含空串)⇒ 那一键按空名单 + 一行告警,整份不判坏、另一键照取",
+      [{ deployScripts: "deploy-prod.ps1", privateRepos: ["app-private"] }, { deployScripts: { a: 1 } }, { privateRepos: ["app-private", 7] }, { deployScripts: ["deploy-prod.ps1", " "] }]
+        .map((o) => { const r = pc(o); return [r.error || null, r.deployScripts, r.privateRepos, r.warnings.length]; }),
+      [[null, [], ["app-private"], 1], [null, [], [], 1], [null, [], [], 1], [null, [], [], 1]]);
+    t("305 配置:部署脚本项带目录 / 私仓项带属主或地址 ⇒ 同样按空名单 + 告警(名单里只写名字)",
+      [{ deployScripts: ["scripts/deploy-prod.ps1"] }, { deployScripts: ["scripts\\deploy-prod.ps1"] }, { privateRepos: ["x/app-private"] }, { privateRepos: ["https://github.com/x/app-private.git"] }]
+        .map((o) => { const r = pc(o); return [r.deployScripts, r.privateRepos, r.warnings.length]; }), [[[], [], 1], [[], [], 1], [[], [], 1], [[], [], 1]]);
+    t("305 配置:归一——去首尾空白、大小写不同的重复项只留一个、私仓名结尾的 .git 去掉",
+      (() => { const r = pc({ deployScripts: [" deploy-prod.ps1 ", "Deploy-Prod.PS1", "release.sh"], privateRepos: ["app-private.git", "App-Private"] }); return [r.deployScripts, r.privateRepos, r.warnings]; })(),
+      [["deploy-prod.ps1", "release.sh"], ["app-private"], []]);
+    t("305 配置:告警文字点名是哪个键、后果是什么", (() => { const w = pc({ privateRepos: "app-private" }).warnings[0] || ""; return [/privateRepos/.test(w), /空名单/.test(w), /判据不响/.test(w)]; })(), [true, true, true]);
+    t("305 配置:名单不进义务快照(义务核对不读它们;旧快照比对不变)", (() => { const s = snapshotConfig(K); return ["deployScripts" in s, "privateRepos" in s, "warnings" in s]; })(), [false, false, false]);
+    t("305 配置:并基点版时名单与告警跟现行版走", (() => { const m = mergeInstallConfig(pc({ deployScripts: ["a.ps1"], privateRepos: "坏" }), K); return [m.deployScripts, m.privateRepos, m.warnings.length]; })(), [["a.ps1"], [], 1]);
+  }
+  t("305 --status:名单键写错 ⇒ 打一行告警、退出码照旧 0;写对了 ⇒ 没有这行", [
+    sandbox(({ cli }) => { const r = cli("--status"); return [r.status, /⚠ 安装方配置:.*deployScripts.*空名单/.test(r.stdout)]; }, { config: JSON.stringify({ format: "gate-install/v1", deployScripts: "deploy-prod.ps1" }) }),
+    sandbox(({ cli }) => { cli("--arm", "305", "--cond", "甲"); const r = cli("--status"); return [r.status, /⚠ 安装方配置:.*privateRepos.*空名单/.test(r.stdout)]; }, { config: JSON.stringify({ format: "gate-install/v1", privateRepos: [1] }) }),
+    sandbox(({ cli }) => { const r = cli("--status"); return [r.status, /⚠ 安装方配置/.test(r.stdout)]; }),
+  ], [[0, true], [0, true], [0, false]]);
   t("298 配置:未知键(拼错 diray)⇒ 整份判坏", !!parseInstallConfig(JSON.stringify({ format: "gate-install/v1", diray: "x.md" })).error, true);
   t("298 配置:路径带 .. / 绝对路径 ⇒ 判坏", [!!parseInstallConfig(JSON.stringify({ format: "gate-install/v1", diary: "../x.md" })).error, !!parseInstallConfig(JSON.stringify({ format: "gate-install/v1", adrDir: "/abs" })).error], [true, true]);
   t("298 配置:format 不对 / 不是 JSON ⇒ 判坏", [!!parseInstallConfig("{}").error, !!parseInstallConfig("{oops").error], [true, true]);
@@ -2530,6 +2561,8 @@ function oblRead(g) {
   return { kind: snap.kind, why: snap.why, dir: sd.dir, view: oblView(OB.TRUSTED.has(snap.kind) ? snap : null, g, oblCtx()) };
 }
 function printOblStatus(g) {
+  // 批 305:安装方配置里的名单键(deployScripts / privateRepos)写错了不判坏整份配置,只是那一支判据不响——在这里出声(--status 的两条路径都经过本函数)
+  for (const w of arr(installConfig().warnings)) console.log(`  ⚠ 安装方配置:${w}`);
   const o = oblRead(g);
   const v = o.view;
   console.log(`  义务账(${o.dir ? path.join(o.dir, "state.json") : "取不到"}):${OB.TRUSTED.has(o.kind) ? "可信" : `判不了(${o.kind}:${o.why})——--clear 会拒`}`);
