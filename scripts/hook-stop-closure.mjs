@@ -3471,7 +3471,8 @@ export function hintDeferWhy(findings, { yielding = false, root = ".", sid, entr
   return null;
 }
 
-function emit(findings, streak = 0, opts = {}) {
+/** 导出只为跨钩子的全程自测(hook-start-gate.selftest.mjs 的 Z 组:真 emit 寄存 → 真开工钩子取走);生产只经下方主块调用。 */
+export function emit(findings, streak = 0, opts = {}) {
   // D40:与 run() 同一纪律——落盘台账(心跳/报警分母)只认显式 `opts.live`,不再嗅 argv。
   const live = opts.live === true;
   // 批 292(287 设计 2.8;用户 11-06「只是改成只提醒不阻断的话会不会依然继续污染上下文?」):
