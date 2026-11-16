@@ -5703,7 +5703,7 @@ function selfTest() {
           hp("305 DP 远端格:远端名恰好等于名单里的名字 ⇒ 认;只是相像(前后多字)⇒ 不认",
             ["git push app-private main", "git push app-private", "git push my-app-private main", "git push app-private-mirror main", "git push app-private2 main"].map((c) => sp(c)).join(""), "11000");
           hp("305 DP 远端格:别人的 -private 仓 / 分支名 / refspec / -o 的值 / 提交信息 / 别的子命令里出现同样的字 ⇒ 不认",
-            ["git push https://github.com/someone/notes-private.git main", "git push origin feature/keep-notes-private", "git push origin feature/app-private", "git push origin app-private",
+            ["git push https://github.com/acme/notes-private.git main", "git push origin feature/keep-notes-private", "git push origin feature/app-private", "git push origin app-private",
               "git push upstream main:refs/heads/app-private", "git push -o note=app-private upstream main", "git commit -m \"push to app-private later\"",
               "git remote add app-private https://github.com/x/app-private.git", "gh repo view x/app-private", "git push https://github.com/x/app-private-mirror.git main",
               "git push https://github.com/app-private/tools.git main"].map((c) => sp(c)).join(""), "00000000000");
@@ -5727,14 +5727,14 @@ function selfTest() {
             const hit = run(NAMES);
             // 不追探针:别仓里推的不是名单里的仓(哪怕名字以 -private 结尾、哪怕分支 / refspec / 选项值里出现名单里的字)
             const AWAY = [
-              `cd ${other} && git push https://github.com/someone/notes-private.git main`,
+              `cd ${other} && git push https://github.com/acme/notes-private.git main`,
               // 远端名用 upstream:origin / custodiet 是「确知公开」的字面名,推它们本来就不算,当不了证人
               `cd ${other} && git push upstream feature/keep-notes-private`,
               `cd ${other} && git push upstream feature/app-private`,
               `cd ${other} && git push upstream main:refs/heads/app-private`,
               `cd ${other} && git push -o note=app-private upstream main`,
               `cd ${other} && git push https://github.com/x/app-private-mirror.git main`,
-              `git -C ${other} push https://github.com/someone/notes-private.git`,
+              `git -C ${other} push https://github.com/acme/notes-private.git`,
             ];
             // 仍然追:别仓里按地址 / 按远端名推的就是名单里的仓
             const MINE = [
@@ -5753,7 +5753,7 @@ function selfTest() {
             hp("305 DP 别仓:名单为空 / 没接名单通道 ⇒ 短路不生效(按地址推那个仓也不追),别仓判定照旧",
               [vec(run([]), MINE), vec(run(undefined), MINE)], ["00000000", "00000000"]);
             hp("305 DP 本仓:不在别仓时名单不影响结论(推别人的 -private 仓照算;推公开远端照放)",
-              [hit("git push https://github.com/someone/notes-private.git main"), hit("git push app-private main"), hit("git push origin main"), run([])("git push https://github.com/someone/notes-private.git main")], [1, 1, 0, 1]);
+              [hit("git push https://github.com/acme/notes-private.git main"), hit("git push app-private main"), hit("git push origin main"), run([])("git push https://github.com/acme/notes-private.git main")], [1, 1, 0, 1]);
             // 变异:各拧断一处,上面两组读数必须变(拧断就红)
             const FAMILY = (s) => /[\/:][\w.-]+-private(?:\.git)?(?=$|[\s"'])/i.test(s);
             const mut = {
