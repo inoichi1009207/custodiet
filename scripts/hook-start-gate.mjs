@@ -396,4 +396,35 @@ if (hookEvent === "PreToolUse") {
 // 批 294:UserPromptSubmit 侧一律「同会话、同状态、同内容只说一次」。
 //   槽 = goalState|msg,值 = 正文指纹 ⇒ 武装 / 结清(必达点③)或内容跟**上次送的**不一样才会再说。
 //   必达点①(会话第一条消息)由按会话分账满足:新会话的账是空的,第一条一定说(SessionStart 已说过同内容则不重复)。
-sayOnce(msgText());
+//
+// 批 305(设计稿第三节第 5 项):收尾闸的「只提示」在交互会话里不再当轮续轮,寄存到 `.claude/.gate-pending-hints/`,
+//   由这里在下一次 UserPromptSubmit 取走、与开工上下文合成**一次**输出注入,然后清掉(lib/gate-hint-relay.mjs 是唯一实现)。
+//   每次都先打「读端在场」标记——收尾钩子只在看见这个标记时才寄存(没接本钩子的仓永远走老通道,提示不会寄存了没人取)。
+//   顺序同上:**先输出、后记账**(commit 在输出之后;中途出事 ⇒ 下次再送一遍,多送方向)。
+//   别的会话留下、超期没人取的提示在这里记进丢弃账后清掉(会话换了的情形)。
+//   子代理(带 agent_id)不取也不打标记:注入进的会是子代理的上下文(同 PreToolUse 分支的口径)。
+//   本段任何一步出错 ⇒ 只当没有可送的提示,开工上下文照旧(fail-open:不许拖垮开工提醒)。
+let relayTake = null;
+if (sessionId && !payloadObj.agent_id) {
+  try {
+    const relay = await import("./lib/gate-hint-relay.mjs");
+    const ROOT_DIR = fileURLToPath(new URL("..", import.meta.url));
+    relay.markReceiver(ROOT_DIR, sessionId);
+    relay.sweepExpired(ROOT_DIR, sessionId);
+    relayTake = relay.takeHints(ROOT_DIR, sessionId);
+  } catch { relayTake = null; }
+}
+{
+  const startText = msgText();
+  const slot = `${goalState}|msg`;
+  const sayStart = !!startText && shouldSay(sessionId, slot, textKey(startText));
+  const parts = [];
+  if (sayStart) parts.push(startText);
+  if (relayTake && relayTake.text) parts.push(relayTake.text);
+  if (parts.length) {
+    if (sayStart) pruneOld(Date.now());   // 慢操作放在输出之前(红队 294-r3 BP-12)
+    say(parts.join("\n\n"));
+    if (sayStart) record(sessionId, slot, textKey(startText));
+  }
+  try { if (relayTake) relayTake.commit(); } catch { /* commit 自己不抛;防御 */ }
+}

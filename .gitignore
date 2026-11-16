@@ -9,4 +9,6 @@
 .claude/.hook-payload-keys.log
 .claude/.p-head/
 .claude/.gate-replay/
+.claude/.gate-pending-hints/
+.claude/.gate-hints-dropped.jsonl
 node_modules/

@@ -68,6 +68,9 @@ const FILES = [
   "scripts/lib/write-effects.mjs",
   // 0.9.6:gate-rules.mjs / hook-stop-closure.mjs 顶部 import 它(P 的「修闸 tag」判据)。本包不带记账钩子 ⇒ 账不存在 ⇒ 按「碰过」算,P 行为同前。
   "scripts/lib/gate-touch.mjs",
+  // 批 305:收尾钩子与开工钩子都静态 import 它(「只提示」延后到下一条用户消息送达:寄存 / 取走 / 过期记账的唯一实现)。
+  //   只接了收尾钩子的仓(安装器缺省)里它不起作用:没有读端在场标记 ⇒ 提示照旧走当轮通道。
+  "scripts/lib/gate-hint-relay.mjs",
   // 0.10.0:收尾钩子与开批脚本静态 import 的五件(此前公开树缺它们)+ 写入检查的自测
   "scripts/lib/write-state.mjs",
   "scripts/lib/install-config.mjs",
