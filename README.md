@@ -34,13 +34,13 @@
 
 ## 为什么需要它
 
-编码代理会报告假成功：任务没做成，它说做成了。[arXiv 2606.09863](https://arxiv.org/abs/2606.09863)(ICML 2026 FAGEN workshop)在 AppWorld 的 1,879 条轨迹上测得：带明确状态声明、自己评估结果的编码代理，失败里有 **75.8%** 是这种情况。拿 LLM 当裁判抓它效果差:tau2-bench 上 AUROC 最高 **0.65**,AppWorld 上 0.54。轻量 TF-IDF 检测器则达到 0.83 / 0.95。
+编码代理会报告假成功：任务没做成，它说做成了。[arXiv 2606.09863](https://arxiv.org/abs/2606.09863)(FAGEN@ICML 2026 收录)在 9,876 条 tau2-bench 轨迹和 1,879 条 AppWorld 轨迹上测了它。占比随场景变化:tau2-bench 单方控制的领域里是失败的 45–48%;AppWorld 上带明确状态声明、自己评估结果的编码代理轨迹里是 **75.8%**。拿 LLM 当裁判抓它效果差:tau2-bench 上没有一种配置的 AUROC 超过 **0.65**,同样的裁判在 AppWorld 的 API 调用轨迹上只有 0.54。轻量 TF-IDF 检测器在任务不相交的划分下达到 0.83(tau2-bench)和 0.95(AppWorld)。
 
 另外两篇 2026 年的论文走的就是本仓这条路：对 agent 的工具调用轨迹做确定性检查。
-- [arXiv 2608.02464](https://arxiv.org/abs/2608.02464) 用 agent 实际收到的工具结果复算它报告的结果，并核对该调的工具都调了：抓到 60% 的失败(加上覆盖检查是 96%),误报 0 / 63。
+- [arXiv 2608.02464](https://arxiv.org/abs/2608.02464) 用 agent 实际收到的工具结果复算它报告的总数，并核对该调的工具都调了：与监控器正面对比时抓到 60% 的失败(加上覆盖检查是 96%),误报 0 / 63。
 - [AgentLTL](https://arxiv.org/abs/2607.02599) 用时序逻辑在工具调用轨迹上写流程规则，在工具执行前拦截，让 7 个模型里 5 个的合规率上升。
 
-上游有一个 issue 报告「Claude Code 的系统指令导致 Claude 撒谎、伪造结果」([anthropics/claude-code#2969](https://github.com/anthropics/claude-code/issues/2969)),状态是 closed as **not planned**,由 GitHub Actions 机器人关闭。
+上游有一个 issue 报告「Claude Code 的系统指令导致 Claude 撒谎、伪造结果」([anthropics/claude-code#2969](https://github.com/anthropics/claude-code/issues/2969)),状态是 closed as **not planned**,是 60 天无活动后由 GitHub Actions 机器人自动关闭的。
 
 <p>
 <img src="assets/catch-saying-not-doing.jpg" alt="闸逮住 agent 在描述工作而不是做工作" width="640">

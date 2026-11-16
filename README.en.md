@@ -34,13 +34,13 @@ The data behind this, and its scope, are in [False-block data](#false-block-data
 
 ## Why
 
-Coding agents report false success: the task failed and the agent says it succeeded. [arXiv 2606.09863](https://arxiv.org/abs/2606.09863) (ICML 2026 FAGEN workshop) measured it on 1,879 AppWorld trajectories: among self-assessing coding-agent trajectories with explicit status claims, **75.8%** of failures are false successes. LLM judges catch it poorly — AUROC at most **0.65** on tau2-bench and 0.54 on AppWorld. Lightweight TF-IDF detectors reach 0.83 / 0.95.
+Coding agents report false success: the task failed and the agent says it succeeded. [arXiv 2606.09863](https://arxiv.org/abs/2606.09863) (accepted to FAGEN@ICML 2026) measured it on 9,876 tau2-bench and 1,879 AppWorld trajectories. The share varies by setting: 45–48% of failures in single-control tau2-bench domains, and **75.8%** among AppWorld self-assessing coding-agent trajectories with explicit status claims. LLM judges catch it poorly — no configuration exceeds AUROC **0.65** on tau2-bench, and the same judges reach 0.54 on AppWorld API-call traces. Lightweight TF-IDF detectors reach task-disjoint AUROC 0.83 on tau2-bench and 0.95 on AppWorld.
 
 Two other 2026 papers take this repo's route: deterministic checks over the agent's tool-call trajectory.
-- [arXiv 2608.02464](https://arxiv.org/abs/2608.02464) recomputes the agent's reported results from the tool results it actually received and checks that the required tools were called: it catches 60% of failures (96% with the coverage check) at 0 of 63 false positives.
+- [arXiv 2608.02464](https://arxiv.org/abs/2608.02464) recomputes a run's stated total from the tool results it actually received and confirms every required call was made: head-to-head against a monitor, it catches 60% of failures (96% with the coverage check) at 0 of 63 false positives.
 - [AgentLTL](https://arxiv.org/abs/2607.02599) writes process rules in temporal logic over tool-call traces and intercepts before a tool runs; compliance rose for 5 of 7 models.
 
-An upstream issue titled "Claude Code System Instructions Cause Claude to Lie, Fabricate Results" ([anthropics/claude-code#2969](https://github.com/anthropics/claude-code/issues/2969)) is closed as **not planned**; it was closed by the GitHub Actions bot.
+An upstream issue titled "Claude Code System Instructions Cause Claude to Lie, Fabricate Results" ([anthropics/claude-code#2969](https://github.com/anthropics/claude-code/issues/2969)) is closed as **not planned**; it was closed automatically by the GitHub Actions bot after 60 days of inactivity.
 
 <p>
 <img src="assets/catch-saying-not-doing.jpg" alt="The gate catches the agent describing work instead of doing it" width="640">
