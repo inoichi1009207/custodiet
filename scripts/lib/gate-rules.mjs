@@ -10314,9 +10314,10 @@ const DP_UNWRAP = (seg, wrap, depth = 0) => {
 //   ② 段内 `git -C <路径>`(绝对路径重新定起点,相对路径接在已知起点后)。
 //   一律判严的情形(照旧计入):去向带变量 / 引号外反斜杠 / 相对路径起点 / 目录不存在 / git 取不到 common-dir;
 //   第一段之后再出现任何 cd 类词(含包装器、子 shell、`{ }` 里的,按原文找,宁多勿少);`||` 之后;命令里有后台 `&`;
-//   带 GIT_DIR / GIT_WORK_TREE / --git-dir / --work-tree;段里写了 app-private(按 URL 推私仓不因所在目录放过);一段里不止一个 git。
+//   带 GIT_DIR / GIT_WORK_TREE / --git-dir / --work-tree;推送的**远端那一格**点的是安装方自己的私仓(见下方 dpSegAway 的短路,
+//   名单来自安装方配置 privateRepos:按地址推私仓不因所在目录放过);一段里不止一个 git。
 //   本仓自己的推送另有 reflog 事实路径(各 worktree 共用 reflog)兜底,这里只撤命令解析那一路的误拦。
-//   代价(漏放,按用户「误拦比漏放贵」接受):在别的仓里按**远端名**推、而那个远端其实指向 app-private(远端名不是 URL)⇒ 不计;
+//   代价(漏放,按用户「误拦比漏放贵」接受):在别的仓里按**远端名**推、而那个远端其实指向自己的私仓(远端名不在名单里)⇒ 不计;
 //   会话 cwd 已经持久停在别的仓(上一条 Bash 的 cd)时本条看不见,照旧计入(误拦残余,不是漏放)。
 const DP_CD_WORD = /^(?:cd|chdir|pushd|sl|set-location|push-location)$/i;
 const DP_CD_ANY = /(?:^|[\s({;&|"'`])(?:cd|chdir|pushd|popd|sl|set-location|push-location|pop-location)(?=$|[\s;)}"'`])/i;
@@ -10357,13 +10358,68 @@ const dpSegOps = (cmd) => {
   out.push({ s: raw.slice(at).trim(), op: "" });
   return out.filter((x) => x.s);
 };
-/** 一段(已剥壳)推送的去向是否确知落在别的仓。base = 本命令第一段 cd 落定的别仓目录(null = 本仓)。 */
-const dpSegAway = (u, base, awayOf) => {
+// ── 批 305:「远端那一格点的是不是安装方自己的私仓」──────────────────────────────────────────
+//   0.10.0 把写死的一个仓名改成认 `<名>-private` 这一族,0.10.1 收窄到「远端地址里的」——仍是按一族认、且在整段里找:
+//   在别的仓里往名字以 -private 结尾的**别人仓库**或**分支**(`feature/keep-notes-private`)推,都被当成推自己的私仓、追着要探针;
+//   反过来地址后紧贴重定向符(`…-private.git>push.log`)又认不出。
+//   现在:仓名是安装方事实,读安装方配置里的确切名单(gate-install.json 的 privateRepos,经 ctx.installNames 注入),
+//   且**只在远端那一格上认**——
+//     · 取格:引号感知分词后找 `git [全局选项] push`,跳过 push 自己的选项(带值的连值跳),第一个位置参数;没有位置参数时取 `--repo` 的值
+//       (与 DP_IS_PUSH 同一个取法 `dpPushRemoteToks`,不另抄)。
+//     · 取名:去掉开头的引号,取到第一个引号 / 重定向符 / 管道 / `&` / `;` / 逗号 / 括号 / 空白为止(这些都算地址结束);反斜杠按路径分隔符
+//       (续行符落在词尾,随结尾分隔符一起去掉);去结尾的 `/`、去 `.git`;按 `/` 或 `:` 取末段。按远端名推时整格就是末段。
+//     · 比较:与名单里的名字整名相等,不分大小写(托管平台与 Windows 路径都不分)。
+//   分支名、refspec、注释、别的参数里出现同样的字不认。名单为空 ⇒ 这条短路不生效,其余去向判定照旧。
+//   CEILING(照实写):结构取不出的写法(`$(git push <私仓地址>)`、`(git push …)` 粘了括号的 git)不走这条短路 ⇒ 在别的仓里这样推自己的私仓不计
+//     (漏放向,少跑一次探针;在本仓里推不受影响——那里 base 为 null,本来就照算)。
+const DP_GIT_BARE = /^git(?:\.exe)?$/i;
+const DP_GIT_ANY = /^(?:\S*[\\/])?git(?:\.exe)?$/i;
+/** 一段(已剥壳)命令里每个 `git … push` 的远端那一格:原始词(引号未剥);一个都取不出该格 ⇒ 该项为 null。
+ *  `gitRe` = 认哪种 git 词(DP_IS_PUSH 只认裸 `git`,去向判定连带路径的也认)。 */
+const dpPushRemoteToks = (seg, gitRe = DP_GIT_BARE) => {
+  const ts = String(seg).match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || [];
+  const out = [];
+  for (let g = 0; g < ts.length; g++) {
+    if (!gitRe.test(ts[g])) continue;
+    let i = g + 1;
+    while (i < ts.length && ts[i].startsWith("-")) {
+      if (/^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--exec-path|--super-prefix)$/.test(ts[i])) i++;
+      i++;
+    }
+    if (ts[i] !== "push") continue;
+    let rawTok = null, repoOpt = null;
+    for (i = i + 1; i < ts.length; i++) {
+      const t = ts[i];
+      if (/^(-o|--push-option|--receive-pack|--exec)$/.test(t)) { i++; continue; }
+      // 红队 r2:短选项簇 `-fo X`——o 在簇尾时下一个词是它的值(git parse-options)
+      if (/^-[A-Za-z]+$/.test(t) && t.endsWith("o")) { i++; continue; }
+      if (t === "--repo") { repoOpt = ts[i + 1] ?? null; i++; continue; }
+      if (/^--repo=/.test(t)) { repoOpt = t.slice(7); continue; }
+      if (t.startsWith("-")) continue;
+      rawTok = t; break;
+    }
+    out.push(rawTok ?? repoOpt);
+  }
+  return out;
+};
+/** 远端那一格的词 ⇒ 仓名(地址末段 / 远端名);取不出 ⇒ null。 */
+const dpRepoNameOf = (tok) => {
+  if (typeof tok !== "string") return null;
+  const t = tok.replace(/^["']+/, "").replace(/\\/g, "/");
+  const body = (/^[^"'`<>|&;,(){}\s]*/.exec(t) || [""])[0].replace(/\/+$/, "").replace(/\.git$/i, "").replace(/\/+$/, "");
+  return body.split(/[/:]/).pop() || null;
+};
+/** 这一段里有没有哪个推送的远端那一格点了名单里的仓。名单为空 ⇒ false。 */
+const dpSegPushesPrivate = (seg, privateRepos) => {
+  const names = (Array.isArray(privateRepos) ? privateRepos : []).filter((n) => typeof n === "string" && n).map((n) => n.toLowerCase());
+  if (!names.length) return false;
+  return dpPushRemoteToks(seg, DP_GIT_ANY).some((t) => { const n = dpRepoNameOf(t); return !!n && names.includes(n.toLowerCase()); });
+};
+/** 一段(已剥壳)推送的去向是否确知落在别的仓。base = 本命令第一段 cd 落定的别仓目录(null = 本仓)。
+ *  `privHit(段)` = 该段点了安装方自己的私仓(批 305;缺省恒 false = 没有名单)。 */
+const dpSegAway = (u, base, awayOf, privHit = () => false) => {
   const s = String(u);
-  // 0.10.0:私仓名认 `<名>-private` 这一形(原来写死一个具体仓名)——命令里点了私仓名的推送不判成「推去了别仓」。
-  //   0.10.1:只认远端地址里的仓名(前面是 `/` 或 `:`,后面到头、空白、引号或 `.git`)——0.10.0 的写法连 `gh … --private`、
-  //   `check-private-…` 这类旗标和文件名也认。
-  if (/[\/:][\w.-]+-private(?:\.git)?(?=$|[\s"'])/i.test(s) ||/\bGIT_(?:DIR|WORK_TREE|COMMON_DIR)\b|--git-dir|--work-tree/i.test(s)) return false;
+  if (privHit(s) || /\bGIT_(?:DIR|WORK_TREE|COMMON_DIR)\b|--git-dir|--work-tree/i.test(s)) return false;
   const ts = DP_RAW_TOKS(s);
   const gi = ts.map((t, i) => (/^(?:\S*[\\/])?git(?:\.exe)?$/i.test(t) ? i : -1)).filter((i) => i >= 0);
   if (gi.length > 1) return false;
@@ -10404,7 +10460,7 @@ const dpAwayOf = (root) => (dir) => {
   const a = dpCommonDir(dir), b = dpCommonDir(root);
   return !!a && !!b && a !== b;
 };
-const DP_SEGS_T = (cmds, wrap = DP_WRAP, awayOf = null) => (cmds || []).flatMap((c) => {
+const DP_SEGS_T = (cmds, wrap = DP_WRAP, awayOf = null, privHit = () => false) => (cmds || []).flatMap((c) => {
   const body = DP_UNCOMMENT(stripHeredoc(String(c)));
   const ops = dpSegOps(body);
   // 后台 `&`(`cd X && a & git push`:and-list 整个进了子 shell,cd 不改外层)⇒ 本命令不做去向判定
@@ -10418,7 +10474,7 @@ const DP_SEGS_T = (cmds, wrap = DP_WRAP, awayOf = null) => (cmds || []).flatMap(
         if (cd && cd.dir && (op === "&&" || op === ";" || op === "\n") && awayOf(cd.dir)) base = cd.dir;
       } else if (ops[k - 1].op === "||" || DP_CD_ANY.test(s)) base = null;
     }
-    for (const u of DP_UNWRAP(s, wrap)) out.push({ s: u, away: !!awayOf && !bg && dpSegAway(u, base, awayOf) });
+    for (const u of DP_UNWRAP(s, wrap)) out.push({ s: u, away: !!awayOf && !bg && dpSegAway(u, base, awayOf, privHit) });
   });
   return /<</.test(String(c)) && DP_AST(String(c)) === true ? [{ s: String(c), away: false }, ...out] : out;
 }).map((x) => ({ s: x.s.trim(), away: x.away })).filter((x) => x.s);
@@ -10534,28 +10590,9 @@ const DP_IS_PUSH = (seg, { headCheck = true, ast = true } = {}) => {
   //   `-o "note custodiet build"` 按空白拆开)⇒ 改为**引号感知分词 + 结构绑定**:找到裸 `git` 词,跳过全局选项(带值的连值跳),
   //   下一个词必须正好是 `push`;任何一处对不上结构(`$(git`、`push)`)就当解不出,按推 private 算。只有结构完整且远端是字面公开名才放。
   if (/\s-c\s+["']?remote\.[\w.-]+\.(?:push)?url=/i.test(String(seg))) return true;
-  const ts = String(seg).match(/"(?:\\.|[^"\\])*"|'[^']*'|\S+/g) || [];
+  // 批 305:远端那一格的取词循环抽成 dpPushRemoteToks(逐字搬运,本函数判法不变;去向判定的私仓短路与它共用同一个取法)
   let sawPublic = false;
-  for (let g = 0; g < ts.length; g++) {
-    if (!/^git(?:\.exe)?$/i.test(ts[g])) continue;
-    let i = g + 1;
-    while (i < ts.length && ts[i].startsWith("-")) {
-      if (/^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--exec-path|--super-prefix)$/.test(ts[i])) i++;
-      i++;
-    }
-    if (ts[i] !== "push") continue;
-    let rawTok = null, repoOpt = null;
-    for (i = i + 1; i < ts.length; i++) {
-      const t = ts[i];
-      if (/^(-o|--push-option|--receive-pack|--exec)$/.test(t)) { i++; continue; }
-      // 红队 r2:短选项簇 `-fo X`——o 在簇尾时下一个词是它的值(git parse-options)
-      if (/^-[A-Za-z]+$/.test(t) && t.endsWith("o")) { i++; continue; }
-      if (t === "--repo") { repoOpt = ts[i + 1] ?? null; i++; continue; }
-      if (/^--repo=/.test(t)) { repoOpt = t.slice(7); continue; }
-      if (t.startsWith("-")) continue;
-      rawTok = t; break;
-    }
-    const tok = rawTok ?? repoOpt;
+  for (const tok of dpPushRemoteToks(seg, DP_GIT_BARE)) {
     if (tok === null || /["'`$()<>\\{}]/.test(tok) || !DP_PUBLIC_REMOTES.has(tok)) return true;
     sawPublic = true;
   }
@@ -10620,13 +10657,17 @@ const DP_FACTS = (f) => {
 };
 // 批 285(D161②):`isPush` 是推送识别的注入口,只给 mutations 换形态用(钉住 D139⑤ 的「只排除字面公开名」口径);
 //   `away`(D161①):关掉即回到「不看在哪个仓里推」的修前形态(反向证人在 hook-stop-closure 自测,要真的别仓目录,写不进静态夹具)。
-const DP_DETECT = (ctx, { ordered = true, useWindow = true, wrap = DP_WRAP, probe = DP_IS_PROBE, headCheck = true, useFacts = true, facts = DP_FACTS, ast = true, isPush = DP_IS_PUSH, away = true } = {}) => {
+//   `privHit`(批 305):去向判定里「这一段点了安装方自己的私仓」的判法注入口 `(段, 名单) => 真假`;缺省 = 只在远端那一格上按名单认。
+//   名单取 `ctx.installNames.privateRepos`(hook 读安装方配置一次、注入;没接 / 没配 ⇒ 空 ⇒ 短路不生效)。
+//   它的变异同样写不进静态夹具(短路只在「确知在别的仓」时才起作用),反向证人在 hook-stop-closure 自测(经 `RULE_DP._dp.detect` 换形态)。
+const DP_DETECT = (ctx, { ordered = true, useWindow = true, wrap = DP_WRAP, probe = DP_IS_PROBE, headCheck = true, useFacts = true, facts = DP_FACTS, ast = true, isPush = DP_IS_PUSH, away = true, privHit = dpSegPushesPrivate } = {}) => {
   if (!toolPresent("scripts/verify-prod.mjs")) return [];
   const byFacts = useFacts && ctx.debtFacts && typeof ctx.debtFacts === "object" ? facts(ctx.debtFacts) : [];
   if (byFacts.length) return byFacts;   // 事实这一路判出即拦,文本声明不认
   const w = useWindow && typeof ctx.window === "function" ? ctx.window() : null;
   const root = (typeof ctx.hookCheckout === "string" && ctx.hookCheckout) || process.cwd();
-  const tagged = DP_SEGS_T([...((w && w.bashCmds) || []), ...(ctx.bashCmds || [])], wrap, away ? dpAwayOf(root) : null);
+  const priv = ctx.installNames && Array.isArray(ctx.installNames.privateRepos) ? ctx.installNames.privateRepos : [];
+  const tagged = DP_SEGS_T([...((w && w.bashCmds) || []), ...(ctx.bashCmds || [])], wrap, away ? dpAwayOf(root) : null, (seg) => privHit(seg, priv));
   const segs = tagged.map((x) => x.s);
   let lastPush = -1;
   tagged.forEach((x, i) => { if (!x.away && isPush(x.s, { headCheck, ast })) lastPush = i; });
@@ -10645,6 +10686,9 @@ const RULE_DP = {
     // 「就地声明 ⟪欠账探针:不适用,因⟫」已撤(第六轮 BP-1):两条路都不认文本声明,推送被拒也要跑一次探针。
   ],
   detect: (ctx) => DP_DETECT(ctx),
+  // 批 305:给 hook-stop-closure 自测用的零件口(要真的别仓目录的证人与变异在那边;同 P 的 `_p`)。
+  //   `detect(ctx, 选项)` = 带注入口的判据本体;`segPushesPrivate` / `repoNameOf` / `pushRemoteToks` = 私仓短路的三个纯函数。
+  _dp: { detect: (ctx, opt) => DP_DETECT(ctx, opt), segPushesPrivate: dpSegPushesPrivate, repoNameOf: dpRepoNameOf, pushRemoteToks: dpPushRemoteToks },
   exempts: [],
   message: (hits) =>
     `**推了 private(\`${hits[0]}\`),之后却没跑欠账探针**——生产法三:收尾逐级查,查到即清、只报结果。\n` +

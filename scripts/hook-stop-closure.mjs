@@ -5663,7 +5663,8 @@ function selfTest() {
           execFileSync("git", ["init", "-q", other], { windowsHide: true, stdio: "ignore" });
         } catch { other = null; }
         if (DP && other && fs.existsSync("scripts/verify-prod.mjs")) {
-          const hit = (cmd) => DP.detect({ bashCmds: [cmd], hookCheckout: here }).length > 0 ? 1 : 0;
+          // 批 305:私仓名改读安装方名单(ctx.installNames.privateRepos)——「按 URL 推私仓 ⇒ 照算」那条要带名单才成立
+          const hit = (cmd) => DP.detect({ bashCmds: [cmd], hookCheckout: here, installNames: { deployScripts: [], privateRepos: ["app-private"] } }).length > 0 ? 1 : 0;
           hp("285 D161① DP:别仓 cd 后推 / 别仓 cd 后裸推 / git -C 别仓 ⇒ 不计",
             [`cd ${other} && git push private main`, `cd "${other}" && git push`, `git -C ${other} push private main`].map(hit).join(""), "000");
           hp("285 D161① DP:再 cd 回本仓 / || / 管道 / 后台 & / GIT_DIR / 包装器里 cd / -C 回本仓 / 按 URL 推私仓 / 子 shell 首段 ⇒ 照算",
@@ -5674,6 +5675,103 @@ function selfTest() {
           hp("285 D161① DP:本仓目录 cd 后推照算", hit(`cd ${here} && git push private`), 1);
         } else hp("285 D161① DP 证人:临时仓起不来或缺 verify-prod(公开树)⇒ 跳过", true, true);
         try { if (other) fs.rmSync(other, { recursive: true, force: true }); } catch { /* 临时目录清不掉不影响判定 */ }
+      }
+      // 批 305:DP 的「这一段点了安装方自己的私仓 ⇒ 不算推去别仓」短路,改读安装方名单(privateRepos)里的确切仓名,且只在远端那一格上认。
+      //   ① 纯函数面(取格 / 取名 / 比名)不需要临时仓;② 去向面要真的别仓目录:起两个临时 git 仓——「本仓」里放一个探针桩
+      //   (DP 在没有 scripts/verify-prod.mjs 的树里按设计整条退场,公开树即如此),进程切进去跑,跑完切回。
+      //   ③ 变异经 `_dp.detect` 的 privHit 注入口换形态,断言同一组命令的读数**变了**(拧断就红);写不进静态夹具的理由同上一组。
+      {
+        const DP = RULES.find((r) => r.id === "DP");
+        const D = DP && DP._dp;
+        const NAMES = ["app-private"];
+        if (D) {
+          hp("305 DP 取名:地址末段去 .git / 去结尾斜杠 / scp 形 / 引号 / 反斜杠路径 / 远端名原样",
+            ["https://github.com/x/app-private.git", "https://github.com/x/app-private/", "git@github.com:x/app-private.git", "git@host:app-private.git",
+              "\"https://github.com/x/app-private.git\"", "'D:\\srv\\app-private.git'", "app-private", "../app-private/", "https://u:p@host/x/app-private.git/"]
+              .map((t) => D.repoNameOf(t)).join(" "), Array(9).fill("app-private").join(" "));
+          hp("305 DP 取名:地址后紧贴重定向符 / 逗号 / 续行符 / 分号 / 管道都算结束",
+            ["https://github.com/x/app-private.git>push.log", "https://github.com/x/app-private.git>logs/push.log", "https://github.com/x/app-private.git,",
+              "https://github.com/x/app-private.git\\", "https://github.com/x/app-private.git;", "https://github.com/x/app-private|tee", "https://github.com/x/app-private.git2>&1"]
+              .map((t) => D.repoNameOf(t)).join(" "), "app-private app-private app-private app-private app-private app-private app-private.git2");
+          hp("305 DP 取名:取不出 ⇒ null(null / 空串 / 只有符号)", [D.repoNameOf(null), D.repoNameOf(""), D.repoNameOf(">x.log")], [null, null, null]);
+          const sp = (cmd, names = NAMES) => (D.segPushesPrivate(cmd, names) ? 1 : 0);
+          hp("305 DP 远端格:按地址推名单里的仓(带 .git / 紧贴重定向 / 引号 / 大小写不同 / --repo= / --repo 空格 / -o 取值后 / 带路径的 git / git -C)⇒ 认",
+            ["git push https://github.com/x/app-private.git master", "git push https://github.com/x/app-private.git>push.log master", "git push \"https://github.com/x/app-private.git\" master",
+              "git push https://github.com/x/APP-Private master", "git push --repo=https://github.com/x/app-private.git", "git push --repo git@github.com:x/app-private.git",
+              "git push -o ci.skip https://github.com/x/app-private.git main", "/usr/bin/git push https://github.com/x/app-private.git", "git -C E:/x push https://github.com/x/app-private.git"]
+              .map((c) => sp(c)).join(""), "111111111");
+          hp("305 DP 远端格:远端名恰好等于名单里的名字 ⇒ 认;只是相像(前后多字)⇒ 不认",
+            ["git push app-private main", "git push app-private", "git push my-app-private main", "git push app-private-mirror main", "git push app-private2 main"].map((c) => sp(c)).join(""), "11000");
+          hp("305 DP 远端格:别人的 -private 仓 / 分支名 / refspec / -o 的值 / 提交信息 / 别的子命令里出现同样的字 ⇒ 不认",
+            ["git push https://github.com/someone/notes-private.git main", "git push origin feature/keep-notes-private", "git push origin feature/app-private", "git push origin app-private",
+              "git push upstream main:refs/heads/app-private", "git push -o note=app-private upstream main", "git commit -m \"push to app-private later\"",
+              "git remote add app-private https://github.com/x/app-private.git", "gh repo view x/app-private", "git push https://github.com/x/app-private-mirror.git main",
+              "git push https://github.com/app-private/tools.git main"].map((c) => sp(c)).join(""), "00000000000");
+          hp("305 DP 远端格:名单为空 / 不是数组 ⇒ 一律不认", [sp("git push https://github.com/x/app-private.git", []), sp("git push app-private", null), sp("git push app-private", "app-private")], [0, 0, 0]);
+          hp("305 DP 远端格:名单里多个名字都认,脏项(非字符串 / 空串)丢掉", [sp("git push git@host:x/second-repo.git", ["app-private", 1, "", "second-repo"]), sp("git push app-private", [null, "app-private"])], [1, 1]);
+        }
+        const cwd0 = process.cwd();
+        let home = null, other = null;
+        try {
+          home = fs.mkdtempSync(path.join(os.tmpdir(), "dp305-home-")).replace(/\\/g, "/");
+          other = fs.mkdtempSync(path.join(os.tmpdir(), "dp305-other-")).replace(/\\/g, "/");
+          execFileSync("git", ["init", "-q", home], { windowsHide: true, stdio: "ignore" });
+          execFileSync("git", ["init", "-q", other], { windowsHide: true, stdio: "ignore" });
+          fs.mkdirSync(`${home}/scripts`, { recursive: true });
+          fs.writeFileSync(`${home}/scripts/verify-prod.mjs`, "// 自测桩:只为让 DP 判「探针在场」\n");
+        } catch { home = null; }
+        if (D && home && other) {
+          try {
+            process.chdir(home);
+            const run = (names, opt) => (cmd) => (D.detect({ bashCmds: [cmd], hookCheckout: home, ...(names === undefined ? {} : { installNames: { deployScripts: [], privateRepos: names } }) }, opt).length > 0 ? 1 : 0);
+            const hit = run(NAMES);
+            // 不追探针:别仓里推的不是名单里的仓(哪怕名字以 -private 结尾、哪怕分支 / refspec / 选项值里出现名单里的字)
+            const AWAY = [
+              `cd ${other} && git push https://github.com/someone/notes-private.git main`,
+              // 远端名用 upstream:origin / custodiet 是「确知公开」的字面名,推它们本来就不算,当不了证人
+              `cd ${other} && git push upstream feature/keep-notes-private`,
+              `cd ${other} && git push upstream feature/app-private`,
+              `cd ${other} && git push upstream main:refs/heads/app-private`,
+              `cd ${other} && git push -o note=app-private upstream main`,
+              `cd ${other} && git push https://github.com/x/app-private-mirror.git main`,
+              `git -C ${other} push https://github.com/someone/notes-private.git`,
+            ];
+            // 仍然追:别仓里按地址 / 按远端名推的就是名单里的仓
+            const MINE = [
+              `cd ${other} && git push https://github.com/x/app-private.git master`,
+              `cd ${other} && git push https://github.com/x/app-private.git>push.log master`,
+              `cd ${other} && git push app-private main`,
+              `cd ${other} && git push git@github.com:x/app-private.git`,
+              `cd ${other} && git push "https://github.com/x/App-Private" master`,
+              `cd ${other} && git push --repo=https://github.com/x/app-private.git`,
+              `git -C ${other} push https://github.com/x/app-private/ master`,
+              `cd ${other} && git push https://github.com/x/app-private.git 2>&1 | tail -3`,
+            ];
+            const vec = (f, xs) => xs.map(f).join("");
+            hp("305 DP 别仓:推别人的 -private 仓 / 分支名 / refspec / 选项值里带名单里的字 / 近名仓 ⇒ 不追探针", vec(hit, AWAY), "0000000");
+            hp("305 DP 别仓:按地址推名单里的私仓(含紧贴 >push.log、scp 形、引号大小写、--repo=、结尾斜杠、后接管道)/ 远端名恰为名单里的名字 ⇒ 仍然追", vec(hit, MINE), "11111111");
+            hp("305 DP 别仓:名单为空 / 没接名单通道 ⇒ 短路不生效(按地址推那个仓也不追),别仓判定照旧",
+              [vec(run([]), MINE), vec(run(undefined), MINE)], ["00000000", "00000000"]);
+            hp("305 DP 本仓:不在别仓时名单不影响结论(推别人的 -private 仓照算;推公开远端照放)",
+              [hit("git push https://github.com/someone/notes-private.git main"), hit("git push app-private main"), hit("git push origin main"), run([])("git push https://github.com/someone/notes-private.git main")], [1, 1, 0, 1]);
+            // 变异:各拧断一处,上面两组读数必须变(拧断就红)
+            const FAMILY = (s) => /[\/:][\w.-]+-private(?:\.git)?(?=$|[\s"'])/i.test(s);
+            const mut = {
+              "退回:私仓名按一族认(整段里找 <名>-private,0.10.1 的写法)": { privHit: FAMILY },
+              "松:不读名单(短路恒不生效)": { privHit: () => false },
+              "松:名字在整段里找(不限远端那一格)": { privHit: (s, names) => names.some((n) => String(s).toLowerCase().includes(n.toLowerCase())) },
+              "严:取名不认地址后紧贴的符号(重定向符 / 逗号 / 续行符)": { privHit: (s, names) => D.pushRemoteToks(s, /git/i).some((t) => typeof t === "string" && names.includes(t.replace(/^["']|["']$/g, "").replace(/\/+$/, "").replace(/\.git$/i, "").split(/[/:]/).pop().toLowerCase())) },
+              "严:比名分大小写": { privHit: (s, names) => D.pushRemoteToks(s, /git/i).some((t) => names.includes(D.repoNameOf(t))) },
+            };
+            for (const [name, opt] of Object.entries(mut)) {
+              const got = [vec(run(NAMES, opt), AWAY), vec(run(NAMES, opt), MINE)].join(" ");
+              hp(`305 DP 变异「${name}」⇒ 读数变(实得 ${got})`, got !== "0000000 11111111", true);
+            }
+            hp("305 DP 变异读数逐条钉(防「变了但不是因为它」):一族认 ⇒ 别人的 -private 仓 / -private 结尾的分支被追、紧贴重定向的认不出",
+              [vec(run(NAMES, mut["退回:私仓名按一族认(整段里找 <名>-private,0.10.1 的写法)"]), AWAY.slice(0, 3)), run(NAMES, { privHit: FAMILY })(MINE[1])], ["111", 0]);
+          } finally { process.chdir(cwd0); }
+        } else hp("305 DP 别仓证人:临时仓起不来 ⇒ 跳过", true, true);
+        for (const d of [home, other]) { try { if (d) fs.rmSync(d, { recursive: true, force: true }); } catch { /* 临时目录清不掉不影响判定 */ } }
       }
       // 批 266:原样装入的闸引擎(安装清单核对)。假 git:按 `<sha>:<path>` 返回树里的内容
       {
