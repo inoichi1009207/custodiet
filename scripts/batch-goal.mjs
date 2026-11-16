@@ -30,6 +30,8 @@
 //   node --no-warnings scripts/batch-goal.mjs --outcome "<可见成果一句话>"    ⇒ 自动序号 O<n>(批 256)
 //   node --no-warnings scripts/batch-goal.mjs --withdraw <批号-Dn | On> --reason "<理由>"   撤回误登记的一项(批 256b)
 //   node --no-warnings scripts/batch-goal.mjs --clear [--verdict "N=达成|未达成|不适用[:理由]"]…   (批 298:逐条裁决,可选)
+//        (批 305:成功时多打一行主尺并记进 clear 行——从指令到关账,转录里人亲口说了几条;量不出写明原因)
+//   node --no-warnings scripts/batch-goal.mjs --ruler              ⇒ 只读:现算主尺(未结清)或打关账时记下的那份(批 305)
 //   node --no-warnings scripts/batch-goal.mjs --context            ⇒ 一行摘要 + 状态文件路径 + 内容哈希(批 298)
 //   node --no-warnings scripts/batch-goal.mjs --settle [<义务 id>]  ⇒ 卡住(连续判不了 ≥3 次)的义务转欠账(批 298)
 //   node --no-warnings scripts/batch-goal.mjs --repair-obligations ⇒ 按台账重建义务账状态文件(批 298;不改结论)
@@ -49,7 +51,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { ledgerAppend, verifyFile as verifyFileChain } from "./lib/ledger-chain.mjs";
-import { quoteUntrusted } from "./lib/gate-ctx.mjs";
+import { quoteUntrusted, buildCtx } from "./lib/gate-ctx.mjs";   // buildCtx:批 305 自测拿它和主尺的认人口径逐条对账
 import { isCarrierPath, CARRIER_SURFACE } from "./lib/gate-carriers.mjs";
 import { readInstallConfig, parseInstallConfig, mergeInstallConfig, absentInstallConfig, snapshotConfig, configFromSnapshot, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
 import * as OB from "./lib/obligations.mjs";
@@ -1312,6 +1314,29 @@ export function armMetaLines(g) {
 function pickArmMeta(g) {
   return { ...(g && g.instruction ? { instruction: g.instruction } : {}), ...(g && typeof g.finishLine === "string" ? { finishLine: g.finishLine } : {}), ...(g && g.caps ? { caps: g.caps } : {}) };
 }
+/** 批 305:主尺——从指令那一刻到现在,转录里人亲口说了几条(数法与天花板见 lib/batch-ruler.mjs 头注)。只读;任何一步拿不到 ⇒ { ok:false, why },不猜。
+ *  读哪几份转录:指令所在会话、武装过本批的会话(批状态的 armedBy 与本批各 arm 行的 armedBy)、现在跑这条命令的会话。 */
+function computeRuler(g) {
+  try {
+    const ins = g && g.instruction;
+    if (!ins || !ins.at) return RULER.measureRuler({ instruction: ins || null });
+    const sids = [g.armedBy, sidEnv()];
+    try {
+      for (const l of fs.readFileSync(JOURNAL, "utf8").split("\n")) {
+        if (!l.includes('"arm"')) continue;
+        let o; try { o = JSON.parse(l); } catch { continue; }
+        if (o && o.action === "arm" && String(o.batch) === String(g.batch) && (o.armedAt || null) === (g.armedAt || null) && typeof o.armedBy === "string") sids.push(o.armedBy);
+      }
+    } catch { /* 台账读不到 ⇒ 只按批状态里的会话号 */ }
+    return RULER.measureRuler({ instruction: ins, sids, dirs: transcriptDirsHere(), nowMs: Date.now() });
+  } catch (e) { return { ok: false, why: `算的时候出错:${String(e && e.message || e).slice(0, 160)}` }; }
+}
+/** 主尺结果 ⇒ 写进批日志 clear 行的那一份(不带展示用的长串)。 */
+function rulerRecord(r) {
+  if (!r || !r.ok) return { ok: false, why: String((r && r.why) || "没有结果"), ...(r && r.sessions ? { sessions: r.sessions } : {}) };
+  return { ok: true, count: r.count, byKind: r.byKind, excluded: r.excluded, since: r.since, until: r.until, sessions: r.sessions,
+    ...(Object.keys(r.unknownOrigins || {}).length ? { unknownOrigins: r.unknownOrigins } : {}), ...(r.noTimestamp ? { noTimestamp: r.noTimestamp } : {}) };
+}
 
 // 自测用的安装方配置:HostApp 的取值,写成字面量(不读 cwd 那份,自测在哪跑都一样)。沙盒仓里写同一份进 gate-install.json。
 const TEST_INSTALL_JSON = JSON.stringify({ format: "gate-install/v1", diary: "docs/product-diary.md", adrDir: "docs/adr", debtTable: "docs/gate-debts.md",
@@ -2481,6 +2506,143 @@ export function selfTest305(t) {
       t("305 ① 反例 定位:文件不存在 ⇒ 给原因,不抛", /转录读不了/.test(RULER.locateInstruction(path.join(tmp, "none.jsonl"), INS).why || ""), true);
     } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 清不掉不判 */ } }
   }
+  // ── ② 主尺:指令到关账,人亲口说了几条 ──
+  //   夹具:每一种「不是人说的」各一条、每一种「算」的各一条。notHuman / human 两张表同时是数法的说明书。
+  const fxAll = (f, at0 = 10) => {
+    const notHuman = [
+      ["工具结果", "tool-result", f.TR("toolu_a", "命令输出里的一句话", at0 + 1)],
+      ["子代理回件(Agent 工具的结果)", "tool-result", f.TR("toolu_agent", "子代理说:都做完了", at0 + 1, { toolUseResult: { agentId: "a1", status: "completed" } })],
+      ["钩子反馈(Stop hook feedback,isMeta)", "hook", f.U("Stop hook feedback:\n[闸] 条件没对照", at0 + 2, { isMeta: true })],
+      ["钩子反馈(插件来源)", "hook", f.U([{ type: "text", text: "Stop hook feedback:\n插件说的话" }], at0 + 2, { isMeta: true, origin: { kind: "plugin" } })],
+      ["钩子反馈(老形态:无来源、非 isMeta)", "hook", f.U("Stop hook feedback:\n老形态", at0 + 2)],
+      ["钩子注入的附件(开工注入)", "hook", f.AT({ type: "hook_additional_context", content: ["BATCH-CONTEXT 批 500 已武装"] }, at0 + 2)],
+      ["钩子注入的附件(阻断)", "hook", f.AT({ type: "hook_blocking_error", toolUseID: "x", blockingError: { blockingError: "拦了" } }, at0 + 2)],
+      ["系统提醒(isMeta)", "system-reminder", f.U("<system-reminder>\n今天的日期是某天\n</system-reminder>", at0 + 3, { isMeta: true })],
+      ["系统提醒(无来源、非 isMeta 的整条提醒)", "system-reminder", f.U("<system-reminder>记得更新任务清单</system-reminder>", at0 + 3)],
+      ["后台任务通知(user 行)", "task-notification", f.U("<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>", at0 + 4, { origin: { kind: "task-notification" } })],
+      ["后台任务通知(排队附件)", "task-notification", f.AT({ type: "queued_command", origin: { kind: "task-notification" }, commandMode: "task-notification", prompt: "<task-notification>\n<task-id>b2</task-id>\n</task-notification>" }, at0 + 4)],
+      ["后台任务通知(排队附件,老形态无来源)", "task-notification", f.AT({ type: "queued_command", commandMode: "task-notification", prompt: "<task-notification>\n<task-id>b3</task-id>\n</task-notification>" }, at0 + 4)],
+      ["子代理回件(排队附件,来源 peer)", "peer", f.AT({ type: "queued_command", origin: { kind: "peer" }, commandMode: "prompt", prompt: "<agent-message from=\"worker\">做完了</agent-message>" }, at0 + 5)],
+      ["跨会话消息(来源 peer)", "peer", f.U("Another Claude session sent a message: 你好", at0 + 5, { isMeta: true, origin: { kind: "peer" } })],
+      ["子代理侧链里的人形消息(isSidechain)", "subagent", f.H("给子代理的任务书", at0 + 5, { isSidechain: true })],
+      ["压缩后的摘要", "compact-summary", f.U("This session is being continued from a previous conversation. 用户先前说过要改三处", at0 + 6, { isCompactSummary: true })],
+      ["技能 / 命令正文(isMeta)", "meta", f.U([{ type: "text", text: "Base directory for this skill: /repo/.claude/skills/x\n请照下面做" }], at0 + 6, { isMeta: true })],
+      ["本地命令的说明行(isMeta)", "meta", f.U("<local-command-caveat>Caveat: 下面是本地命令产生的</local-command-caveat>", at0 + 6, { isMeta: true })],
+      ["本地命令输出", "command-output", f.U("<local-command-stdout>已切换模型</local-command-stdout>", at0 + 7)],
+      ["「!」命令的输出", "command-output", f.U("<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>", at0 + 7)],
+      ["自动续跑", "auto-continuation", f.U("继续上一轮没做完的事", at0 + 7, { isMeta: true, origin: { kind: "auto-continuation" } })],
+      ["来源不认识(单列,不计入)", "unknown-origin", f.U("某种新来源的消息", at0 + 7, { origin: { kind: "channel-x" } })],
+      ["其它附件(日期、工具清单等)", "attachment-other", f.AT({ type: "date", date: "某天" }, at0 + 7)],
+    ];
+    const human = [
+      ["打字的消息", "typed", f.H("这里改一下", at0 + 8)],
+      ["带图的消息(文字 + 图片块)", "typed", f.H([{ type: "text", text: "看这张图" }, { type: "image", source: { type: "base64", data: "AAAA" } }], at0 + 8)],
+      ["排队插话(附件)", "queued", f.AT({ type: "queued_command", origin: { kind: "human" }, commandMode: "prompt", prompt: "顺便把文档也改了" }, at0 + 9)],
+      ["排队插话(落成 user 行的)", "queued", f.H("到哪一步了", at0 + 9, { promptSource: "queued" })],
+      ["斜杠命令(带来源)", "slash", f.H("<command-message>status</command-message>\n<command-name>/status</command-name>", at0 + 10)],
+      ["斜杠命令(本地命令,无来源)", "slash", f.U("<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>", at0 + 10)],
+      ["「!」命令的输入", "bang", f.U("<bash-input>git status</bash-input>", at0 + 11)],
+      ["中断标记", "interrupt", f.U([{ type: "text", text: "[Request interrupted by user]" }], at0 + 12)],
+      ["无头会话的提示词", "sdk", f.H("执行方案 500", at0 + 13, { promptSource: "sdk", turnOrigin: "sdk" })],
+      ["无来源标记的老形态", "legacy", f.U("老转录里的一句话", at0 + 14)],
+    ];
+    return { notHuman, human };
+  };
+  {
+    const f = fx305(), all = fxAll(f);
+    const k = (e) => { const c = RULER.classifyEntry(e); return c ? [c.human, c.kind] : null; };
+    t("305 ② 认人:每一种不是人说的消息都不算(工具结果 / 钩子 / 系统提醒 / 后台通知 / 子代理 / 压缩摘要 / 技能正文 / 命令输出 / 自动续跑 / 来源不认识 / 其它附件)",
+      all.notHuman.filter(([, kind, e]) => JSON.stringify(k(e)) !== JSON.stringify([false, kind])).map(([name, , e]) => `${name}⇒${JSON.stringify(k(e))}`), []);
+    t("305 ② 认人:每一种人说的都算,且分到对的类型(打字 / 排队 / 斜杠命令 / 「!」命令 / 中断 / 无头提示词 / 老形态)",
+      all.human.filter(([, kind, e]) => JSON.stringify(k(e)) !== JSON.stringify([true, kind])).map(([name, , e]) => `${name}⇒${JSON.stringify(k(e))}`), []);
+    t("305 ② 认人:助理消息与 system 行不参与(返回 null)", [RULER.classifyEntry(f.A([{ type: "text", text: "x" }], 1)), RULER.classifyEntry({ type: "system", subtype: "stop_hook_summary" }), RULER.classifyEntry(null)], [null, null, null]);
+    // 与 gate-ctx.buildCtx 对账:同一条条目,buildCtx 收没收到用户的字 == 这里算不算人说的。差异只许是头注写明的两处。
+    const ctxHuman = (e) => String(buildCtx([e]).userText || "").trim() !== "";
+    const diff = [...all.notHuman, ...all.human].filter(([, , e]) => ctxHuman(e) !== !!RULER.classifyEntry(e)?.human).map(([name]) => name);
+    t("305 ② 与 gate-ctx.buildCtx 的认人口径逐条对账:差异只有头注写明的「侧链条目」一处(buildCtx 不看 isSidechain)", diff, ["子代理侧链里的人形消息(isSidechain)"]);
+    t("305 ② 与 gate-ctx 对账(第二处差异):只有图片没有文字的人的消息,buildCtx 收不到字,这里算一条",
+      (() => { const e = f.H([{ type: "image", source: { type: "base64", data: "AAAA" } }], 1); return [ctxHuman(e), RULER.classifyEntry(e)]; })(), [false, { human: true, kind: "typed" }]);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bg305r-"));
+    try {
+      const wr = (name, es) => { const p = path.join(tmp, `${name}.jsonl`); fs.writeFileSync(p, es.map((e) => JSON.stringify(e)).join("\n") + "\n"); return p; };
+      const SA = "selftest-sess-0305-aaaa", SB = "selftest-sess-0305-bbbb", SC = "selftest-sess-0305-cccc";
+      const ins = f.H(INS, 10);
+      const before = [f.H("指令之前说的话", 0), f.H("指令之前又说了一句", 5)];
+      wr(SA, [...before, ins, f.A([{ type: "text", text: "开工" }], 10), ...all.notHuman.map((x) => x[2]), ...all.human.map((x) => x[2]),
+        { type: "api-request-blob", blob: "x".repeat(2000) + "\"role\":\"user\"" }, "这一行不是 JSON"].map((e) => e));
+      const I = { text: INS, sid: SA, at: f.iso(10) };
+      const now = Date.parse(f.iso(600));
+      const r1 = RULER.measureRuler({ instruction: I, sids: [SA], dirs: [tmp], nowMs: now });
+      t("305 ② 主尺正例:指令 1 条 + 之后 10 条人说的 = 11;指令之前的 2 条不算;23 条不是人说的一条没混进来",
+        [r1.ok, r1.count, r1.byKind, Object.values(r1.excluded).reduce((a, b) => a + b, 0), r1.unknownOrigins, r1.since === f.iso(10)],
+        [true, 11, { typed: 3, queued: 2, slash: 2, bang: 1, interrupt: 1, sdk: 1, legacy: 1 }, 23, { "channel-x": 1 }, true]);
+      t("305 ② 主尺的一行:写明条数、分项、含指令、读了几份、口径是上界", (() => { const l = RULER.formatRuler(r1); return [/^主尺:人亲口说了 11 条/.test(l), /打字 3/.test(l) && /排队插话 2/.test(l) && /斜杠命令 2/.test(l) && /中断标记 1/.test(l), /含引出本批的那句指令/.test(l), /读了 1 份转录/.test(l), /上界/.test(l) && /不区分纠正 \/ 拍板 \/ 问进度/.test(l) && /只数读得到的转录/.test(l)]; })(), [true, true, true, true, true]);
+      t("305 ② 明细:没算进去的各类各几条、来源不认识的单列出声", (() => { const d = RULER.formatRulerDetail(r1).join("\n"); return [/工具结果 2/.test(d), /钩子注入 5/.test(d), /后台任务通知 3/.test(d), /压缩摘要 1/.test(d), /来源不认识、没计入:channel-x×1/.test(d)]; })(), [true, true, true, true, true]);
+      t("305 ② 窗口:截止时刻之后的人话不算(关账以后说的不进本批)", RULER.measureRuler({ instruction: I, sids: [SA], dirs: [tmp], nowMs: Date.parse(f.iso(18)) }).count, 3);
+      // 跨会话:续跑的会话 B 里又说了 2 条;其中一条的 uuid 与 A 里的同一条重复(续接带上的旧行)⇒ 不重复数
+      const dupA = all.human[0][2];
+      wr(SB, [dupA, f.H("续跑会话里说的第一句", 300), f.TR("toolu_b", "结果", 301), f.H("续跑会话里说的第二句", 302)]);
+      const r2 = RULER.measureRuler({ instruction: I, sids: [SA, SB, SC], dirs: [tmp], nowMs: now });
+      t("305 ② 跨会话:读得到的两份合计(同一条在两份里只数一次),读不到的那份点名、不当成零也不让整体作废",
+        [r2.ok, r2.count, r2.sessions.map((s) => [s.sid === SA ? "A" : s.sid === SB ? "B" : "C", s.read, s.count ?? null]), /读了 2 份转录、另 1 份读不到/.test(RULER.formatRuler(r2))],
+        [true, 13, [["A", true, 11], ["B", true, 2], ["C", false, null]], true]);
+      // 排队附件与它落成的 user 行指向同一条 ⇒ 只数一次
+      const qa = f.AT({ type: "queued_command", origin: { kind: "human" }, commandMode: "prompt", prompt: "同一句排队的话", source_uuid: "u305-same" }, 20);
+      const qu = f.H("同一句排队的话", 21, { uuid: "u305-same", promptSource: "queued" });
+      const fq = wr("selftest-sess-0305-qqqq", [f.H(INS, 10), qa, qu]);
+      t("305 ② 去重:排队附件与它后来落成的 user 行(source_uuid 相同)只数一次", (() => { const r = RULER.countHuman(fq, { sinceMs: Date.parse(f.iso(10)), untilMs: now }); return [r.count, r.deduped]; })(), [2, 1]);
+      const why = (x) => { const r = RULER.measureRuler(x); return [r.ok, RULER.formatRuler(r)]; };
+      t("305 ② 反例:没记指令 ⇒ 量不出(写明原因),不猜", why({ instruction: null, sids: [SA], dirs: [tmp] }), [false, "主尺:量不出(开批时没记指令(--arm 时加 --instruction \"<原话>\"))"]);
+      t("305 ② 反例:指令未定位 ⇒ 量不出,带上未定位的原因", (() => { const [ok, l] = why({ instruction: { text: INS, sid: SA, at: null, why: "找不到会话的转录文件" }, sids: [SA], dirs: [tmp] }); return [ok, l]; })(), [false, "主尺:量不出(指令未定位:找不到会话的转录文件)"]);
+      t("305 ② 反例:指令所在会话的转录读不到 ⇒ 量不出(别的会话读得到也不拿来顶)", (() => { const [ok, l] = why({ instruction: { text: INS, sid: SC, at: f.iso(10) }, sids: [SA], dirs: [tmp] }); return [ok, /读不到指令所在会话的转录/.test(l)]; })(), [false, true]);
+      t("305 ② 反例:转录目录不在 / 没有会话号 ⇒ 量不出", [why({ instruction: I, sids: [SA], dirs: null })[1], why({ instruction: { text: INS, sid: null, at: f.iso(10) }, sids: [], dirs: [tmp] })[1]].map((l) => l.startsWith("主尺:量不出(")), [true, true]);
+      t("305 ② 反例:转录超过扫描上限 ⇒ 量不出(不把读了一半的数当结果)", (() => { const r = RULER.measureRuler({ instruction: I, sids: [SA], dirs: [tmp], nowMs: now, budget: 64 }); return [r.ok, /超过扫描上限/.test(r.why || "")]; })(), [false, true]);
+      t("305 ② 流式读:多字节字符与超长行跨读块边界不坏(4MB 一块,造一条 5MB 的人话)", (() => {
+        const big = "汉字".repeat(900_000);   // UTF-8 约 5.4MB,必跨块
+        const p = wr("selftest-sess-0305-bigg", [f.H(INS, 10), f.H(big, 11), f.H("尾巴", 12)]);
+        const r = RULER.countHuman(p, { sinceMs: Date.parse(f.iso(10)), untilMs: now });
+        const hit = RULER.locateInstruction(p, "尾巴", { untilMs: now });
+        return [r.count, r.err || null, hit.at === f.iso(12)];
+      })(), [3, null, true]);
+    } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 清不掉不判 */ } }
+  }
+  t("305 ② 集成正例:--clear 成功时多打一行主尺、写进批日志 clear 行;clear 行仍是台账末行(收尾闸的结清证据不受影响);--ruler 只读、读数一致", box305(({ cli, st, jrows, transcript, repo }) => {
+    const f = fx305(), all = fxAll(f);
+    transcript(SID, [f.H("先看一下现状", 0), f.H(INS, 10), ...all.notHuman.map((x) => x[2]), f.H("这里改一下", 20), f.U([{ type: "text", text: "[Request interrupted by user]" }], 21),
+      f.AT({ type: "queued_command", origin: { kind: "human" }, commandMode: "prompt", prompt: "顺便把文档也改了" }, 22)]);
+    cli(SIDE, "--arm", "510", "--cond", "甲", "--instruction", INS, "--finish-line", "自测过就停");
+    const v0 = st().version, n0 = jrows().length;
+    const q = cli(SIDE, "--ruler");
+    const ro = [st().version === v0, jrows().length === n0];
+    const c = cli(SIDE, "--clear");
+    const rows = jrows(), last = rows[rows.length - 1] || {};
+    const q2 = cli(SIDE, "--ruler");
+    return [q.status, q.stdout.includes("主尺:人亲口说了 4 条(打字 2、"), q.stdout.includes("没算进去(不是人说的):"), ro, c.status, /主尺:人亲口说了 4 条/.test(c.stdout), last.action, last.ruler?.ok, last.ruler?.count, last.ruler?.byKind,
+      last.instruction?.text, last.finishLine, st().cleared, q2.status, /批 510 已结清/.test(q2.stdout) && /主尺:人亲口说了 4 条/.test(q2.stdout), verifyChainOk(path.join(repo, ".claude", ".batch-goal.jsonl"))];
+  }), [0, true, true, [true, true], 0, true, "clear", true, 4, { typed: 2, interrupt: 1, queued: 1 }, INS, "自测过就停", true, 0, true, true]);
+  t("305 ② 集成反例:老用法(没记指令)⇒ 照常结清(退出 0),主尺那行写「量不出(开批时没记指令…)」,clear 行记 ruler.ok=false", box305(({ cli, jrows }) => {
+    cli(SIDE, "--arm", "511", "--cond", "甲");
+    const c = cli(SIDE, "--clear"); const last = jrows().pop() || {};
+    return [c.status, c.stdout.includes("主尺:量不出(开批时没记指令"), last.action, last.ruler?.ok, "instruction" in last];
+  }), [0, true, "clear", false, false]);
+  t("305 ② 集成反例:指令未定位 / 开批后转录被删 ⇒ 照常结清,主尺写量不出并给原因(不猜一个数)", box305(({ cli, jrows, transcript }) => {
+    cli(SIDE, "--arm", "512", "--cond", "甲", "--instruction", INS);
+    const c1 = cli(SIDE, "--clear"); const l1 = jrows().pop() || {};
+    const f = fx305(); const file = transcript(SID, [f.H(INS, 10)]);
+    cli(SIDE, "--arm", "513", "--cond", "甲", "--instruction", INS);
+    fs.rmSync(file);
+    const c2 = cli(SIDE, "--clear"); const l2 = jrows().pop() || {};
+    return [c1.status, c1.stdout.includes("主尺:量不出(指令未定位"), l1.ruler?.ok, c2.status, c2.stdout.includes("主尺:量不出(读不到指令所在会话的转录"), l2.ruler?.ok];
+  }), [0, true, false, 0, true, false]);
+  t("305 ② 集成:跑关账的是另一个会话 ⇒ 两份转录都读;--ruler 在未武装时说明没有批", box305(({ cli, jrows, transcript }) => {
+    const f = fx305(), SB = "selftest-sess-0305-bbbb";
+    const none = cli(SIDE, "--ruler");
+    transcript(SID, [f.H(INS, 10), f.H("第一个会话里又说一句", 12)]);
+    transcript(SB, [f.H("换了会话接着干", 100), f.TR("toolu_z", "结果", 101)]);
+    cli(SIDE, "--arm", "514", "--cond", "甲", "--instruction", INS);
+    const c = cli({ CLAUDE_CODE_SESSION_ID: SB }, "--clear"); const last = jrows().pop() || {};
+    return [none.status, none.stdout.includes("主尺:量不出(未武装"), c.status, last.ruler?.count, (last.ruler?.sessions || []).map((s) => [s.sid === SID ? "A" : "B", s.read, s.count])];
+  }), [0, true, 0, 3, [["A", true, 2], ["B", true, 1]]]);
 }
 const verifyChainOk = (f) => { try { return verifyFileChain(f).ok; } catch { return false; } };
 
@@ -2492,7 +2654,7 @@ const IS_MAIN = !!process.argv[1] &&
   import.meta.url.endsWith(process.argv[1].split(/[\\/]/).pop());
 const argv = IS_MAIN ? process.argv.slice(2) : ["--imported-noop"];
 if (argv.includes("--self-test")) process.exit(selfTest());
-{ const modes = ["--arm", "--status", "--dry-check", "--clear", "--history", "--decision", "--outcome", "--withdraw", "--settle", "--repair-obligations", "--context"].filter((m) => argv.includes(m));
+{ const modes = ["--arm", "--status", "--dry-check", "--clear", "--history", "--decision", "--outcome", "--withdraw", "--settle", "--repair-obligations", "--context", "--ruler", "--handoff"].filter((m) => argv.includes(m));
   if (modes.length > 1) { console.error(`一次只能一个模式,得到:${modes.join(" ")}`); process.exit(2); } }
 
 if (argv.includes("--clear")) {
@@ -2678,7 +2840,9 @@ if (argv.includes("--clear")) {
     if (accNow.length) console.log(`本批曾确认义务账丢失(理由:${accNow.map((r) => r.reason).join(";")})——收尾报告须写明`);
     const oblCleared = recs.filter((r) => r.status === "cleared").map((r) => r.id);
     const oblSettled = recs.filter((r) => r.status === "settled").map((r) => ({ id: r.id, debtId: r.settle?.debtId, expiry: r.settle?.expiry }));
-    journal("clear", { batch: prev?.batch ?? null, conditions: prev?.conditions ?? null,
+    // 批 305:主尺在写 clear 行**之前**算好、记在 clear 行里(收尾闸要求台账末行就是 clear 行,不能事后另追一行)。只读转录,量不出也照常结清。
+    const ruler = computeRuler(prev);
+    journal("clear", { batch: prev?.batch ?? null, conditions: prev?.conditions ?? null, ...pickArmMeta(prev), ruler: rulerRecord(ruler),
       checks: prev?.checks ?? null, armedAt: prev?.armedAt ?? null, baseCommit: prev?.baseCommit ?? null,
       decisions: prev?.decisions ?? null, outcomes: prev?.outcomes ?? null, withdrawn: prev?.withdrawn ?? null,
       obligations: { cleared: oblCleared.length, settled: oblSettled, head: evalOut.head ?? null, version: evalOut.version },
@@ -2696,6 +2860,7 @@ if (argv.includes("--clear")) {
       ...(typeof prev?.armedBy === "string" && prev.armedBy ? { armedBy: prev.armedBy } : {}),
       ...(typeof prev?.armedAt === "string" && prev.armedAt ? { armedAt: prev.armedAt } : {}) });
     console.log("已结清批级完成条件(留结清标记,下次 --arm 覆盖;条件已存入 .batch-goal.jsonl)");
+    console.log(RULER.formatRuler(ruler));   // 批 305:主尺一行(量不出也打,写明原因)
     debtTableWarn();
     // 批 258 条件 4:收尾自动出一张报警量 × 误报率表(按规则),待修行下一批 --arm 会再列一次
     const rep = fpReport();
@@ -2894,6 +3059,29 @@ if (argv.includes("--status")) {
   for (const o of numberOutcomes(g.outcomes)) console.log(`  成果 O${o.n}: ${o.text}`);
   for (const w of arr(g.withdrawn)) console.log(`  已撤 ${w?.kind === "decision" ? w.id : `O${w?.n}`}: ${w?.text}  ——理由:${w?.reason}`);
   printOblStatus(g);
+  process.exit(0);
+}
+
+if (argv.includes("--ruler")) {
+  // 批 305:主尺的只读子命令——随时单独算一遍,便于核对。不写批状态、不写台账。
+  //   未结清的批 ⇒ 现算(指令到此刻);刚结清 ⇒ 打关账时记进 clear 行的那一份;没有批 ⇒ 量不出。
+  let g = null;
+  try { g = load(); } catch (e) { console.log(`主尺:量不出(批状态读不了:${e.message})`); process.exit(0); }
+  if (g && !g.cleared && Array.isArray(g.conditions) && g.conditions.length) {
+    const r = computeRuler(g);
+    console.log(`批 ${g.batch}(未结清;现算到此刻)`);
+    for (const l of armMetaLines(g)) console.log(`  ${l}`);
+    console.log(RULER.formatRuler(r));
+    for (const l of RULER.formatRulerDetail(r)) console.log(l);
+  } else if (g && g.cleared) {
+    let row = null;
+    try { for (const l of fs.readFileSync(JOURNAL, "utf8").split("\n")) { if (!l.trim()) continue; let o; try { o = JSON.parse(l); } catch { continue; } if (o && o.action === "clear" && String(o.batch) === String(g.batch)) row = o; } } catch { row = null; }
+    console.log(`批 ${g.batch} 已结清;下面是关账时记进批日志的那一份(${row ? String(row.at || "").slice(0, 19) : "台账里没找到这批的 clear 行"})`);
+    if (row) for (const l of armMetaLines(row)) console.log(`  ${l}`);
+    const r = row && row.ruler ? row.ruler : { ok: false, why: row ? "这一批关账时还没有主尺(旧版本关的账)" : "台账里没有这批的 clear 行" };
+    console.log(RULER.formatRuler(r));
+    for (const l of RULER.formatRulerDetail(r)) console.log(l);
+  } else console.log("主尺:量不出(未武装:盘上没有批)");
   process.exit(0);
 }
 
