@@ -10,8 +10,12 @@
 //     并在清单里标 `sidecar`(旁件也已存在且不同 ⇒ `skipped`,一个字节都不写)。
 //     ⚠️ 对 `scripts/` 下的闸件这意味着:目标仓里**旧的那份仍是生效的那份**,清单如实报出。
 //   · **覆盖安装(`--overwrite`)只管 `scripts/` 下的闸件**:已存在且内容不同的直接替换,清单里标 `replaced`(带替换前的摘要),
-//     另在清单顶层 `overwrite.replaced` 列出全部被替换的路径。替换前先核这些路径在目标仓的 git 工作区是干净的——
+//     另在清单顶层 `overwrite.replaced` 列出全部被替换的路径。替换前逐路径核「git 兜得住」:已跟踪、暂存区与 HEAD 相同、
+//     工作区内容与 HEAD 里那份相同(按 git 的换行归一口径比;不读 `git status` 的输出,不受它的显示配置和 assume-unchanged / skip-worktree 标记影响)——
 //     改了没提交、暂存了没提交、未跟踪、被忽略,有任何一种 ⇒ 退出 7、逐个列出、**一个字节都不写**(被替换的内容必须能从 git 里拿回来)。
+//   · **任何写入位置经过符号链接、或解析后落在目标仓之外 ⇒ 退出 8、列出、一个字节都不写**(普通安装与覆盖安装都管):
+//     沿链接写会把仓里别的文件(包括规矩文件)或仓外的东西盖掉。
+//   · **目标仓已有 `docs/gate-phrasebook.md` 且不是生成器写的 ⇒ 退出 9、一个字节都不写**:安装器要在这个位置生成《闸用语》,不覆盖别人的文件,也不留半截安装。
 //     **规矩文件(`AGENTS.md`、`docs/` 下的)与 `.claude/agents/` 下的不受这个开关影响**,照旧只落旁件:
 //     目标仓自己的规矩文件永远不能被安装器覆盖。
 //   · `.claude/settings.json` 只做 JSON 合并去重(按命令串去重);解析不了 ⇒ 不碰它,写旁件。
@@ -29,6 +33,8 @@
 //        node scripts/custodiet-init.mjs --self-test
 // 退出码:0 完成(含有旁件/跳过的情形,看清单)  2 参数错  3 目标不存在或不是 git 仓根  4 node 版本过低
 //        5 插件模式尚未实现  6 装完但《闸用语》没生成 / 取不到引擎口径  7 覆盖安装被拒(待替换的路径在目标仓里不干净)
+//        8 写入位置经过符号链接或落在目标仓之外  9 目标仓已有不是生成器写的 docs/gate-phrasebook.md
+//        (7 / 8 / 9 都是预检拒绝:一个字节都没写)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -140,6 +146,9 @@ const GENERATED = { "CLAUDE.md": "@AGENTS.md\n" };
 const HOOK_CMD = 'node --no-warnings "$CLAUDE_PROJECT_DIR/scripts/hook-stop-closure.mjs"';
 const HOOK_EVENTS = ["Stop", "SubagentStop"];
 const HOOK_NAME = "hook-stop-closure.mjs";
+// 《闸用语》手册的位置与生成件标题(与 scripts/gate-phrasebook.mjs 同一句;自测钉着两处写法相同)
+const PHRASEBOOK_REL = "docs/gate-phrasebook.md";
+const PHRASEBOOK_HEAD = "# 闸用语(生成件,勿手改)";
 
 function die(code, msg, extra = {}) {
   process.stderr.write(`custodiet-init: ${msg}\n`);
@@ -170,9 +179,11 @@ for (let i = 0; i < argv.length; i++) {
     process.stdout.write("用法: node scripts/custodiet-init.mjs --target <目标仓根> [--mode copy] [--observe] [--overwrite]\n" +
       "       node scripts/custodiet-init.mjs --self-test\n" +
       "  --overwrite 覆盖安装:目标仓 scripts/ 下已存在且内容不同的同名闸件直接替换(缺省是写旁件、旧的那份继续生效)。\n" +
-      "             替换前先核这些路径在目标仓的 git 工作区是干净的;改了没提交 / 暂存了没提交 / 未跟踪 / 被忽略\n" +
+      "             替换前逐路径核:已跟踪、暂存区与 HEAD 相同、工作区内容与 HEAD 相同;改了没提交 / 暂存了没提交 / 未跟踪 / 被忽略\n" +
       "             ⇒ 退出 7、逐个列出、一个字节都不写。替换了哪些:清单里 status=replaced,顶层 overwrite.replaced。\n" +
       "             规矩文件(AGENTS.md、docs/ 下的)与 .claude/agents/ 下的不受这个开关影响,照旧只落旁件。\n" +
+      "  预检拒绝(都是一个字节不写):写入位置经过符号链接或落在目标仓之外 ⇒ 退出 8;\n" +
+      "             目标仓已有不是生成器写的 docs/gate-phrasebook.md ⇒ 退出 9(先改名或挪走)。\n" +
       "  --observe  装成观察档:闸照常判、照常记 .claude/.gate-alerts.jsonl,但不阻断、不对模型输出;\n" +
       "             示例宪法只落旁件 AGENTS.custodiet.md、CLAUDE.md 不引入它(《闸用语》照挂)。\n" +
       "             生效:模式文件提交后**新开的会话**才进观察档;装闸的这个会话照常阻断。\n" +
@@ -201,8 +212,77 @@ if (path.resolve(T) === path.resolve(SRC)) die(3, "目标就是 custodiet 仓自
 const pre = ["AGENTS.md", "CLAUDE.md", ".claude/settings.json", "package.json", "docs/gate/AGENTS.md", "docs/archive/laws-2026-11"]
   .filter((p) => fs.existsSync(path.join(T, p)));
 
-// ── 覆盖安装的预检(先于任何写入)──────────────────────────────────────
+// ── 预检一:写入路径不得经过符号链接、不得落在目标仓之外(先于任何写入;普通安装与覆盖安装都管)──────────
+//   codex 304-sync-review-r1 第 1 条:`scripts/report-gate.mjs` 是指向 `../AGENTS.md` 的符号链接时,覆盖安装沿链接写,
+//   把目标仓自己的规矩文件盖掉;`scripts/` 是指到仓外的目录联接时,普通安装把整套脚本写到仓外(本机复现:仓外多出 59 个条目)。
+//   判法:本安装器**可能写到**的每个路径(拷贝件、它们的旁件、settings、手册、模式文件、清单、.gitignore),从仓根往下逐级看——
+//   任何一级已存在的组成部分是符号链接(Windows 的目录联接也算),或解析后落在仓根之外 ⇒ 整个不装、列出路径、一个字节不写。
+//   拿不准(读不了、解析不了)一律算不安全:漏放的代价是盖掉用户的文件,误拒只是让人清一下路径。
+{
+  const REAL_T = fs.realpathSync(T);
+  const inside = (abs) => { const r = path.relative(REAL_T, abs); return r === "" || (!r.startsWith("..") && !path.isAbsolute(r)); };
+  const unsafeAt = (rel) => {
+    const parts = rel.split("/");
+    let cur = T;
+    for (let i = 0; i < parts.length; i++) {
+      cur = path.join(cur, parts[i]);
+      const at = parts.slice(0, i + 1).join("/");
+      let st;
+      try { st = fs.lstatSync(cur); } catch (e) { if (e && e.code === "ENOENT") return null; return { at, why: `读不了(${e?.code || "未知错误"})` }; }
+      if (st.isSymbolicLink()) return { at, why: "是符号链接" };
+      let real;
+      try { real = fs.realpathSync(cur); } catch (e) { return { at, why: `解析不了(${e?.code || "未知错误"})` }; }
+      if (!inside(real)) return { at, why: "解析后落在目标仓之外" };
+    }
+    return null;
+  };
+  const targets = FILES.map((rel) => (observe && rel === "AGENTS.md" ? sidecarOf(rel) : rel));
+  const writePaths = [...new Set([
+    ...targets, ...targets.map(sidecarOf),
+    ...Object.keys(GENERATED), ...Object.keys(GENERATED).map(sidecarOf),
+    ".claude/settings.json", ".claude/settings.custodiet.json", PHRASEBOOK_REL, "CLAUDE.md",
+    ".claude/custodiet-mode", ".claude/custodiet-manifest.json", ".gitignore",
+  ])];
+  const seen = new Map();   // 出问题的那一级 ⇒ { path, why, affects: 经过它的写入路径 }
+  for (const rel of writePaths) {
+    const u = unsafeAt(rel);
+    if (!u) continue;
+    if (!seen.has(u.at)) seen.set(u.at, { path: u.at, why: u.why, affects: [] });
+    seen.get(u.at).affects.push(rel);
+  }
+  if (seen.size) {
+    const unsafePaths = [...seen.values()];
+    die(8, `安装被拒:${unsafePaths.length} 个写入位置经过符号链接或落在目标仓之外(换成普通文件 / 目录再重跑;什么都没写):` +
+      unsafePaths.map((u) => `${u.path}[${u.why};影响 ${u.affects.length} 个写入路径]`).join("、"), { unsafePaths });
+  }
+}
+
+// ── 预检二:目标仓已有同名《闸用语》手册、且不是生成器写的 ⇒ 不装(先于任何写入)────────────────
+//   codex 304-sync-review-r1 第 4 条:原来这个冲突要等脚本拷完、hooks 合并完,生成器才发现(退出 3),安装器最后退出 6——
+//   留下一个装了一半的仓。判据与生成器 scripts/gate-phrasebook.mjs 同一句(首行是不是生成件标题;自测钉着两处写法相同)。
+{
+  const p = path.join(T, PHRASEBOOK_REL);
+  if (fs.existsSync(p)) {
+    let cur = null, why = null;
+    try { cur = fs.readFileSync(p, "utf8"); } catch (e) { why = `读不了(${e?.code || "未知错误"})`; }
+    if (cur === null || !cur.startsWith(PHRASEBOOK_HEAD)) {
+      die(9, `安装被拒:目标仓已有 ${PHRASEBOOK_REL},且${why || "不是《闸用语》生成器写的(首行不是生成件标题)"}。安装器要在这个位置生成手册、不会覆盖你的文件——` +
+        `先把它改名或挪走(提交),再重跑;什么都没写。`, { conflict: PHRASEBOOK_REL });
+    }
+  }
+}
+
+// ── 预检三:覆盖安装(先于任何写入)────────────────────────────────────
 //   只管 scripts/ 下的闸件。规矩文件(AGENTS.md、docs/)与 agent 定义永远走旁件——目标仓自己的规矩不能被安装器盖掉。
+//   待替换的路径必须「git 兜得住」:已跟踪、暂存区与 HEAD 相同、工作区内容与 HEAD 里那份相同。其余一律拒绝。
+//   **不读 `git status` 的输出**(codex 304-sync-review-r1 第 2 条:`status.showUntrackedFiles=no` 让未跟踪 / 被忽略的文件从输出里消失,
+//   `assume-unchanged` / `skip-worktree` 让改过的已跟踪文件从输出里消失——本机这几种都复现成「被替换」)。改成逐路径直接比:
+//     · 索引里没有这条路径(未跟踪或被忽略)⇒ 拒绝;
+//     · 没有 HEAD、HEAD 里没有它、或索引条目与 HEAD 条目不同(暂存了没提交)、或有未合并条目 ⇒ 拒绝;
+//     · 工作区内容 vs HEAD:先按 git 自己的入库口径算这份文件的对象号(`git hash-object`,过换行转换与属性过滤,
+//       所以 autocrlf 检出的 CRLF 不会误拒;它直接读文件,不看 assume-unchanged / skip-worktree 标记),与 HEAD 的对象号相同 ⇒ 干净;
+//       不同再比一次原始字节(HEAD 里本来就存着 CRLF 的文件),相同 ⇒ 干净;都不同 ⇒ 拒绝。
+//   任何一步 git 跑不了 ⇒ 证明不了干净 ⇒ 拒绝。
 const overwritable = (rel) => rel.startsWith("scripts/");
 const replaced = [];
 if (overwrite) {
@@ -212,21 +292,59 @@ if (overwrite) {
     return fs.existsSync(s) && fs.existsSync(d) && sha(fs.readFileSync(d)) !== sha(fs.readFileSync(s));
   });
   if (cand.length) {
-    // 待替换的路径在目标仓里有没有 git 兜不住的内容:改了没提交、暂存了没提交、未跟踪、被忽略——有任何一种就整个不装。
-    //   git 跑不了 / 退出非零 ⇒ 证明不了干净 ⇒ 同样拒绝。
-    const st = spawnSync("git", ["-C", T, "status", "--porcelain=v1", "--ignored", "-z", "--", ...cand], { encoding: "utf8", windowsHide: true, timeout: 60000 });
-    if (st.status !== 0) {
-      die(7, `覆盖安装被拒:读不到目标仓的 git 状态(${String(st.stderr || st.error?.message || "").trim().split("\n")[0]}),证明不了待替换的路径是干净的`, { dirty: null, wouldReplace: cand });
+    const g = (args, input) => spawnSync("git", ["--literal-pathspecs", "-C", T, ...args], { encoding: "utf8", windowsHide: true, timeout: 60000, maxBuffer: 1 << 28, input });
+    const gRaw = (args) => spawnSync("git", ["--literal-pathspecs", "-C", T, ...args], { encoding: "buffer", windowsHide: true, timeout: 60000, maxBuffer: 1 << 28 });
+    const cannot = (what, r) => die(7, `覆盖安装被拒:${what}(${String(r.stderr || r.error?.message || "").trim().split("\n")[0] || `退出 ${r.status}`}),证明不了待替换的路径是干净的`,
+      { dirty: null, wouldReplace: cand });
+    // 索引条目:`<mode> <对象号> <stage>\t<路径>\0`
+    const ls = g(["ls-files", "-s", "-z", "--", ...cand]);
+    if (ls.status !== 0) cannot("读不到目标仓的索引", ls);
+    const index = new Map();
+    for (const e of ls.stdout.split("\0").filter(Boolean)) {
+      const m = /^(\d+) ([0-9a-f]+) (\d)\t([\s\S]+)$/.exec(e);
+      if (!m) cannot("索引条目解析不了", { stderr: e.slice(0, 80) });
+      if (!index.has(m[4])) index.set(m[4], []);
+      index.get(m[4]).push({ mode: m[1], oid: m[2], stage: m[3] });
     }
-    const dirty = [];
-    const ent = st.stdout.split("\0").filter(Boolean);
-    for (let i = 0; i < ent.length; i++) {
-      const xy = ent[i].slice(0, 2);
-      dirty.push({ path: ent[i].slice(3), status: xy.trim() || xy });
-      if (/[RC]/.test(xy)) i++;   // 改名 / 复制:下一项是旧路径,不单算
+    // HEAD 条目:`<mode> <type> <对象号>\t<路径>\0`;没有 HEAD(还没有提交)⇒ 表空
+    const head = new Map();
+    const hasHead = g(["rev-parse", "-q", "--verify", "HEAD^{commit}"]).status === 0;
+    if (hasHead) {
+      const lt = g(["ls-tree", "-z", "HEAD", "--", ...cand]);
+      if (lt.status !== 0) cannot("读不到 HEAD 的树", lt);
+      for (const e of lt.stdout.split("\0").filter(Boolean)) {
+        const m = /^(\d+) (\w+) ([0-9a-f]+)\t([\s\S]+)$/.exec(e);
+        if (!m) cannot("HEAD 树条目解析不了", { stderr: e.slice(0, 80) });
+        head.set(m[4], { mode: m[1], type: m[2], oid: m[3] });
+      }
+    }
+    const dirty = [], toHash = [];
+    for (const rel of cand) {
+      const ix = index.get(rel);
+      if (!ix) {
+        // 只为把标签报准(两种都拒):被 .gitignore 忽略的标 ignored,其余标 untracked
+        const ig = spawnSync("git", ["-C", T, "check-ignore", "-q", "--", rel], { encoding: "utf8", windowsHide: true, timeout: 60000 });
+        dirty.push({ path: rel, status: ig.status === 0 ? "ignored" : "untracked" });
+      } else if (ix.length !== 1 || ix[0].stage !== "0") dirty.push({ path: rel, status: "unmerged" });
+      else if (!head.has(rel)) dirty.push({ path: rel, status: "staged-not-in-head" });
+      else if (head.get(rel).type !== "blob" || head.get(rel).oid !== ix[0].oid || head.get(rel).mode !== ix[0].mode) dirty.push({ path: rel, status: "staged" });
+      else toHash.push(rel);
+    }
+    if (toHash.length) {
+      // 一次算完:每行一个路径进,每行一个对象号出(同序)
+      const ho = g(["hash-object", "--stdin-paths"], toHash.join("\n") + "\n");
+      const oids = ho.status === 0 ? ho.stdout.split("\n").filter(Boolean) : [];
+      if (ho.status !== 0 || oids.length !== toHash.length) cannot("算不出工作区文件的对象号", ho);
+      toHash.forEach((rel, i) => {
+        if (oids[i] === head.get(rel).oid) return;
+        const blob = gRaw(["cat-file", "blob", head.get(rel).oid]);
+        if (blob.status === 0 && Buffer.compare(blob.stdout, fs.readFileSync(path.join(T, rel))) === 0) return;
+        dirty.push({ path: rel, status: "modified" });
+      });
     }
     if (dirty.length) {
-      die(7, `覆盖安装被拒:${dirty.length} 个待替换的路径在目标仓里有未提交的内容(先提交或还原,再重跑):` +
+      dirty.sort((a, b) => cand.indexOf(a.path) - cand.indexOf(b.path));
+      die(7, `覆盖安装被拒:${dirty.length} 个待替换的路径在目标仓里有 git 兜不住的内容(已跟踪的先提交或还原,没跟踪的先提交或挪走,再重跑;什么都没写):` +
         dirty.map((d) => `${d.path}[${d.status}]`).join("、"), { dirty, wouldReplace: cand });
     }
   }
@@ -449,19 +567,36 @@ process.stderr.write("未提交任何东西。下一步:在目标仓里跑 `node
   "    装闸件尚未提交时红 4 到 5 条(空仓 5 条);装闸提交之后剩 3 条,要等之后有一次**新增了文件**的提交才全绿\n" +
   "    (判据取的是「最近一次新增过文件的提交」,只改不增的提交不算)。\n" +
   "    没装解析依赖(npm --prefix scripts/gate-deps install)时,「写入三态」组另有 2 条红。\n");
+// 阻断档下,规矩文件留在旁件里 ⇒ 落在它上面的法条指针是死的,自检的「law 锚点」把它们标 SIDE 并计失败——
+//   这类红不随提交转绿(codex 304-sync-review-r1 第 3 条;本机复现:目标仓自带 AGENTS.md 时 5 条持续红)。这里把条件和出路报出来,不改判据。
+const lawSidecars = [];
+if (!observe) {
+  for (const f of files.filter((x) => ["sidecar", "sidecar-unchanged", "skipped"].includes(x.status))) {
+    const hit = RULES.filter((r) => String(r.law || "").split("#")[0] === f.path);
+    if (hit.length) lawSidecars.push({ file: f.path, sidecar: f.sidecar || sidecarOf(f.path), rules: hit.map((r) => r.id), anchors: [...new Set(hit.map((r) => String(r.law).split("#")[1]))] });
+  }
+}
+for (const s of lawSidecars) {
+  process.stderr.write(`⚠ 目标仓已有自己的 ${s.file}:示例规矩落在旁件 ${s.sidecar} 里(模型不加载旁件)。规则 ${s.rules.join(" / ")} 的法条指针落在这份文件上——\n` +
+    `    你自己的 ${s.file} 里没有对应的标题 / 列点句名时,自检的「law 锚点」把这 ${s.rules.length} 条标成 SIDE 并计失败(自检退出码非零),提交多少次都不会转绿。\n` +
+    `    出路二选一:①把旁件里这几处并进自己的 ${s.file}:${s.anchors.map((a) => `「${a}」`).join("、")};\n` +
+    `              ②用观察档:带 --observe 重跑一次安装器(观察档下 SIDE 不计失败;注意观察档下闸只记账、不阻断)。\n`);
+}
 const allOk = phrasebook.status === "generated";
 if (manifest.ignored) process.stderr.write(`⚠ ${manifest.path} 被目标仓的 .gitignore 挡住:装闸提交前先 \`git add -f ${manifest.path}\`,否则闸认不出这次是原样装入\n`);
 if (!allOk) process.stderr.write(`⚠ 《闸用语》手册没生成(${phrasebook.error || "未知原因"}),CLAUDE.md 未挂引用;闸件已装,手册要另跑 node --no-warnings scripts/gate-phrasebook.mjs\n`);
 process.stdout.write(JSON.stringify({
   ok: allOk, mode, target: T, source: { name: "custodiet", version },
   preExisting: pre, changed, files, settings, gitignore, observe: observeFile, phrasebook, manifest, notInstalled,
-  overwrite: { requested: overwrite, replaced },
+  overwrite: { requested: overwrite, replaced }, lawSidecars,
 }) + "\n");
 process.exit(allOk ? 0 : 6);
 
 // ── 自测(--self-test)──────────────────────────────────────────────────
 //   静态三条(引擎口径同一份、拷贝清单覆盖 scripts/、law 目标文件都在清单里)+ 在系统临时目录里建一次性 git 仓,
-//   把本安装器当子进程实跑:普通安装、重装幂等、旁件、覆盖安装、覆盖安装的四种拒绝、规矩文件不受覆盖开关影响。
+//   把本安装器当子进程实跑:普通安装、重装幂等、旁件、覆盖安装、覆盖安装的拒绝(含不读 git status 输出的几种状态与换行反例)、
+//   规矩文件不受覆盖开关影响、写入位置经过符号链接 / 落在仓外的拒绝、已有同名手册的拒绝、自带规矩文件时的 lawSidecars。
+//   文件符号链接在 Windows 上要特权:建不了就打一行 SKIP、不计数(目录联接的几条照跑)。
 //   不碰本仓、不联网;临时目录用完即删。
 function selfTest() {
   let pass = 0, fail = 0;
@@ -557,28 +692,94 @@ function selfTest() {
       RULEFILES.map((f) => [st(r4.j, f), read(c, f) === OLD, read(c, sidecarOf(f)) === src(f)]), RULEFILES.map(() => ["sidecar", true, true]));
     t("覆盖安装:被替换的引擎文件进安装清单", Object.hasOwn(JSON.parse(read(c, ".claude/custodiet-manifest.json") || "{}").files || {}, ENG), true);
     // ⑤ 覆盖安装的拒绝:待替换的路径不干净 ⇒ 退出 7、列出、一个字节都不写
+    const dirtyOf = (r) => (r.j?.dirty || []).map((x) => `${x.path}[${x.status}]`).sort();
+    const untouched = (d) => [fs.existsSync(path.join(d, "scripts/hook-stop-closure.mjs")), fs.existsSync(path.join(d, ".claude/custodiet-manifest.json")), fs.existsSync(path.join(d, "AGENTS.md"))];
     const refuse = (name, prep) => {
       const d = mk(name, { [TOOL]: OLD, [PS1]: OLD });
       commit(d, "seed");
       const before = prep(d);
       const r = run(d, "--overwrite");
-      return [r.code, r.j?.ok, (r.j?.dirty || []).map((x) => `${x.path}[${x.status}]`).sort(), read(d, TOOL) === before, read(d, PS1) === OLD,
-        fs.existsSync(path.join(d, "scripts/hook-stop-closure.mjs")), fs.existsSync(path.join(d, ".claude/custodiet-manifest.json")), fs.existsSync(path.join(d, "AGENTS.md"))];
+      return [r.code, r.j?.ok, dirtyOf(r), read(d, TOOL) === before, read(d, PS1) === OLD, ...untouched(d)];
     };
     t("覆盖安装被拒:改了没提交", refuse("dirty-modified", (d) => { fs.writeFileSync(path.join(d, TOOL), "// edited\n"); return "// edited\n"; }),
-      [7, false, [`${TOOL}[M]`], true, true, false, false, false]);
+      [7, false, [`${TOOL}[modified]`], true, true, false, false, false]);
     t("覆盖安装被拒:暂存了没提交", refuse("dirty-staged", (d) => { fs.writeFileSync(path.join(d, TOOL), "// staged\n"); git(d, "add", TOOL); return "// staged\n"; }),
-      [7, false, [`${TOOL}[M]`], true, true, false, false, false]);
+      [7, false, [`${TOOL}[staged]`], true, true, false, false, false]);
     {
       const d = mk("dirty-untracked", { [TOOL]: OLD });
       const r = run(d, "--overwrite");
-      t("覆盖安装被拒:未跟踪的同名文件", [r.code, (r.j?.dirty || []).map((x) => `${x.path}[${x.status}]`), read(d, TOOL), fs.existsSync(path.join(d, "scripts/hook-stop-closure.mjs"))], [7, [`${TOOL}[??]`], OLD, false]);
+      t("覆盖安装被拒:未跟踪的同名文件", [r.code, dirtyOf(r), read(d, TOOL), ...untouched(d)], [7, [`${TOOL}[untracked]`], OLD, false, false, false]);
     }
     {
       const d = mk("dirty-ignored", { ".gitignore": "scripts/report-gate.mjs\n", [TOOL]: OLD });
       commit(d, "seed");
       const r = run(d, "--overwrite");
-      t("覆盖安装被拒:被 .gitignore 忽略的同名文件", [r.code, (r.j?.dirty || []).map((x) => `${x.path}[${x.status}]`), read(d, TOOL), fs.existsSync(path.join(d, "scripts/hook-stop-closure.mjs"))], [7, [`${TOOL}[!!]`], OLD, false]);
+      t("覆盖安装被拒:被 .gitignore 忽略的同名文件", [r.code, dirtyOf(r), read(d, TOOL), ...untouched(d)], [7, [`${TOOL}[ignored]`], OLD, false, false, false]);
+    }
+    // —— 回修 2(codex 304-sync-review-r1):预检不读 git status 的输出;回件里的三个最小状态各一例,另补同族 ——
+    {
+      const d = mk("r2-untracked-hidden", { [TOOL]: OLD });
+      git(d, "config", "status.showUntrackedFiles", "no");
+      const r = run(d, "--overwrite");
+      t("回修2:status.showUntrackedFiles=no + 未跟踪的同名文件 ⇒ 拒、原文件不动", [r.code, dirtyOf(r), read(d, TOOL), ...untouched(d)], [7, [`${TOOL}[untracked]`], OLD, false, false, false]);
+    }
+    {
+      const d = mk("r2-ignored-hidden", { ".gitignore": "scripts/report-gate.mjs\n", [TOOL]: OLD });
+      commit(d, "seed");
+      git(d, "config", "status.showUntrackedFiles", "no");
+      const r = run(d, "--overwrite");
+      t("回修2:被忽略的同名文件 + status.showUntrackedFiles=no ⇒ 拒、原文件不动", [r.code, dirtyOf(r), read(d, TOOL), ...untouched(d)], [7, [`${TOOL}[ignored]`], OLD, false, false, false]);
+    }
+    t("回修2:assume-unchanged 后再改 ⇒ 拒、改动还在", refuse("r2-assume-unchanged", (d) => { git(d, "update-index", "--assume-unchanged", TOOL); fs.writeFileSync(path.join(d, TOOL), "// edited\n"); return "// edited\n"; }),
+      [7, false, [`${TOOL}[modified]`], true, true, false, false, false]);
+    t("回修2:skip-worktree 后再改 ⇒ 拒、改动还在", refuse("r2-skip-worktree", (d) => { git(d, "update-index", "--skip-worktree", TOOL); fs.writeFileSync(path.join(d, TOOL), "// edited\n"); return "// edited\n"; }),
+      [7, false, [`${TOOL}[modified]`], true, true, false, false, false]);
+    {
+      // 首次提交之后才 git add、从没提交过:HEAD 里没有这份内容
+      const d = mk("r2-staged-new", { "README.md": "x\n" });
+      commit(d, "seed");
+      fs.mkdirSync(path.join(d, "scripts"), { recursive: true }); fs.writeFileSync(path.join(d, TOOL), OLD); git(d, "add", TOOL);
+      const r = run(d, "--overwrite");
+      t("回修2:已暂存但 HEAD 里没有(从没提交过)⇒ 拒", [r.code, dirtyOf(r), read(d, TOOL)], [7, [`${TOOL}[staged-not-in-head]`], OLD]);
+    }
+    {
+      const d = mk("r2-unborn", { [TOOL]: OLD });
+      git(d, "add", "-A");
+      const r = run(d, "--overwrite");
+      t("回修2:还没有任何提交、文件只在暂存区 ⇒ 拒", [r.code, dirtyOf(r), read(d, TOOL)], [7, [`${TOOL}[staged-not-in-head]`], OLD]);
+    }
+    {
+      // 只改了换行:autocrlf 关着时 git 也认它是改动 ⇒ 拒
+      const d = mk("r2-eol-only", { [TOOL]: "// a\n// b\n" });
+      commit(d, "seed");
+      git(d, "config", "core.autocrlf", "false");
+      fs.writeFileSync(path.join(d, TOOL), "// a\r\n// b\r\n");
+      const r = run(d, "--overwrite");
+      t("回修2:只改了换行、仓里关着 autocrlf(git 也认它是改动)⇒ 拒", [r.code, dirtyOf(r)], [7, [`${TOOL}[modified]`]]);
+    }
+    {
+      // 反例:HEAD 里是 LF,工作区是 autocrlf 检出的 CRLF ⇒ git 眼里没改 ⇒ 不误拒
+      const d = mk("r2-autocrlf", { [TOOL]: "// a\n// b\n" });
+      commit(d, "seed");
+      git(d, "config", "core.autocrlf", "true");
+      fs.writeFileSync(path.join(d, TOOL), "// a\r\n// b\r\n");
+      const r = run(d, "--overwrite");
+      t("回修2 反例:autocrlf 检出的 CRLF(HEAD 里是 LF)不误拒 ⇒ 照常替换", [r.code, st(r.j, TOOL), read(d, TOOL) === src(TOOL)], [0, "replaced", true]);
+    }
+    {
+      // 反例:HEAD 里本来就存着 CRLF,工作区逐字节相同,仓里开着 autocrlf ⇒ 不误拒
+      const d = mk("r2-crlf-in-head", { [TOOL]: "// a\r\n// b\r\n" });
+      commit(d, "seed");
+      git(d, "config", "core.autocrlf", "true");
+      const r = run(d, "--overwrite");
+      t("回修2 反例:HEAD 里本来就是 CRLF、工作区逐字节相同 ⇒ 照常替换", [r.code, st(r.j, TOOL)], [0, "replaced"]);
+    }
+    {
+      const d = mk("r2-assume-clean", { [TOOL]: OLD });
+      commit(d, "seed");
+      git(d, "update-index", "--assume-unchanged", TOOL);
+      const r = run(d, "--overwrite");
+      t("回修2 反例:标了 assume-unchanged 但没改 ⇒ 照常替换", [r.code, st(r.j, TOOL)], [0, "replaced"]);
     }
     {
       // 不干净的是**不在待替换之列**的文件 ⇒ 不拦(只核要被替换的那些路径)
@@ -598,6 +799,100 @@ function selfTest() {
       const d = mk("overwrite-empty");
       const r = run(d, "--overwrite");
       t("覆盖安装(空仓,没有可替换的):等同普通安装", [r.code, r.j?.overwrite, (r.j?.files || []).filter((f) => f.status !== "created").length], [0, { requested: true, replaced: [] }, 0]);
+    }
+
+    // —— 回修 1(codex 304-sync-review-r1):写入位置经过符号链接 / 落在仓外 ⇒ 退出 8、列出、一个字节不写 ——
+    //   目录用联接(Windows 上不要特权;别的系统上就是目录符号链接);文件符号链接在 Windows 上要特权,建不了就打 SKIP、不计数。
+    const countAll = (dir) => { try { return fs.readdirSync(dir, { recursive: true }).length; } catch { return -1; } };
+    const unsafeOf = (r) => (r.j?.unsafePaths || []).map((u) => `${u.path}[${u.why}]`);
+    for (const flag of [[], ["--overwrite"]]) {
+      const label = flag.length ? "覆盖安装" : "普通安装";
+      const out = path.join(tmpRoot, `outside-${flag.length}`); fs.mkdirSync(out);
+      const d = mk(`r1-scripts-junction-${flag.length}`, { "README.md": "x\n" });
+      commit(d, "seed");
+      fs.symlinkSync(out, path.join(d, "scripts"), "junction");
+      const r = run(d, ...flag);
+      t(`回修1:scripts/ 是指到仓外的目录联接 ⇒ ${label}拒(退出 8)、仓外一个字节不写、仓里也没装`,
+        [r.code, r.j?.ok, unsafeOf(r), countAll(out), fs.existsSync(path.join(d, ".claude")), fs.existsSync(path.join(d, "AGENTS.md"))], [8, false, ["scripts[是符号链接]"], 0, false, false]);
+    }
+    {
+      // 链接指向仓内另一处也拒:沿它写会盖掉仓里别的文件
+      const d = mk("r1-docs-junction-inside", { "mydocs/keep.md": "mine\n" });
+      commit(d, "seed");
+      fs.symlinkSync(path.join(d, "mydocs"), path.join(d, "docs"), "junction");
+      const r = run(d);
+      t("回修1:docs/ 是指到仓内另一个目录的联接 ⇒ 拒、那个目录里什么都没多", [r.code, unsafeOf(r), countAll(path.join(d, "mydocs")), fs.existsSync(path.join(d, "scripts"))], [8, ["docs[是符号链接]"], 1, false]);
+    }
+    {
+      const out = path.join(tmpRoot, "outside-claude"); fs.mkdirSync(out);
+      const d = mk("r1-claude-junction");
+      fs.symlinkSync(out, path.join(d, ".claude"), "junction");
+      const r = run(d);
+      t("回修1:.claude/ 是目录联接(settings / 清单 / agent 的写入位置)⇒ 拒、列出受影响的写入路径数", [r.code, (r.j?.unsafePaths || []).map((u) => [u.path, u.affects.length > 0]), countAll(out), fs.existsSync(path.join(d, "scripts"))], [8, [[".claude", true]], 0, false]);
+    }
+    {
+      // 目标路径**本身**是链接(不是父目录):这里用目录联接顶替——文件符号链接在本类机器上建不了(见下一条的 SKIP),走的是同一个判断
+      const d = mk("r1-leaf-junction", { "keep/a.md": "mine\n" });
+      commit(d, "seed");
+      fs.mkdirSync(path.join(d, "scripts"));
+      fs.symlinkSync(path.join(d, "keep"), path.join(d, TOOL), "junction");
+      fs.symlinkSync(path.join(d, "keep"), path.join(d, "AGENTS.custodiet.md"), "junction");
+      const r = run(d, "--overwrite");
+      t("回修1:写入路径本身是链接(scripts/ 下的拷贝件、规矩文件的旁件位置各一)⇒ 拒、链接指向的目录不动",
+        [r.code, unsafeOf(r).sort(), countAll(path.join(d, "keep")), fs.existsSync(path.join(d, "scripts/hook-stop-closure.mjs"))], [8, ["AGENTS.custodiet.md[是符号链接]", `${TOOL}[是符号链接]`], 1, false]);
+    }
+    {
+      // 回件的最小状态:已提交、干净的 scripts/report-gate.mjs 是指向 ../AGENTS.md 的符号链接,AGENTS.md 有未提交内容,跑 --overwrite
+      const d = mk("r1-file-symlink", { "AGENTS.md": "# mine\n" });
+      fs.mkdirSync(path.join(d, "scripts"));
+      let made = null;
+      try { fs.symlinkSync("../AGENTS.md", path.join(d, TOOL), "file"); } catch (e) { made = e?.code || String(e); }
+      if (made) console.log(`SKIP  回修1:文件符号链接 scripts/report-gate.mjs → ../AGENTS.md(本机建不了文件符号链接:${made};目录联接的几条照跑)`);
+      else {
+        git(d, "-c", "core.symlinks=true", "add", "-A"); git(d, "commit", "-q", "-m", "seed");
+        fs.writeFileSync(path.join(d, "AGENTS.md"), "# mine\nuncommitted\n");
+        for (const flag of [["--overwrite"], []]) {
+          const r = run(d, ...flag);
+          t(`回修1:scripts/report-gate.mjs 是指向 ../AGENTS.md 的符号链接 ⇒ ${flag.length ? "覆盖安装" : "普通安装"}拒、AGENTS.md 一字不动`,
+            [r.code, unsafeOf(r), read(d, "AGENTS.md"), fs.existsSync(path.join(d, "scripts/hook-stop-closure.mjs"))], [8, [`${TOOL}[是符号链接]`], "# mine\nuncommitted\n", false]);
+        }
+      }
+    }
+
+    // —— 回修 4(codex 304-sync-review-r1):已有不是生成器写的同名手册 ⇒ 预检就拒(退出 9),不留半截安装 ——
+    t("回修4:判据与生成器同一句(生成器源码里是同一个标题串)", fs.readFileSync(path.join(SRC, "scripts/gate-phrasebook.mjs"), "utf8").includes(`startsWith(${JSON.stringify(PHRASEBOOK_HEAD)})`), true);
+    for (const flag of [[], ["--overwrite"], ["--observe"]]) {
+      const d = mk(`r4-own-phrasebook-${flag.join("") || "plain"}`, { [PHRASEBOOK_REL]: "# 我自己的手册\n" });
+      commit(d, "seed");
+      const r = run(d, ...flag);
+      t(`回修4:已有自己写的 ${PHRASEBOOK_REL}(${flag.join(" ") || "普通安装"})⇒ 退出 9、什么都没写、手册不动`,
+        [r.code, r.j?.ok, r.j?.conflict, read(d, PHRASEBOOK_REL), fs.existsSync(path.join(d, "scripts")), fs.existsSync(path.join(d, ".claude")), fs.existsSync(path.join(d, "CLAUDE.md")), fs.existsSync(path.join(d, ".gitignore"))],
+        [9, false, PHRASEBOOK_REL, "# 我自己的手册\n", false, false, false, false]);
+    }
+    {
+      const d = mk("r4-generated-phrasebook", { [PHRASEBOOK_REL]: `${PHRASEBOOK_HEAD}\n\n旧的一版\n` });
+      commit(d, "seed");
+      const r = run(d);
+      t("回修4 反例:已有的是生成器写的旧版 ⇒ 照常装、手册重新生成", [r.code, r.j?.phrasebook?.status, (read(d, PHRASEBOOK_REL) || "").includes("旧的一版")], [0, "generated", false]);
+    }
+
+    // —— 回修 3(codex 304-sync-review-r1):目标仓自带规矩文件 ⇒ 法条指针留在旁件里,清单与提示把条件报出来(判据不动)——
+    {
+      const lawOn = (file) => RULES.filter((r) => String(r.law || "").split("#")[0] === file).map((r) => r.id);
+      const d = mk("r3-own-agents", { "AGENTS.md": "# Project guidelines\n" });
+      commit(d, "seed");
+      const r = run(d);
+      t("回修3:目标仓已有自己的 AGENTS.md、普通安装 ⇒ 清单 lawSidecars 报出文件、旁件、落在上面的规则",
+        [r.code, st(r.j, "AGENTS.md"), (r.j?.lawSidecars || []).map((s) => [s.file, s.sidecar, s.rules, s.anchors.length > 0]), lawOn("AGENTS.md").length > 0],
+        [0, "sidecar", [["AGENTS.md", "AGENTS.custodiet.md", lawOn("AGENTS.md"), true]], true]);
+      const o = mk("r3-own-agents-observe", { "AGENTS.md": "# Project guidelines\n", "docs/gate/AGENTS.md": "# 我的闸规矩\n" });
+      commit(o, "seed");
+      const ro = run(o, "--observe");
+      t("回修3 反例:自带两份规矩文件的仓用 --observe 装 ⇒ 不报(观察档下旁件里的指针不计失败)", [ro.code, st(ro.j, "docs/gate/AGENTS.md"), ro.j?.lawSidecars], [0, "sidecar", []]);
+      t("回修3 反例:空仓普通安装 ⇒ 不报", r1.j?.lawSidecars, []);
+      const g2 = mk("r3-own-gate-rules", { "docs/gate/AGENTS.md": "# 我的闸规矩\n" });
+      commit(g2, "seed");
+      t("回修3:自带的是 docs/gate/AGENTS.md ⇒ 同样报出", (run(g2).j?.lawSidecars || []).map((s) => [s.file, s.rules]), [["docs/gate/AGENTS.md", lawOn("docs/gate/AGENTS.md")]]);
     }
   } finally {
     try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* 清不掉不影响结论 */ }

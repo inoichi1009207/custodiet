@@ -175,7 +175,7 @@
 
 #### custodiet(拷贝模式)
 
-前提:node ≥ 20;目标是一个 git 仓的根目录(脚本不替你 `git init`)。
+前提:安装器和闸本身要 node ≥ 20(「装完以后」第 1 步的解析依赖要求更高，见那一步);目标是一个 git 仓的根目录(脚本不替你 `git init`)。
 
 ```bash
 git clone https://github.com/inoichi1009207/custodiet
@@ -187,16 +187,18 @@ node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
 - 把 `scripts/` 下的闸与工作流脚本(收尾钩子 `hook-stop-closure.mjs`、开批脚本 `batch-goal.mjs`、`scripts/lib/` 下的引擎件、其余钩子脚本、验收与工作流工装；只有本安装器和 `check-private-identifiers.mjs` 不拷)、示例规矩文件(仓规矩 `AGENTS.md`、闸规矩 `docs/gate/AGENTS.md`,以及 `docs/archive/laws-2026-11/` 下仍被规则引用的归档示例)、`docs/noun-diary.md`、`docs/gate-debts.md`、红队 agent `.claude/agents/_gate-bypass-hunter.md` 与误拦猎手 `.claude/agents/_gate-false-block-hunter.md` 拷进目标仓，并生成 `CLAUDE.md`(内容为 `@AGENTS.md`)。
 - 把 `Stop` 与 `SubagentStop` 两个 hook 合并进目标的 `.claude/settings.json`(按命令去重)。其余钩子脚本(`hook-start-gate.mjs` 等)只拷不接，要用的自己加进 `settings.json`,接在哪个事件上见各脚本头注。
 - 把闸的运行时台账路径追加进目标的 `.gitignore`。
-- 生成《闸用语》`docs/gate-phrasebook.md`,在 `CLAUDE.md` 末尾加一段首尾标记圈住的托管块引用它(重跑只换标记之间的内容)。
+- 生成《闸用语》`docs/gate-phrasebook.md`,在 `CLAUDE.md` 末尾加一段首尾标记圈住的托管块引用它(重跑只换标记之间的内容)。目标仓里已有同名文件、又不是这个生成器写的(首行不是生成件标题)时，安装器在动手之前就以退出码 9 拒绝，什么都不写——先把你那份改名或挪走再装。
 - 拷贝件已存在时缺省不覆盖：内容不同时写旁件 `<名>.custodiet<扩展名>`,在 stdout 末行的 JSON 清单里逐个报出(这时目标仓里旧的那份仍是生效的那份)。
-- 加 `--overwrite` 做覆盖安装:`scripts/` 下已存在且内容不同的同名文件直接替换，清单里标 `replaced`,顶层 `overwrite.replaced` 列出全部被替换的路径。替换前先核这些路径在目标仓的 git 工作区是干净的：改了没提交、暂存了没提交、未跟踪、被 `.gitignore` 忽略，有任何一种就以退出码 7 拒绝并逐个列出，一个字节都不写。规矩文件(`AGENTS.md`、`docs/` 下的)和 `.claude/agents/` 下的不受这个开关影响，照旧只落旁件。
+- 加 `--overwrite` 做覆盖安装:`scripts/` 下已存在且内容不同的同名文件直接替换，清单里标 `replaced`,顶层 `overwrite.replaced` 列出全部被替换的路径。替换前逐个核这些路径：必须已被 git 跟踪，且暂存区和工作区的内容都与 HEAD 里那份相同(换行按 git 的归一口径比，不看 `git status` 的显示配置);改了没提交、暂存了没提交、未跟踪、被 `.gitignore` 忽略，有任何一种就以退出码 7 拒绝并逐个列出，一个字节都不写。规矩文件(`AGENTS.md`、`docs/` 下的)和 `.claude/agents/` 下的不受这个开关影响，照旧只落旁件。
+- 任何一个写入位置(包括旁件和 `.claude/` 下的文件)本身、或它在目标仓里的某一级父目录是符号链接(Windows 的目录联接也算),或者解析后落在目标仓之外时，普通安装和覆盖安装都以退出码 8 拒绝并列出路径，一个字节都不写——换成普通文件 / 目录再装。
 - `.claude/settings.json`、`.gitignore`、`CLAUDE.md` 是追加/合并，不是整文件替换。不提交、不联网、不碰 `~/.claude/`。
 - 加 `--observe` 装成观察档：只记账、不阻断、不对模型输出(调试变量 `STOP_CLOSURE_STDOUT=1` 例外);示例仓规矩只落旁件 `AGENTS.custodiet.md`,`CLAUDE.md` 不引入它(《闸用语》照挂)。把 `.claude/custodiet-mode` 提交后**新开的会话**才进观察档，装闸的这个会话照常阻断。适合先在一个在用的仓里攒数据。切回阻断档：删掉 `.claude/custodiet-mode` 并提交，再不带 `--observe` 重跑一次安装器(示例仓规矩才落到根目录、`CLAUDE.md` 才引入它)。
 
 装完以后:
 
-1. 在目标仓根目录装写入效果分析的解析依赖:`npm --prefix scripts/gate-deps install`(`tree-sitter` 与 `tree-sitter-bash`,装进 `scripts/gate-deps/node_modules`,不碰你仓的 `package.json`)。不装也能跑:I / J / G / L 判「这条 Bash 命令写了哪些文件」时退回较粗的旧判法。
+1. 在目标仓根目录装写入效果分析的解析依赖:`npm --prefix scripts/gate-deps install`(`@babel/parser`、`tree-sitter`、`tree-sitter-bash`,装进 `scripts/gate-deps/node_modules`,不碰你仓的 `package.json`)。这一步要 node `^22.18.0` 或 `>=24.11.0`(锁定的 `@babel/parser` 8 的要求);node 低于这个版本就跳过这一步。不装也能跑:I / J / G / L 判「这条 Bash 命令写了哪些文件」时退回较粗的旧判法。
 2. 在目标仓里自检:`node --no-warnings scripts/hook-stop-closure.mjs --self-test`。有几条用例读目标仓的真实 git 历史(I、G 各 1 条，「接缝」组里至多 3 条):闸件还没提交时红 4 到 5 条(空仓 5 条),装闸提交之后剩 3 条，要等之后有一次**新增了文件**的提交才全绿——判据取的是「最近一次新增过文件的提交」，只改不增的提交不算。没做第 1 步(解析依赖没装)时，「写入三态」组另有 2 条红。
+   目标仓原本就有自己的 `AGENTS.md`(或 `docs/gate/AGENTS.md`)、安装时又没带 `--observe` 的话，示例规矩只落在旁件里，落在这份文件上的法条指针(`AGENTS.md` 上是 K、K0、AD、W、DP 五条,`docs/gate/AGENTS.md` 上是 P、PF 两条)在自检里标成 `SIDE` 并计失败：自检退出码一直非零，提交多少次都不转绿。出路二选一：把旁件里那几处标题 / 列点句并进自己的那份文件(是哪几处，自检的 `SIDE` 行和安装器末尾的提示都会列出来);或者带 `--observe` 重跑一次安装器，观察档下 `SIDE` 不计失败(观察档下闸只记账、不阻断，见上面 `--observe` 那一条)。
 3. 提交。安装器写了 `.claude/custodiet-manifest.json`(闸引擎件的内容摘要),装闸提交里的引擎件和它一致、且安装源树没有未提交改动时,P 认作原样装入，不要求红队；清单被 `.gitignore` 挡住时安装器会提示先 `git add -f` 它。之后你自己改闸引擎文件，P 要红队 `_gate-bypass-hunter` 与误拦猎手 `_gate-false-block-hunter` 两者都跑过——新写入的 agent 在新会话里才保证调得起来。
 
 限制:
@@ -228,7 +230,7 @@ claude plugin install lanes --marketplace inoichi1009207/custodiet
 |---|---|---|
 | 收尾闸 | Stop 时对本轮的工具调用记录跑 31 条引擎规则(会拦的 7 条)和另外三样检查(A、R、DRIFT;A、R 也会拦),命中会拦的就不让本轮结束 | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
 | 批级完成条件 | 开工先立可核的验收条件，可带机器判据;`--clear` 时自己跑判据，不过就拒清 | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "成片已出" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
-| 规则验收 | 每条规则的正反例 + 变异验收，变异杀不死的用例不许上线(在本仓里跑；先 `npm --prefix scripts/gate-deps install`,其中 windowsHide 检查要解析依赖) | `npm run gate:accept` |
+| 规则验收 | 每条规则的正反例 + 变异验收，变异杀不死的用例不许上线(在本仓里跑；先 `npm --prefix scripts/gate-deps install`,要 node `^22.18.0` 或 `>=24.11.0`,其中 windowsHide 检查要解析依赖) | `npm run gate:accept` |
 | 台账完整性链 | 三份台账带行级 hash 链，改写 / 插行 / 删中间行会红 | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
 | 外部锚(本仓内) | 把台账前缀指纹快照到 `~/.custodiet/`,锚点之前的改写或截断会红 | `node scripts/lib/ledger-anchor.mjs snapshot` |
 | 逃生口 | 每条阻断规则可单独关(P 项没有) | `STOP_CLOSURE_BLOCK_<id>=0` |
