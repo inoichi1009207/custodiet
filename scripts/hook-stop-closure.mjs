@@ -131,7 +131,7 @@ export function mergeJournalRows(lists) {
   all.sort((a, b) => a.at - b.at || a.k - b.k || a.i - b.i);
   return all.map((x) => x.s);
 }
-//   ③ 红队 285 第二轮 BP-1 / BP-4:「先比批号」把具名批(hk-x / hw-check-skill,台账里 hk-* 有 19 个)恒排在数字批之后——
+//   ③ 红队 285 第二轮 BP-1 / BP-4:「先比批号」把具名批(hk-x / x-check-skill,台账里 hk-* 有 19 个)恒排在数字批之后——
 //     先在 worktree 结清 285、再回主树做具名批 ⇒ 挑中已结清的 285,S 不拦停工、K0 按 285 的条数核、主树提交被判未武装(误拦)。
 //     改为**只比武装时刻**:最新开始的批就是当前批,不论名字、不论结清与否(--clear 自本批起保留 armedAt);同刻优先主树。
 //     旧结清态没有 armedAt ⇒ 记 0,排最后。前几轮的形态(旧批没关、跨 checkout 关旧开新、同轮结清)都落在「最新武装」这一判据下。
@@ -5236,11 +5236,11 @@ function selfTest() {
               pickBatchDir([C(".", { batch: "285", armedBy: me, cleared: true, armedAt: "2026-10-28T05:00:00Z" }), C(wt, { batch: "284", armedBy: me, conditions: ["y"], armedAt: "2026-10-28T02:00:00Z" })], me, []), wt);
             // 误拦猎手第二轮 FB-3:worktree 里 285 正在做,主树插做小批并结清 ⇒ 会话在 worktree 时挑 worktree;cwd 取不到也挑未结清的 285
             hp("285 三轮 FB-3:worktree 285 未结清 + 主树后武装并结清的小批,会话在 worktree ⇒ 挑 worktree",
-              pickBatchDir([C(".claude/worktrees/batch285", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".", { batch: "hw-check-skill", armedBy: me, cleared: true, armedAt: "2026-10-28T06:10:00Z" })], me, [], ".claude/worktrees/batch285"), ".claude/worktrees/batch285");
+              pickBatchDir([C(".claude/worktrees/batch285", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".", { batch: "x-check-skill", armedBy: me, cleared: true, armedAt: "2026-10-28T06:10:00Z" })], me, [], ".claude/worktrees/batch285"), ".claude/worktrees/batch285");
             hp("285 三轮 FB-3:同上 cwd 取不到 ⇒ 挑未结清的 285",
-              pickBatchDir([C(".claude/worktrees/batch285", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".", { batch: "hw-check-skill", armedBy: me, cleared: true, armedAt: "2026-10-28T06:10:00Z" })], me, []), ".claude/worktrees/batch285");
+              pickBatchDir([C(".claude/worktrees/batch285", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".", { batch: "x-check-skill", armedBy: me, cleared: true, armedAt: "2026-10-28T06:10:00Z" })], me, []), ".claude/worktrees/batch285");
             hp("285 三轮 cwdBatchDir:主树 / worktree 子目录 / 仓外",
-              [cwdBatchDir("/repo", "/repo"), cwdBatchDir("\\repo\\.claude\\worktrees\\batch285\\scripts", "/repo"), cwdBatchDir("E:/cbot", "/repo"), cwdBatchDir("", "/repo")].join(","),
+              [cwdBatchDir("/repo", "/repo"), cwdBatchDir("\\repo\\.claude\\worktrees\\batch285\\scripts", "/repo"), cwdBatchDir("E:/proj-d", "/repo"), cwdBatchDir("", "/repo")].join(","),
               ".,.claude/worktrees/batch285,,");
             hp("285 二轮 pickBatchDir:worktree 里别的会话武装的 285 + 本会话转录跑过 --arm 285 ⇒ 不挑它(BP-2)",
               pickBatchDir([C(".", { batch: "280", armedBy: other, conditions: ["x"] }), C(wtA, { batch: "285", armedBy: other, conditions: ["z"] }), C(wtB, { batch: "284", armedBy: me, conditions: ["b"] })],
@@ -5264,7 +5264,7 @@ function selfTest() {
             hp("285 末轮 FB-1 对照:同排布本轮没跑 --clear ⇒ 读未结清的 285",
               pickBatchDir([C(".", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".claude/worktrees/hw", { batch: "hw-x", armedBy: me, cleared: true, armedAt: "2026-10-28T06:00:00Z" })], me, [], ".claude/worktrees/hw", false), ".");
             hp("285 收口 红队 BP-1:worktree 285 未结清 + 主树插做并结清的小批,cwd 在主树 ⇒ 读 worktree 285",
-              pickBatchDir([C(".claude/worktrees/batch285", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".", { batch: "hw-check-skill", armedBy: me, cleared: true, armedAt: "2026-10-28T06:10:00Z" })], me, [], "."), ".claude/worktrees/batch285");
+              pickBatchDir([C(".claude/worktrees/batch285", { batch: "285", armedBy: me, conditions: ["a", "b"], armedAt: "2026-10-28T02:00:00Z" }), C(".", { batch: "x-check-skill", armedBy: me, cleared: true, armedAt: "2026-10-28T06:10:00Z" })], me, [], "."), ".claude/worktrees/batch285");
             // batch-goal --clear 留下的结清态形状(cleared + batch + armedBy + armedAt,无 conditions)照样被认作本会话的
             hp("285 二轮 ownBatchDirs:结清态(--clear 留 armedBy)的 worktree 算本会话的",
               JSON.stringify(ownBatchDirs([C(wtA, { cleared: true, batch: "285", armedBy: me, armedAt: "2026-10-28T01:00:00Z" }), C(wtB, { cleared: true, batch: "285" })], me, [])), JSON.stringify([wtA]));
@@ -5374,7 +5374,7 @@ function selfTest() {
       // 批 276c(误拦猎手 FB-5):通用名只认仓相对形——裸名、别的仓里的同名绝对路径不算闸引擎(hunterBound 是绑定词,照认)
       hp("276b/c GATE_ENGINE / ENGINE_PATH_RE / hunterBound 认装钩子脚本与钩子本体(BP-7),不认他仓同名(FB-5)",
         ["scripts/install-git-hooks.mjs", "scripts/git-hooks/pre-push.mjs", "install-git-hooks.mjs", "scripts/git-hooks/README.md",
-          "E:/lacuna/scripts/install-git-hooks.mjs", "E:/lacuna/scripts/git-hooks/pre-commit.mjs"]
+          "E:/proj-c/scripts/install-git-hooks.mjs", "E:/proj-c/scripts/git-hooks/pre-commit.mjs"]
           .map((p) => `${_Pp.GATE_ENGINE.test(p) ? 1 : 0}${_Pp.ENGINE_PATH_RE.test(p) ? 1 : 0}${_Pp.hunterBound({ input: { prompt: "只看 " + p } }) ? 1 : 0}`).join(" "),
         "111 111 001 000 001 001");
       hp("GATE_ENGINE 认写入效果分析器与盲审", ["scripts/lib/write-effects.mjs", "scripts/fp-audit.mjs", "scripts/gate-deps/package.json"].map((p) => _Pp.GATE_ENGINE.test(p) ? 1 : 0).join(""), "111");
@@ -5396,7 +5396,7 @@ function selfTest() {
         hp("285 D145 startGateHit:本仓闸 / 暂存树副本 / worktree 副本 / 他仓通用名 / 带 ./ 的钩子 / 本仓非闸",
           [`${R}/scripts/hook-stop-closure.mjs`, "scripts/lib/gate-rules.mjs", `${R}/clipboard/oss/public-repo/scripts/hook-stop-closure.mjs`,
             "clipboard/oss/public-repo/scripts/lib/gate-rules.mjs", `${R}/.claude/worktrees/x/scripts/hook-guard.mjs`,
-            "E:/lacuna/scripts/install-git-hooks.mjs", `${R}/scripts/./git-hooks/pre-push.mjs`, `${R}/scripts/batch-goal.mjs`]
+            "E:/proj-c/scripts/install-git-hooks.mjs", `${R}/scripts/./git-hooks/pre-push.mjs`, `${R}/scripts/batch-goal.mjs`]
             .map((p) => (_Pp.startGateHit(p, R) ? 1 : 0)).join(""), "11000010");
         // 接线证人:hook-start-gate 必须走 startGateHit,不得退回未锚定的 GATE_ENGINE 整串正则
         let sg = "";

@@ -197,8 +197,8 @@ export function touchWhy(input, deps) {
         //   不带目录参数、或目录在本仓根下的照记。代价(漏放侧,接受):可写沙箱的笼子在本机没关住(往 ../ 写成功),
         //   指向别仓的 codex 仍可能写到本仓闸文件——出现一次即重开。
         // 批 285 第二轮复核(红队第 2 份 BP-3):目录参数只认 codex 自己的参数区(第一个非选项的 prompt 串之前),多次给出取最后一个
-        //   (与常见 CLI 解析一致)——原在整段里找第一个,prompt 里引了「git -C E:/cbot」就当成指向别仓不记 tag,
-        //   `--cwd E:/cbot --cwd /repo` 取了前一个。只会让「指向别仓」更难成立 ⇒ 多记 tag 的方向(偏严,同 ⑤)。
+        //   (与常见 CLI 解析一致)——原在整段里找第一个,prompt 里引了「git -C E:/proj-d」就当成指向别仓不记 tag,
+        //   `--cwd E:/proj-d --cwd /repo` 取了前一个。只会让「指向别仓」更难成立 ⇒ 多记 tag 的方向(偏严,同 ⑤)。
         const cdir = codexDirArg(s2);
         //   目录是变量 / 命令替换(`$PWD`、`$(pwd)`)解析不出 ⇒ 当本仓照记
         const elsewhere = cdir && !/\$/.test(cdir) && !underRoot(segCwd && !/^([A-Za-z]:)?[\\/]|^~|^\$/.test(cdir) ? `${String(segCwd).replace(/\\/g, "/").replace(/\/+$/, "")}/${cdir}` : cdir);
@@ -248,7 +248,7 @@ export function selfTest(deps0, os, log = console.log) {
   t("Edit 闸引擎文件 ⇒ 记", call("Edit", { file_path: "/repo/scripts/lib/gate-rules.mjs" }), "write:");
   t("Edit 相对路径闸文件 ⇒ 记", call("Write", { file_path: "scripts/hook-stop-closure.mjs" }), "write:");
   t("Edit 普通文件 ⇒ 不记", call("Edit", { file_path: "/repo/docs/x.md" }), null);
-  t("Edit 别的仓同名文件 ⇒ 不记", call("Edit", { file_path: "E:/cbot/scripts/lib/gate-rules.mjs" }), null);
+  t("Edit 别的仓同名文件 ⇒ 不记", call("Edit", { file_path: "E:/proj-d/scripts/lib/gate-rules.mjs" }), null);
   t("Bash 重定向写闸文件 ⇒ 记", call("Bash", { command: "echo x > scripts/lib/gate-ctx.mjs" }), "cmd-write:");
   t("Bash 先 cd 再写(无 scripts/ 字样)⇒ 记", call("Bash", { command: "cd scripts && cd lib && echo x > gate-rules.mjs" }), "cmd-write:");
   t("Edit 带 .. 的路径 ⇒ 记", call("Edit", { file_path: "/repo/docs/../scripts/lib/gate-rules.mjs" }), "write:");
@@ -262,16 +262,16 @@ export function selfTest(deps0, os, log = console.log) {
   t("codex 只读 ⇒ 不记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md" }), null);
   t("红队复审 BP-1:裸 codex exec 可写沙箱 ⇒ 记", call("Bash", { command: "codex exec --sandbox workspace-write \"fix it\"" }), "codex-writable");
   // 批 285(D173 FB-7):codex 工作目录显式指到别的仓 ⇒ 不记;指本仓 / 相对 / 变量 ⇒ 照记
-  t("285 FB-7:codex-run --cwd 别的仓 + 可写 ⇒ 不记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd E:/cbot --sandbox workspace-write" }), null);
-  t("285 FB-7:裸 codex -C 别的仓 + 可写 ⇒ 不记", call("Bash", { command: "codex exec -C E:/cbot --sandbox workspace-write \"fix it\"" }), null);
+  t("285 FB-7:codex-run --cwd 别的仓 + 可写 ⇒ 不记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd E:/proj-d --sandbox workspace-write" }), null);
+  t("285 FB-7:裸 codex -C 别的仓 + 可写 ⇒ 不记", call("Bash", { command: "codex exec -C E:/proj-d --sandbox workspace-write \"fix it\"" }), null);
   t("285 FB-7:裸 codex --cd=别的仓 + 可写 ⇒ 不记", call("Bash", { command: "codex exec --cd=\"E:/other repo\" --sandbox workspace-write x" }), null);
   t("285 FB-7 反向:--cwd 本仓子目录 + 可写 ⇒ 记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd /repo/scripts --sandbox workspace-write" }), "codex-writable");
   t("285 FB-7 反向:--cwd 相对路径(落在本仓)+ 可写 ⇒ 记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd . --sandbox workspace-write" }), "codex-writable");
   t("285 FB-7 反向:--cwd 变量 + 可写 ⇒ 记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd $PWD --sandbox workspace-write" }), "codex-writable");
   // 批 285 第二轮复核(红队第 2 份 BP-3):目录参数只认 codex 参数区、取最后一个
-  t("285 二轮 BP-3:prompt 里引了 git -C 别的仓 ⇒ 照记", call("Bash", { command: "codex exec --sandbox workspace-write \"先跑 git -C E:/cbot status 再修\"" }), "codex-writable");
-  t("285 二轮 BP-3:--cwd 写两次取最后一个(本仓)⇒ 照记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd E:/cbot --cwd /repo --sandbox workspace-write" }), "codex-writable");
-  t("285 二轮 BP-3 对照:--cwd 写两次、最后一个是别的仓 ⇒ 不记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd /repo --cwd E:/cbot --sandbox workspace-write" }), null);
+  t("285 二轮 BP-3:prompt 里引了 git -C 别的仓 ⇒ 照记", call("Bash", { command: "codex exec --sandbox workspace-write \"先跑 git -C E:/proj-d status 再修\"" }), "codex-writable");
+  t("285 二轮 BP-3:--cwd 写两次取最后一个(本仓)⇒ 照记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd E:/proj-d --cwd /repo --sandbox workspace-write" }), "codex-writable");
+  t("285 二轮 BP-3 对照:--cwd 写两次、最后一个是别的仓 ⇒ 不记", call("Bash", { command: "node ~/.claude/scripts/codex-run.mjs --task t.md --cwd /repo --cwd E:/proj-d --sandbox workspace-write" }), null);
   t("红队复审 BP-1:命令替换写目标 + 闸字样 ⇒ 记", call("Bash", { command: "printf x >> $(printf scripts/lib/gate-rules.mjs)" }), "dynamic-target");
   t("变量写目标但与闸无关 ⇒ 不记", call("Bash", { command: "echo x > $TMPDIR/out.txt" }), null);
   // 误拦猎手 279 终版 FB-1 / FB-3 / FB-4
@@ -290,8 +290,8 @@ export function selfTest(deps0, os, log = console.log) {
   t("FB-3:git reset --hard ⇒ 记", call("Bash", { command: "git reset --hard HEAD~1" }), "git-reset");
   t("FB-3:git reset HEAD~1(移 HEAD)⇒ 记", call("Bash", { command: "git reset HEAD~1" }), "git-reset");
   t("FB-3:git apply --check ⇒ 不记", call("Bash", { command: "git apply --check p.diff" }), null);
-  t("FB-4:git -C 别的仓 merge ⇒ 不记", call("Bash", { command: "git -C E:/cbot merge origin/main" }), null);
-  t("FB-4:cd 别的仓再 pull ⇒ 不记", call("Bash", { command: "cd E:/cbot && git pull" }), null);
+  t("FB-4:git -C 别的仓 merge ⇒ 不记", call("Bash", { command: "git -C E:/proj-d merge origin/main" }), null);
+  t("FB-4:cd 别的仓再 pull ⇒ 不记", call("Bash", { command: "cd E:/proj-d && git pull" }), null);
   t("FB-4:git -C 本仓 merge ⇒ 记", call("Bash", { command: "git -C /repo merge x" }), "git-merge");
   // 收窄版内存探针(红队两次被截断后自跑)
   t("探针:checkout <ref> -- . ⇒ 记", call("Bash", { command: "git checkout HEAD~3 -- ." }), "git-checkout");
@@ -312,8 +312,8 @@ export function selfTest(deps0, os, log = console.log) {
   t("收窄版 FB-2:git checkout .(从暂存区还原)⇒ 不记", call("Bash", { command: "git checkout ." }), null);
   t("收窄版 FB-2:git checkout HEAD docs/x.md ⇒ 不记", call("Bash", { command: "git checkout HEAD docs/x.md" }), null);
   t("收窄版 FB-2 对照:git checkout HEAD~3 scripts/lib ⇒ 记", call("Bash", { command: "git checkout HEAD~3 scripts/lib" }), "git-checkout");
-  t("收窄版 FB-3:PowerShell Set-Location 别的仓再 pull ⇒ 不记", call("PowerShell", { command: "Set-Location E:\\cbot; git pull" }), null);
-  t("收窄版 FB-4:子 shell cd 别的仓 ⇒ 不记", call("Bash", { command: "(cd E:/cbot && git pull)" }), null);
+  t("收窄版 FB-3:PowerShell Set-Location 别的仓再 pull ⇒ 不记", call("PowerShell", { command: "Set-Location E:\\proj-d; git pull" }), null);
+  t("收窄版 FB-4:子 shell cd 别的仓 ⇒ 不记", call("Bash", { command: "(cd E:/proj-d && git pull)" }), null);
   t("收窄版 FB-4:cd ~/proj ⇒ 不记", call("Bash", { command: "cd ~/proj && git pull" }), null);
   t("收窄版 FB-4:cd 带空格的引号路径 ⇒ 不记", call("Bash", { command: "cd \"E:/my repo\" && git pull" }), null);
   t("codex r2 附 1:checkout -b 新分支 <起点> ⇒ 记", call("Bash", { command: "git checkout -b new other-branch" }), "git-checkout");
@@ -323,11 +323,11 @@ export function selfTest(deps0, os, log = console.log) {
   t("末笔 FB-1:worktree 里 checkout -B 到基点 ⇒ 不记", call("Bash", { command: "git checkout -B b 668dc6f" }, { cwd: "/repo/.claude/worktrees/agent-x" }), null);
   t("末笔 FB-1:cd 进 worktree 再 switch -c ⇒ 不记", call("Bash", { command: "cd /repo/.claude/worktrees/agent-x && git switch -c w master" }), null);
   t("末笔 FB-1 对照:主树 merge worktree 分支 ⇒ 记", call("Bash", { command: "git merge worktree-agent-x" }), "git-merge");
-  t("末笔附节二 1:子 shell cd 他仓后回本仓 pull ⇒ 记", call("Bash", { command: "(cd E:/cbot && git pull) && git pull" }), "git-pull");
-  t("末笔附节二 1:Push/Pop-Location 后本仓 pull ⇒ 记", call("PowerShell", { command: "Push-Location E:/cbot; git pull; Pop-Location; git pull" }), "git-pull");
+  t("末笔附节二 1:子 shell cd 他仓后回本仓 pull ⇒ 记", call("Bash", { command: "(cd E:/proj-d && git pull) && git pull" }), "git-pull");
+  t("末笔附节二 1:Push/Pop-Location 后本仓 pull ⇒ 记", call("PowerShell", { command: "Push-Location E:/proj-d; git pull; Pop-Location; git pull" }), "git-pull");
   t("末笔附节二 4:git reset . ⇒ 不记", call("Bash", { command: "git reset ." }), null);
   t("末笔附节二 4:git checkout HEAD -- . ⇒ 不记", call("Bash", { command: "git checkout HEAD -- ." }), null);
-  t("末笔 FB-2:子 shell cd 他仓后本仓写闸 ⇒ 记", call("Bash", { command: "(cd E:/cbot && git pull); echo x >> scripts/lib/gate-rules.mjs" }), "cmd-write");
+  t("末笔 FB-2:子 shell cd 他仓后本仓写闸 ⇒ 记", call("Bash", { command: "(cd E:/proj-d && git pull); echo x >> scripts/lib/gate-rules.mjs" }), "cmd-write");
   t("Read ⇒ 不记", call("Read", { file_path: "/repo/scripts/lib/gate-rules.mjs" }), null);
   t("解析抛错 ⇒ 记", touchWhy({ tool_name: "Bash", tool_input: { command: "x" } }, { ...deps, writeTargets: () => { throw new Error("boom"); } }), "parse-failed");
   const f = path.join(os.tmpdir(), `gate-touch-selftest-${process.pid}.jsonl`);

@@ -4,7 +4,7 @@
 // 为什么要有(批 266,用户 10-19 签:「我们设计了一堆防漏放,结果误拦了,得不偿失」;ADR 0028 / 265b-D1):
 //   红队(_gate-bypass-hunter)按设计找的是「怎样不被拦住」,误拦要靠真实语料才看得出——批 265 用一个比赛用仓
 //   2,837 个真实回合回放,才量出直接开阻断会拦 30.7% 的回合。本工具把那次一次性回放做成每次改规则都能跑的默认件:
-//   误拦猎手 agent(用户级 ~/.claude/agents/_gate-false-block-hunter.md,权威在 dotfiles-claude)的固定动作就是跑它、再对「新增阻断」逐条抽样判拦对 / 误拦。
+//   误拦猎手 agent(用户级 ~/.claude/agents/_gate-false-block-hunter.md,权威在 my-dotfiles)的固定动作就是跑它、再对「新增阻断」逐条抽样判拦对 / 误拦。
 //
 // 做什么:
 //   · 改前 = `--base <rev>`(工具缺省 HEAD;误拦猎手不许靠缺省——批内已提交时 HEAD 对工作树恒为零新增,P 也不认)时刻的 scripts/hook-stop-closure.mjs + scripts/lib/**,落到 .claude/.gate-replay/<sha8>/(gitignore 面);
@@ -243,10 +243,10 @@ function selfTest() {
   // 批 285(D174⑥):worktree 里跑时主树的转录目录也进缺省语料;slug 把 `.` 也换成 `-`;不存在的目录不进
   {
     const H = path.resolve("/h285"), P = (s) => path.join(H, ".claude", "projects", s);
-    const seen = new Set([P("D--m"), P("D--m--claude-worktrees-w")]);
+    const seen = new Set([P("E--m"), P("E--m--claude-worktrees-w")]);
     const got = corpusDirs([], [path.resolve("E:/m/.claude/worktrees/w"), path.resolve("E:/m")], H, (d) => seen.has(d)).map((d) => path.basename(d));
-    chk("285 D174⑥ corpusDirs:worktree 自己的目录 + 主树目录都进", got, ["D--m", "D--m--claude-worktrees-w"]);
-    chk("285 D174⑥ corpusDirs:主树目录缺 ⇒ 只剩存在的", corpusDirs([], [path.resolve("E:/m/x"), path.resolve("E:/m")], H, (d) => seen.has(d)).map((d) => path.basename(d)), ["D--m"]);
+    chk("285 D174⑥ corpusDirs:worktree 自己的目录 + 主树目录都进", got, ["E--m", "E--m--claude-worktrees-w"]);
+    chk("285 D174⑥ corpusDirs:主树目录缺 ⇒ 只剩存在的", corpusDirs([], [path.resolve("E:/m/x"), path.resolve("E:/m")], H, (d) => seen.has(d)).map((d) => path.basename(d)), ["E--m"]);
     const cr = corpusRoots();
     chk("285 D174⑥ corpusRoots:末项是主树根(含 .git 目录)", cr.length === 1 || fs.existsSync(path.join(cr[cr.length - 1], ".git")), true);
   }
