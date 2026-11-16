@@ -39,6 +39,11 @@
 //     hook 不读作业目录 ⇒ codexJobs 冻结为未接 ⇒ 该格只剩 MCP 通路;改这一格的判据,回放的「新增 / 解除」读数不作数,只能靠夹具与 live 探针。
 //   · **「修闸 tag」零覆盖**(批 279):回放里 `gateTouched` 恒为 undefined ⇒ P 的 selfTouched 恒真 ⇒ 修闸 tag 与 PF 一条都回放不到,
 //     只能靠读 diff、hook 自测与内存探针(误拦猎手 279 终版附节二 4)。
+//   · **安装方名单不冻结**(批 305):W 的部署脚本文件名、DP 的私仓仓名来自本 checkout 根的 gate-install.json(deployScripts / privateRepos)。
+//     回放器读一次、注入两版(`installNames`);它是随仓提交的配置,不是台账那类两次读之间会变的状态。读到的是**今天**的名单,套在历史回合上。
+//     本 checkout 没有这份文件(闸仓自己就没有)或没写这两个键 ⇒ 两个空名单 ⇒ 改后版本里 W 的部署脚本那一支不响、DP 的私仓短路不生效;
+//     改前版本早于批 305 时不认这个键(它按一族名字认)⇒ 那种对比读数量的是「按一族认 → 按名单认」,名单为空时就是「按一族认 → 这一支关掉」。
+//     要量「安装方的判决变没变」,得在装了闸、带着真实名单的安装方 checkout 里回放。摘要里有一行报两份名单各几个名字。
 //   · 输出:缺省写 `.claude/.gate-replay/run-<时刻>-<pid>.json` 并抄一份到 last.json;并发时 last.json 只留最后写的那次,以摘要里「全量:」那行的路径为准(批 279)。
 import fs from "node:fs";
 import os from "node:os";
@@ -200,7 +205,10 @@ async function main(argv) {
   //   改前版本若早于本改动(不认 ctx.newEvidence),它那一侧仍会自己读一遍——见 CEILING。
   const ev = typeof after.isNewEvidence === "function" ? after.isNewEvidence(undefined) : undefined;
   const evShared = typeof before.isNewEvidence === "function";   // 导出与 run 认注入是同一次改动加的,以导出在否作代理
-  const r = diffRuns(jobs, (e) => before.run(null, { entries: e, newEvidence: ev }), (e) => after.run(null, { entries: e, newEvidence: ev }));
+  // 批 305:安装方名单读一次、两版共用(见 CEILING「安装方名单不冻结」)。改后版本没有这个导出(回放一个早于批 305 的工作树)⇒ 不注入。
+  const names = typeof after.readInstallNames === "function" ? after.readInstallNames(ROOT) : undefined;
+  const namesCount = names ? { deployScripts: names.deployScripts.length, privateRepos: names.privateRepos.length } : null;
+  const r = diffRuns(jobs, (e) => before.run(null, { entries: e, newEvidence: ev, installNames: names }), (e) => after.run(null, { entries: e, newEvidence: ev, installNames: names }));
   for (const row of r.rows) delete row.entries;
   fs.mkdirSync(path.dirname(opt.out), { recursive: true });
   const rel = (f) => path.basename(path.dirname(f)) + "/" + path.basename(f).slice(0, 8);
@@ -209,7 +217,7 @@ async function main(argv) {
   let worktree = null;
   try { worktree = git(["rev-parse", "HEAD"]).trim() + (git(["status", "--porcelain", "--", "scripts/hook-stop-closure.mjs", "scripts/lib"]).trim() ? "+dirty" : ""); } catch { /* 取不到不影响 */ }
   fs.writeFileSync(opt.out, JSON.stringify({ base: base.sha, after: "worktree", worktree, seed: opt.seed, max: opt.max, tail: opt.tail, corpus: dirs,
-    turnsAvailable: all.length, evidenceShared: evShared, ...r, rows: undefined, added: r.added, removed: r.removed, changed: r.changed, errored,
+    turnsAvailable: all.length, evidenceShared: evShared, installNames: namesCount, ...r, rows: undefined, added: r.added, removed: r.removed, changed: r.changed, errored,
     picked: jobs.map((j) => `${j.file}#${j.idx}`) }, null, 1));   // 全路径:多语料目录有同名转录时也能唯一反查(codex 266-r2 表)
   if (opt.outDefault) { try { fs.copyFileSync(opt.out, path.join(path.dirname(opt.out), "last.json")); } catch { /* 抄不成不影响本次结果文件 */ } }
   const rules = Object.entries(r.newBlocksByRule).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join(" ") || "无";
@@ -218,6 +226,11 @@ async function main(argv) {
   for (const x of errored.slice(0, 5)) console.log(`  ! ${rel(x.file)}#${x.idx} ${x.err}`);
   console.log(`  新增阻断按规则:${rules}`);
   for (const x of [...r.added, ...r.changed].slice(0, 10)) console.log(`  + ${rel(x.file)}#${x.idx} [${x.before.join(",") || "-"}→${x.after.join(",")}] «${x.text.slice(0, 80)}»`);
+  // 只报个数,不印名字(名字是安装方的私有事实,回放摘要常被整段贴进报告)
+  console.log(namesCount
+    ? `  安装方名单(本 checkout 根的 gate-install.json,读一次两版共用):部署脚本 ${namesCount.deployScripts} 个、私仓 ${namesCount.privateRepos} 个` +
+      (namesCount.deployScripts && namesCount.privateRepos ? "" : ";为 0 的那份 ⇒ 改后版本里对应判据关掉(W 的部署脚本那一支 / DP 的私仓短路)")
+    : "  安装方名单:改后版本不认(早于批 305)⇒ 未注入");
   console.log(`  全量:${path.relative(ROOT, opt.out).replace(/\\/g, "/")}`);
   console.log("  CEILING: 外部状态冻结为「无批、无台账」;不带 git 事实(原样装入豁免不在覆盖面)/ 后台任务载荷 / 观察档;每回合只看末尾 --tail 条;P / DP / A / K 读数打折看");
   // codex 266-r3 补充事实:改前版本不认 newEvidence 注入时,它自己读预检台账 / git 索引,同一份规则也能读出假的新增 I——明说,别让人当真
