@@ -2835,6 +2835,8 @@ import { ledgerAppend, verifyFile as ledgerVerify } from "./lib/ledger-chain.mjs
 import { readTouched, selfTest as touchSelfTest } from "./lib/gate-touch.mjs";   // 批 279「修闸 tag」
 // 批 299 / 299b:写入三态观测(287 设计 2.5;判法见 299b-design)。本文件只把观测落账(.claude/.write-state.jsonl),不改任何规则的判决
 import { observeWrites, collectInterval, ledgerRow as writeStateRow, selfTest as writeStateSelfTest } from "./lib/write-state.mjs";
+// 批 305:「只提示」延后到下一条用户消息送达(寄存端在 emit();取走端在 hook-start-gate.mjs)
+import { stashHint, takeHints, interactiveSession, receiverSeen, markReceiver as markHintReceiver, boxFile as hintBoxFile, dropSummary as hintDropSummary, selfTest as hintRelaySelfTest } from "./lib/gate-hint-relay.mjs";
 
 /** 反推「闸机件」清单:凡**改了它就可能改变闸的行为**的文件。
  *
@@ -3446,6 +3448,29 @@ export function splitLogOnly(findings, ids = logOnlyIds()) {
   return { shown, logged };
 }
 
+/** 批 305(设计稿第三节第 5 项):本轮的非阻断输出能不能**延后**到下一条用户消息再送。
+ *  返回 null = 可以延后;否则返回不延后的原因(走老通道:当轮经 additionalContext 送,会让模型再走一轮)。纯函数,自测直接调。
+ *
+ *  为什么要延后:Stop 的 `hookSpecificOutput.additionalContext` 会让模型续一轮(本机 changelog 原话「keep the turn going」;
+ *  本机转录里 1,057 次只提示有 1,040 次的下一条是 assistant)。「只提示」档按设计不该为它单独把模型叫回来。
+ *  只延后「只提示」档:档位取自命中的 `block` 字段(引擎按规则的 `blocking` 算出),不抄规则名单——
+ *    · 含阻断档的命中(连撞降级成提示的、被 STOP_CLOSURE_BLOCK_<X>=0 降成提示的)⇒ 不延后:那是「本该拦」的项,当轮就要让模型看到;
+ *    · 含没判成的项(unknown)⇒ 不延后:判据坏了要当轮出声。
+ *  其余条件见 lib/gate-hint-relay.mjs 头注的不变量①②:读端在场、正面认出是交互会话。拿不准一律不延后——
+ *  延后了没人取 = 提示悄悄丢了(等于把「只提示」降成「只记账」);不延后只是多走一轮。
+ *  开关:`STOP_CLOSURE_HINT_DEFER=0` 退回老行为(全部当轮送)。 */
+export function hintDeferWhy(findings, { yielding = false, root = ".", sid, entries, env = process.env } = {}) {
+  if (env && env.STOP_CLOSURE_HINT_DEFER === "0") return "开关关了";
+  if (yielding) return "降级轮";
+  if (!Array.isArray(findings) || !findings.length) return "没有提示";
+  if (findings.some((f) => f && f.block)) return "含阻断档";
+  if (findings.some((f) => f && f.unknown)) return "含没判成的项";
+  if (!sid) return "没有会话号";
+  if (!interactiveSession(entries, env)) return "认不出是交互会话";
+  if (!receiverSeen(root, sid)) return "读端不在场";
+  return null;
+}
+
 function emit(findings, streak = 0, opts = {}) {
   // D40:与 run() 同一纪律——落盘台账(心跳/报警分母)只认显式 `opts.live`,不再嗅 argv。
   const live = opts.live === true;
@@ -3693,6 +3718,20 @@ function emit(findings, streak = 0, opts = {}) {
           : ""),
     })));
     return 2;
+  }
+  // 批 305(设计稿第三节第 5 项):交互会话里的「只提示」不经下面那条会续轮的出口——寄存到盘上,
+  //   开工钩子在下一次 UserPromptSubmit 时取走、随用户那条消息注入一次(lib/gate-hint-relay.mjs)。
+  //   能不能延后只由 hintDeferWhy 判(档位、读端在场、交互会话、开关);寄存抛错 ⇒ 落到下面的老通道,不许既没寄存又没送。
+  //   生产路径(live)用真仓根与本会话转录;自测注入 `opts.hintRelay`;离线回放两者都没有 ⇒ 行为同改前。
+  //   给人看的 systemMessage(批次提醒等)不续轮,照常出。上面写到 stderr 的那份清单也照写(exit 0 的 stderr 只进调试日志与
+  //   hook 附件,不到模型;盲审取证 fp-audit 靠它在 Stop 那一刻认出本次提示)。
+  const relay = opts.hintRelay || (live ? { root: ".", sid: _ledgerSid, entries: _allEntriesCache, env: process.env } : null);
+  if (relay && hintDeferWhy(findings, { ...relay, yielding }) === null) {
+    try {
+      stashHint(relay.root, relay.sid, { text: notice, ids: findings.map((f) => f.id) });
+      if (sysParts.length) process.stdout.write(JSON.stringify({ systemMessage: sysParts.join("\n") }));
+      return 0;
+    } catch { /* 寄存不成 ⇒ 当轮照送(宁可多走一轮,不丢提示) */ }
   }
   // 非阻断项走官方的 additionalContext 出口,而不是 stderr:
   // 官方明写它「shown in the transcript as hook feedback **rather than a hook error**」
@@ -4925,6 +4964,50 @@ function selfTest() {
     }
     sc("未降级时照常阻断", held.includes('"decision":"block"'), true);
     sc("未降级时不谎称降级", held.includes("自行降级"), false);
+    // 批 305(设计稿第三节第 5 项):交互会话里「只提示」不再经会续轮的 additionalContext 输出,寄存到盘上、
+    //   由开工钩子随下一条用户消息送达(lib/gate-hint-relay.mjs)。无头会话、读端不在场、拿不准、寄存不成 ⇒ 一律老通道。
+    //   这里注入 `opts.hintRelay`(临时目录当仓根),不走 live ⇒ 不写任何真台账。
+    {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "hint-defer-st-"));
+      try {
+        const SID = "s-305-defer";
+        const hint = [{ id: "DRIFT", block: false, msg: "文档漂移\n第二行说明" }];
+        const relay = (over = {}) => ({ root: tmp, sid: SID, entries: [{ entrypoint: "cli" }], env: {}, ...over });
+        const kicks = (s) => s.includes("additionalContext");
+        const boxed = (sid = SID) => takeHints(tmp, sid).n;
+        // 读端还没在本会话跑过 ⇒ 不寄存
+        const noRx = capture(() => emit(hint, 0, { hintRelay: relay() }));
+        sc("305 读端不在场(开工钩子没接 / 没跑过)⇒ 老通道照送、不寄存", `${kicks(noRx)}:${boxed()}`, "true:0");
+        markHintReceiver(tmp, SID);
+        const deferred = capture(() => emit(hint, 0, { hintRelay: relay() }));
+        sc("305 交互会话 + 读端在场:只提示 ⇒ 对模型零输出(不续轮)", deferred.trim(), "");
+        const got = takeHints(tmp, SID);
+        sc("305 寄存的是原提示全文(标题行、命中行、CEILING 行都在)",
+          [got.n, got.text.includes("收尾闭环闸命中 1 项"), got.text.includes("[DRIFT] 文档漂移"), got.text.includes("CEILING")].join(":"), "1:true:true:true");
+        got.commit();
+        sc("305 取走并 commit 之后信箱空(同一条只送一次)", boxed(), 0);
+        // 无头 / 拿不准 ⇒ 老通道
+        sc("305 无头会话(sdk-cli)⇒ 老通道照送、不寄存", `${kicks(capture(() => emit(hint, 0, { hintRelay: relay({ entries: [{ entrypoint: "sdk-cli" }] }) })))}:${boxed()}`, "true:0");
+        sc("305 转录里认不出入口 ⇒ 老通道(拿不准宁可多送)", `${kicks(capture(() => emit(hint, 0, { hintRelay: relay({ entries: [{ type: "user" }] }) })))}:${boxed()}`, "true:0");
+        sc("305 没有会话号 ⇒ 老通道", kicks(capture(() => emit(hint, 0, { hintRelay: relay({ sid: undefined }) }))), true);
+        // 开关退回老行为
+        sc("305 开关 STOP_CLOSURE_HINT_DEFER=0 ⇒ 老通道照送、不寄存",
+          `${kicks(capture(() => emit(hint, 0, { hintRelay: relay({ env: { STOP_CLOSURE_HINT_DEFER: "0" } }) })))}:${boxed()}`, "true:0");
+        // 档位:只有「只提示」档才延后
+        sc("305 阻断档被连撞降级成提示 ⇒ 不延后(老通道,当轮送)", `${kicks(capture(() => emit(boom, 99, { hintRelay: relay() })))}:${boxed()}`, "true:0");
+        const both = capture(() => emit([...boom, ...hint], 0, { hintRelay: relay() }));
+        sc("305 与阻断同轮 ⇒ 照旧随阻断说明一起出(只出这一份)、不寄存", `${both.includes('"decision":"block"')}:${both.includes("同时提示")}:${boxed()}`, "true:true:0");
+        sc("305 提示里有没判成的项(unknown)⇒ 不延后", `${kicks(capture(() => emit([{ id: "A", block: false, unknown: true, msg: "账读不出" }], 0, { hintRelay: relay() })))}:${boxed()}`, "true:0");
+        sc("305 hintDeferWhy:阻断档(被开关降成提示的也算)不延后", hintDeferWhy([{ id: "K", block: true, msg: "x" }], { ...relay(), yielding: false }), "含阻断档");
+        sc("305 hintDeferWhy:全是只提示档 + 交互 + 读端在场 ⇒ 可延后", hintDeferWhy(hint, { ...relay(), yielding: false }), null);
+        sc("305 hintDeferWhy:档位取自命中的 block 字段,不按规则名单", hintDeferWhy([{ id: "随便什么新规则", block: false, msg: "x" }], { ...relay(), yielding: false }), null);
+        // 寄存不成 ⇒ 退回老通道(不能既不寄存又不送)
+        fs.writeFileSync(hintBoxFile(tmp, SID), "{坏的");
+        sc("305 信箱坏了寄存不成 ⇒ 老通道照送", kicks(capture(() => emit(hint, 0, { hintRelay: relay() }))), true);
+        // 离线(回放 / --dry-run:不 live、不注入)⇒ 行为与改前逐字相同
+        sc("305 离线形态不寄存、照旧输出", kicks(capture(() => emit(hint, 0))), true);
+      } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 清不掉不影响 */ } }
+    }
 
     // ⚠️ **跨轮窗口必须真的接上**(2026-08-20 实撞:`priorEntries` 从落地起就没被
     //   生产路径喂过 ⇒ `ctx.window()` 恒为 null ⇒ I 项那条「窗口放宽到批」的修法是死代码)。
@@ -4993,6 +5076,15 @@ function selfTest() {
         [/^报警分母: /m, /^RECALL=UNKNOWN/m, /^规则  报警  误报  误报率/m].map((re) => (re.test(full) ? 1 : 0)).join(""), "111");
       sc("305 误报表:--hot 形态首行同样是口径句", rep(["--hot"]).split("\n")[0], WANT);
       sc("305 误报表:导出常量与印出的一致", FP_SCOPE_NOTE, WANT);
+      // 「只提示」延后送达的丢弃账要有必经读点:结清时整表转出 ⇒ 这一行跟着到模型眼前。没有丢弃 ⇒ 不出这一行。
+      sc("305 误报表:没有丢弃账 ⇒ 不出「没送到模型」行", full.includes("只提示延后送达"), false);
+      fs.mkdirSync(path.join(tmp, ".claude"), { recursive: true });
+      fs.writeFileSync(path.join(tmp, ".claude", ".gate-hints-dropped.jsonl"),
+        [{ ts: "2026-11-16T08:00:00.000Z", reason: "expired", n: 2, ids: ["B", "C"] }, { ts: "2026-11-17T09:00:00.000Z", reason: "corrupt", n: null }].map((r) => JSON.stringify(r)).join("\n") + "\n");
+      const withDrops = rep([]);
+      sc("305 误报表:有丢弃账 ⇒ 末尾汇总一行(次数、条数、最近一次)",
+        /^只提示延后送达:2 次共 3 条没送到模型就丢弃了.*2026-11-17T09:00/.test(withDrops.trim().split("\n").pop() || ""), true);
+      sc("305 误报表:--hot 形态不出这一行(开批只读待修行)", rep(["--hot"]).includes("只提示延后送达"), false);
       try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 清不掉不影响 */ }
     }
   }
@@ -6054,11 +6146,16 @@ function selfTest() {
   let wsPass = 0, wsTotal = 0;
   try { const r = writeStateSelfTest({ quiet: true }); wsPass = r.pass; wsTotal = r.total; }
   catch (e) { console.log(`FAIL  write-state 自测跑不起来:${e && e.message}`); wsTotal = 1; }
+  // 批 305:「只提示」延后送达的寄存 / 取走 / 过期记账自测(lib/gate-hint-relay.mjs;同上,经本文件自测进验收链)
+  let hrPass = 0, hrTotal = 0;
+  try { const r = hintRelaySelfTest({ quiet: true }); hrPass = r.pass; hrTotal = r.total; }
+  catch (e) { console.log(`FAIL  gate-hint-relay 自测跑不起来:${e && e.message}`); hrTotal = 1; }
 
   console.log(`\n自测 ${pass}/${cases.length}` +
     (carrTotal ? ` · 载体分类 ${carrPass}/${carrTotal}` : "") +
     (dfTotal ? ` · 欠账事实 ${dfPass}/${dfTotal}` : "") +
     (wsTotal ? ` · 写入三态 ${wsPass}/${wsTotal}` : "") +
+    (hrTotal ? ` · 只提示延后 ${hrPass}/${hrTotal}` : "") +
     (seamTotal ? ` · 接缝 ${seamPass}/${seamTotal}` : "") +
     (cxTotal ? ` · codex 账 ${cxPass}/${cxTotal}` : "") +
     (escTotal ? ` · 逃生口 ${escPass}/${escTotal}` : "") +
@@ -6070,7 +6167,7 @@ function selfTest() {
   return (pass === cases.length && driftPass === driftTotal && probePass === probeTotal
     && partPass === partTotal && hpPass === hpTotal && seamPass === seamTotal && escPass === escTotal
     && cxPass === cxTotal
-    && lawPass + (lawObserve ? lawSide : 0) === lawTotal && carrPass === carrTotal && dfPass === dfTotal && wsPass === wsTotal) ? 0 : 1;
+    && lawPass + (lawObserve ? lawSide : 0) === lawTotal && carrPass === carrTotal && dfPass === dfTotal && wsPass === wsTotal && hrPass === hrTotal) ? 0 : 1;
 }
 
 // ── main
@@ -6233,6 +6330,12 @@ if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
     // 窗口注写在「← 下一批待修」之前:batch-goal 只剥行尾那个标记(batch-goal.mjs 读 --hot 的那段)
     const winNote = (r) => (r.since ? `  [判据窗口起 ${r.since.slice(0, 16)}Z;全量 报警 ${r.all.alerts} 误报 ${r.all.fp} ${(r.all.rate * 100).toFixed(1)}%]` : "");
     for (const r of tbl) if (!hotOnly || r.hot) console.log(`${hotOnly ? "待修 " : ""}${r.id.padEnd(4)}  ${String(r.alerts).padStart(4)}  ${String(r.fp).padStart(4)}  ${(r.rate * 100).toFixed(1).padStart(5)}%  ${String(r.confirmed).padStart(12)}${winNote(r)}  ${r.hot ? "← 下一批待修" : ""}`);
+    // 批 305:「只提示」延后送达时没送到模型就丢弃的(过期没人取 / 信箱损坏),在这里汇总一行——结清时整表转出,是它的必经读点。
+    //   没有丢弃 ⇒ 不出这一行。失效条件:连续 5 批这行一直是零 ⇒ 这行可撤,丢弃账照留。
+    if (!hotOnly) {
+      const d = hintDropSummary(".");
+      if (d.times) console.log(`\n只提示延后送达:${d.times} 次共 ${d.hints} 条没送到模型就丢弃了(寄存后过期没人取,或信箱损坏;最近一次 ${d.last.slice(0, 16)}Z;明细 .claude/.gate-hints-dropped.jsonl)`);
+    }
   }
   process.exit(0);
 }
