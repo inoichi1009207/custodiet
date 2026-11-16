@@ -300,7 +300,11 @@ console.log("正反例:");
 //   第十八次:`justAdded`(批 285,D136②)——「同轮造件分两次提交」这一漏放形态原先在夹具层无机器证人(只能拿 tracked 近似);
 //     注入面与 tracked / preExisted 同形,值为仓根相对路径数组。只补夹具通道,不改任何判据。
 //   第十七次:`batchEverArmed`(批 265,K0 在「从没立过批的仓」不判;实时 hook 才注入,夹具不加写不出这一形)。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "justAdded", "preExisted", "batchGoal", "batchEverArmed", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "resolveRev", "hookCheckout", "gateTouched", "at", "then", "expectBlock", "priorFar", "codexJobs"]);
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "justAdded", "preExisted", "batchGoal", "batchEverArmed", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "resolveRev", "hookCheckout", "gateTouched", "at", "then", "expectBlock", "priorFar", "codexJobs", "installNames"]);
+//   第二十次:`installNames`(批 305)——安装方配置里的两份确切名字名单(部署脚本文件名 / 私仓仓名),注入通道,不进 entries。
+//     W 的部署脚本那一支、DP 的私仓短路改读它之后,「配了这个名字 / 没配」两半在夹具里要分得开;不写 ⇒ 不传(两个空名单)。
+//     值 `{ deployScripts?: string[], privateRepos?: string[] }`;子键与值形状都校验(写成字符串会被 buildCtx 静默归空)。
+const INSTALL_NAMES_KEYS = new Set(["deployScripts", "privateRepos"]);
 //   第十九次:`codexJobs`(批 297,D203)——P 跨模型格改认 codex-run 自己写的作业记录后,「命令长这样、有 / 没有合格记录」
 //     两半在夹具里要分得开;注入通道,不进 entries。值 `{ root, upper?, jobs:[{ id?, state, startedAt, endedAt?, resultAt?, cwd?, top, threadId,
 //     exitCode, failLines? }] }`(r2:upper = 此刻 / 本轮结束;top = cwd 所在 git 顶层;failLines = 失败行),
@@ -350,6 +354,14 @@ const mkEntries = (c) => {
     }
   }
   if ("expectBlock" in c && typeof c.expectBlock !== "boolean") throw new Error(`夹具 expectBlock 须是 true / false:${JSON.stringify(c.expectBlock)}`);
+  if ("installNames" in c) {
+    const g = c.installNames;
+    if (!g || typeof g !== "object" || Array.isArray(g)) throw new Error(`夹具 installNames 须是 { deployScripts?: [], privateRepos?: [] }:${JSON.stringify(g)}`);
+    for (const k of Object.keys(g)) {
+      if (!INSTALL_NAMES_KEYS.has(k)) throw new Error(`installNames 子键不认识:「${k}」—— 合法键:${[...INSTALL_NAMES_KEYS].join(", ")}`);
+      if (!Array.isArray(g[k]) || g[k].some((s) => typeof s !== "string" || !s.trim())) throw new Error(`installNames.${k} 须是非空字符串数组:${JSON.stringify(g[k])} —— 形状不对会被静默归成空名单`);
+    }
+  }
   if ("codexJobs" in c) {
     const g = c.codexJobs;
     if (!g || typeof g !== "object" || typeof g.root !== "string" || !Array.isArray(g.jobs)) throw new Error(`夹具 codexJobs 须是 { root: 串, upper?, jobs: [] }:${JSON.stringify(g)}`);
@@ -497,6 +509,8 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...("gateTouched" in c ? { gateTouched: c.gateTouched } : {}),
   // `codexJobs` = 批 297 作业记录注入(取数方不按 since 预筛:窗口判据全在规则侧,夹具要能写出「早于窗口」的记录)
   ...("codexJobs" in c ? { codexJobs: () => c.codexJobs } : {}),
+  // `installNames` = 批 305 安装方名单注入(不写 ⇒ 不传 ⇒ 两个空名单)
+  ...("installNames" in c ? { installNames: c.installNames } : {}),
   // `prior` = [{text, write?, …}, …] ⇒ 拼成 assistant entries 交给 priorEntries。
   // 没写 `prior` 就**不传**(window() 保持 null),与生产上「取不到窗口」一致。
   ...(Array.isArray(c.prior) ? (() => {

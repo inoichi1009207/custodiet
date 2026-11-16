@@ -1,4 +1,4 @@
-import { CARRIER_SURFACE, isDeliverable, CONTENT_WRITE_RE, normPath, isCarrierPath, NON_CARRIER_AREA } from "./gate-carriers.mjs";
+import { CARRIER_SURFACE, isDeliverable, contentWriteRe, quotedContentWritePathRe, normPath, isCarrierPath, NON_CARRIER_AREA } from "./gate-carriers.mjs";
 import { classifyDiffTier, coversWrites } from "./gate-difftier.mjs";
 // gate-rules.mjs —— 声明式规则集(迁移中)
 //
@@ -7877,6 +7877,8 @@ const RULE_P = {
 //   ②窗口按条数封顶(400 entries),更早轮次的交付物写入会滑出视野 ⇒ 方向是漏放,
 //   常态节奏(写完当批收)不受影响;③「提及文件名」可被空跑刷(派个 agent 提一嘴不看内容)
 //   ——但那是一次真实的、有产出回件的调用,伪造成本≈真做成本,接受。
+// 批 305:夹具用的安装方名单(中性占位名)。部署脚本那一支只认名单里的确切文件名,带 deploy-prod.ps1 的用例都得带它。
+const W_DEPLOY = Object.freeze({ deployScripts: ["deploy-prod.ps1"] });
 export const RULE_W = {
   id: "W",
   blocking: (ctx) => { try { return ranClear(ctx); } catch { return true; } },
@@ -7946,7 +7948,7 @@ export const RULE_W = {
       return [...out];
     },
     // ── 批 253(D130,窄例外③判据过重):生产写判据分清「读」与「执行」 ─────────────
-    //   旧判据对整条命令串跑 `CONTENT_WRITE_RE` 子串 ⇒ `grep -n … scripts/deploy-prod.ps1`、
+    //   旧判据对整条命令串跑脚本名正则(当时的常量 `CONTENT_WRITE_RE`,批 305 起是 `this.cw()`)子串 ⇒ `grep -n … scripts/deploy-prod.ps1`、
     //   `sed -n '1,40p' scripts/deploy-prod.ps1` 这类**读脚本**被当成生产写入(批 240 实撞)。
     //   **修法是「只豁免可证的纯读」,不是「只认段头为脚本名」**——后者会让本仓写正文的唯一调用形
     //   `node scripts/write-node.mjs --apply x` 漏判(D130 红队 BP-2)。故:含脚本名的命令**默认仍算写入**,
@@ -7994,7 +7996,7 @@ export const RULE_W = {
     //     「只在引号里」的惰性(`const r = execSync("node scripts/write-node.mjs --apply p")`)。
     //     收窄理由(代价口径:误拦与漏放同价):`cat >> docs/x.md <<'EOF'` 这类**数据** heredoc 的正文
     //     不被执行,照旧享受惰性——否则登记债务时写一句「"write-node.mjs 预览通过"」就被拦。
-    //   CEILING(残余,照实写):①`QUOTED_PATH` 里的脚本名表是 `CONTENT_WRITE_RE` 的手抄同步件(改那边须改这边);
+    //   CEILING(残余,照实写):①(批 305 已消)`QUOTED_PATH` 原是脚本名表的手抄同步件,现与 `cw()` 同出 gate-carriers 的一张表;
     //     ②`echo "scripts/write-node.mjs"` 这类只打印整串路径的形态会误拦(罕见,走 fp);
     //     ③heredoc 正文未加引号地提到脚本名本来就算执行(与本批前一致),数据 heredoc 的该形误拦不在本批。
     //   ── 批 253e(第四轮红队)BP-4(误拦,阻断)────────────────────────────────
@@ -8052,7 +8054,29 @@ export const RULE_W = {
     //     `(Get-Content scripts/write-node.mjs).Count`)走 `isReadSeg` 读类表,本批不动 ⇒ 仍误拦,走 fp;
     //     ④PowerShell 方法调用括号(`.Replace("a","b")`)内层判不出段头 ⇒ 按执行,误拦向;
     //     ⑤数据 heredoc 写进无扩展名文件再由壳执行(`cat > runme <<EOF` 后 `bash runme`)⇒ 漏放,罕见。
-    QUOTED_PATH: /^[^\s"']*(?:write-node|prod-lib|bulk[-_]?create[\w-]*|deploy-[\w-]+)\.(?:mjs|cjs|js|ts|ps1)$/i,
+    // ── 批 305:脚本名判据按安装方名单派生(部署脚本那一支读 gate-install.json 的 deployScripts)──────────
+    //   原来这里有两份写死的脚本名表:模块级常量 `CONTENT_WRITE_RE`(gate-carriers)与本对象的 `QUOTED_PATH`(手抄同步件,
+    //   部署脚本的扩展名表还和前者不一致)。两者现在都由 gate-carriers 的同一张表 + 同一份名单派生:
+    //     `cw()`          命令串里提到内容写脚本(原 `CONTENT_WRITE_RE.test` 的全部使用点)
+    //     `quotedPath()`  引号串整串是以内容写脚本结尾的路径(原 `this.QUOTED_PATH.test`)
+    //     `valueRuns()`   node 取值旗标的值是内容写脚本(原 `this.VALUE_RUNS.test`)
+    //   名单从哪来:`detect` 在入口把 `ctx.installNames.deployScripts` 绑到 `deployScripts`(一次,见 `bindNames`),
+    //   本对象的方法只读 `this.deployScripts`——规则仍是「只读 ctx 和传入参数」,不读磁盘;夹具经 `installNames` 注入,回放由回放器注入。
+    //   名单为空(没配 / 没有配置文件 / 通道没接)⇒ 部署脚本那一支不响,另外三类(write-node / prod-lib / bulk-create)照旧。
+    //   `QUOTED_PATH` / `VALUE_RUNS` 留作**变异注入口**:缺省 null = 按名单派生;给了正则就压过派生的(变异按名换形态用)。
+    //   CEILING(照实写):①省略扩展名调用部署脚本(`.\scripts\deploy-prod -Apply`、`npm run deploy-prod`)不认——名单里是带扩展名的
+    //     文件名,已登记的天花板,不为它加逻辑;②部署脚本改名 / 复制成别的名字再跑、经别的脚本间接跑 ⇒ 不认(前者属蓄意,后者与 253f CEILING ③ 同族);
+    //     ③名单是安装方事实:部署脚本换了名而配置没跟着改 ⇒ 这一支静默不响(`batch-goal --status` 只报「值形状不对」,不报「名字对不上盘上的文件」)。
+    deployScripts: [],
+    QUOTED_PATH: null,
+    cw() { return contentWriteRe(this.deployScripts); },
+    quotedPath() { return this.QUOTED_PATH || quotedContentWritePathRe(this.deployScripts); },
+    valueRuns() { return this.VALUE_RUNS || this.cw(); },
+    /** detect 入口:把本轮的部署脚本名单绑上去。派生一层(不改 H 本身;变异换掉的方法与注入口照旧生效)。 */
+    bindNames(ctx) {
+      const names = ctx && ctx.installNames && Array.isArray(ctx.installNames.deployScripts) ? ctx.installNames.deployScripts : [];
+      return Object.assign(Object.create(this), { deployScripts: names });
+    },
     HEREDOC_EXEC_HEAD: /^(?:python\d*(?:\.\d+)?|py|perl|ruby|php|osascript)$/i,
     /** 引号串内容列表(与 `tok` 同一套引号/转义口径)。 */
     quotedSpans(seg) {
@@ -8117,7 +8141,7 @@ export const RULE_W = {
     },
     /** 脚本名**只**出现在引号里(掩掉引号后就不见了)。 */
     quotedOnly(seg) {
-      return CONTENT_WRITE_RE.test(String(seg)) && !CONTENT_WRITE_RE.test(stripQuoted(seg));
+      return this.cw().test(String(seg)) && !this.cw().test(stripQuoted(seg));
     },
     /** 引号里的东西会被执行吗?段头是壳/解释器,或引号串本身就在执行位。 */
     // ── 253f BP-1:方向反过来——**非执行段头表**(唯一一张)。段里有引号整串脚本路径时,
@@ -8216,8 +8240,8 @@ export const RULE_W = {
     /** 掩码后含这些字符 ⇒ 段里另有命令在跑(进程替换/子壳/命令替换),段头不作数。 */
     //   253g ②:`(` 与 `$(` 不再一律撤,交 `unwrapGroups` 取内层再判;进程替换 `<(`/`>(`、`{`、反引号照旧撤。
     SUBSHELL: /[<>]\(|[{`]/,
-    /** 取值旗标(`--import`/`-r`…)的值若是内容写脚本 ⇒ 它被加载执行。 */
-    VALUE_RUNS: CONTENT_WRITE_RE,
+    /** 取值旗标(`--import`/`-r`…)的值若是内容写脚本 ⇒ 它被加载执行。判据 = `valueRuns()`(缺省同 `cw()`);本键只是变异注入口。 */
+    VALUE_RUNS: null,
     /** 剥 `X=1` 与包装头(包装头后的旗标与 `--` 一并跳过)后的 token 序列。 */
     leadToks(seg) {
       const base = (t) => String(t).replace(/\\/g, "/").split("/").pop().replace(/\.exe$/i, "");
@@ -8269,7 +8293,7 @@ export const RULE_W = {
       if (this.RUN_PM.test(h)) {
         const rest = toks.slice(1).filter((x) => !/^-/.test(x.t));
         if (rest[0] && !rest[0].q && /^(?:run|run-script)$/.test(rest[0].t) && rest[1] && !rest[1].q &&
-            this.RUN_NAME.test(rest[1].t) && !this.SCRIPT_EXT.test(rest[1].t) && !CONTENT_WRITE_RE.test(rest[1].t)) return true;
+            this.RUN_NAME.test(rest[1].t) && !this.SCRIPT_EXT.test(rest[1].t) && !this.cw().test(rest[1].t)) return true;
       }
       if (!this.NODEISH.test(h)) return false;
       // node 类:执行位上是**别的**脚本才惰性
@@ -8279,22 +8303,22 @@ export const RULE_W = {
         const x = rest[i];
         if (/^-/.test(x.t)) {
           if (!x.q && /^(?:-e|--eval|-p|--print|--input-type)(?:=|$)/.test(x.t)) return false;
-          if (this.NODE_VALUE_FLAG.test(x.t)) { if (rest[i + 1] && this.VALUE_RUNS.test(rest[i + 1].t)) return false; i++; }
+          if (this.NODE_VALUE_FLAG.test(x.t)) { if (rest[i + 1] && this.valueRuns().test(rest[i + 1].t)) return false; i++; }
           continue;
         }
         if (!sub && this.NODE_SUBCMD.test(x.t)) { sub = true; continue; }
-        return this.SCRIPT_EXT.test(x.t) && !CONTENT_WRITE_RE.test(x.t);
+        return this.SCRIPT_EXT.test(x.t) && !this.cw().test(x.t);
       }
       return false;
     },
     execsQuoted(seg) {
       // 253d BP-3 → 253e BP-4 → 253f BP-1:引号整串路径在场 ⇒ 除非段头明确非执行,一律算执行(见头注 253f 节)
-      if (this.quotedSpans(seg).some((q) => this.QUOTED_PATH.test(q))) return !this.inertHead(seg);
+      if (this.quotedSpans(seg).some((q) => this.quotedPath().test(q))) return !this.inertHead(seg);
       const toks = this.tok(seg).filter((x) => !/^\w+=/.test(x.t));
       if (!toks.length) return true;                      // 认不出 ⇒ 保守算执行
       const base = (t) => String(t).replace(/\\/g, "/").split("/").pop().replace(/\.exe$/i, "");
       const head = toks[0];
-      if (head.q && CONTENT_WRITE_RE.test(head.t)) return true;   // `"…/deploy-prod.ps1" -Apply`
+      if (head.q && this.cw().test(head.t)) return true;   // `"…/deploy-prod.ps1" -Apply`
       if (/^&$/.test(head.t)) return true;                        // PowerShell 调用运算符
       const h = base(head.t);
       if (this.EXEC_HEAD.test(h)) return true;
@@ -8302,7 +8326,7 @@ export const RULE_W = {
         const rest = toks.slice(1);
         if (rest.some((x) => !x.q && /^(?:-e|--eval|-p|--print|--input-type|-r|--require)$/.test(x.t))) return true;
         const first = rest.find((x) => !/^-/.test(x.t));           // 首个位置参数 = 被跑的脚本
-        if (first && CONTENT_WRITE_RE.test(first.t)) return true;  // 路径带引号也是执行
+        if (first && this.cw().test(first.t)) return true;  // 路径带引号也是执行
       }
       return false;
     },
@@ -8319,7 +8343,7 @@ export const RULE_W = {
     /** 惰性段:段里提到脚本名,但这一段不会执行它。 */
     inertSeg(seg) {
       const s = String(seg);
-      if (!CONTENT_WRITE_RE.test(s)) return false;          // 没提到 ⇒ 本判定不适用
+      if (!this.cw().test(s)) return false;          // 没提到 ⇒ 本判定不适用
       if (this.BG_AMP.test(stripQuoted(s))) return false;    // BP-6:后台 `&` 藏着另一条真命令
       if (this.quotedOnly(s) && !this.execsQuoted(s)) return true;   // 文本面提及(commit message / --cond)
       const head = this.segHead(s);
@@ -8344,12 +8368,12 @@ export const RULE_W = {
       return true;
     },
     cmdWrites(c) {
-      if (!CONTENT_WRITE_RE.test(String(c))) return false;
+      if (!this.cw().test(String(c))) return false;
       // 253g ①:数据 heredoc(属主 cat/tee/git commit -F - …)正文不切段判段头
       const s = this.stripDataHeredocs(String(c));
-      if (!CONTENT_WRITE_RE.test(s)) return false;
+      if (!this.cw().test(s)) return false;
       const segs = segments(s);
-      const hitSegs = segs.filter((seg) => CONTENT_WRITE_RE.test(seg));
+      const hitSegs = segs.filter((seg) => this.cw().test(seg));
       if (!hitSegs.length) return true;
       // 253d BP-2:解释器吃进的 heredoc 正文里,「只在引号里」不构成惰性
       const bodies = this.execHeredocBodies(s);
@@ -8455,8 +8479,10 @@ export const RULE_W = {
     },
   },
   // 第二参只给 mutations 注入变异版 `_w`(引擎只传 ctx,默认值即真判据)
-  detect: (ctx, H = RULE_W._w) => {
+  detect: (ctx, H0 = RULE_W._w) => {
     if (!ranClear(ctx)) return [];
+    // 批 305:部署脚本名单从 ctx 来(hook 读安装方配置一次、注入;夹具 / 回放经 installNames 注入),绑一次后下面全走 H
+    const H = H0.bindNames(ctx);
     const out = [];
     // 支① 交付物(docs/clipboard 文章):须只读子代理审读且入参绑定文件名
     // D101②(2026-09-06 用户亲签「1 做」):**用户本轮原话**明示免外审 ⇒ 支①放行。
@@ -8495,7 +8521,7 @@ export const RULE_W = {
   mutations: [
     // 批 253 三条:把 D130 修法逐块退回,各自的证人在 cases 里
     { name: "生产写判据退回整串子串(读脚本也算写,D130 误拦复活)", apply: (r) => ({ ...r,
-      detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, cmdWrites: (c) => CONTENT_WRITE_RE.test(String(c)) }) }) },
+      detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, cmdWrites(c) { return this.cw().test(String(c)); } }) }) },
     { name: "读类段头去掉 `[({`]` 守卫(复刻 ca7b33b:cat <(node write-node …) 放行)", apply: (r) => ({ ...r,
       detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, isReadSeg(seg) {
         const masked = stripQuoted(seg), head = this.segHead(seg);
@@ -8504,8 +8530,8 @@ export const RULE_W = {
     { name: "去掉管道守卫(grep 脚本名 | xargs node 放行)", apply: (r) => ({ ...r,
       detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, cmdWrites(c) {
         const s = String(c);
-        if (!CONTENT_WRITE_RE.test(s)) return false;
-        const hitSegs = segments(s).filter((seg) => CONTENT_WRITE_RE.test(seg));
+        if (!this.cw().test(s)) return false;
+        const hitSegs = segments(s).filter((seg) => this.cw().test(seg));
         return !hitSegs.length || hitSegs.some((seg) => !this.isReadSeg(seg));
       } }) }) },
     // 批 253b 三条:BP-6 / BP-12 的修法各自留退回变异,证人在 cases 里
@@ -8530,7 +8556,7 @@ export const RULE_W = {
         if (!toks.length) return true;
         const base = (t) => String(t).replace(/\\/g, "/").split("/").pop().replace(/\.exe$/i, "");
         const head = toks[0];
-        if (head.q && CONTENT_WRITE_RE.test(head.t)) return true;
+        if (head.q && this.cw().test(head.t)) return true;
         if (/^&$/.test(head.t)) return true;
         const h = base(head.t);
         if (this.EXEC_HEAD.test(h)) return true;
@@ -8538,7 +8564,7 @@ export const RULE_W = {
           const rest = toks.slice(1);
           if (rest.some((x) => !x.q && /^(?:-e|--eval|-p|--print|--input-type|-r|--require)$/.test(x.t))) return true;
           const first = rest.find((x) => !/^-/.test(x.t));
-          if (first && CONTENT_WRITE_RE.test(first.t)) return true;
+          if (first && this.cw().test(first.t)) return true;
         }
         return false;
       } }) }) },
@@ -8549,9 +8575,9 @@ export const RULE_W = {
     { name: "253d BP-2 过头:解释器 heredoc 正文里 git 参数/提交信息也算执行", apply: (r) => ({ ...r,
       detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, cmdWrites(c) {
         const s = String(c);
-        if (!CONTENT_WRITE_RE.test(s)) return false;
+        if (!this.cw().test(s)) return false;
         const segs = segments(s);
-        const hitSegs = segs.filter((seg) => CONTENT_WRITE_RE.test(seg));
+        const hitSegs = segs.filter((seg) => this.cw().test(seg));
         if (!hitSegs.length) return true;
         const bodies = this.execHeredocBodies(s);
         const live = hitSegs.filter((seg) => !this.inertSeg(seg) || (bodies.some((b) => b.includes(seg)) && this.quotedOnly(seg)));
@@ -8588,7 +8614,7 @@ export const RULE_W = {
           }
           return null;
         };
-        { const x = execPosTok(); if (x && x.q && this.QUOTED_PATH.test(x.t)) return true; }
+        { const x = execPosTok(); if (x && x.q && this.quotedPath().test(x.t)) return true; }
         return RULE_W._w.execsQuoted.call(Object.assign(Object.create(this), { QUOTED_PATH: /(?!)/ }), seg);
       } }) }) },
     { name: "253f BP-1 过头:node 类段头不认执行位上的别的脚本(node gate-migrate-check --file \"…\" 误拦)", apply: (r) => ({ ...r,
@@ -8634,12 +8660,12 @@ export const RULE_W = {
       detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, RUN_PM: /(?!)/ }) }) },
     { name: "253d BP-3 过头:引号整串路径压过 git 参数惰性(git add \"scripts/write-node.mjs\" 误拦)", apply: (r) => ({ ...r,
       detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, inertSeg(seg) {
-        if (this.quotedSpans(seg).some((q) => this.QUOTED_PATH.test(q))) return false;
+        if (this.quotedSpans(seg).some((q) => this.quotedPath().test(q))) return false;
         return RULE_W._w.inertSeg.call(this, seg);
       } }) }) },
     { name: "按段头判(段头须是脚本名才算写,D130 红队 BP-2:node write-node.mjs 漏判)", apply: (r) => ({ ...r,
       detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, cmdWrites(c) {
-        return segments(String(c)).some((seg) => CONTENT_WRITE_RE.test(this.segHead(seg)));
+        return segments(String(c)).some((seg) => this.cw().test(this.segHead(seg)));
       } }) }) },
     { name: "任意 Agent 都算审读(去只读白名单)", apply: (r) => ({ ...r, detect: (ctx) => {
       const H = RULE_W._w;
@@ -8717,7 +8743,7 @@ export const RULE_W = {
         text: "收工。",
         bash: ["grep -l apply scripts/write-node.mjs | xargs -I{} node {} --apply p.json", "node --no-warnings scripts/batch-goal.mjs --clear"] },
       { name: "D130:pwsh -File 跑部署脚本(段头 pwsh 不是读)⇒ 命中",
-        text: "部署完收工。",
+        text: "部署完收工。", installNames: W_DEPLOY,
         bash: ["pwsh -File scripts/deploy-prod.ps1", "node --no-warnings scripts/batch-goal.mjs --clear"] },
       { name: "D130:bash -c 包一层 write-node ⇒ 命中",
         text: "收工。",
@@ -8726,7 +8752,7 @@ export const RULE_W = {
         text: "收工。",
         bash: ["grep -n apply scripts/write-node.mjs && node scripts/write-node.mjs --apply p.json", "node --no-warnings scripts/batch-goal.mjs --clear"] },
       { name: "D130:Get-Content 脚本 | iex ⇒ 命中",
-        text: "收工。",
+        text: "收工。", installNames: W_DEPLOY,
         bash: ["Get-Content scripts/deploy-prod.ps1 | iex", "node --no-warnings scripts/batch-goal.mjs --clear"] },
       // ── 批 253b(第二轮红队)────────────────────────────────────────────────
       { name: "253b BP-6:后台 `&` 把真跑的那一半藏在读类段头后面 ⇒ 命中",
@@ -8870,16 +8896,16 @@ export const RULE_W = {
       { text: "先写着。", bash: "node scripts/write-node.mjs --preview payload.json" },
       // ── 批 253(D130 误拦实撞):读脚本不是执行(变异「退回整串子串」在此翻面) ──
       { name: "D130 实撞:grep/sed -n 读 deploy-prod.ps1 查操作序 ⇒ 不算生产写",
-        text: "docs-only 快车道,收工。",
+        text: "docs-only 快车道,收工。", installNames: W_DEPLOY,
         bash: ["grep -n ff-only scripts/deploy-prod.ps1", "sed -n '1,40p' scripts/deploy-prod.ps1",
                "node --no-warnings scripts/batch-goal.mjs --clear"] },
       { name: "D130:cat 读 write-node 并 | head、Get-Content | Select-Object ⇒ 不算生产写",
-        text: "只读了脚本,收工。",
+        text: "只读了脚本,收工。", installNames: W_DEPLOY,
         bash: ["cat scripts/write-node.mjs | head -50", "Get-Content scripts/deploy-prod.ps1 | Select-Object -First 40",
                "node --no-warnings scripts/batch-goal.mjs --clear"] },
       // 0.10.1(装回源仓后回放实撞的两处误拦):名字里带 deploy- 的普通文件不是部署脚本
       { name: "0.10.1:docs/deploy-windows.md、记忆文件名 …-deploy-is-law 不是部署脚本 ⇒ 不算生产写",
-        text: "文档挪好了,收工。",
+        text: "文档挪好了,收工。", installNames: W_DEPLOY,
         bash: ["git rm --cached docs/deploy-windows.md",
                "node --no-warnings scripts/batch-goal.mjs --arm 293 --cond \"记忆 default-commit-deploy-is-law 补一句\"",
                "node --no-warnings scripts/batch-goal.mjs --clear"] },
@@ -8944,7 +8970,7 @@ export const RULE_W = {
         text: "迁移核过了,收工。",
         bash: ['bun run scripts/gate-migrate-check.mjs --file "scripts/prod-lib.mjs"', "node --no-warnings scripts/batch-goal.mjs --clear"] },
       { name: "253f BP-1:type / code 引号整串路径(非执行头)⇒ 不算生产写",
-        text: "看了一眼,收工。",
+        text: "看了一眼,收工。", installNames: W_DEPLOY,
         bash: ['type "scripts\\deploy-prod.ps1"', 'code "scripts/write-node.mjs"', "node --no-warnings scripts/batch-goal.mjs --clear"] },
       // ── 批 253g(第六份红队,阻断式误拦)──
       { name: "253g ① 红队 BP:git commit -F - <<'EOF' 正文散文行带引号整串脚本路径 ⇒ 不算生产写",
@@ -9057,6 +9083,76 @@ RULE_W.cases.pos.push({
   text: "名词日记:不适用,因这是对闸拦词的追问。收工。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
   write: "clipboard/oss/public-repo/README.md",
 });
+// ── 批 305:部署脚本那一支只认安装方名单里的确切文件名(夹具名单 = W_DEPLOY,中性占位名 deploy-prod.ps1)──────────
+//   两只审查代理给的形态:按一族名字认(`deploy-<名>.<脚本扩展名>`)时,下面「不该拦」的几组全被当成生产写入。
+{
+  const CLEAR = "node --no-warnings scripts/batch-goal.mjs --clear";
+  RULE_W.cases.neg.push(
+    { name: "305:对 src/lib/deploy-utils.ts 跑测试 / lint(同族名字的普通源码)⇒ 不算生产写",
+      text: "测试和 lint 都过了,收工。", installNames: W_DEPLOY,
+      bash: ["npx vitest run src/lib/deploy-utils.ts", "pnpm eslint src/lib/deploy-utils.ts", "pnpm test -- src/lib/deploy-utils.test.ts", CLEAR] },
+    { name: "305:node scripts/deploy-status.mjs --json(名单外的 deploy-<名> 脚本)⇒ 不算生产写",
+      text: "看了一眼部署状态,收工。", installNames: W_DEPLOY,
+      bash: ["node scripts/deploy-status.mjs --json", CLEAR] },
+    { name: "305:未配置的 scripts/deploy-staging.sh 做 bash -n / chmod +x / ls -la ⇒ 不算生产写",
+      text: "语法查过了,收工。", installNames: W_DEPLOY,
+      bash: ["bash -n scripts/deploy-staging.sh", "chmod +x scripts/deploy-staging.sh", "ls -la scripts/deploy-staging.sh", CLEAR] },
+    { name: "305 边界:带后缀 / 前缀的近名文件(deploy-prod.ps1.bak、my-deploy-prod.ps1)不是名单里那个 ⇒ 不算生产写",
+      text: "留了个备份,收工。", installNames: W_DEPLOY,
+      bash: ["cp scripts/deploy-prod.ps1.bak clipboard/305/", "pwsh -File scripts/my-deploy-prod.ps1", CLEAR] },
+    { name: "305:没配名单(别的仓装了闸、没写 deployScripts)⇒ 部署脚本那一支不响",
+      text: "部署完收工。",
+      bash: ["pwsh -File scripts/deploy-prod.ps1", "bash scripts/deploy-staging.sh", CLEAR] },
+    { name: "305:名单是空数组 ⇒ 同样不响",
+      text: "部署完收工。", installNames: { deployScripts: [] },
+      bash: ["pwsh -File scripts/deploy-prod.ps1", CLEAR] },
+    { name: "305:配了名单,读脚本 / 列文件 / git 操作仍不是执行(cat、ls -la 引号路径、git add、git diff 引号路径)",
+      text: "只读了脚本,收工。", installNames: W_DEPLOY,
+      bash: ["cat scripts/deploy-prod.ps1", 'ls -la "scripts/deploy-prod.ps1"', "git add scripts/deploy-prod.ps1", 'git diff "scripts/deploy-prod.ps1"', CLEAR] },
+    { name: "305 天花板钉:省略扩展名调用(.\\scripts\\deploy-prod -Apply、npm run deploy-prod)不认——名单里是带扩展名的文件名",
+      text: "收工。", installNames: W_DEPLOY,
+      bash: [CLEAR], ps: [".\\scripts\\deploy-prod -Apply", "npm run deploy-prod"] },
+  );
+  RULE_W.cases.pos.push(
+    ...[
+      ['pwsh -File "scripts/deploy-prod.ps1"', "带引号的路径"],
+      ['& "E:/x/scripts/deploy-prod.ps1" -Apply', "调用运算符 + 引号绝对路径"],
+      ["pwsh -File .\\scripts\\deploy-prod.ps1 -Apply", "反斜杠路径"],
+      ["pwsh -File scripts/deploy-prod.PS1", "扩展名大写"],
+      ["powershell -File SCRIPTS\\DEPLOY-PROD.PS1", "整名大写(Windows 文件系统不分大小写)"],
+      ["bash -c 'pwsh -File scripts/deploy-prod.ps1'", "壳里再包一层"],
+    ].map(([cmd, why]) => ({ name: `305:${why}——${cmd} ⇒ 命中`, text: "部署完收工。", installNames: W_DEPLOY, bash: [cmd, CLEAR] })),
+    { name: "305:PowerShell 工具直接跑 .\\scripts\\deploy-prod.ps1 -Apply(反斜杠、无解释器前缀)⇒ 命中",
+      text: "部署完收工。", installNames: W_DEPLOY, bash: [CLEAR], ps: [".\\scripts\\deploy-prod.ps1 -Apply"] },
+    { name: "305:包装头 + 引号整串路径(cross-env … pwsh \"scripts/deploy-prod.ps1\")⇒ 命中(引号整串形与提及形同一份名单)",
+      text: "部署完收工。", installNames: W_DEPLOY,
+      bash: ['cross-env STAGE=prod pwsh "scripts/deploy-prod.ps1" -Apply', CLEAR] },
+    { name: "305:名单里有两个名字,第二个也认",
+      text: "部署完收工。", installNames: { deployScripts: ["deploy-prod.ps1", "release.sh"] },
+      bash: ["bash scripts/release.sh --yes", CLEAR] },
+  );
+  // 变异:各拧断一处,证人都在上面
+  const W_FAMILY = /write-node\.mjs|prod-lib\.mjs|bulk[-_]?create|deploy-[\w-]+\.(?:[Pp][Ss]1|sh|mjs|cjs|js|ts)\b/;
+  const W_FAMILY_QUOTED = /^[^\s"']*(?:write-node|prod-lib|bulk[-_]?create[\w-]*|deploy-[\w-]+)\.(?:mjs|cjs|js|ts|ps1)$/i;
+  const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\/-]/g, "\\$&");
+  RULE_W.mutations.push(
+    { name: "305 退回:部署脚本按一族名字认(0.10.1 的 deploy-<名>.<脚本扩展名>;deploy-utils.ts / deploy-staging.sh / 没配名单也拦)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, cw: () => W_FAMILY, quotedPath: () => W_FAMILY_QUOTED }) }) },
+    { name: "305 松:不读名单(配了部署脚本也不认)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, bindNames() { return this; } }) }) },
+    { name: "305 松:名单按子串认(不看文件名边界:deploy-prod.ps1.bak / my-deploy-prod.ps1 也算)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, cw() {
+        return new RegExp(contentWriteRe(this.deployScripts).source.replace("(?<![\\w.-])", "").replace("(?![\\w.-])", ""));
+      } }) }) },
+    { name: "305 严:名单分大小写(扩展名大写 .PS1 / 整名大写不认)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, cw() {
+        const names = this.deployScripts.map(esc).join("|");
+        return names ? new RegExp(`${contentWriteRe([]).source}|(?<![\\w.-])(?:${names})(?![\\w.-])`) : contentWriteRe([]);
+      } }) }) },
+    { name: "305 松:引号整串形不读名单(只剩写死的三类;cross-env … pwsh \"scripts/deploy-prod.ps1\" 漏放)", apply: (r) => ({ ...r,
+      detect: (ctx) => RULE_W.detect(ctx, { ...RULE_W._w, quotedPath: () => quotedContentWritePathRe([]) }) }) },
+  );
+}
 // ===== RULE_W END =====
 
 /** V:呈签清单缺「免签例外已核」痕迹(绊线,2026-08-25 批 102)。
