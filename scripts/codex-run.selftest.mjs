@@ -558,13 +558,15 @@ export async function runSelfTest({ self }) {
       const p = spawnSync(process.execPath, [self, "--poll", J], { encoding: "utf8", windowsHide: true, env, cwd: repo });
       if (!/CODEX_STATE=failed/.test(p.stdout || "")) throw new Error(p.stdout + p.stderr);
     });
-    // 批 305:--no-taskbook-check 整体豁免——不合格的任务书照发,结果件头部记一行「任务书检查:跳过」
+    // 批 305:--no-taskbook-check 整体豁免——不合格的任务书照发;跳过只记在作业台账,结果件头部仍是 8 行
+    //   (codex 305-int r1 第 1 条:多一行会让收尾闸「第 9 行起是正文」的兜底把头部分隔符当成读过的正文)
     fs.writeFileSync(path.join(repo, "bare.md"), "x\n");
     const r2 = spawnSync(process.execPath, [self, "--task", path.join(repo, "bare.md"), "--no-taskbook-check", "--out", path.join(lab, "skip.md"), "--cwd", repo, "--wait-ms", "60000"], { encoding: "utf8", windowsHide: true, env, cwd: repo });
-    t("305 --no-taskbook-check:不合格的任务书照发(有 CODEX_JOB),结果件头部记「任务书检查:跳过」", () => {
+    t("305 --no-taskbook-check:不合格的任务书照发(有 CODEX_JOB);结果件头部 8 行、第 9 行起是正文", () => {
       if (!/^CODEX_JOB=\S+/m.test(r2.stdout || "")) throw new Error(`没发车:${(r2.stdout || "") + (r2.stderr || "")}`);
       const head = fs.readFileSync(path.join(lab, "skip.md"), "utf8");
-      if (!/^任务书检查:跳过/m.test(head)) throw new Error(`头部没记:${JSON.stringify(head.slice(0, 400))}`);
+      if (/任务书检查/.test(head)) throw new Error(`头部不该多行:${JSON.stringify(head.slice(0, 400))}`);
+      eq(head.split("\n")[7], "---", "第 8 行是头部收尾的 ---");
     });
     t("305【反向】正常过检的发起:结果件头部没有「任务书检查」行(头部仍是 8 行)", () => {
       const head = fs.readFileSync(path.join(lab, "r.md"), "utf8");
@@ -732,12 +734,27 @@ export async function runSelfTest({ self }) {
       eq(S.parseArgs(["--task", "a.md", "--fact-check"]).factCheck, true);
     });
     t("305 --poll 不受任务书检查影响(缺失作业照旧退出 1,不是 4)", () => { eq(run(["--poll", `selftest-305-${process.pid}`]).status, 1); });
-    t("305 结果件头部:跳过检查才多一行「任务书检查:跳过」;缺省仍是 8 行(收尾闸按第 9 行认正文)", () => {
+    t("305(codex 305-int r1 第 1 条)结果件头部恒为 8 行:跳过检查与否都一样(收尾闸按第 9 行认正文)", () => {
       const skip = S.resultHeader({ codexVersion: "v", taskbookCheck: "skipped" }, "t");
-      if (!/\n任务书检查:跳过[^\n]*\n---\n$/.test(skip)) throw new Error(skip);
       const dft = S.resultHeader({ codexVersion: "v" }, "t");
-      if (/任务书检查/.test(dft)) throw new Error(dft);
-      eq(dft.split("\n").length, 9, "缺省头部 8 行 + 收尾换行");
+      eq(skip, dft, "跳过检查不改头部");
+      eq(dft.split("\n").length, 9, "头部 8 行 + 收尾换行");
+    });
+    t("305(codex 305-int r1 第 2 条)任务书被拒的 stderr 首行以「拒绝入参」开头——收尾闸据此认「不是发起」", () => {
+      const d = fs.mkdtempSync(path.join(os.tmpdir(), "codex-run-305ref-"));
+      const tf = path.join(d, "bare.md"); fs.writeFileSync(tf, "x\n");
+      const r = run(["--task", tf, "--out", path.join(d, "refused.md"), "--cwd", d]);
+      const left = fs.existsSync(path.join(d, "refused.md"));
+      fs.rmSync(d, { recursive: true, force: true });
+      eq(r.status, S.TASKBOOK_CHECK_EXIT); eq(left, false, "被拒时不占结果件");
+      const first = String(r.stderr || "").split(/\r?\n/)[0];
+      if (!/^拒绝入参/.test(first)) throw new Error(first);
+      // 与收尾闸的 CODEX_ARG_ERROR 同一认法(那边改了这里要跟)
+      const hook = fs.readFileSync(new URL("./hook-stop-closure.mjs", import.meta.url), "utf8");
+      const m = /const CODEX_ARG_ERROR = (\/.*\/);/.exec(hook);
+      if (!m) throw new Error("收尾闸里找不到 CODEX_ARG_ERROR");
+      const re = new Function(`return ${m[1]}`)();
+      if (!re.test(r.stderr)) throw new Error("收尾闸的 CODEX_ARG_ERROR 认不出这次拒绝");
     });
 
     // 第二轮起:--poll 取到 done 时提示先派方向复核

@@ -32,7 +32,7 @@
 //
 // 发车前查任务书(批 305):`--task` 发车那一刻读任务书判四条(用途 / 完成标准 / 结论选项里有「不用再审」/ 审设计类不过长),
 //   任一条不过 ⇒ 不取号、不占结果件槽位、不起 worker,退出码 4,stderr 写明缺哪条并打出四条要求原文。
-//   `--fact-check` 免「不过长」;`--no-taskbook-check` 整体跳过(给脚本生成的任务书用,结果件头部记「任务书检查:跳过」);
+//   `--fact-check` 免「不过长」;`--no-taskbook-check` 整体跳过(给脚本生成的任务书用,只记在作业台账,结果件头部不变);
 //   `--resume` / `--poll` / `--doctor` / `--self-test` 不查。`--skeleton [design|fact]` 出骨架,`--check-taskbook <文件>` 只判不发。
 //   第二轮起(结果文件 `<slug>-r<n>.md` 的 n ≥ 2)done 的输出在 BODY 块之后多一行提示:分拣前先派 `_direction-judge`。
 //
@@ -183,9 +183,8 @@ export function resultHeader(job, threadId) {
     "network: on(codex 自带通道;2026-08-09 实测 read-only 下四客户端全 200)",
     `repo_brief: ${job.repoBrief || "(none)"}`,
     `复看: codex resume ${threadId || "(未取到 thread-id)"}`,
-    // 批 305:只有 --no-taskbook-check 发起的才多这一行(缺省头部仍是 8 行;收尾闸优先按第二个 `---` 定位正文,
-    //   它的「第 9 行」常量只在第 1 行没读到时兜底——跳过检查的结果件正文从第 10 行起)
-    ...(job.taskbookCheck === "skipped" ? ["任务书检查:跳过(--no-taskbook-check)"] : []),
+    // 批 305(codex 305-int r1 第 1 条):「任务书检查跳过」不再单加一行——收尾闸的分页兜底按第 9 行认正文,
+    //   多一行就会把头部分隔符当成读过的正文。跳过与否只记在作业台账的 taskbookCheck 键里,头部恒为 8 行。
     "---",
     "",
   ].join("\n");
@@ -805,7 +804,7 @@ ${TASKBOOK_REQUIREMENTS.map((r) => "    " + r).join("\n")}
   --skeleton [design|fact]   只打印一份任务书骨架(缺省 design),不发车
   --check-taskbook <文件>    只判不发:逐条打印过没过(可叠 --fact-check);不过 ⇒ 退出码 ${TASKBOOK_CHECK_EXIT}
   --fact-check               核事实类任务(比副本、核引文、核读数):免 d,a、b、c 照查
-  --no-taskbook-check        整体跳过(给脚本生成的任务书用);结果件头部会记一行「任务书检查:跳过」
+  --no-taskbook-check        整体跳过(给脚本生成的任务书用);跳过只记在作业台账,结果件头部不变
 
   沙箱缺省 read-only:codex 可读仓库、可联网;本机实测 read-only 未必拦得住写入(D141),要禁写就在任务书里写明;
   --sandbox workspace-write 放开写(只在用户点名时用)。
@@ -871,7 +870,9 @@ async function main() {
   if (tbMode === "check") {
     const res = checkTaskbook(fs.readFileSync(taskPath, "utf8"), { factCheck: !!opts.factCheck });
     if (!res.ok) {
-      process.stderr.write(`任务书检查不过,没有发车(退出码 ${TASKBOOK_CHECK_EXIT}):${path.basename(taskPath)}\n` + taskbookFailText(res));
+      // codex 305-int r1 第 2 条:首行以「拒绝入参」开头——收尾闸的 CODEX_ARG_ERROR 认这四个字为「不是发起」,
+      //   否则一次被拒的发车会被登记成重发,把同任务的旧失败误判为已处理。改这四个字要两边一起改。
+      process.stderr.write(`拒绝入参 --task:任务书检查不过,没有发车(退出码 ${TASKBOOK_CHECK_EXIT}):${path.basename(taskPath)}\n` + taskbookFailText(res));
       process.exit(TASKBOOK_CHECK_EXIT);
     }
   }
@@ -890,7 +891,7 @@ async function main() {
     model: opts.model || null, modelLabel: opts.model ? null : codexDefaultModel(),
     effort: opts.effort, resume: opts.resume, sandbox: opts.sandbox || "read-only",
     timeoutMs: opts.timeoutMs, codexVersion: codexVersion(),
-    // 批 305:只有 --no-taskbook-check 才多这一键(worker 据它在结果件头部记「任务书检查:跳过」);其余发起记录形状照旧
+    // 批 305:只有 --no-taskbook-check 才多这一键(只留在作业台账;结果件头部不变,见 resultHeader);其余发起记录形状照旧
     ...(tbMode === "skipped" ? { taskbookCheck: "skipped" } : {}),
   });
 
