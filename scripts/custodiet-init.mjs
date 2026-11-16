@@ -445,8 +445,10 @@ if (replaced.length) process.stderr.write(`覆盖安装:替换了 ${replaced.len
 if (attention.length) process.stderr.write(`⚠ ${attention.length} 个文件目标里已有不同版本,未覆盖——看清单里的 sidecar/skipped,自己合并` +
   `${overwrite ? "(规矩文件与 agent 定义不受 --overwrite 影响)" : "(scripts/ 下的闸件可以加 --overwrite 直接替换)"}。\n`);
 process.stderr.write("未提交任何东西。下一步:在目标仓里跑 `node --no-warnings scripts/hook-stop-closure.mjs --self-test`。\n" +
-  "  ⚠ 已知(第一刀实测):自测里有 2 条 I 类用例读的是目标仓**真实的 git 历史**(git ls-files / 末次提交新增的文件)——\n" +
-  "    装闸件尚未提交、或装闸那次提交恰好是 HEAD 时,这 2 条会红;装闸提交之后再有一次提交即转绿。\n");
+  "  ⚠ 已知(0.10.0 在临时仓里实测):自测里有几条用例读的是目标仓**真实的 git 历史**(I、G 各 1 条,「接缝」组至多 3 条)——\n" +
+  "    装闸件尚未提交时红 4 到 5 条(空仓 5 条);装闸提交之后剩 3 条,要等之后有一次**新增了文件**的提交才全绿\n" +
+  "    (判据取的是「最近一次新增过文件的提交」,只改不增的提交不算)。\n" +
+  "    没装解析依赖(npm --prefix scripts/gate-deps install)时,「写入三态」组另有 2 条红。\n");
 const allOk = phrasebook.status === "generated";
 if (manifest.ignored) process.stderr.write(`⚠ ${manifest.path} 被目标仓的 .gitignore 挡住:装闸提交前先 \`git add -f ${manifest.path}\`,否则闸认不出这次是原样装入\n`);
 if (!allOk) process.stderr.write(`⚠ 《闸用语》手册没生成(${phrasebook.error || "未知原因"}),CLAUDE.md 未挂引用;闸件已装,手册要另跑 node --no-warnings scripts/gate-phrasebook.mjs\n`);

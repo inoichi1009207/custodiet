@@ -196,7 +196,7 @@ node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
 装完以后:
 
 1. 在目标仓根目录装写入效果分析的解析依赖:`npm --prefix scripts/gate-deps install`(`tree-sitter` 与 `tree-sitter-bash`,装进 `scripts/gate-deps/node_modules`,不碰你仓的 `package.json`)。不装也能跑:I / J / G / L 判「这条 Bash 命令写了哪些文件」时退回较粗的旧判法。
-2. 在目标仓里自检:`node --no-warnings scripts/hook-stop-closure.mjs --self-test`。有 2 条 I 类用例读目标仓的真实 git 历史：闸件还没提交、或装闸那次提交正好是 HEAD 时会红，再有一次提交就转绿。
+2. 在目标仓里自检:`node --no-warnings scripts/hook-stop-closure.mjs --self-test`。有几条用例读目标仓的真实 git 历史(I、G 各 1 条，「接缝」组里至多 3 条):闸件还没提交时红 4 到 5 条(空仓 5 条),装闸提交之后剩 3 条，要等之后有一次**新增了文件**的提交才全绿——判据取的是「最近一次新增过文件的提交」，只改不增的提交不算。没做第 1 步(解析依赖没装)时，「写入三态」组另有 2 条红。
 3. 提交。安装器写了 `.claude/custodiet-manifest.json`(闸引擎件的内容摘要),装闸提交里的引擎件和它一致、且安装源树没有未提交改动时,P 认作原样装入，不要求红队；清单被 `.gitignore` 挡住时安装器会提示先 `git add -f` 它。之后你自己改闸引擎文件，P 要红队 `_gate-bypass-hunter` 与误拦猎手 `_gate-false-block-hunter` 两者都跑过——新写入的 agent 在新会话里才保证调得起来。
 
 限制:
