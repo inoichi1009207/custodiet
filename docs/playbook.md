@@ -146,7 +146,7 @@ export const RULE_X = {
   id: "X",
   blocking: true,                  // 或 (ctx)=>bool —— 条件阻断合法,但引擎必须按第 2 步 blockOf 求值:
                                    //   命中路径调用之,UNKNOWN/抛错路径按 true;裸 `!!r.blocking` 会让函数恒真
-  law: "docs/laws/xx.md#锚名",     // 出生证①:它执行谁。锚必须解析得到
+  law: "AGENTS.md#条名",           // 出生证①:它执行谁。锚必须解析得到
   requires: ["batchGoal"],         // 用到的注入通道逐个声明(三态由引擎统一管)
   detect: (ctx) => {...},          // 返回命中数组;空=未命中;永不自读磁盘
   exempts: [{ kind: "action", why: "...", test: (c) => ... }],   // 能不设就不设

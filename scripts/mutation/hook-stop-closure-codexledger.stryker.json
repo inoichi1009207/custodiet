@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/core/schema/stryker-schema.json",
+  "_comment": "闸引擎变异测试 · 目标 3:hook-stop-closure.mjs 的 codexLedger 函数(第 831–1163 行,`export function codexLedger` 到其收尾 `}`)。行号随源文件漂移——改了 hook-stop-closure.mjs 要先重核这两处行号再跑。判据=整份 --self-test(单次约 3.6 s,含 codex 账 237 项)。",
+  "_inPlace_why": "本目标 inPlace=true,**只许在 git worktree 里跑,绝不在主树跑**:主树 scripts/ 是正在生效的闸,原地变异会让运行中的 Stop hook 读到插桩件。不用沙箱的原因(2026-10-10 实测):整份自测要读 AGENTS.md、docs/laws/(law 锚点,观测到至少 22 项 FAIL)并对真 git 仓判「是否已追踪」(接缝 2 项 + I 项 1 条 FAIL),只放 scripts/ 进沙箱时初跑即红;放全仓进沙箱则 git 判据仍失真。中断后先 `git diff scripts/hook-stop-closure.mjs` 确认已还原。",
+  "testRunner": "command",
+  "commandRunner": { "command": "node --no-warnings scripts/hook-stop-closure.mjs --self-test" },
+  "coverageAnalysis": "off",
+  "_disableTypeChecks_why": "首跑(2026-10-10)未设此项:Stryker 在 inPlace 模式下给仓内 175 个 js/ts 文件头插了 `// @ts-nocheck`(跑完从备份还原)。本仓是纯 .mjs、无类型检查,设 false 让它只碰被变异的那一个文件。",
+  "disableTypeChecks": false,
+  "inPlace": true,
+  "mutate": ["scripts/hook-stop-closure.mjs:831-1163"],
+  "concurrency": 8,
+  "timeoutMS": 30000,
+  "reporters": ["clear-text", "progress", "json"],
+  "jsonReporter": { "fileName": "reports/mutation/hook-stop-closure-codexledger.json" },
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": true
+}

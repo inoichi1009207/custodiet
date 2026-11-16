@@ -950,15 +950,20 @@ export const PAT = {
 //   冲突表 #3 遥测不计写入),攒够批数后按 p95 定增量消费方案,量之前不动读法。
 const _T0 = Date.now();
 const _perf = { rt: 0, rtMs: 0, rtBytes: 0 };
+/** 批 299b:最近一次 readTranscript 的损坏行 / 半行位置(该行之后那一条在返回数组里的下标),write-state 的动作区间收集器
+ *  据此判「区间完整性」。只记位置、不改返回的条目(规则输入不变)。{ path, at:[…] };没读过 ⇒ null。 */
+let _lastTranscriptBad = null;
 function readTranscript(p) {
   const t = Date.now();
   const raw = fs.readFileSync(p, "utf8");
   _perf.rt++; _perf.rtBytes += raw.length;
   const out = [];
+  const bad = [];
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch { /* 半行/损坏行跳过 */ }
+    try { out.push(JSON.parse(line)); } catch { bad.push(out.length); /* 半行/损坏行跳过 */ }
   }
+  _lastTranscriptBad = { path: p, at: bad, entries: out };
   _perf.rtMs += Date.now() - t;
   return out;
 }
@@ -1628,7 +1633,8 @@ export function codexLedger(entries, env = {}) {
     }
   }
   const since = Number.isFinite(env.since) ? env.since : -Infinity;
-  const out = { jobs: [], open: [], unknown: [], running: [] };
+  // jobDirs(批 297 r2,误拦猎手 FB-6):转录里 CODEX_LOG 指出的作业目录,交给 P 跨模型格的取数面(同一套目录集)
+  const out = { jobs: [], open: [], unknown: [], running: [], jobDirs: [...jobDirs] };
   for (const job of jobs.values()) {
     // 规则不追溯(v7,红队 v6 BP-4):v7 生效之前发起的作业不入账——旧判据下诚实做完的,不按新判据补账
     if (Number.isFinite(job.useTs) && job.useTs < since) continue;
@@ -1778,6 +1784,25 @@ export function readTranscriptTail(p, bytes) {
   } finally { fs.closeSync(fd); }
 }
 
+/** 批 297 r2(误拦猎手 FB-2 / FB-7):cwd 所在的 git 顶层——从 cwd 往上找第一个含 `.git`(目录或文件,worktree 是文件)的祖先。
+ *  不起 git 进程;先剥 `\\?\` / `//?/` 前缀,能 realpath 就 realpath(失败照原形走,不报错)。找不到 / 入参空 ⇒ null。正斜杠形。 */
+export function gitTopOf(cwd) {
+  let p = String(cwd || "").trim().replace(/^(?:\\\\|\/\/)\?[\\/]/, "");
+  if (!p) return null;
+  try { p = fs.realpathSync.native(p); } catch { /* 照原形 */ }
+  p = String(p).replace(/^(?:\\\\|\/\/)\?[\\/]/, "").replace(/\\/g, "/").replace(/\/+$/, "");
+  for (let i = 0; i < 64 && p; i++) {
+    try { if (fs.existsSync(`${p}/.git`)) return p; } catch { /* 读不了当没有 */ }
+    const up = p.replace(/\/[^/]*$/, "");
+    if (!up || up === p) break;
+    p = up;
+  }
+  return null;
+}
+
+// 批 302(D205 ①):原 `failLinesOf`(从作业日志尾 256KB 抽失败行给 P 判「通道不可用」)删除——三轮各冒新形态
+//   (尾窗切行首、来源前缀挤占预算、stdout item 半行混进 stderr)。现由 codex-run 从完整事件流写结构化字段 `unavailable{reason}`,P 只读字段。
+
 /** 生产 hook 的注入面:作业状态文件、反查、结果正文。读不到 ⇒ null(未知),半写有限重试。 */
 export function liveCodexEnv(extra = {}) {
   const root = `${String(os.tmpdir()).replace(/\\/g, "/")}/codex-run-jobs`;
@@ -1851,6 +1876,35 @@ export function liveCodexEnv(extra = {}) {
         }
       }
       return best ? best.j : null;
+    },
+    // 批 297(D203):收尾闸 P 跨模型格的取数面——列出 startedAt ≥ since 的作业记录。与 findJob 同一读法(readJson)、
+    //   同一目录集(rootsWith:hook 自己的作业目录 ∪ 调用方给的 CODEX_LOG 目录,r2 误拦猎手 FB-6)、同一每目录上限 3000;
+    //   先按文件 mtime 粗筛(记录在发起时写、终态时重写 ⇒ mtime ≥ startedAt,mtime < since 的必不合格)。
+    //   每条附两样取证(r2):`top` = cwd 所在的 git 顶层(从 cwd 往上找第一个含 `.git` 的祖先,不起 git;剥 `\\?\` / `//?/`、
+    //   能 realpath 就 realpath,失败不报错;找不到 ⇒ null);批 302 起不再附 `failLines`(P 只读 codex-run 写的结构化字段 `unavailable` / `binSource`)。
+    //   只取数不判:合格与否的判据唯一实现在 gate-rules 的 RULE_P._p.codexJobsEval。任何一份读不了 ⇒ 跳过,不抛。
+    listJobs(q = {}) {
+      const out = [], seen = new Set(), tops = new Map();
+      const since = Number.isFinite(q.since) ? q.since : null;
+      for (const d of rootsWith(q.dirs)) {
+        let names;
+        try { names = fs.readdirSync(d).filter((n) => /^[A-Za-z0-9_-]{1,64}\.json$/.test(n)); } catch { continue; }
+        for (const n of names.slice(-3000)) {
+          const id = n.slice(0, -5);
+          if (seen.has(id)) continue;
+          const f = `${d}/${n}`;
+          if (since !== null) { try { if (fs.statSync(f).mtimeMs < since) continue; } catch { continue; } }
+          const j = readJson(f);
+          if (!j || typeof j !== "object") continue;
+          const t = Date.parse(j.startedAt || "");
+          if (since !== null && !(Number.isFinite(t) && t >= since)) continue;
+          const ck = String(j.cwd || "");
+          if (!tops.has(ck)) tops.set(ck, gitTopOf(ck));
+          seen.add(id);
+          out.push({ ...j, id, top: tops.get(ck) });
+        }
+      }
+      return out;
     },
     resultBody(R) {
       try {
@@ -2533,14 +2587,17 @@ export function pLedgerView(j, sid) {
   const e = by ? by[pSidKey(sid)] : null;
   // codex 284-r1 附 1:去重用的 shas 也按会话分——原来共用,A 的时刻窗口认领了 B 的提交并记进共用 shas,B 自己的那笔就永远被去重成 0
   return { carriers: e && Number.isFinite(+e.n) ? Math.max(0, Math.floor(+e.n)) : 0,
-    shas: e && Array.isArray(e.shas) ? e.shas : [], hunted: j && Array.isArray(j.hunted) ? j.hunted : [] };
+    shas: e && Array.isArray(e.shas) ? e.shas : [], hunted: j && Array.isArray(j.hunted) ? j.hunted : [],
+    // 批 297 r2:本会话那格上次结清的时刻(P 跨模型格的下界之一);没有 ⇒ 不加键
+    ...(e && typeof e.settledAt === "string" && e.settledAt ? { settledAt: e.settledAt } : {}) };
 }
 /** 写盘前与盘上现账合并(纯函数):本会话那一格换成新值,别的会话的格保留;shas / hunted 取并集(封顶 400)。
  *  盘上账是写之前**重读**的——两个会话的 Stop 交错时,后写的不再整份盖掉先写的(D52 写不半截之外的另一半;竞态窗口缩到读与 rename 之间)。
  *  格数封顶 50(按 at 留最新)。 */
 export function mergePLedger(disk, ledger, sid, now) {
   const by = { ...(disk && disk.bySid && typeof disk.bySid === "object" && !Array.isArray(disk.bySid) ? disk.bySid : {}) };
-  by[pSidKey(sid)] = { n: ledger.carriers, shas: (Array.isArray(ledger.shas) ? ledger.shas : []).slice(-200), at: now };
+  by[pSidKey(sid)] = { n: ledger.carriers, shas: (Array.isArray(ledger.shas) ? ledger.shas : []).slice(-200), at: now,
+    ...(typeof ledger.settledAt === "string" && ledger.settledAt ? { settledAt: ledger.settledAt } : {}) };   // 批 297 r2
   const keep = Object.keys(by).sort((a, b) => String((by[b] && by[b].at) || "").localeCompare(String((by[a] && by[a].at) || ""))).slice(0, 50);
   const uni = (a, b) => [...new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])])].slice(-400);
   return { carriers: ledger.carriers, bySid: Object.fromEntries(keep.map((k) => [k, by[k]])),
@@ -2554,7 +2611,7 @@ export function mergePLedger(disk, ledger, sid, now) {
  *       原来这里是命令语法计数,`git add -A` / merge 合回计 0 ⇒ 宽限账永不涨)。`shas` 累积已计提交(封顶 400),去重用;
  *    · advance = 推进基点:**只在 git 事实非 null 且 P 无命中**时(BP-2:事实取不到时回退面沉默 ≠ 结清,推进会让之前欠的蒸发);
  *    · head = 推进到哪:git 事实读到的那个 HEAD(BP-6:不重新 rev-parse,读事实与写基点之间落的提交留给下一次审)。 */
-export function settleP(P, eCtx, eFindings) {
+export function settleP(P, eCtx, eFindings, now) {
   const prior = (eCtx.pLedger && eCtx.pLedger.carriers) || 0;
   const priorShas = (eCtx.pLedger && Array.isArray(eCtx.pLedger.shas)) ? eCtx.pLedger.shas : [];
   const t = P.tally(eCtx);
@@ -2582,7 +2639,12 @@ export function settleP(P, eCtx, eFindings) {
   let newHunted = [];
   try { newHunted = typeof P.huntedShas === "function" ? P.huntedShas(eCtx) : []; } catch { newHunted = []; }
   const hunted = [...new Set([...priorHunted, ...newHunted])].slice(-400);
-  const ledger = (next !== prior || allThree || shas.length !== priorShas.length || hunted.length !== priorHunted.length) ? { carriers: next, shas, hunted } : null;
+  // 批 297 r2(红队 BP-1 / 误拦猎手 FB-3):记下本会话 P 账上次结清(三通道齐、清零)的时刻,P 跨模型格在本批没武装时拿它当
+  //   作业记录的下界。结清 ⇒ 记此刻;没结清 ⇒ 沿用旧值;从没结清过 ⇒ 不加键(账形状与旧版逐字同)。
+  const priorSettled = eCtx.pLedger && Number.isFinite(eCtx.pLedger.settledAt) ? new Date(eCtx.pLedger.settledAt).toISOString() : null;
+  const settledAt = allThree ? new Date(Number.isFinite(now) ? now : Date.now()).toISOString() : priorSettled;
+  const ledger = (next !== prior || allThree || shas.length !== priorShas.length || hunted.length !== priorHunted.length)
+    ? { carriers: next, shas, hunted, ...(settledAt ? { settledAt } : {}) } : null;
   const f = P.facts(eCtx);
   const advance = !!f && !eFindings.some((x) => x && x.id === "P");
   return { ledger, advance, head: f && typeof f.head === "string" ? f.head : null };
@@ -2767,6 +2829,8 @@ const _fpAuditForSelfTest = process.argv.includes("--self-test")
 // D1/批 102:两份台账的追加改走行级 hash 链(完整性告警;担保边界见 ledger-chain 头注)
 import { ledgerAppend, verifyFile as ledgerVerify } from "./lib/ledger-chain.mjs";
 import { readTouched, selfTest as touchSelfTest } from "./lib/gate-touch.mjs";   // 批 279「修闸 tag」
+// 批 299 / 299b:写入三态观测(287 设计 2.5;判法见 299b-design)。本文件只把观测落账(.claude/.write-state.jsonl),不改任何规则的判决
+import { observeWrites, collectInterval, ledgerRow as writeStateRow, selfTest as writeStateSelfTest } from "./lib/write-state.mjs";
 
 /** 反推「闸机件」清单:凡**改了它就可能改变闸的行为**的文件。
  *
@@ -3116,6 +3180,25 @@ export function run(transcriptPath, ctx = {}) {
         //   窗口取**上一个回合边界之前的若干轮**,按条数封顶控成本;
         //   取不到 ⇒ 不传(`window()` 仍返回 null,规则侧 fail-closed,与原行为一致)。
         priorEntries: ctx.priorEntries !== undefined ? ctx.priorEntries : _priorWindow(turn),
+        // 批 297(D203):P 跨模型格认 codex-run 自己写的作业记录(<tmpdir>/codex-run-jobs/*.json;判据在 RULE_P._p.codexJobHits)。
+        //   惰性:只在 P 真要判该格时读。根 = 本脚本所在 checkout(worktree 里跑时规则侧剥成主根)。
+        //   自测隔离(STOP_CLOSURE_SELFTEST=1,gate-replay 回放同此)不读盘 ⇒ undefined ⇒ 该格只剩 MCP 通路
+        //   (测出来的东西不得取决于磁盘上碰巧有什么;回放读数因此对该格偏严,见批 297 报告)。
+        //   上界 `upper`(r2,红队 BP-3/BP-4、codex §3):实时 = Stop 此刻;离线 --audit / --dry-run = 本轮最晚条目时刻
+        //   (取不到 ⇒ null ⇒ 一条都不认)。判据在规则侧(startedAt 与终态时刻都不得晚于 upper)。
+        //   目录集 = hook 自己的作业目录 ∪ A 账从转录里收的 CODEX_LOG 目录(r2,误拦猎手 FB-6;与 A 同一套)。
+        codexJobs: ctx.codexJobs !== undefined ? ctx.codexJobs
+          : (process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : (() => {
+            const root = fileURLToPath(new URL("..", import.meta.url));
+            let upper = null;
+            if (ctx.live) upper = Date.now();
+            else {
+              const ts = (Array.isArray(turn) ? turn : []).map((e) => Date.parse(String((e && e.timestamp) || ""))).filter(Number.isFinite);
+              upper = ts.length ? Math.max(...ts) : null;
+            }
+            const dirs = cx && Array.isArray(cx.jobDirs) ? cx.jobDirs : [];
+            return (since) => ({ root, upper, jobs: liveCodexEnv().listJobs({ since, dirs }) });
+          })()),
         // 批 285 D143⑫:只供 gate-ctx 的「轮开口滚出窗口」远端续扫(W 的用户免审);调用方自带 priorEntries(夹具)时不给
         ...(ctx.priorEntries !== undefined ? {} : { priorScanEntries: _priorScan(turn) }),
       });
@@ -3166,6 +3249,24 @@ export function run(transcriptPath, ctx = {}) {
       if (live && _settle && _settle.advance && _ledgerOk) try {
         writePHead(ctx.sessionId, _settle.head);
       } catch { /* 基点写不了不影响闸 */ }
+      // ── 批 299 / 299b:写入三态观测落账(287 设计 2.5;判法见 clipboard/299b-design.md)。**只落账**:不进 eFindings、不碰 ctx、
+      //   任何规则都不读它 ⇒ 判决不变(回放新增 0、解除 0)。只在实时主 Stop 跑(SubagentStop 走文件末尾自己的分支,不到这里;
+      //   离线回放 / 自测不带 live)。动作区间由 write-state 的 collectInterval 从**整份转录**里收(起点 = 「上一次放行的 Stop 之后」与「最后一条用户亲口消息」中较早者,见 299b-design 5c-②;整份转录有任何坏行即不完整);
+      //   完整性正证要两件事:条目确是本次 readTranscript 读全文件得来的(fromStart),以及读时的损坏行位置(badAt)——
+      //   条目不是这么来的(调用方自带 entries)⇒ 两件都不给 ⇒ 不完整 ⇒ 看不清。快照代码已删(299b 第 2 节)。
+      //   落点 gitignore 面;写不了只出声,不影响闸。
+      if (live) try {
+        const _wsRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+        const _fresh = _lastTranscriptBad && _lastTranscriptBad.entries === _allEntriesCache;
+        const _iv = collectInterval(_allEntriesCache, _fresh ? { fromStart: true, badAt: _lastTranscriptBad.at } : {});
+        const _obs = observeWrites(_iv, {
+          root: _wsRoot,
+          // Stop 载荷的 background_tasks **原样**(批 299b 实现复审:缺字段 / 非空 ⇒ 看不清,不按 status 过滤)
+          bgTasks: ctx.bgTasks,
+        });
+        fs.appendFileSync(path.join(_wsRoot, ".claude", ".write-state.jsonl"),
+          JSON.stringify(writeStateRow(_obs, { sid: _ledgerSid, at: Array.isArray(_allEntriesCache) ? _allEntriesCache.length : undefined })) + "\n");
+      } catch (e) { try { process.stderr.write("LEDGER-WRITE-FAILED(.write-state): " + safeErrMsg(e) + "\n"); } catch { /* 空 */ } }
       // ── D50 绊线(批 098):本轮写过 gate-playbook.md 或 docs/**.md ⇒ 顺带跑文档引用漂移核 ──
       //   「靠人记得」当日被 T 项判死(登记不算处置),升级为写触发:写与查同轮必然相遇。
       //   只在 live 生产形态跑(audit/dry-run 重放离线语料会反复空触发);绊线自身失败不拦、
@@ -3311,10 +3412,81 @@ function batchOpenWarning() {
  *  「连这一步都失败就只剩 stderr」的承诺是假的。 */
 function safeErrMsg(e) { try { return String((e && e.message) || e); } catch { return "(错误对象自身不可读)"; } }
 
+/** 批 292:「只记账」档的规则 id(规则对象上 `logOnly: true`;287 设计 2.8)。
+ *  ⚠️ 惰性求值:gate-rules.mjs 反向 import 本文件(循环依赖),模块顶层直接读 RULES 会在先加载 gate-rules 的调用方
+ *  (hook-guard)里抛「Cannot access 'RULES' before initialization」——批 292 实撞,hook-guard D100/D102 16 条自测因此全红。 */
+let _logOnlyIds = null;
+export function logOnlyIds() { return _logOnlyIds || (_logOnlyIds = new Set(RULES.filter((r) => r && r.logOnly).map((r) => r.id))); }
+/** 批 292:候选台账(287 设计 2.6「措辞类命中另写候选台账」、2.9 证据字段)。`batch-goal --clear` 按武装时刻起汇总一行。 */
+export const CANDIDATE_LEDGER = ".claude/.gate-candidates.jsonl";
+/** 批 292 复核 codex fix-r1 §3:写端与读端(batch-goal candidateLedgerPath)同一口径——按 git 公共目录定**主树**的 `.claude/`,
+ *  worktree 自己的 hook 也写进主树那一份;取不到 ⇒ 退回 cwd 相对(旧行为)。同一会话只算一次。 */
+let _candPath = null;
+let _candFailMsg = "";
+// 红队(批 292 末段)BP-2:emit 在吐出阻断决定之前同步跑这次 git ⇒ 必须带超时(同文件其他 git 调用口径 5000ms),否则 git 卡住会拖过
+//   Stop 30 秒超时、整个 hook 被杀、同轮阻断项一起放过。超时 ⇒ 抛错 ⇒ 退回 cwd 相对(不阻塞)。
+export function candidateLedgerFile(git = (args) => execFileSync("git", args, { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"], timeout: 5000 })) {
+  if (_candPath) return _candPath;
+  try {
+    const d = String(git(["rev-parse", "--path-format=absolute", "--git-common-dir"]) || "").trim();
+    _candPath = d ? path.join(path.dirname(d), CANDIDATE_LEDGER) : CANDIDATE_LEDGER;
+  } catch { _candPath = CANDIDATE_LEDGER; }
+  return _candPath;
+}
+/** 只记账档的命中拆出来:返回 `{ shown, logged }`;`logged` 不进模型上下文。纯函数,自测直接调。
+ *  批 292 红队 BP-3 / BP-4:**阻断级命中**(有人把规则改回 blocking 却忘了删 logOnly)与 **UNKNOWN**(判据抛错 / 缺通道)
+ *  一律留在 `shown`,不进只记账——前者不许被静默吞掉,后者是「判据坏了」,要让人看见,不能记成一次正常命中。 */
+export function splitLogOnly(findings, ids = logOnlyIds()) {
+  const shown = [], logged = [];
+  for (const f of findings || []) ((f && ids.has(f.id) && !f.block && !f.unknown) ? logged : shown).push(f);
+  return { shown, logged };
+}
+
 function emit(findings, streak = 0, opts = {}) {
   // D40:与 run() 同一纪律——落盘台账(心跳/报警分母)只认显式 `opts.live`,不再嗅 argv。
   const live = opts.live === true;
-  const sysWarn = batchOpenWarning();
+  // 批 292(287 设计 2.8;用户 11-06「只是改成只提醒不阻断的话会不会依然继续污染上下文?」):
+  //   「只记账」档的命中写进候选台账,**从这里起不再出现在任何对模型的输出里**(不阻断、不提示、不进去重表)。
+  //   为了让它真有人看(用户 11-06「记账了真的还有人去看嘛」):`batch-goal --clear` 结清时汇总一行(本批窗口内各规则命中数)。
+  //   失效条件:连续 5 批结清汇总里这些命中没有一次引起改动 ⇒ 按闸规矩第三节「删规则之前做真阳性回放」后删检测(债表 D200)。
+  {
+    const { shown, logged } = splitLogOnly(findings);
+    if (logged.length) {
+      let wrote = !live;   // 离线回放 / 自测不落盘,按「已记」处理
+      const at = Array.isArray(_allEntriesCache) ? _allEntriesCache.length : undefined;
+      // 红队(批 292 末段)附三②:两本台账分开 try——原来同一个 catch,报警台账锁争用也被报成「候选台账写不进去」
+      const fails = [];
+      if (live) try {
+        // codex 292-wording-review-r1 §1(287 设计 2.9 证据字段):存**整条**命中消息(E0 的原句在消息后半段,原来只存首行被丢),
+        //   超 2000 字截断并标 `cut`;带法条锚点(规则 law)与观察档标记。`at` = 截至本轮解析出的转录条目数(不是物理行号,同报警台账)。
+        //   未存:规则文件提交号、转录文件路径与物理行号(本函数拿不到;sid + at 可回到原会话那一轮)——CEILING。
+        const lawOf = (id) => { const r = RULES.find((x) => x && x.id === id); return r && typeof r.law === "string" ? r.law : null; };
+        fs.appendFileSync(candidateLedgerFile(), JSON.stringify({
+          ts: new Date().toISOString(), sid: _ledgerSid, at, ...(observeMode() ? { observe: true } : {}),
+          hits: logged.map((f) => { const m = String(f.msg || ""); return { id: f.id, law: lawOf(f.id), msg: m.slice(0, 2000), ...(m.length > 2000 ? { cut: true } : {}) }; }),
+        }) + "\n");
+      } catch (e) { fails.push(["候选台账 .gate-candidates", e]); }
+      // 红队 BP-2:287 设计 2.6「所有命中写进报警台账;措辞类另写候选台账」——是两本都写,不是二选一。
+      //   只记账档的 id 也进 `.gate-alerts.jsonl`(`logged` 字段标明),fp 误报率表的分母不冻结;同轮的其余命中由下面主落账照写。
+      if (live) try {
+        ledgerAppend(".claude/.gate-alerts.jsonl", { ts: new Date().toISOString(), ids: logged.map((f) => f.id), logged: logged.map((f) => f.id), blocked: [], sid: _ledgerSid, at, streak,
+          ...(observeMode() ? { observe: true } : {}) });   // codex fix-r1:只记账那一行也带观察档标记
+      } catch (e) { fails.push(["报警台账 .gate-alerts", e]); }
+      if (live && !fails.length) wrote = true;
+      if (fails.length) {
+        for (const [which, e] of fails) { try { process.stderr.write(`LEDGER-WRITE-FAILED(${which}): ${safeErrMsg(e)}\n`); } catch { /* 空 */ } }
+        // codex fix-r1 §2:每次失败走 systemMessage 给人看(不续轮、不进模型上下文);红队附三①:文案照实——这些命中**没**给模型
+        _candFailMsg = `⚠ 收尾闸${fails.map(([w]) => w).join("、")}写不进去(${safeErrMsg(fails[0][1]).slice(0, 120)}):只记账档本轮 ${logged.map((f) => f.id).join("、")} 未能落账、也不给模型,结清汇总会少计`;
+      }
+      // 红队 BP-2 原修法是「写不进去 ⇒ 这一轮照旧作为提示给模型」;误拦猎手(批 292 第二份)FB-1:没有 .claude/ 的仓里
+      //   13 条只记账规则的命中会整批回到模型上下文并续轮——正是本批要消掉的污染。改为:**一律不给模型**,
+      //   写失败只经上面的 systemMessage 告诉人(不续轮);少计的事实由那一行留痕,不靠模型代为记住。
+      findings = shown;
+      void wrote;
+    }
+  }
+  const sysWarn = [batchOpenWarning(), _candFailMsg].filter(Boolean).join("\n") || null;
+  _candFailMsg = "";
   // ⚠️ **泄压阀拉开时必须当着用户的面拉**(2026-08-20 用户实撞:
   //   「不结清。——那为什么还是停下来了?」)。
   //   `yielding`(连撞 ≥ CAP-2 时把**全部**阻断降级成提示)本意是
@@ -4278,6 +4450,33 @@ function selfTest() {
         cx("tmpdir:不给兜底目录 ⇒ 查不到", liveCodexEnv().jobState("JALT1"), null);
         const altLaunch = call("Bash", { command: launchCmd }, `CODEX_JOB=JALT1\nCODEX_STATE=background\nCODEX_LOG=${alt}/JALT1.log\nCODEX_RESULT=${R}\n`);
         cx("tmpdir:账里自动带上 CODEX_LOG 目录 ⇒ done、待读", st([...altLaunch], { ...liveCodexEnv(), since: undefined, resultBody: () => FILE }, "JALT1"), "pending-read");
+        // 批 297(D203):P 跨模型格的取数面 listJobs——时间窗过滤、坏记录跳过不抛;r2:git 顶层 top、失败作业的 failLines
+        const T = Date.parse("2026-11-07T08:00:00Z");
+        // 夹具仓:alt/repo(.git 目录)⊃ sub、nest(嵌套仓,.git 文件);alt/bare 无 .git
+        fs.mkdirSync(`${alt}/repo/.git`, { recursive: true }); fs.mkdirSync(`${alt}/repo/sub/deep`, { recursive: true });
+        fs.mkdirSync(`${alt}/repo/nest`, { recursive: true }); fs.writeFileSync(`${alt}/repo/nest/.git`, "gitdir: x");
+        fs.mkdirSync(`${alt}/bare`, { recursive: true });
+        const top = (p) => { const v = gitTopOf(p); return v === null ? null : codexNormPath(v, null); };
+        const N = (p) => codexNormPath(p, null);
+        cx("297 r2 gitTopOf:仓根 / 普通子目录 ⇒ 仓根", [top(`${alt}/repo`), top(`${alt}/repo/sub/deep`)].join(","), [N(`${alt}/repo`), N(`${alt}/repo`)].join(","));
+        cx("297 r2 gitTopOf:嵌套仓(.git 是文件)⇒ 嵌套仓自己", top(`${alt}/repo/nest`), N(`${alt}/repo/nest`));
+        cx("297 r2 gitTopOf:\\\\?\\ 前缀剥掉、反斜杠", top(`\\\\?\\${alt.replace(/\//g, "\\")}\\repo\\sub`), N(`${alt}/repo`));
+        cx("297 r2 gitTopOf:不存在的路径照原形往上找、空串 ⇒ null", [top(`${alt}/repo/sub/不存在`), top("")].join(","), [N(`${alt}/repo`), ""].join(","));
+        const rec = (id, at, o = {}) => fs.writeFileSync(`${alt}/${id}.json`, JSON.stringify({ id, state: "done", startedAt: new Date(at).toISOString(), cwd: `${alt}/repo/sub`, threadId: "t", exitCode: 0, ...o }));
+        fs.writeFileSync(`${alt}/JL3.log`, [
+          "# codex-run worker JL3", "# heartbeat x", '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"429 Too Many Requests 是债表里的引文"}}',
+          '{"type":"error","message":"exceeded retry limit, last status: 429 Too Many Requests"}', "2026-11-07T08:00:01Z ERROR codex_models_manager::manager: failed to refresh available models: request timed out",
+          "Not inside a trusted directory", "# TIMEOUT 900000ms — SIGTERM"].join("\n"));
+        rec("JL1", T); rec("JL2", T + 1000, { cwd: `${alt}/bare` }); rec("JL3", T + 2000, { state: "failed", exitCode: 1, error: "codex 退出码 1 且无最终消息", errorCode: "empty-body", log: `${alt}/JL3.log` });
+        rec("JL0", T - 60_000);
+        fs.writeFileSync(`${alt}/JBAD.json`, "{坏");
+        const lj = liveCodexEnv().listJobs({ dirs: [alt], since: T - 1000 }).filter((j) => /^JL/.test(j.id)).sort((a, b) => a.id.localeCompare(b.id));
+        cx("297 listJobs:since 之前的剔掉、坏记录跳过", lj.map((j) => j.id).join(","), "JL1,JL2,JL3");
+        // JL2 的 cwd 不在夹具仓里:往上可能撞到本机别处的 .git,也可能 null——只断言「不是夹具仓」
+        cx("297 r2 listJobs:附 git 顶层", lj.map((j) => (j.top !== null && N(j.top) === N(`${alt}/repo`) ? "repo" : "other")).join(","), "repo,other,repo");
+        // 批 302(D205):P 只读 codex-run 写的结构化字段,listJobs 不再从日志尾窗抽失败行
+        cx("302 D205 listJobs:不再附 failLines", lj.map((j) => String("failLines" in j)).join(","), "false,false,false");
+        cx("297 listJobs:目录读不了 ⇒ 空、不抛", (() => { try { return liveCodexEnv().listJobs({ dirs: [`${alt}/不存在`], since: T + 9e9 }).length; } catch { return "抛了"; } })(), 0);
       } finally { fs.rmSync(alt, { recursive: true, force: true }); }
     }
     // ── r3b 钉(v5 期望):shell 读法一律不推断 ⇒ 待读(预期代价) ──
@@ -4613,15 +4812,17 @@ function selfTest() {
     // ⚠️ 切换后(2026-08-22 亲签)对照组已死,这三条测试的**目标换了**:
     //   原来验「引擎与旧实现一致」;现在旧实现不存在,改验引擎自身的两条硬性质——
     //   官方字段可见性(立法动机原样保留)与 engine:false 的**退役语义**。
+    // 批 292:E0 / Q 改「只记账」(不阻断),这几条验的是**官方字段可见性**,不是阻断等级 ⇒ 认命中本身(有无 `!` 都算)
+    const hasId = (s, id) => String(s).split(",").some((x) => x.replace(/!$/, "") === id);
     const t1 = "根因是缓存没刷新。这三件留给下次做。";
     const on1 = ids(run(null, { text: t1, turn: [] }));
-    sc("transcript 读不到时,引擎看得见官方文本(E0/Q 照拦)", on1.includes("E0!") && on1.includes("Q!"), true);
-    sc("且确实拦住了(不是两边都空)", on1.includes("E0!") && on1.includes("Q!"), true);
+    sc("transcript 读不到时,引擎看得见官方文本(E0/Q 照命中)", hasId(on1, "E0") && hasId(on1, "Q"), true);
+    sc("且确实命中了(不是两边都空)", on1.length > 0, true);
 
     // 末句只在 last_assistant_message 里(transcript 在但落后)⇒ 引擎必须看得见
     const t2 = "开始干活\n根因是缓存没刷新";
     sc("末句只在官方字段里也看得见",
-      ids(run(null, { text: t2, turn: [{ type: "assistant", message: { content: [{ type: "text", text: "开始干活" }] } }] })).includes("E0!"), true);
+      hasId(ids(run(null, { text: t2, turn: [{ type: "assistant", message: { content: [{ type: "text", text: "开始干活" }] } }] })), "E0"), true);
 
     // 切换后 engine:false 的语义 = **只剩未迁原生规则**(A/R 族),引擎 21 条一律不产出。
     //   它若还能产出引擎 id,说明内联尸体没删干净。
@@ -4698,6 +4899,26 @@ function selfTest() {
     sc("观察档:有阻断项也不阻断", observed.includes('"decision":"block"'), false);
     sc("观察档:对模型零输出", observed.trim() === "", true);
     sc("观察档关掉后同一批项照常阻断", capture(() => emit(boom, 0)).includes('"decision":"block"'), true);
+    // 批 292(287 设计 2.8):「只记账」档的命中对模型零输出;与别的命中同轮时,只有别的那条出现
+    {
+      const lo = [...logOnlyIds()][0];
+      sc("292 只记账档:规则表里至少有 E0 / E2 / S / Q", ["E0", "E2", "S", "Q"].every((id) => logOnlyIds().has(id)), true);
+      sc("292 循环依赖:先加载 gate-rules 再读只记账档不抛错", (() => { try { return logOnlyIds().size > 0; } catch { return false; } })(), true);
+      sc("292 只记账档:只有只记账命中 ⇒ 对模型零输出(心跳走 stderr)", capture(() => emit([{ id: lo, block: false, msg: "x 因果断言" }], 0)).trim(), "");
+      const mixed = capture(() => emit([{ id: lo, block: false, msg: "只记账那条" }, { id: "DRIFT", block: false, msg: "文档漂移" }], 0));
+      sc("292 只记账档:与提示项同轮 ⇒ 只出提示项", `${mixed.includes("文档漂移")}:${mixed.includes("只记账那条")}`, "true:false");
+      sc("292 splitLogOnly:按 id 拆分", JSON.stringify(splitLogOnly([{ id: "E2" }, { id: "P" }, { id: "S" }]).logged.map((f) => f.id)), JSON.stringify(["E2", "S"]));
+      // codex fix-r1 §3:写端按 git 公共目录定主树(与读端同口径)
+      { const saved = _candPath; _candPath = null;
+        sc("292 codex fix-r1 §3:候选台账写端按 git 公共目录定主树",
+          candidateLedgerFile(() => "/repo/.git\n").replace(/\\/g, "/"), "/repo/.claude/.gate-candidates.jsonl");
+        _candPath = null;
+        sc("292 codex fix-r1 §3:git 取不到 ⇒ 退回 cwd 相对", candidateLedgerFile(() => { throw new Error("no git"); }), ".claude/.gate-candidates.jsonl");
+        _candPath = saved; }
+      sc("292 红队 BP-3:只记账档 id 的阻断级命中不被吞(留在 shown)", JSON.stringify(splitLogOnly([{ id: "S", block: true }]).shown.map((f) => f.id)), JSON.stringify(["S"]));
+      sc("292 红队 BP-4:只记账档 id 的 UNKNOWN 不进账(留在 shown,让人看见判据坏了)", JSON.stringify(splitLogOnly([{ id: "E0", unknown: true }]).shown.map((f) => f.id)), JSON.stringify(["E0"]));
+      sc("292 只记账档:I / ND 是提醒(不阻断、不在只记账档)", RULES.filter((r) => ["I", "ND"].includes(r.id)).map((r) => `${r.id}:${r.blocking}:${!!r.logOnly}`).join(","), "I:false:false,ND:false:false");
+    }
     sc("未降级时照常阻断", held.includes('"decision":"block"'), true);
     sc("未降级时不谎称降级", held.includes("自行降级"), false);
 
@@ -5046,9 +5267,12 @@ function selfTest() {
       {
         const P_ = RULES.find((r) => r.id === "P")._p;
         const S1 = "1".repeat(40), S2 = "2".repeat(40), S3 = "3".repeat(40), HD = "9".repeat(40);
-        const sc = ({ ledger = { carriers: 0 }, facts, cmd = "git add -A && git commit -m x", extra = [] } = {}) => buildCtx(
-          [{ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: cmd } }, ...extra] } }],
-          { pLedger: ledger, ...(facts === undefined ? {} : { headFacts: () => facts }) });
+        // 批 297(D203):跨模型格认 codex-run 作业记录 ⇒ 「三通道齐」的用例要给 `jobs`(一条合格记录)与本轮时间戳(窗口起点)
+        const sc = ({ ledger = { carriers: 0 }, facts, cmd = "git add -A && git commit -m x", extra = [], jobs } = {}) => buildCtx(
+          [{ type: "assistant", ...(jobs ? { timestamp: "2026-11-07T08:00:00Z" } : {}), message: { content: [{ type: "tool_use", name: "Bash", input: { command: cmd } }, ...extra] } }],
+          { pLedger: ledger, ...(facts === undefined ? {} : { headFacts: () => facts }), ...(jobs ? { codexJobs: () => jobs } : {}) });
+        const J297 = { root: "/repo", upper: "2026-11-07T09:00:00Z", jobs: [{ id: "J297", state: "done", startedAt: "2026-11-07T08:00:05Z", endedAt: "2026-11-07T08:05:00Z",
+          resultAt: "2026-11-07T08:04:59Z", cwd: "/repo", top: "/repo", threadId: "t", exitCode: 0 }] };
         const law3 = { root: "/repo", head: HD, commits: [S1, S2, S3].map((sha) => ({ sha, files: ["docs/laws/collab.md"] })) };
         const s1 = settleP(P_, sc({ facts: law3 }), []);
         hp("settleP BP-1:git add -A 带进 3 笔法典提交 ⇒ 账 +3(原命令语法计 0)、记下 sha", JSON.stringify(s1.ledger), JSON.stringify({ carriers: 3, shas: [S1, S2, S3], hunted: [] }));
@@ -5062,8 +5286,16 @@ function selfTest() {
         hp("settleP:git 事实通道没接 ⇒ 不推进基点", settleP(P_, sc({}), []).advance, false);
         const all3 = [{ type: "tool_use", name: "Bash", input: { command: "node ~/.claude/scripts/codex-run.mjs --task t.md" } },
           { type: "tool_use", name: "Agent", input: { subagent_type: "grill:testing" } }, { type: "tool_use", name: "WebSearch", input: { query: "先例" } }];
-        hp("settleP:三通道齐 ⇒ 清零(sha 照记)", JSON.stringify(settleP(P_, sc({ ledger: { carriers: 4 }, facts: law3, extra: all3 }), []).ledger),
-          JSON.stringify({ carriers: 0, shas: [S1, S2, S3], hunted: [] }));
+        const NOW297 = Date.parse("2026-11-07T08:30:00Z");
+        hp("settleP:三通道齐 ⇒ 清零(sha 照记;r2 记下结清时刻 settledAt)", JSON.stringify(settleP(P_, sc({ ledger: { carriers: 4 }, facts: law3, extra: all3, jobs: J297 }), [], NOW297).ledger),
+          JSON.stringify({ carriers: 0, shas: [S1, S2, S3], hunted: [], settledAt: "2026-11-07T08:30:00.000Z" }));
+        hp("297 r2 settleP:没结清 ⇒ settledAt 沿用旧值", settleP(P_, sc({ ledger: { carriers: 4, settledAt: "2026-11-07T07:00:00Z" }, facts: law3, extra: all3, jobs: { ...J297, jobs: [] } }), [], NOW297).ledger.settledAt,
+          "2026-11-07T07:00:00.000Z");
+        hp("297 r2 mergePLedger / pLedgerView:settledAt 按会话格往返", pLedgerView(mergePLedger(null, { carriers: 0, shas: [], hunted: [], settledAt: "2026-11-07T08:30:00.000Z" }, "aaaaaaaa-1", "t"), "aaaaaaaa-1").settledAt,
+          "2026-11-07T08:30:00.000Z");
+        // 批 297 反向钉:同样三条命令、没有合格作业记录 ⇒ 跨模型格不算齐 ⇒ 不清零(账照涨)
+        hp("297 settleP:codex-run 命令在、作业记录不在 ⇒ 不清零", JSON.stringify(settleP(P_, sc({ ledger: { carriers: 4 }, facts: law3, extra: all3, jobs: { root: "/repo", jobs: [] } }), []).ledger),
+          JSON.stringify({ carriers: 7, shas: [S1, S2, S3], hunted: [] }));
         // 批 285(D149⑦):轻档批(承重改动全是测试文件)detect 免两条软通道 ⇒ 结算不累加(冻结,不清零);重档 / 缺独立视角照涨
         {
           const TF = "scripts/lib/ledger-chain.test.mjs";
@@ -5139,12 +5371,12 @@ function selfTest() {
         // 批 266:闸引擎面要红队与误拦猎手两者都在
         const fbHunter = { type: "tool_use", name: "Agent", input: { subagent_type: "_gate-false-block-hunter", prompt: "回放合回的 scripts/lib/gate-rules.mjs 改动 --base 1234567" } };
         const ok3 = [all3[0], hunter, fbHunter, all3[2]];
-        const c1 = sc({ ledger: { carriers: 0 }, facts: f61, cmd: merge, extra: ok3 });
+        const c1 = sc({ ledger: { carriers: 0 }, facts: f61, cmd: merge, extra: ok3, jobs: J297 });
         const h1 = PR.detect(c1);
         const st1 = settleP(P_, c1, h1.length ? [{ id: "P" }] : []);
         hp("settleP a9af71da BP-1:聚合项 + 三通道齐 ⇒ P 无命中、advance=true、推进到 HEAD、账清零",
           `${h1.length}:${st1.advance}:${st1.head === HD}:${st1.ledger && st1.ledger.carriers}`, "0:true:true:0");
-        const c2 = sc({ ledger: { carriers: 0 }, facts: f61, cmd: merge, extra: [all3[0], all3[1], all3[2]] });
+        const c2 = sc({ ledger: { carriers: 0 }, facts: f61, cmd: merge, extra: [all3[0], all3[1], all3[2]], jobs: J297 });
         const h2 = PR.detect(c2);
         const st2 = settleP(P_, c2, h2.length ? [{ id: "P" }] : []);
         hp("settleP a9af71da BP-1:聚合项带闸改动、无红队(只有 grill)⇒ P 命中(欠独立视角)、不推进、账按 count 计 61",
@@ -5378,6 +5610,18 @@ function selfTest() {
           .map((p) => `${_Pp.GATE_ENGINE.test(p) ? 1 : 0}${_Pp.ENGINE_PATH_RE.test(p) ? 1 : 0}${_Pp.hunterBound({ input: { prompt: "只看 " + p } }) ? 1 : 0}`).join(" "),
         "111 111 001 000 001 001");
       hp("GATE_ENGINE 认写入效果分析器与盲审", ["scripts/lib/write-effects.mjs", "scripts/fp-audit.mjs", "scripts/gate-deps/package.json"].map((p) => _Pp.GATE_ENGINE.test(p) ? 1 : 0).join(""), "111");
+      // P0 收口(codex p0-close r2 ②:66ed078 只扩了 GATE_ENGINE,其余四处口径没跟上、旧位图也没覆盖这九个文件):
+      //   五处(GATE_ENGINE / ENGINE_REL / ENGINE_PATHSPECS / ENGINE_PATH_RE / hunterBound)对新纳入的九个文件一致认;各自的 .selftest 后四处不认;
+      //   暂存树 / worktree 副本:真正的写入入口 isEnginePath / startGateHit 不认(未锚定的 GATE_ENGINE、ENGINE_PATH_RE 与绑定词表 hunterBound 原样会认,它们不单独当写入判据用——codex p0-close r3 ①)
+      {
+        const NEW9 = ["hook-start-gate", "batch-goal", "verify-laws", "codex-run"].map((n) => `scripts/${n}.mjs`)
+          .concat(["write-checks", "write-state", "debt-schema", "obligations", "install-config"].map((n) => `scripts/lib/${n}.mjs`));
+        const five = (p) => `${_Pp.GATE_ENGINE.test(p) ? 1 : 0}${_Pp.ENGINE_REL.test(p) ? 1 : 0}${_Pp.ENGINE_PATHSPECS.some((s) => asRe(s).test(p)) ? 1 : 0}${_Pp.ENGINE_PATH_RE.test(p) ? 1 : 0}${_Pp.hunterBound({ input: { prompt: "只看 " + p } }) ? 1 : 0}`;
+        hp("P0 收口:九个新纳入引擎面的文件五处口径都认", NEW9.map(five).join(" "), NEW9.map(() => "11111").join(" "));
+        hp("P0 收口【反向】:它们的 .selftest 后四处不认(ENGINE_REL / PATHSPECS / ENGINE_PATH_RE / hunterBound);暂存树副本过 isEnginePath 不认",
+          ["scripts/codex-run.selftest.mjs", "scripts/lib/write-checks.selftest.mjs", "scripts/hook-start-gate.selftest.mjs"].map((p) => five(p).slice(1)).join(" ") + " " +
+          `${_Pp.isEnginePath("clipboard/oss/public-repo/scripts/batch-goal.mjs") ? 1 : 0}`, "0000 0000 0000 0");
+      }
       // 批 285 D160(误拦余项):备份件(.orig / .bak / -old)不是闸引擎;句末标点、引号照认
       hp("D160:GATE_ENGINE 备份件不认、句末标点照认",
         ["scripts/lib/write-effects.mjs.orig", "scripts/hook-guard.mjs.bak", "scripts/lib/gate-rules.mjs-old", "scripts/gate-deps/package.json.bak",
@@ -5396,8 +5640,13 @@ function selfTest() {
         hp("285 D145 startGateHit:本仓闸 / 暂存树副本 / worktree 副本 / 他仓通用名 / 带 ./ 的钩子 / 本仓非闸",
           [`${R}/scripts/hook-stop-closure.mjs`, "scripts/lib/gate-rules.mjs", `${R}/clipboard/oss/public-repo/scripts/hook-stop-closure.mjs`,
             "clipboard/oss/public-repo/scripts/lib/gate-rules.mjs", `${R}/.claude/worktrees/x/scripts/hook-guard.mjs`,
-            "E:/proj-c/scripts/install-git-hooks.mjs", `${R}/scripts/./git-hooks/pre-push.mjs`, `${R}/scripts/batch-goal.mjs`]
+            "E:/proj-c/scripts/install-git-hooks.mjs", `${R}/scripts/./git-hooks/pre-push.mjs`, `${R}/scripts/verify-prod.mjs`]   // 末位原用 batch-goal.mjs,P0 收口后它已入引擎面,换成真的非闸件
             .map((p) => (_Pp.startGateHit(p, R) ? 1 : 0)).join(""), "11000010");
+        // P0 收口(codex p0-close r2 ②):新纳入的文件开工闸同样认;暂存树 / worktree 里的副本照旧不认
+        hp("P0 收口 startGateHit:本仓 batch-goal / lib/write-checks / codex-run 认,暂存树与 worktree 副本、其 .selftest 不认",
+          [`${R}/scripts/batch-goal.mjs`, "scripts/lib/write-checks.mjs", `${R}/scripts/codex-run.mjs`, `${R}/clipboard/oss/public-repo/scripts/batch-goal.mjs`,
+            `${R}/.claude/worktrees/x/scripts/lib/write-checks.mjs`, `${R}/scripts/codex-run.selftest.mjs`]
+            .map((p) => (_Pp.startGateHit(p, R) ? 1 : 0)).join(""), "111000");
         // 接线证人:hook-start-gate 必须走 startGateHit,不得退回未锚定的 GATE_ENGINE 整串正则
         let sg = "";
         try { sg = fs.readFileSync(new URL("./hook-start-gate.mjs", import.meta.url), "utf8"); } catch { /* 公开树缺件 ⇒ 下条判空 */ }
@@ -5775,10 +6024,15 @@ function selfTest() {
     try { const r = debtFactsSelfTest({ quiet: true }); dfPass = r.pass; dfTotal = r.total; }
     catch (e) { console.log(`FAIL  debt-facts 自测跑不起来:${e && e.message}`); dfTotal = 1; }
   }
+  // 批 299:写入三态观测自测(write-state.mjs;不在 package.json 的链上,经本文件自测进 gate:self-test / gate:accept)
+  let wsPass = 0, wsTotal = 0;
+  try { const r = writeStateSelfTest({ quiet: true }); wsPass = r.pass; wsTotal = r.total; }
+  catch (e) { console.log(`FAIL  write-state 自测跑不起来:${e && e.message}`); wsTotal = 1; }
 
   console.log(`\n自测 ${pass}/${cases.length}` +
     (carrTotal ? ` · 载体分类 ${carrPass}/${carrTotal}` : "") +
     (dfTotal ? ` · 欠账事实 ${dfPass}/${dfTotal}` : "") +
+    (wsTotal ? ` · 写入三态 ${wsPass}/${wsTotal}` : "") +
     (seamTotal ? ` · 接缝 ${seamPass}/${seamTotal}` : "") +
     (cxTotal ? ` · codex 账 ${cxPass}/${cxTotal}` : "") +
     (escTotal ? ` · 逃生口 ${escPass}/${escTotal}` : "") +
@@ -5790,7 +6044,7 @@ function selfTest() {
   return (pass === cases.length && driftPass === driftTotal && probePass === probeTotal
     && partPass === partTotal && hpPass === hpTotal && seamPass === seamTotal && escPass === escTotal
     && cxPass === cxTotal
-    && lawPass + (lawObserve ? lawSide : 0) === lawTotal && carrPass === carrTotal && dfPass === dfTotal) ? 0 : 1;
+    && lawPass + (lawObserve ? lawSide : 0) === lawTotal && carrPass === carrTotal && dfPass === dfTotal && wsPass === wsTotal) ? 0 : 1;
 }
 
 // ── main
@@ -6157,6 +6411,9 @@ if (hookInput.hook_event_name === "SubagentStop") {
       //     ⇒ **接入**。注意本通道整体是**提示**不阻断(见下「升阻断的判据」):接入只让「派子代理写 memory」不再静默,
       //     并没有把它堵成阻断(误拦猎手 r7 附二①纠正);SE 吃的是认错措辞,子代理的自述不是执行方本人,不接。
       const only = new Set(["I", "M", "L", "B", "MF"]);
+      // 批 292:曾在此接 splitLogOnly 让子代理面也只记账(误拦猎手第二份 附二④),codex 292-wording-fix2-review-r1 判
+      //   正常档下 `hitIds` 只在观察档落账 ⇒ 被拆出的 B 命中两本台账都不进、也不输出,整条丢失(新形态)⇒ **撤回**,
+      //   子代理面照旧输出提示(与「只记账」不一致,但不丢记录);接上子代理面的候选落账后再改(债表 D200 ④)。
       const subFindings = runRules(RULES.filter((r) => only.has(r.id)), sCtx);
       hitIds = subFindings.map((f) => f.id);
       const hits = subFindings

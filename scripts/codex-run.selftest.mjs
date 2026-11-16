@@ -1,0 +1,568 @@
+// codex-run.selftest.mjs — codex-run.mjs 的离线自测集(038 批)。
+//
+// 全部离线,**零 codex 调用**。硬要求:必须含反向用例——只测正向等于没测
+// (memory prompt-id-atomic-alloc-023 的实撞教训)。
+// 反向用例 = ③④⑤(沙箱旗标 / --add-dir / 非法 mode 必须被拒且退出码正确)。
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+
+import {
+  parseArgs,
+  deriveSlug,
+  resolveResultPath,
+  resolveRepoBrief,
+  extractThreadId,
+  buildCodexArgs,
+  classifyOutcome,
+  formatJobBlock,
+  codexDefaultModel,
+  resultHeader,
+  hooksConfigWarn,
+  copyDrift,
+} from "./codex-run.mjs";
+import { pathToFileURL } from "node:url";
+
+export async function runSelfTest({ self }) {
+  let pass = 0;
+  const fails = [];
+  const t = (name, fn) => {
+    try {
+      fn();
+      pass++;
+    } catch (e) {
+      fails.push(`${name}: ${e && e.message ? e.message : e}`);
+    }
+  };
+  const eq = (a, b, msg) => {
+    if (a !== b) throw new Error(`${msg || "不等"} — 实得 ${JSON.stringify(a)},期望 ${JSON.stringify(b)}`);
+  };
+  const run = (args) => spawnSync(process.execPath, [self, ...args], { windowsHide: true, encoding: "utf8" });
+
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "codex-run-selftest-"));
+  // 被测副本本身(变异验收改的是 self;静态 import 拿到的是原件)。批 257 起新增用例一律走它
+  const selfMod = await import(pathToFileURL(self).href);
+
+  // ① --task 缺失 ⇒ 非零退出且文案可读
+  t("① --task 缺失", () => {
+    const r = run([]);
+    if (r.status === 0) throw new Error("应非零退出");
+    if (!/缺 --task/.test(r.stderr)) throw new Error(`文案不可读:${r.stderr}`);
+  });
+
+  // ② 任务文件不存在 ⇒ 非零退出
+  t("② 任务文件不存在", () => {
+    const r = run(["--task", path.join(sandbox, "没有这个文件.md")]);
+    if (r.status === 0) throw new Error("应非零退出");
+    if (!/任务文件不存在/.test(r.stderr)) throw new Error(`文案不可读:${r.stderr}`);
+  });
+
+  // ③ 2026-09-05 用户裁定「先暂时把沙箱打开」:`--sandbox workspace-write` 是显式可选项,须被**接受**
+  //   (接受后照常走到「任务文件不存在」⇒ exit 1);非法值与短形态 -s 照旧 exit 2。
+  t("③ --sandbox workspace-write 被接受(走到任务文件检查)", () => {
+    const r = run(["--sandbox", "workspace-write", "--task", "x.md"]);
+    eq(r.status, 1, "退出码应为 1(任务文件不存在)");
+    if (!/任务文件不存在/.test(r.stderr)) throw new Error(`文案不可读:${r.stderr}`);
+  });
+  t("③c【反向】--sandbox 非法值被拒", () => {
+    eq(run(["--sandbox", "danger", "--task", "x.md"]).status, 2, "退出码应为 2");
+  });
+  t("③d【反向】--sandbox 缺值被拒(不吞下一个旗标)", () => {
+    eq(run(["--sandbox", "--task", "x.md"]).status, 2, "退出码应为 2");
+  });
+  t("③b【反向】-s 短形态同样被拒", () => {
+    eq(run(["-s", "read-only", "--task", "x.md"]).status, 2, "退出码应为 2");
+  });
+
+  // ④【反向】--add-dir ⇒ exit 2(笼外零暴露)
+  t("④【反向】--add-dir 被拒", () => {
+    const r = run(["--add-dir", sandbox, "--task", "x.md"]);
+    eq(r.status, 2, "退出码应为 2");
+  });
+  t("④b【反向】--dangerously-* 被拒", () => {
+    eq(run(["--dangerously-bypass-approvals-and-sandbox", "--task", "x.md"]).status, 2, "退出码应为 2");
+  });
+
+  // ⑤【反向】research 已整支移除 ⇒ --mode 现在必须是**未知参数**,不得被静默吞掉。
+  // 这条封的是「删功能时删了实现却留了入口」那个缺口:入口还在就等于功能还在。
+  t("⑤【反向】--mode 已不再是合法参数", () => {
+    const r = run(["--mode", "research", "--task", "x.md"]);
+    if (r.status === 0) throw new Error("应非零退出");
+    if (!/未知参数 --mode/.test(r.stderr)) throw new Error(`拒因不对:${r.stderr}`);
+  });
+  t("⑤b【反向】旧背书环境变量不再有任何效力", () => {
+    const r = spawnSync(process.execPath, [self, "--mode", "research", "--task", "x.md"], { windowsHide: true,
+      encoding: "utf8",
+      env: { ...process.env, CODEX_RESEARCH_CAGE_ATTESTED: "1" },
+    });
+    if (r.status === 0) throw new Error("设了旧变量也不该放行");
+    if (!/未知参数 --mode/.test(r.stderr)) throw new Error(`拒因不对:${r.stderr}`);
+  });
+
+  // ⑥ --slug 缺省推导
+  t("⑥ slug 缺省推导", () => {
+    eq(deriveSlug("/a/b/probe-audit.md"), "probe-audit");
+    eq(deriveSlug("/a/b/probe-audit.md", "自定 名"), "自定-名");
+  });
+
+  // ⑦ r<n> 递增
+  t("⑦ r<n> 递增", () => {
+    const cwd = path.join(sandbox, "proj");
+    fs.mkdirSync(path.join(cwd, "clipboard"), { recursive: true });
+    const a = resolveResultPath({ cwd, slug: "s", id: "JA" });
+    eq(path.basename(a.file), "s-r1.md");
+    // v6(红队 BP-2/9):发起即占位——不等 done 写盘,紧接着的同 slug 发起也拿不到同一个 n
+    if (!/JA/.test(fs.readFileSync(a.file, "utf8"))) throw new Error("r1 未被占位");
+    const b = resolveResultPath({ cwd, slug: "s", id: "JB" });
+    eq(path.basename(b.file), "s-r2.md");
+    eq(a.fellBack, false);
+  });
+
+  // ⑧ clipboard/ 不在场 ⇒ 退回临时目录并被标记
+  t("⑧ clipboard 缺席时落点回退", () => {
+    const cwd = path.join(sandbox, "bare");
+    fs.mkdirSync(cwd, { recursive: true });
+    const r = resolveResultPath({ cwd, slug: "s" });
+    eq(r.fellBack, true, "应标记为回退");
+    fs.rmSync(r.file, { force: true });                     // 占位落在系统临时目录,自测不留垃圾
+    if (r.file.startsWith(cwd)) throw new Error("回退落点不该在项目内");
+  });
+
+  // ⑩ repo-brief 三级探测 + 全缺席
+  t("⑩ repo-brief 三级探测", () => {
+    const mk = (rel) => {
+      const cwd = fs.mkdtempSync(path.join(sandbox, "rb-"));
+      fs.mkdirSync(path.join(cwd, path.dirname(rel)), { recursive: true });
+      fs.writeFileSync(path.join(cwd, rel), "x");
+      return cwd;
+    };
+    eq(resolveRepoBrief(mk(path.join("clipboard", "codex-repo-brief.md"))), path.join("clipboard", "codex-repo-brief.md"));
+    eq(resolveRepoBrief(mk(path.join("docs", "repo-brief.md"))), path.join("docs", "repo-brief.md"));
+    eq(resolveRepoBrief(mk("AGENTS.md")), "AGENTS.md");
+    eq(resolveRepoBrief(fs.mkdtempSync(path.join(sandbox, "empty-"))), null, "全缺席应回 null 且不抛错");
+  });
+
+  // ⑪ 优先序:三者同在时取 clipboard/codex-repo-brief.md
+  t("⑪ repo-brief 优先序", () => {
+    const cwd = fs.mkdtempSync(path.join(sandbox, "rb-all-"));
+    for (const rel of [path.join("clipboard", "codex-repo-brief.md"), path.join("docs", "repo-brief.md"), "AGENTS.md"]) {
+      fs.mkdirSync(path.join(cwd, path.dirname(rel)), { recursive: true });
+      fs.writeFileSync(path.join(cwd, rel), "x");
+    }
+    eq(resolveRepoBrief(cwd), path.join("clipboard", "codex-repo-brief.md"));
+  });
+
+  // ⑫ 缺省沙箱 read-only:不点名 workspace-write 时,参数向量里不得出现写/越权旗标
+  t("⑫ 缺省沙箱 read-only", () => {
+    const args = buildCodexArgs({ cwdForCodex: "/p", lastMsgFile: "/t" }).join(" ");
+    if (!/-s read-only/.test(args)) throw new Error("应为 read-only");
+    if (/workspace-write|network_access|--add-dir|dangerously/.test(args)) {
+      throw new Error(`不得带写/越权旗标:${args}`);
+    }
+    // 反向:即使调用方硬塞一个 mode 字段进来,也不该改变沙箱
+    const forced = buildCodexArgs({ mode: "research", cwdForCodex: "/p", lastMsgFile: "/t" }).join(" ");
+    if (!/-s read-only/.test(forced) || /workspace-write/.test(forced)) {
+      throw new Error("函数签名已不认 mode,塞了也不该生效");
+    }
+  });
+  t("⑫b 用户点名 --sandbox workspace-write ⇒ 参数向量才带它;其余值一律回落 read-only", () => {
+    const ww = selfMod.buildCodexArgs({ cwdForCodex: "/p", lastMsgFile: "/t", sandbox: "workspace-write" }).join(" ");
+    if (!/-s workspace-write/.test(ww) || /-s read-only/.test(ww)) throw new Error(`应为 workspace-write:${ww}`);
+    const odd = selfMod.buildCodexArgs({ cwdForCodex: "/p", lastMsgFile: "/t", sandbox: "danger-full-access" }).join(" ");
+    if (!/-s read-only/.test(odd)) throw new Error(`非法值应回落 read-only:${odd}`);
+    eq(selfMod.parseArgs(["--sandbox", "workspace-write", "--task", "a.md"]).sandbox, "workspace-write");
+  });
+
+  // ⑬ thread-id 三名都认
+  t("⑬ thread-id 提取", () => {
+    eq(extractThreadId('{"thread_id":"abc"}'), "abc");
+    eq(extractThreadId('{"session_id":"def"}'), "def");
+    eq(extractThreadId('{"conversation_id":"ghi"}'), "ghi");
+    eq(extractThreadId("{}"), null);
+  });
+
+  // ⑭ parseArgs 缺值不静默
+  t("⑭ 参数缺值", () => {
+    let threw = false;
+    try { parseArgs(["--task"]); } catch { threw = true; }
+    if (!threw) throw new Error("--task 缺值应抛错");
+  });
+
+  // ⑮ 批 257:空正文判失败——判原始 body 的 trim(),不看退出码、不按字数
+  t("⑮ 空正文 ⇒ failed empty-body(退出码 0 也算)", () => {
+    for (const body of ["", "  \n\t", "﻿", "\r\n"]) {
+      const o = classifyOutcome({ code: 0, body });
+      eq(o.state, "failed", `body=${JSON.stringify(body)}`);
+      eq(o.errorCode, "empty-body", `body=${JSON.stringify(body)}`);
+    }
+    eq(classifyOutcome({ code: 1, body: "" }).errorCode, "empty-body", "非零退出 + 空正文同码");
+  });
+  t("⑮b【反向】一句「无发现」不空 ⇒ done", () => {
+    eq(classifyOutcome({ code: 0, body: "无发现" }).state, "done");
+    eq(classifyOutcome({ code: 0, body: "报告见 clipboard/review.md" }).state, "done");
+  });
+  t("⑮c 现存分支照旧:退出码非 0 但正文非空 ⇒ done", () => {
+    eq(classifyOutcome({ code: 1, body: "部分结论……" }).state, "done");
+  });
+
+  // ⑯ 批 257:所有返回都以 CODEX_JOB=<id> 开头(收尾闸按它进账/归属 poll)
+  t("⑯ 四种返回形态都带 CODEX_JOB 与 CODEX_STATE", () => {
+    const forms = [
+      [formatJobBlock({ id: "J1", state: "done", result: "/r.md" }), "done"],
+      [formatJobBlock({ id: "J1", state: "failed", errorCode: "empty-body", error: "x" }, { log: "/l.log" }), "failed"],
+      [formatJobBlock({ id: "J1", state: "running", result: "/r.md" }, { kind: "launch", log: "/l.log" }), "background"],
+      [formatJobBlock({ id: "J1", state: "running" }, { kind: "poll" }), "running"],
+    ];
+    for (const [s, st] of forms) {
+      if (!s.startsWith("CODEX_JOB=J1\n")) throw new Error(`首行不是 CODEX_JOB:${JSON.stringify(s)}`);
+      if (!s.includes(`\nCODEX_STATE=${st}\n`)) throw new Error(`缺 CODEX_STATE=${st}:${JSON.stringify(s)}`);
+    }
+    if (!forms[1][0].includes("CODEX_ERROR_CODE=empty-body")) throw new Error("failed 缺 CODEX_ERROR_CODE");
+    if (!forms[2][0].includes("CODEX_POLL=")) throw new Error("background 缺 CODEX_POLL 交接行");
+    if (forms[0][0].includes("CODEX_POLL=")) throw new Error("done 不该带 CODEX_POLL");
+    // 批 257 红队 BP-5:`| tail -1` 截尾后仍要带得出 J ⇒ 每种形态的末行都是 CODEX_END=<id>
+    for (const [s] of forms) {
+      const last = s.trim().split("\n").pop();
+      if (last !== "CODEX_END=J1") throw new Error(`末行不是 CODEX_END=J1:${JSON.stringify(last)}`);
+    }
+  });
+  // 批 285 D131②:hooks 配置解析失败 ⇒ 台账 warn + 机器块 CODEX_WARN;末行仍是 CODEX_END
+  t("285 D131② 日志里 hooks 配置解析失败 ⇒ 给提示(JSONL 转义路径与 stderr 明文两形)", () => {
+    const j = '{"type":"error","message":"failed to parse hooks config E:\\\\test\\\\.codex\\\\hooks.json: unknown field `_cc_bridge_version`"}';
+    const w1 = hooksConfigWarn(j);
+    if (!w1 || !/hooks\.json/.test(w1)) throw new Error(`JSONL 形未认出:${w1}`);
+    const w2 = hooksConfigWarn("ERROR failed to parse hooks config /home/x/.codex/hooks.json: expected value at line 1\n");
+    if (!w2 || !/\/home\/x\/\.codex\/hooks\.json\)/.test(w2)) throw new Error(`stderr 形未认出:${w2}`);
+  });
+  t("285 D131②【反向】没有该错 ⇒ null;块里不出现 CODEX_WARN", () => {
+    eq(hooksConfigWarn('{"type":"item.completed"}\nhooks loaded\n'), null);
+    eq(hooksConfigWarn(""), null);
+    if (formatJobBlock({ id: "J1", state: "done", result: "/r.md" }).includes("CODEX_WARN=")) throw new Error("无 warn 不该出 CODEX_WARN");
+  });
+  t("285 D131② 台账带 warn ⇒ 机器块有 CODEX_WARN 行、末行仍是 CODEX_END", () => {
+    const s = formatJobBlock({ id: "J1", state: "done", result: "/r.md", warn: "hooks 坏了" });
+    if (!s.includes("\nCODEX_WARN=hooks 坏了\n")) throw new Error(s);
+    eq(s.trim().split("\n").pop(), "CODEX_END=J1");
+  });
+  t("285 D141 双源漂移:不同 ⇒ same=false;相同 ⇒ same=true;就是仓内那支 / 仓内没有 ⇒ null", () => {
+    const lab = fs.mkdtempSync(path.join(os.tmpdir(), "codex-drift-"));
+    try {
+      const runFile = path.join(lab, "user-copy.mjs");
+      fs.writeFileSync(runFile, "// a\n");
+      eq(copyDrift(runFile, lab), null, "仓内没有副本");
+      fs.mkdirSync(path.join(lab, "scripts"));
+      const repoFile = path.join(lab, "scripts", "codex-run.mjs");
+      fs.writeFileSync(repoFile, "// b\n");
+      const d1 = copyDrift(runFile, lab);
+      if (!d1 || d1.same !== false || !/--install/.test(d1.text)) throw new Error(JSON.stringify(d1));
+      fs.writeFileSync(repoFile, "// a\n");
+      eq(copyDrift(runFile, lab).same, true, "内容相同");
+      eq(copyDrift(repoFile, lab), null, "运行的就是仓内那支");
+    } finally { fs.rmSync(lab, { recursive: true, force: true }); }
+  });
+  t("285 D141 结果件头部不再替 read-only 打「写被 OS 拒」的包票", () => {
+    const h = resultHeader({ codexVersion: "v", sandbox: "read-only" }, null);
+    if (/写被 OS 拒/.test(h)) throw new Error(h);
+    if (!/未必拦得住写入/.test(h)) throw new Error(h);
+  });
+  t("⑯b【反向】源码里不得再有绕过 formatJobBlock 的 CODEX_STATE 直写", () => {
+    const src = fs.readFileSync(self, "utf8");
+    // 认字符串字面量开头的 CODEX_STATE=(旧直写形态 `"CODEX_STATE=background"` / `` `CODEX_STATE=done\n…` ``);
+    //   注释里的散文提及以「…」结尾,不算
+    const n = (src.match(/["'`]CODEX_STATE=[^…]/g) || []).length;
+    eq(n, 1, "CODEX_STATE= 模板只许出现在 formatJobBlock 一处");
+  });
+  t("⑯c --poll 台账缺失:CODEX_JOB 机器块 + 末行旧口径(`| tail -1` 的轮询循环不被打断),退出 1", () => {
+    const id = `selftest-nonexistent-${process.pid}`;
+    const r = run(["--poll", id]);
+    eq(r.status, 1, "退出码应为 1");
+    if (!r.stdout.startsWith(`CODEX_JOB=${id}\nCODEX_STATE=failed`)) throw new Error(`缺机器块:${r.stdout}`);
+    const ls = r.stdout.trim().split(/\r?\n/);
+    const last = ls.pop();
+    if (!last.startsWith(`failed job ${id}`)) throw new Error(`末行不是旧口径:${JSON.stringify(last)}`);
+    // 机器块末行恒为 CODEX_END(批 257 红队 BP-5);这里经子进程验,改坏运行副本本身也会红
+    if (ls.pop() !== `CODEX_END=${id}`) throw new Error(`机器块末行不是 CODEX_END:${r.stdout}`);
+  });
+
+  // ⑰ 批 257 v4:--poll J --wait-ms N 等到终态(BP4-1/BP4-7)。读与睡注入,假时钟,不碰真台账。
+  //   从 self 动态导入:变异验收改的是 self 副本,静态 import 拿到的是原件,会让变异逃过
+  const { waitForTerminal, POLL_WAIT_CAP_MS } = selfMod;
+  const waitCase = async (states, waitMs) => {
+    let i = 0, t = 0, reads = 0;
+    const job = await waitForTerminal({ read: () => { reads++; return states[Math.min(i++, states.length - 1)]; },
+      waitMs, sleep: async (ms) => { t += ms; }, now: () => t });
+    return { job, reads, t };
+  };
+  const w1 = await waitCase([{ state: "running" }, { state: "running" }, { state: "done" }], 60000);
+  t("⑰ --wait-ms:running 两次后 done ⇒ 等到 done", () => { eq(w1.job.state, "done"); eq(w1.reads, 3); });
+  const w2 = await waitCase([{ state: "running" }], 3000);
+  t("⑰【反向】一直 running ⇒ 到时限返回 running,不死等", () => { eq(w2.job.state, "running"); if (w2.t > 3000) throw new Error(`睡过头:${w2.t}`); });
+  const w3 = await waitCase([null], 60000);
+  t("⑰【反向】台账缺失 ⇒ 立即返回,不当作还在跑", () => { eq(w3.job, null); eq(w3.reads, 1); });
+  const w4 = await waitCase([{ state: "running" }], 99 * 60 * 1000);
+  t("⑰ --wait-ms 上限 10 分钟", () => { if (w4.t > POLL_WAIT_CAP_MS) throw new Error(`超上限:${w4.t}`); });
+  t("⑰ --poll 缺失作业带 --wait-ms ⇒ 立即返回 failed(子进程,不碰真台账写)", () => {
+    const id = `selftest-wait-${process.pid}`;
+    const t0 = Date.now();
+    const r = run(["--poll", id, "--wait-ms", "5000"]);
+    eq(r.status, 1, "退出码应为 1");
+    if (Date.now() - t0 > 4000) throw new Error("缺失作业不该等满 --wait-ms");
+  });
+
+  // ⑱ 批 257 v5:runner 交付正文。done ⇒ 结果件全文夹在带 J 的 BODY 块里;failed ⇒ 日志尾部夹在 FAIL 块里;
+  //   --wait-ms 到期仍 running ⇒ 退出码 3。读文件注入,不碰真台账;同样从 self 动态导入。
+  const { renderOutcome, POLL_EXPIRED_EXIT } = selfMod;
+  const files = { "/r.md": "---\n模型: x\n---\n## 结论\n甲方对。\n", "/l.log": Array.from({ length: 60 }, (_, i) => `log${i + 1}`).join("\n") + "\n" };
+  const rf = (p) => (p in files ? files[p] : null);
+  t("⑱ poll done ⇒ 机器块 + BODY 块(全文原样)+ 末行 done,退出 0", () => {
+    const r = renderOutcome({ id: "J1", state: "done", result: "/r.md" }, { kind: "poll", readFile: rf });
+    eq(r.code, 0);
+    if (!r.out.startsWith("CODEX_JOB=J1\n")) throw new Error(`首行不是 CODEX_JOB:${r.out}`);
+    if (!r.out.includes(`\nCODEX_END=J1\nCODEX_BODY_BEGIN=J1\n${files["/r.md"]}CODEX_BODY_END=J1\n`)) throw new Error(`BODY 块不对:${JSON.stringify(r.out)}`);
+    eq(r.out.trim().split("\n").pop(), "done /r.md", "末行保持旧口径");
+  });
+  t("⑱ 前台 done 发起 ⇒ 同样带 BODY 块(无末行)", () => {
+    const r = renderOutcome({ id: "J1", state: "done", result: "/r.md" }, { kind: "launch", readFile: rf });
+    eq(r.code, 0);
+    eq(r.out.trim().split("\n").pop(), "CODEX_BODY_END=J1");
+  });
+  t("⑱【反向】结果件读不到 ⇒ 不打 BODY 块、退出 1、stderr 说明", () => {
+    const r = renderOutcome({ id: "J1", state: "done", result: "/gone.md" }, { kind: "poll", readFile: rf });
+    eq(r.code, 1);
+    if (/CODEX_BODY_BEGIN/.test(r.out)) throw new Error("读不到正文就不该有 BODY 块");
+    if (!/结果件读不到/.test(r.err || "")) throw new Error(`缺 stderr 说明:${r.err}`);
+  });
+  t("⑱ failed ⇒ FAIL 块装日志末 40 行,退出 1", () => {
+    const r = renderOutcome({ id: "J1", state: "failed", error: "x", log: "/l.log" }, { kind: "poll", readFile: rf });
+    eq(r.code, 1);
+    const m = /CODEX_FAIL_BEGIN=J1\n([\s\S]*?)CODEX_FAIL_END=J1\n/.exec(r.out);
+    if (!m) throw new Error(`缺 FAIL 块:${r.out}`);
+    if (!m[1].startsWith("log21\n") || !m[1].includes("log60")) throw new Error(`尾部不对:${JSON.stringify(m[1].slice(0, 40))}`);
+    eq(r.out.trim().split("\n").pop(), "failed x");
+  });
+  // v6(codex v5 复核第 2 条):FAIL 块在收尾闸那边等于「日志已送达」,日志读不到就不能发
+  t("⑱ failed 日志读不到 ⇒ 不打 FAIL 块,stderr 写明", () => {
+    const r = renderOutcome({ id: "J1", state: "failed", error: "x", log: "/none.log" }, { kind: "launch", readFile: rf });
+    if (/CODEX_FAIL_BEGIN/.test(r.out)) throw new Error(r.out);
+    if (!/日志读不到:\/none\.log/.test(r.err || "")) throw new Error(String(r.err));
+    eq(r.code, 1);
+  });
+  t("⑱ running:普通 poll 退出 0;--wait-ms 到期退出 3;都不打 BODY", () => {
+    const a = renderOutcome({ id: "J1", state: "running" }, { kind: "poll", readFile: rf });
+    const b = renderOutcome({ id: "J1", state: "running" }, { kind: "poll", readFile: rf, waitExpired: true });
+    eq(a.code, 0); eq(b.code, POLL_EXPIRED_EXIT); eq(POLL_EXPIRED_EXIT, 3);
+    if (/CODEX_BODY|CODEX_FAIL/.test(a.out + b.out)) throw new Error("running 不该带 BODY/FAIL 块");
+    eq(b.out.trim().split("\n").pop(), "running");
+  });
+  t("⑱ 台账缺失 ⇒ failed job-missing、退出 1、不打 FAIL 块", () => {
+    const r = renderOutcome(null, { kind: "poll", id: "JX", readFile: rf });
+    eq(r.code, 1);
+    if (/CODEX_FAIL_BEGIN/.test(r.out) || !/CODEX_ERROR_CODE=job-missing/.test(r.out)) throw new Error(r.out);
+  });
+
+  // ── 红队 a2155edb 附节二①:默认模型只作标签,不参与传参;只读 config 顶层;认 CODEX_HOME ──
+  {
+    const ch = path.join(sandbox, "codex-home");
+    fs.mkdirSync(ch, { recursive: true });
+    const cfg = (s) => fs.writeFileSync(path.join(ch, "config.toml"), s, "utf8");
+    t("⑲ 默认模型:读 config 顶层 model", () => {
+      cfg('model = "gpt-top"\n\n[profiles.fast]\nmodel = "gpt-prof"\n');
+      eq(codexDefaultModel({ codexHome: ch }), "gpt-top");
+    });
+    t("⑲【反向】顶层没有 model ⇒ null(不抓 [profiles.*] 下的)", () => {
+      cfg('approval_policy = "never"\n[profiles.fast]\nmodel = "gpt-prof"\n');
+      eq(codexDefaultModel({ codexHome: ch }), null);
+    });
+    t("⑲ 认 CODEX_HOME(没给 codexHome 时取环境变量)", () => {
+      cfg("model = 'gpt-env'\n");
+      eq(codexDefaultModel({ env: { CODEX_HOME: ch }, home: path.join(sandbox, "nohome") }), "gpt-env");
+    });
+    t("⑲ 没有 CODEX_HOME ⇒ <home>/.codex", () => {
+      const h = path.join(sandbox, "h2");
+      fs.mkdirSync(path.join(h, ".codex"), { recursive: true });
+      fs.writeFileSync(path.join(h, ".codex", "config.toml"), 'model = "gpt-home"\n', "utf8");
+      eq(codexDefaultModel({ env: {}, home: h }), "gpt-home");
+    });
+    t("⑲ 默认模型不进参数向量(job.model 为空 ⇒ 不传 -m)", () => {
+      const a = buildCodexArgs({ cwdForCodex: sandbox, model: null, lastMsgFile: "x" });
+      if (a.includes("-m")) throw new Error(a.join(" "));
+    });
+    t("⑲【反向】源码里 job.model 不得再取 codexDefaultModel()", () => {
+      const src = fs.readFileSync(self, "utf8");
+      if (/model:\s*opts\.model\s*\|\|\s*codexDefaultModel\(/.test(src)) throw new Error("job.model 又混进了默认模型");
+      if (!/modelLabel:\s*opts\.model\s*\?\s*null\s*:\s*codexDefaultModel\(\)/.test(src)) throw new Error("modelLabel 未按「只作标签」写入台账");
+    });
+    // 结果件头部:收尾闸按「第二个 `---` 之后是正文、第 9 行起」认读回(a2155edb BP-8),行数改了两边一起改
+    t("⑳ 结果件头部 8 行、以换行收尾、正文紧接(第 9 行起)", () => {
+      const h = resultHeader({ codexVersion: "codex-cli 0", sandbox: "read-only" }, "tid");
+      const lines = (h + "BODY").split("\n");
+      eq(lines[0], "---"); eq(lines[7], "---"); eq(lines[8], "BODY");
+    });
+    t("⑳ 头部模型行:显式 model 原样;否则带默认标签", () => {
+      const a = resultHeader({ codexVersion: "v", model: "gpt-x" }, null);
+      const b = resultHeader({ codexVersion: "v", model: null, modelLabel: "gpt-top" }, null);
+      const c = resultHeader({ codexVersion: "v" }, null);
+      if (!/模型: gpt-x\n/.test(a)) throw new Error(a);
+      if (!/模型: \(codex 默认;config 顶层 model=gpt-top/.test(b)) throw new Error(b);
+      if (!/模型: \(codex 默认\)\n/.test(c)) throw new Error(c);
+    });
+  }
+
+  // ── 批 302(D205 ①②④)────────────────────────────────────────────────────────
+  // 防的失败:①「通道不可用」靠日志尾窗事后拼——切在行首 / 来源前缀挤占 / item 半行混进 stderr(D205 ① 三轮形态);
+  //   ② `CODEX_BIN` 替身写出完整合格记录而 P 认不出(D205 ②);③ hooks 告警扫到 codex 读到的文件原文(D205 ④)。
+  //   (作业记录双写公共目录、发起即建义务两项已按主会话裁定删掉:记录只写 tmpdir,写法同 1781e63。)
+  {
+    const S = selfMod;
+    // 防的失败:codex 内部 exec 子命令在 stderr 留下 ENOTFOUND,而本次失败的真因(顶层事件)与通道无关 ⇒ 不得判不可用(红队 p0-close BP-4)
+    t("p0-close BP-4:有顶层失败事件时只看事件,stderr 的 exec 报错不冒充 network", () => {
+      const sc = S.makeStreamScanner();
+      sc.err("ERROR codex_core::exec: curl: getaddrinfo ENOTFOUND example.invalid\n");
+      sc.out('{"type":"turn.failed","error":{"message":"invalid model: gpt-x"}}\n');
+      sc.end();
+      eq(sc.unavailable(true), null);
+    });
+    t("p0-close BP-4 对照:没有顶层事件时 stderr 的网络报错照认", () => {
+      const sc = S.makeStreamScanner();
+      sc.err("ERROR: getaddrinfo ENOTFOUND api.openai.com\n");
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network"); eq(u.source, "stderr");
+    });
+    // 防的失败:codex 先在 stderr 打真实网络错,再发一个不带原因的泛化 turn.failed("stream error") ⇒ 事件优先把 stderr 整路丢掉、判 null(codex p0-close r2 ③)
+    t("p0-close r2 ③:顶层事件只是泛化 stream error ⇒ 回退看 stderr,真网络错照认", () => {
+      const sc = S.makeStreamScanner();
+      sc.err("ERROR: getaddrinfo ENOTFOUND api.openai.com\n");
+      sc.out('{"type":"turn.failed","error":{"message":"stream error: stream disconnected before completion"}}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network"); eq(u.source, "stderr");
+    });
+    t("p0-close r2 ③【反向】泛化事件 + 明说原因的事件(配置错)同在 ⇒ 不回退 stderr", () => {
+      const sc = S.makeStreamScanner();
+      sc.err("ERROR codex_core::exec: curl: getaddrinfo ENOTFOUND example.invalid\n");
+      sc.out('{"type":"error","message":"stream error: retrying"}\n{"type":"turn.failed","error":{"message":"invalid model: gpt-x"}}\n');
+      sc.end();
+      eq(sc.unavailable(true), null);
+    });
+    t("b302 BP-1:只有配置告警事件 + stderr 网络错 ⇒ 回退 stderr,判 network(告警不算「明说了别的原因」)", () => {
+      const sc = S.makeStreamScanner();
+      sc.err("ERROR: getaddrinfo ENOTFOUND api.openai.com\n");
+      sc.out('{"type":"error","message":"Codex is ignoring 1 unrecognized configuration setting."}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network"); eq(u.source, "stderr");
+    });
+    t("b302 BP-1:配置告警 + 泛化 turn.failed + stderr 429 ⇒ rate-limit(stderr)", () => {
+      const sc = S.makeStreamScanner();
+      sc.err("ERROR: exceeded retry limit, last status: 429 Too Many Requests\n");
+      sc.out('{"type":"error","message":"Codex is ignoring 1 unrecognized configuration setting."}\n{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "rate-limit"); eq(u.source, "stderr");
+    });
+    t("b302 BP-1【反向】配置告警 + 明说原因的事件(模型名错)+ stderr 网络噪声 ⇒ 仍是 null", () => {
+      const sc = S.makeStreamScanner();
+      sc.err("ERROR codex_core::exec: curl: getaddrinfo ENOTFOUND example.invalid\n");
+      sc.out('{"type":"error","message":"Codex is ignoring 1 unrecognized configuration setting."}\n{"type":"turn.failed","error":{"message":"invalid model: gpt-x"}}\n');
+      sc.end();
+      eq(sc.unavailable(true), null);
+    });
+    t("302 D205①:turn.failed 里 429 ⇒ unavailable.rate-limit(source=event)", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"thread.started","thread_id":"t"}\n{"type":"turn.failed","error":{"message":"exceeded retry limit, last status: 429 Too Many Requests"}}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "rate-limit"); eq(u.source, "event");
+    });
+    t("302 D205①【反向】429 只出现在 item 事件(codex 读到的债表原文)⇒ null", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"D205 429 Too Many Requests rate limit"}}\n');
+      sc.end();
+      eq(sc.unavailable(true), null);
+    });
+    t("302 D205①:stdout 事件行跨 chunk 拆开、stderr 半行跨 chunk ⇒ 拼好再判(不把 item 半截当 stderr)", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"item.completed","item":{"type":"agent_message","text":"see 4');
+      sc.err("ERROR: getaddrinfo ENOT");
+      sc.out('29 rate limit"}}\n');
+      sc.err("FOUND api.openai.com\n");
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network"); eq(u.source, "stderr");
+    });
+    t("302 D205①【反向】作业没失败 ⇒ 不写 unavailable(中途 429 重试成功)", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"error","message":"429 Too Many Requests, retrying"}\n'); sc.end();
+      eq(sc.unavailable(false), null);
+    });
+    t("302 r1:超过 4 MB 还没换行的半行不拿来分类(直到换行都丢弃)", () => {
+      const sc = S.makeStreamScanner();
+      sc.err("x".repeat(4 * 1024 * 1024 + 10) + " rate limit");
+      eq(sc.unavailable(true), null, "未换行的超长半行");
+      sc.err(" 仍是那一行的尾巴 429\nERROR: getaddrinfo ENOTFOUND api.openai.com\n"); sc.end();
+      eq((sc.unavailable(true) || {}).reason, "network", "换行之后的完整行照判");
+    });
+    t("302 r1:作业被硬截止杀掉(timedOut)⇒ 早先出现过 429 也不写 unavailable", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"error","message":"429 Too Many Requests, retrying"}\n'); sc.end();
+      eq(sc.unavailable(true, true), null);
+      eq((sc.unavailable(true, false) || {}).reason, "rate-limit");
+    });
+    t("302 D205①【反向】配置告警 / 超时不算不可用", () => {
+      eq(S.classifyUnavailable("Codex is ignoring 1 unrecognized configuration setting `rate_limit`"), null);
+      eq(S.classifyUnavailable("command timed out after 10000ms"), null);
+      eq(S.classifyUnavailable("You've hit your usage limit"), "quota");
+    });
+    t("302 D205④:hooks 告警只扫 stderr / 非 JSON 行;item 里的原文不触发", () => {
+      const a = S.makeStreamScanner();
+      a.out('{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"failed to parse hooks config E:/x/hooks.json: bad"}}\n'); a.end();
+      eq(S.hooksConfigWarn(a.nonItemText()), null);
+      const b = S.makeStreamScanner();
+      b.err("ERROR failed to parse hooks config E:/x/hooks.json: expected value\n"); b.end();
+      if (!S.hooksConfigWarn(b.nonItemText())) throw new Error("stderr 形未认出");
+    });
+    t("302 D205②:CODEX_BIN 指向在场文件 ⇒ source=env;否则不是 env", () => {
+      const save = process.env.CODEX_BIN;
+      try {
+        process.env.CODEX_BIN = self; eq(S.resolveCodexBin().source, "env");
+        delete process.env.CODEX_BIN; if (S.resolveCodexBin().source === "env") throw new Error("没设 CODEX_BIN 却报 env");
+      } finally { if (save === undefined) delete process.env.CODEX_BIN; else process.env.CODEX_BIN = save; }
+    });
+    // 端到端:临时仓(带闸库标记)里真发起一次,CODEX_BIN 指向 node 本身(必失败、零 codex 调用)
+    const lab = fs.mkdtempSync(path.join(os.tmpdir(), "codex-run-302-"));
+    const repo = path.join(lab, "repo");
+    const g = (args, cwd = repo) => spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true, env: { ...process.env, GIT_CEILING_DIRECTORIES: lab } });
+    fs.mkdirSync(path.join(repo, "scripts", "lib"), { recursive: true });
+    g(["init", "-q"]);
+    const libSrc = path.join(path.dirname(self), "lib");
+    for (const f of ["obligations.mjs", "ledger-chain.mjs"]) fs.copyFileSync(path.join(libSrc, f), path.join(repo, "scripts", "lib", f));   // 装了闸的仓:旧版会在这里双写公共目录
+    fs.writeFileSync(path.join(repo, "task.md"), "x\n");
+    const env = { ...process.env, CODEX_BIN: process.execPath, GIT_CEILING_DIRECTORIES: lab };
+    const r = spawnSync(process.execPath, [self, "--task", path.join(repo, "task.md"), "--out", path.join(lab, "r.md"), "--cwd", repo, "--wait-ms", "60000"], { encoding: "utf8", windowsHide: true, env, cwd: repo });
+    const J = (/CODEX_JOB=(\S+)/.exec(r.stdout || "") || [])[1];
+    process.stdout.write(`  [302] 自测临时仓 = ${repo}(须在系统临时目录下、不在 /repo 下)\n`);
+    t("302 自测仓不在 /repo 下", () => { if (/^[\\/]repo([\\/]|$)/i.test(repo)) throw new Error(repo); });
+    t("302 D205②:CODEX_BIN 替身发起 ⇒ tmpdir 作业记录 binSource=env、终态 failed、unavailable=null", () => {
+      if (!J) throw new Error(`没拿到 J:${(r.stdout || "") + (r.stderr || "")}`);
+      const rec = JSON.parse(fs.readFileSync(path.join(S.JOB_ROOT, `${J}.json`), "utf8"));
+      eq(rec.binSource, "env"); eq(rec.state, "failed"); eq(rec.unavailable, null);
+    });
+    t("302【反向】作业记录只写 tmpdir:装了闸的仓里也没有 .claude/.codex-jobs、没有义务账", () => {
+      for (const d of [".codex-jobs", ".obligations"]) if (fs.existsSync(path.join(repo, ".claude", d))) throw new Error(`临时仓里出现了 .claude/${d}`);
+    });
+    t("302 --poll 读 tmpdir 那份", () => {
+      const p = spawnSync(process.execPath, [self, "--poll", J], { encoding: "utf8", windowsHide: true, env, cwd: repo });
+      if (!/CODEX_STATE=failed/.test(p.stdout || "")) throw new Error(p.stdout + p.stderr);
+    });
+    try { fs.rmSync(lab, { recursive: true, force: true }); } catch { /* worker 可能还占着日志 */ }
+  }
+
+  fs.rmSync(sandbox, { recursive: true, force: true });
+
+  process.stdout.write(`PASS ${pass} / FAIL ${fails.length}\n`);
+  for (const f of fails) process.stdout.write(`  FAIL ${f}\n`);
+  return fails.length === 0 ? 0 : 1;
+}

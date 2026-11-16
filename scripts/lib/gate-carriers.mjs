@@ -67,8 +67,17 @@ export const CARRIERS = [
   //   ⇒ I 的「经 Bash 写载体绕不过去」用例转红。分类表的每条都必须是**可嵌入**的片段。
   { re: /scripts\/[\w.-]+\.(mjs|ts|js)\b/, creation: true, loadBearing: false,
     why: "普通脚本:新建算造物,但改它不必然触及承重语义" },
-  { re: /AGENTS\.md|CLAUDE\.md|docs\/laws\//, creation: false, loadBearing: true,
-    why: "宪法与法典:**改**它是承重动作;它不是「造物」——不存在手搓一部已有的法" },
+  // 批 290 合并后红队 BP-5:5797f2b 曾加 `docs/gate/X.md` 未解出形状,复核后撤回(理由见 gate-rules LAW_RE 头注、D196 ⑭)。
+  // 复核误拦猎手 FB-26:存档三份加尾边界,`collab.md.bak` 不算承重(同 verify-prod 那支)。
+  // 批 290 合并后误拦猎手 FB-15:存档只收**规则 law 字段实际锚着的**三份(collab / reporting / constitution-*,各 7 条);
+  //   README 与其余存档没有规则锚它,改它动不了任何判决(闸规矩四.0)。新增一条锚向别的存档文件的规则 ⇒ 这里同批加名字。
+  //   FB-17 半修:verify-prod.mjs 加尾边界(`.bak` 不再命中);别仓同名文件仍算承重——跨仓照看是 D93 撤销后的既定口径,拆仓改安装方配置时一并解(D196⑪)。
+  //   失效条件:载体分类自测「290 FB-15」两条翻红。
+  { re: /AGENTS\.md|CLAUDE\.md|docs\/laws\/|docs\/archive\/laws-[^/]+\/(?:collab|reporting|constitution-[\w-]+)\.md(?![\w.-])|scripts\/verify-prod\.mjs(?![\w.-])/, creation: false, loadBearing: true,
+    why: "宪法与法典:**改**它是承重动作;它不是「造物」——不存在手搓一部已有的法。" +
+      "批 290 红队 BP-2/3:存档法典(21 条规则的 law 锚点指着它)、快车道集合的权威 verify-prod.mjs 一并算承重。" +
+      "docs/gate/AGENTS.md 由前面的 AGENTS\\.md 子串接住;docs/gate/ 整目录不收(误拦猎手 FB-6:" +
+      "正则不锚仓根,会把别的仓的 docs/gate/ 当承重),红队 BP-4 列为接受风险,见 D196" },
   { re: /docs\/(tool-register|constraint-register|prod-facts|repo-brief|carrier-facts)/,
     creation: false, loadBearing: true,
     why: "寄存器与事实文档:行内义务句以宪法法律索引为规范来源" },
@@ -121,7 +130,9 @@ const DELIVERABLE_EXCLUDE = new RegExp(
  *  **部署(deploy-prod)也在对象内**:W′ 亲签实现提交 a18fedd 的提交信息原文列「write-node/prod-lib/bulk/deploy」,
  *  它从上线首日就在判据里(批 285 D132 补这句,原注释只写三条内容管线,与判据实含不符)。
  *  天花板(D132,按接受风险结清):只认这四个脚本名——绕开 deploy-prod.ps1 直接 ssh 敲部署步不命中。 */
-export const CONTENT_WRITE_RE = /write-node\.mjs|prod-lib\.mjs|bulk[-_]?create|deploy-prod/;
+//  0.10.0:部署脚本认 `deploy-<名>` 这一形(原来写死一个具体脚本名)——安装方的部署脚本各叫各的。
+//  这四个脚本名本该是安装方配置(闸规矩第五节),现在仍写在这里,见 docs/gate-debts.md。
+export const CONTENT_WRITE_RE = /write-node\.mjs|prod-lib\.mjs|bulk[-_]?create|deploy-[\w-]+/;
 
 /** 写它算「产出交付物」吗(W 项的判据面)。 */
 export function isDeliverable(p) {
@@ -247,6 +258,12 @@ export function selfTest() {
     ["src/app/page.tsx",                    false, false, "业务代码:两者都不是"],
     ["content/private/x.md",                false, false, "正文:两者都不是"],
     ["README.md",                           false, false, "普通文档"],
+    // 批 290 合并后(红队 BP-5 / 误拦猎手 FB-15、FB-17)
+    ["docs/archive/laws-2026-11/collab.md", false, true,  "290 FB-15:规则锚着的存档法典照算承重"],
+    ["docs/archive/laws-2026-11/README.md", false, false, "290 FB-15:没有规则锚的存档 README 不算承重"],
+    ["docs/archive/laws-2026-11/collab.md.bak", false, false, "290 FB-26:存档法典的备份文件不算承重"],
+    ["docs/gate/routing.md",                false, false, "FB-6:docs/gate 下别的文件不算承重"],
+    ["scripts/verify-prod.mjs.bak",         true,  false,"290 FB-17:verify-prod 的备份文件不算承重"],
   ];
   for (const [p, wantC, wantL, why] of M) {
     chk(`creation  ${p.slice(-38).padEnd(38)} ${why}`, isCreationCarrier(p), wantC);

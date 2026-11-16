@@ -7,7 +7,8 @@
 // 为什么不用官方 `/goal`:它是**内建 slash command,模型调不了**——只有用户能敲。
 //        而 2026-08-19 用户明示「以后原则上每个命令都必须 goal,而不是我搁那打 goal」。
 //        官方 `/goal` 的机制(session 级 prompt Stop hook、另一个模型判、后台任务在跑时跳过)
-//        本仓已由 `.claude/settings.json` 的 prompt hook + `hook-stop-closure` 分别覆盖;
+//        本仓原由 `.claude/settings.json` 的 prompt hook + `hook-stop-closure` 分别覆盖
+//        (批 294 按 287 设计 2.8 撤掉了 Stop 上的 prompt hook,「另一个模型判」那一半不再有);
 //        本文件补的是它**唯一无法自动化的那一半:条件从哪来**。
 //
 // 判据(全部结构事实,不判语义):
@@ -26,7 +27,10 @@
 //   node --no-warnings scripts/batch-goal.mjs --no-decision "<为什么本批没有决定>"   ⇒ 承重面批零决定时的声明(批 276,D177)
 //   node --no-warnings scripts/batch-goal.mjs --outcome "<可见成果一句话>"    ⇒ 自动序号 O<n>(批 256)
 //   node --no-warnings scripts/batch-goal.mjs --withdraw <批号-Dn | On> --reason "<理由>"   撤回误登记的一项(批 256b)
-//   node --no-warnings scripts/batch-goal.mjs --clear
+//   node --no-warnings scripts/batch-goal.mjs --clear [--verdict "N=达成|未达成|不适用[:理由]"]…   (批 298:逐条裁决,可选)
+//   node --no-warnings scripts/batch-goal.mjs --context            ⇒ 一行摘要 + 状态文件路径 + 内容哈希(批 298)
+//   node --no-warnings scripts/batch-goal.mjs --settle [<义务 id>]  ⇒ 卡住(连续判不了 ≥3 次)的义务转欠账(批 298)
+//   node --no-warnings scripts/batch-goal.mjs --repair-obligations ⇒ 按台账重建义务账状态文件(批 298;不改结论)
 //   node --no-warnings scripts/batch-goal.mjs --self-test
 // 退出码: 0=正常  2=用法错 / 拒清
 //
@@ -40,11 +44,162 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync, spawn } from "node:child_process";
 import os from "node:os";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { ledgerAppend } from "./lib/ledger-chain.mjs";
+import { ledgerAppend, verifyFile as verifyFileChain } from "./lib/ledger-chain.mjs";
 import { quoteUntrusted } from "./lib/gate-ctx.mjs";
 import { isCarrierPath, CARRIER_SURFACE } from "./lib/gate-carriers.mjs";
+import { readInstallConfig, parseInstallConfig, mergeInstallConfig, absentInstallConfig, snapshotConfig, configFromSnapshot, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
+import * as OB from "./lib/obligations.mjs";
+import { debtRowCells, debtRowParked } from "./lib/debt-schema.mjs";   // 批 301:切列一份实现
+import { planWriteChecks, applyWriteChecks, isWriteCheckType, withdrawnClears } from "./lib/write-checks.mjs";   // 批 301:写入类义务产生器(T / MF / J / M)
+export { debtRowCells, debtRowParked };
 const JOURNAL = path.join(".claude", ".batch-goal.jsonl");
+
+// ── 批 298:义务账 + 编排状态 + 安装方配置接缝(287 设计 2.1、2.7;拆批稿 clipboard/294-p0-breakdown.md「297」节,实际编号 298)──
+//   ① 义务账(scripts/lib/obligations.mjs,格式见其头注)落在 git 公共目录的上一级 `.claude/.obligations/`,各 worktree 共用;
+//      每条带归属会话(owner)与现归属批(batch = 批号 + armedAt)。
+//      本文件把三道既有核对改造成义务类型(行为不变,自测钉住):decision-adr(--decision)、outcome-diary(--outcome)、
+//      load-bearing-decision(承重面零决定,D177)。它们的结论只由 --clear 的求值器写;新产生器(后续批)走 recordEvidence。
+//   ② 带过来:`--arm` 换批、`--arm --force`、同号重放都把本 checkout 上一批未清的义务原样并入新批(原 force-over-obligations
+//      「不再被任何 --clear 核对」那条丢项路已删,批 256b BP-3 的台账行改名 force-carry-obligations,只记不丢);
+//      未归属的义务**只看 checkout**:同一 checkout 的并入(不看会话号,批 298 r2);转欠账到期的也按 checkout 认回开批的那一批。
+//   ③ `--clear` 通用拒绝:本批名下还有 开着 / 判不了 / 待提交转欠账 的义务 ⇒ 拒(退出 2,拒清痕迹同 refuse())。
+//      判不了按开着算。义务账自身判不了(取不到目录 / 锁超时 / 被改过 / 链断)⇒ 也拒。
+//   ④ 没有任何 CLI 能把义务置为「已清」:CLI 只有 --settle(转欠账,不是已清)、--withdraw(只撤自己登记的决定 / 成果,既有)、
+//      --repair-obligations(只按台账重建,不改任何结论)。
+//   ⑤ 卡住转欠账:连续判不了 ≥3 次(首次 + 重试 2 次)⇒ `--settle` 往债表写一行(失效期 ≤ 批号数字部分 + 3)⇒ 提交 ⇒
+//      `--clear` 只认 **HEAD 里已提交**的那一行(不在 --clear 里写债表:写完工作树就脏,D116 自锁;拆批稿 0.5)。
+//   ⑥ 安装方配置(scripts/lib/install-config.mjs):日记、ADR 目录、安装方专属承重路径从仓根 gate-install.json 读;
+//      没有这份文件的仓不做日记 / ADR / 承重面零决定核对。HostApp 的那份照原值写,行为零变化。
+//   ⑦ `--context`:一行摘要 + 状态文件路径 + 内容哈希(给开工注入用,批 299)。`--clear --verdict "N=达成|未达成|不适用[:理由]"`:
+//      逐条裁决参数(2.2 K 行),可选;给了就须覆盖全部条件,记进台账 clear 行。「条件N:达成」文字判据照旧保留(302 再撤)。
+let CONFIG_OVERRIDE = null;   // 自测用:纯函数测试注入 HostApp 形的配置,不依赖 cwd 有没有那份文件
+let CONFIG_CACHE;
+function installConfig() { return CONFIG_OVERRIDE || (CONFIG_CACHE ??= readInstallConfig()); }
+/** 现行配置并上批基点那一版(批内关掉核对的绕过面,见 install-config.mjs 头注)。 */
+function effectiveConfig(goal, git = gitRun) {
+  if (CONFIG_OVERRIDE) return CONFIG_OVERRIDE;
+  const head = installConfig();
+  // 批 298 r2(codex ① / 猎手 FB-6):现行版解析坏 ⇒ 一律 brokenInBatch(不看基点有没有配置,快照也遮不住);
+  //   读错误(EBUSY / EPERM / EISDIR…)⇒ 原样返回(判不了、可重试),不算改坏
+  if (head.error) return head.readError ? head : { ...head, brokenInBatch: true };
+  const base = goal?.baseCommit;
+  if (!(typeof base === "string" && base)) return head;
+  let r; try { r = git(["show", `${base}:${INSTALL_CONFIG_FILE}`]); } catch { r = null; }
+  if (!r || r.status !== 0) return head;   // 基点没有这份文件(或取不到)⇒ 只用现行版
+  const b = parseInstallConfig(String(r.stdout || ""), `${base.slice(0, 10)}:${INSTALL_CONFIG_FILE}`);
+  return mergeInstallConfig(head.found ? head : { ...absentInstallConfig(), found: true }, b);
+}
+/** 批 298 r1(配置冻结):本批的求值配置 = 本批承重面零决定记录建立时(武装时)的快照;没有那条记录(旧批导入)⇒ 现行 ∪ 基点。 */
+function batchConfig(goal, recs, git = gitRun) {
+  const key = batchKeyOf(goal);
+  const lb = arr(recs).find((r) => r.type === "load-bearing-decision" && sameKey(r.origin, key) && r.config);
+  return (lb && configFromSnapshot(lb.config)) || effectiveConfig(goal, git);
+}
+/** 带入义务的求值配置 = 它自己的快照;旧记录没有快照 ⇒ 现行 ∪ 它那一批的基点。改名跟随见 followConfPaths。 */
+const recConfig = (r, git = gitRun) => followConfPaths(configFromSnapshot(r.config) || effectiveConfig({ baseCommit: r.origin?.baseCommit }, git), r.origin?.baseCommit, git);
+
+/** 批 298 r2(猎手 FB-3,诚实迁移):快照里的路径在 HEAD 不存在,而 `git diff -M --name-status 基点..HEAD` 显示它被改名到 curPath、
+ *  且现行配置也指向 curPath ⇒ 返回 curPath;其余一律 null(照旧按快照路径核,不在就算缺)。文件与目录(目录内逐个改名)都认。 */
+export const FOLLOW_UNKNOWN = Symbol("follow-unknown");
+export function followRename(p, base, curPath, git = gitRun) {
+  if (!p || !curPath || curPath === p || !(typeof base === "string" && base)) return null;
+  // 批 298 r3(猎手 FB-6③):git 失败(基点不可达等)⇒ 返回 FOLLOW_UNKNOWN(判不了),不返回 null(null 会落成「缺」)
+  let r; try { r = git(["ls-tree", "--name-only", "HEAD", "--", p]); } catch { return FOLLOW_UNKNOWN; }
+  if (!r || r.status !== 0) return FOLLOW_UNKNOWN;
+  if (String(r.stdout || "").trim()) return null;   // 原路径还在 ⇒ 不跟
+  try { r = git(["diff", "-M", "--name-status", "-z", base, "HEAD"]); } catch { return FOLLOW_UNKNOWN; }
+  if (!r || r.status !== 0) return FOLLOW_UNKNOWN;
+  const parts = String(r.stdout || "").split("\0").map((x) => x.replace(/^\r?\n/, ""));
+  for (let i = 0; i < parts.length;) {
+    const st = parts[i];
+    if (/^[RC]\d*$/.test(st)) {
+      const from = parts[i + 1] || "", to = parts[i + 2] || ""; i += 3;
+      if (/^R/.test(st) && from === p && to === curPath) return curPath;
+      if (/^R/.test(st) && from.startsWith(p + "/") && to.startsWith(curPath + "/") && from.slice(p.length) === to.slice(curPath.length)) return curPath;
+    } else i += 2;
+  }
+  return null;
+}
+/** 对一份求值配置的日记 / ADR 路径做改名跟随(只在现行配置合法时;现行配置指向哪里由它说了算)。 */
+function followConfPaths(conf, base, git = gitRun) {
+  if (!conf || conf.error) return conf;
+  const cur = installConfig();
+  if (cur.error) return conf;
+  const d = followRename(conf.diary, base, cur.diary, git), a = followRename(conf.adrDir, base, cur.adrDir, git);
+  if (d === FOLLOW_UNKNOWN || a === FOLLOW_UNKNOWN) return { ...conf, error: `改名跟随判不了(git diff 基点 ${String(base).slice(0, 10)}..HEAD 失败——基点不可达?)`, readError: true };
+  return d || a ? { ...conf, ...(d ? { diary: d } : {}), ...(a ? { adrDir: a } : {}), followed: [d && `${conf.diary} → ${d}`, a && `${conf.adrDir} → ${a}`].filter(Boolean) } : conf;
+}
+
+/** 批 298 r1(codex §1 / 红队 BP-1、BP-6):批身份 = 批号 + armedAt + baseCommit,以武装台账(带 hash 链)里该批最后一条 arm 行为准。
+ *  返回 { ok, row, why }。旧 arm 行没记 armedAt ⇒ 只比 baseCommit;一条 arm 行都没有 ⇒ 不 ok。 */
+export function armIdentity(g, row = g ? lastArmRow(g.batch) : null) {
+  if (!g || !g.batch) return { ok: false, row: null, why: "没有批" };
+  if (!row) return { ok: false, row: null, why: `武装台账里没有批 ${g.batch} 的 arm 行(状态文件不是 --arm 写出来的)` };
+  const sb = typeof g.baseCommit === "string" && g.baseCommit ? g.baseCommit : null, rb = typeof row.baseCommit === "string" && row.baseCommit ? row.baseCommit : null;
+  if (sb !== rb) return { ok: false, row, why: `状态文件基点 ${String(sb).slice(0, 10)} ≠ 武装台账 ${String(rb).slice(0, 10)}` };
+  if (typeof row.armedAt === "string" && row.armedAt !== (g.armedAt || null)) return { ok: false, row, why: `状态文件 armedAt ${g.armedAt} ≠ 武装台账 ${row.armedAt}` };
+  return { ok: true, row };
+}
+/** 批 298 r1(codex §2)/ r2(猎手 FB-2):批台账里**当前批 arm 行之后**(含 arm 行自己)最后记下的义务账末行 { h, version };
+ *  往前扫到最后一条 arm 行就停——更早的批记的锚不再约束(否则一次丢账会把这个 checkout 永久锁死)。没有 ⇒ null。 */
+export function lastOblAnchor(file = JOURNAL) {
+  let lines = []; try { lines = fs.readFileSync(file, "utf8").split("\n"); } catch { return null; }
+  for (let k = lines.length - 1; k >= 0; k--) {
+    if (!lines[k].trim()) continue;
+    let o; try { o = JSON.parse(lines[k]); } catch { continue; }
+    if (o?.oblHead && typeof o.oblHead.h === "string") return o.oblHead;
+    // 批 298 r3(codex ① / 红队 BP-1):arm 行自带武装那一刻的锚;义务账当时不可信写 anchorUnknown ⇒ 不停,继续往前找
+    if (o?.action === "arm" && o.anchorUnknown === true) continue;
+    if (o?.action === "arm" || o?.action === "accept-obligation-loss") return null;
+  }
+  return null;
+}
+/** 批 298 r3(codex 另项):坏配置的说法按基点有没有这份文件分开——基点没有就不说「基点合法、是本批改坏」,也不给 git show 基点。 */
+function brokenConfigText(base, git = gitRun) {
+  const err = installConfig().error;
+  let r = null;
+  if (typeof base === "string" && base) { try { r = git(["show", `${base}:${INSTALL_CONFIG_FILE}`]); } catch { r = null; } }
+  // 批 298 r3(猎手 FB-4):三种说法——基点没有这份文件 / 基点版也解析不了 / 基点版合法
+  const fixHint = "修好它(格式见 scripts/lib/install-config.mjs 头注;不要这份配置就删掉它),提交,再重跑。";
+  if (!(r && r.status === 0)) return `现行 ${INSTALL_CONFIG_FILE} 解析失败(${err})(基点无此文件)。\n出路:${fixHint}`;
+  const b = parseInstallConfig(String(r.stdout || ""), "基点版");
+  if (b.error) return `现行 ${INSTALL_CONFIG_FILE} 解析失败(${err});基点那一版也解析不了(${b.error})——不是本批改坏的,但现在照样判坏。\n出路:${fixHint}`;
+  return `${INSTALL_CONFIG_FILE} 在本批基点时是合法的,现在解析失败(${err})——是本批改坏的。\n出路:改回 ${INSTALL_CONFIG_FILE}(\`git show ${String(base).slice(0, 10)}:${INSTALL_CONFIG_FILE}\` 对照),提交,再重跑。`;
+}
+/** 批 298 r3(codex §3):确认义务账丢失的记录要看得见。current = 最后一条 clear 行之后(本批期间)的;latest = 全台账最近一条。 */
+export function acceptLossRows(file = JOURNAL) {
+  let rows = [];
+  try { rows = fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+  catch { return { current: [], latest: null }; }
+  let k = rows.length - 1;
+  for (; k >= 0; k--) if (rows[k].action === "clear") break;
+  const all = rows.filter((r) => r.action === "accept-obligation-loss");
+  return { current: rows.slice(k + 1).filter((r) => r.action === "accept-obligation-loss"), latest: all[all.length - 1] || null };
+}
+const fmtAccept = (r) => `${String(r.at || "").slice(0, 19)} 批 ${r.batch}:理由「${r.reason}」;丢失前锚 ${r.lostAnchor ? `第 ${r.lostAnchor.version} 行 h=${String(r.lostAnchor.h).slice(0, 12)}…` : "无"};经手会话 ${r.by || "?"}`;
+/** 批 298 r2(codex ②):写义务账的入口(--decision / --outcome / --withdraw / --settle)写前核锚;对不上 ⇒ 拒,给出路。 */
+function requireAnchorOk(what) {
+  const sd = OB.storeDir();
+  if (sd.unknown) return;   // 取不到目录:写入本身会出声,--clear 时拒
+  const snap = OB.readStore(sd.dir);
+  if (!OB.TRUSTED.has(snap.kind)) return;
+  const p = anchorProblem(snap);
+  if (!p) return;
+  console.error(`拒绝${what}:${p}。\n  不得在丢过的账上重建并覆盖旧锚。出路:停下告诉用户。**须用户确认后才用**:\`--arm <批号> <原条件…> --accept-obligation-loss "<理由>"\` 记一行并重开锚。`);
+  process.exit(2);
+}
+/** 外部锚核对:最后记下的末行仍在义务账里、且义务账不短于它。 */
+export function anchorProblem(snap, anchor = lastOblAnchor()) {
+  if (!anchor) return null;
+  if (!snap?.heads?.has(anchor.h)) return `批台账最后记下的义务账末行(第 ${anchor.version} 行,h=${anchor.h.slice(0, 12)}…)现在不在义务账里——台账被截短或整本换过`;
+  if (Number(snap.version) < Number(anchor.version)) return `义务账只有 ${snap.version} 行,短于批台账记下的 ${anchor.version} 行`;
+  return null;
+}
+const cfgDiary = () => installConfig().diary || "(未配置日记)";
+const cfgAdrDir = () => installConfig().adrDir || "(未配置 ADR 目录)";
+const cfgDebtTable = () => installConfig().debtTable || "docs/gate-debts.md";
 // 盲审日志(fpAudit / fpAuditLast 用)。须在顶部定义:--clear / --arm 分支在文件中段执行并 exit,
 //   定义在函数旁边时落在暂时性死区,发车与读结论都会失败(codex 259-final-r1 附节 1 实测)
 const FP_AUDIT_LOG = path.join("clipboard", "codex", "fp-audit-last.log");
@@ -64,7 +219,7 @@ const FP_AUDIT_LOG = path.join("clipboard", "codex", "fp-audit-last.log");
 //   · 整批 wall-clock 上限 600 s、单条 120 s、maxBuffer 4 MiB;失败输出经 quoteUntrusted 回显。
 //   天花板(诚实写出):自由 `--check` 只证「这条命令在此刻通过」,不证它和条件对象真有关系——写 `echo 218.` 照样过;
 //   它是低保证级判据,结构性绑定(按路径自动组 ffprobe)是另一批;探针结果与写入时序的关系由引擎 X 项另管。
-const KNOWN_ARM_FLAGS = new Set(["--arm", "--cond", "--check", "--expect", "--expect-re", "--force"]);
+const KNOWN_ARM_FLAGS = new Set(["--arm", "--cond", "--check", "--expect", "--expect-re", "--force", "--accept-obligation-loss"]);
 export function parseArm(argv) {
   const conds = [], checks = [];
   const val = (i, flag) => {
@@ -77,6 +232,7 @@ export function parseArm(argv) {
     const a = argv[i];
     if (a === "--arm") { i++; continue; }
     if (a === "--force" || a === "--imported-noop") continue;
+    if (a === "--accept-obligation-loss") { val(i, a); i++; continue; }   // 批 298 r2:值是理由,由 --arm 分支自己读
     if (a === "--cond") { conds.push(val(i, a)); i++; continue; }
     if (a === "--check") {
       if (!conds.length) throw new Error("--check 必须跟在某条 --cond 之后");
@@ -95,6 +251,28 @@ export function parseArm(argv) {
     throw new Error(`多余的位置参数「${a}」——每个值都要跟在它的 flag 后面`);
   }
   return { conds, checks };
+}
+/** 批 298(2.2 K 行):`--clear --verdict "N=达成|未达成|不适用[:理由]"` 逐条裁决。一个都没给 ⇒ null(照旧);
+ *  给了 ⇒ 编号须在 1..n、不重复、覆盖全部;值只认三个词;「未达成」「不适用」须带理由。只记进台账,不判真假(判断归模型)。 */
+export function parseVerdicts(argv, n) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] !== "--verdict") continue;
+    const v = argv[i + 1];
+    if (v === undefined || !String(v).trim() || /^--/.test(v)) throw new Error("--verdict 缺值(写 \"N=达成\" / \"N=未达成:理由\" / \"N=不适用:理由\")");
+    // 批 298 r1(猎手 FB-8):全角数字 / 全角等号归一,容忍句末标点
+    const m = normWidth(String(v)).replace(/＝/g, "=").match(/^\s*(\d+)\s*=\s*(达成|未达成|不适用)\s*(?:[:：]\s*(.*?))?[\s。．.;；,，!！]*$/s);
+    if (!m) throw new Error(`--verdict「${v}」格式不对(写 "N=达成|未达成|不适用[:理由]")`);
+    const k = Number(m[1]);
+    if (!(k >= 1 && k <= n)) throw new Error(`--verdict 条件编号 ${k} 不在 1..${n}`);
+    if (out.some((x) => x.n === k)) throw new Error(`--verdict 条件 ${k} 给了两次`);
+    if (m[2] !== "达成" && !String(m[3] || "").trim()) throw new Error(`--verdict 条件 ${k}「${m[2]}」须带理由(N=${m[2]}:理由)`);
+    out.push({ n: k, verdict: m[2], ...(m[3] && m[3].trim() ? { why: m[3].trim().slice(0, 300) } : {}) });
+  }
+  if (!out.length) return null;
+  const missing = Array.from({ length: n }, (_, i) => i + 1).filter((k) => !out.some((x) => x.n === k));
+  if (missing.length) throw new Error(`--verdict 没覆盖全部条件:缺 ${missing.join("、")}`);
+  return out.sort((a, b) => a.n - b.n);
 }
 /** Git Bash 路径(check 一律经它跑)。找不到返回 null。 */
 export function findBash() {
@@ -265,7 +443,7 @@ export function evaluate(goal, text) {
 // 病:生产法三已亲签「收尾清账不征询」,但 Stop 时**根本没 commit 也不响**——DP 只判
 //   「推了之后有没有跑欠账探针」,D/H/K0 均不覆盖「本批改动没提交」。批 204 就是这么漏的。
 // 为什么修在工装侧、不修在闸侧:与 D126 同理——`--clear` 是「批次完成」这个事件的唯一入口,
-//   在这里拒比在 Stop hook 里猜「这轮算不算收尾」窄得多;且本文件不在 GATE_ENGINE 正则里。
+//   在这里拒比在 Stop hook 里猜「这轮算不算收尾」窄得多。(立项时本文件不在闸引擎面里;2026-11-08 P0 收口起已纳入,改这里的拒绝点同样要过 D11 两猎手。)
 // 只看**已跟踪**文件(含已暂存):未跟踪文件常是草稿与探针,拿它们拒清会逼人绕路。
 // fail-closed:git 跑不起来 ⇒ 判不了 ⇒ 拒清(不是放行)。
 // CEILING:只证「结清那一刻没有未提交的已跟踪改动」;不证推了没有(那是 DP),
@@ -311,7 +489,8 @@ function worktreeState(run = (args) => spawnSync("git", ["-c", "core.quotePath=f
 //    有基点时那一行还须出现在 `git diff <基点> HEAD -- docs/product-diary.md` 的**新增行**里
 //    (同号重开的批不能拿上次那行抵账,BP-2);无基点或基点取不到 ⇒ 维持只看全文并出声。
 //    没登记成果 ⇒ 不查(汇报法「产品日记每批收尾必更」:无证据不写、纯调查批不写)。
-//    日记文件不存在(ENOENT)⇒ 只提示不拒清(别的仓没有这本日记);其它读错误 ⇒ unknown 拒清(BP-4,与 ADR 一侧同口径)。
+//    批 298 r2 起:没配日记的仓不核;配了而文件不存在(ENOENT)⇒ 按「缺」拒清(建出来、加本批行、提交);
+//    其它读错误 ⇒ unknown 拒清(BP-4,与 ADR 一侧同口径)。本批求值按武装时的配置快照,改名会跟随(见 install-config.mjs 头注)。
 // ④ 撤回(批 256b BP-9):`--withdraw <批号-Dn | On> --reason "…"` 把误登记的一项挪进 `withdrawn`,
 //    不再参与核对;台账记 `withdraw` 行带理由,`--status` 列出已撤项。成果序号 `O<n>` 登记时定死,撤回不重排。
 // ⑤ `--force` 换批覆盖带决定/成果的未结清批(BP-3):输出点名丢了哪些编号与成果,并记台账 `force-over-obligations`。
@@ -325,9 +504,9 @@ function worktreeState(run = (args) => spawnSync("git", ["-c", "core.quotePath=f
 //   · ADR 只核「编号出现在本批动过的 ADR 里」,不核那张 ADR 写得对不对、是不是 proposed;不核成果那行写得对不对。
 //   · 「--clear 才查」只保护调用它的路径:忘了 `--decision`/`--outcome` 时两道检查都不跑(候选发现由 AD 项提示,不拦)。
 //   · 路径一律相对**仓根**(与状态文件同一假设:本工具在仓根跑)。
-//   · 蓄意规避(手改状态文件删掉 decisions)不计——用户签的代价模型。
-const ADR_DIR = "docs/adr";
-const DIARY = "docs/product-diary.md";
+//   · 蓄意规避(手改状态文件删掉 decisions)不计——用户签的代价模型。(批 298 起:决定 / 成果另记在义务账,
+//     --clear 按「状态文件 ∪ 义务账」核,手改状态文件删掉的那条照样核。)
+//   · 批 298:ADR 目录与日记路径改读安装方配置(gate-install.json);没配的仓这两道与承重面零决定都不做(只出一行提示)。
 // `-c core.quotePath=false`:不然非 ASCII 路径被转成带引号的八进制转义,正则对不上整张丢(BP-5)。
 const gitRun = (args) => spawnSync("git", ["-c", "core.quotePath=false", ...args], { encoding: "utf8", windowsHide: true, timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
 const arr = (x) => (Array.isArray(x) ? x : []);
@@ -429,7 +608,7 @@ export function maxDecisionNoInJournal(batch, file = JOURNAL) {
     const nb = (x) => String(x ?? "").replace(/^0+(?=\d)/, "").toLowerCase();   // 去前导零、不分大小写(红队 b0d1aa6 BP-2);与 hasDecisionId 在常规批号(数字加字母后缀)上同口径,带连字符的批号这里偏宽(只会跳号不会撞号)
     if (!o || nb(o.batch) !== nb(batch)) continue;
     if (o.action === "decision" || o.action === "withdraw") max = Math.max(max, decisionNo(o.id));
-    else if (o.action === "clear" || o.action === "force-over-obligations") for (const d of [].concat(o.decisions || [], o.withdrawn || [])) max = Math.max(max, decisionNo(d?.id ?? d));
+    else if (o.action === "clear" || o.action === "force-over-obligations" || o.action === "force-carry-obligations") for (const d of [].concat(o.decisions || [], o.withdrawn || [])) max = Math.max(max, decisionNo(d?.id ?? d));
   }
   return max;
 }
@@ -493,9 +672,13 @@ export function diaryHasBatch(md, batch) {
 }
 
 /** ADR 覆盖:返回 {missing, notes} 或 {unknown, why}。git 可注入(自测)。 */
-export function adrCoverage(decisions, baseCommit, git = gitRun) {
+export function adrCoverage(decisions, baseCommit, git = gitRun, adrDir = installConfig().adrDir) {
   const ids = arr(decisions).map((d) => d && d.id).filter((x) => typeof x === "string" && x);
   if (!ids.length) return { missing: [], notes: [] };
+  // 批 298:安装方没配 ADR 目录 ⇒ 不做 ADR 核对(只出声)
+  if (!adrDir) return { missing: [], notes: [`本仓没配 ADR 目录(${INSTALL_CONFIG_FILE} 无 adrDir)——决定的 ADR 覆盖核对跳过`] };
+  const ADR_DIR = adrDir;
+  const adrRe = new RegExp(`^${reEsc(adrDir)}/\\d{4}-[^/]+\\.md$`, "i");
   const notes = [];
   let files = null;
   // 路径列表一律 `-z`(NUL 分隔、不转义;gitRun 另带 core.quotePath=false)——BP-5:中文短名 ADR 曾被转义丢掉。
@@ -510,8 +693,13 @@ export function adrCoverage(decisions, baseCommit, git = gitRun) {
     if (!r || r.status !== 0) return { unknown: true, why: String(r?.stderr || "git ls-tree 失败").trim() };
     files = splitZ(r.stdout);
   }
+  // 批 298 r2(猎手 FB-4):配置写了 ADR 目录、HEAD 里却没有 ⇒ 按「缺 ADR」报(给模板,且须已提交),不判不了、也不跳过
+  if (!files.length) {
+    let r; try { r = git(["ls-tree", "--name-only", "HEAD", "--", ADR_DIR]); } catch (e) { return { unknown: true, why: e.message }; }
+    if (r && r.status === 0 && !String(r.stdout || "").trim()) notes.push(`${ADR_DIR} 在 HEAD 里不存在(配置写了这个目录)——按缺报,建目录写 ADR 并提交`);
+  }
   const texts = [];
-  for (const f of files.map((x) => x.replace(/\\/g, "/")).filter((x) => /^docs\/adr\/\d{4}-[^/]+\.md$/i.test(x))) {
+  for (const f of files.map((x) => x.replace(/\\/g, "/")).filter((x) => adrRe.test(x))) {
     // BP-10:show 失败 ⇒ 判不了(unknown,拒清),不当成「这张没写编号」报缺 ADR——报缺会把人引去补一张根本不缺的 ADR。
     let r; try { r = git(["show", `HEAD:${f}`]); } catch (e) { return { unknown: true, why: `git show HEAD:${f} 抛错(${e.message})` }; }
     if (!r || r.status !== 0) return { unknown: true, why: `git show HEAD:${f} 失败(${String(r?.stderr || "").trim() || "无输出"})` };
@@ -521,7 +709,7 @@ export function adrCoverage(decisions, baseCommit, git = gitRun) {
 }
 
 /** 有基点时取 `git diff <基点> HEAD -- 日记` 的新增行(批 256b BP-2);取不到 ⇒ {note}(调用方退回全文)。 */
-export function diaryAddedLines(baseCommit, git = gitRun) {
+export function diaryAddedLines(baseCommit, git = gitRun, DIARY = installConfig().diary) {
   if (!(typeof baseCommit === "string" && baseCommit)) return { note: `本批武装时没记基点——日记只看全文有没有本批行(同号重开的批可能拿上次那行抵账)` };
   let r; try { r = git(["diff", "--no-color", "--no-ext-diff", "--text", "-U0", baseCommit, "HEAD", "--", DIARY])  /* --text:codex 256b 发现 D,仓里若给日记设了 -diff 属性,不加则只出二进制摘要、零 + 行 ⇒ 误判缺行 */; } catch { r = null; }
   if (!r || r.status !== 0) return { note: `基点 ${baseCommit.slice(0, 10)} 在本仓取不到——日记退回只看全文有没有本批行` };
@@ -536,16 +724,20 @@ export function diaryAddedLines(baseCommit, git = gitRun) {
 //   无基点(早于批 256 的武装)⇒ 跳过并提示;git 判不了 ⇒ unknown 拒清。
 //   失效条件:实现后连续 20 个承重面批 `--no-decision` 占比 >80% ⇒ 它成了仪式,复议(D177)。
 //   红队 r4 BP-2:原表漏了闸引擎的其余成员(write-effects / fp-audit / gate-replay / gate-deps)与 settings.json、CLAUDE.md、两份寄存器、batch-goal 自身。
-const LOAD_BEARING_PATH = /^(?:AGENTS\.md$|CLAUDE\.md$|docs\/laws\/|docs\/(?:constraint|tool)-register\.md$|\.claude\/(?:agents|skills|commands)\/|\.claude\/settings(?:\.[\w-]+)?\.json$|scripts\/hook-[^/]+\.mjs$|scripts\/lib\/(?:gate-[^/]+|write-effects)\.mjs$|scripts\/(?:fp-audit|gate-replay|batch-goal|install-git-hooks)\.mjs$|scripts\/gate-deps\/package(?:-lock)?\.json$|scripts\/git-hooks\/)/i;
-export function loadBearingTouched(baseCommit, git = gitRun) {
+//   批 298(安装方配置接缝):原表拆成两半——闸自己的通用面写在这里;安装方专属的(HostApp:docs/gate/AGENTS.md、
+//   docs/laws/、存档法典、verify-prod.mjs、两份寄存器)搬进 gate-install.json 的 loadBearingExtra。两半之并与原表在
+//   同一组路径上逐条相等(自测「298 承重面拆分等价」钉住);新加的只有本批新文件(obligations / install-config / gate-install.json)。
+export const LOAD_BEARING_GENERIC = /^(?:AGENTS\.md$|CLAUDE\.md$|\.claude\/(?:agents|skills|commands)\/|\.claude\/settings(?:\.[\w-]+)?\.json$|scripts\/hook-[^/]+\.mjs$|scripts\/lib\/(?:gate-[^/]+|write-effects|obligations|install-config)\.mjs$|scripts\/(?:fp-audit|gate-replay|batch-goal|install-git-hooks)\.mjs$|scripts\/gate-deps\/package(?:-lock)?\.json$|scripts\/git-hooks\/|gate-install\.json$)/i;
+export const isLoadBearingPath = (p, extra = installConfig().loadBearingExtra || []) => LOAD_BEARING_GENERIC.test(p) || arr(extra).some((re) => re.test(p));
+export function loadBearingTouched(baseCommit, git = gitRun, extra = installConfig().loadBearingExtra || [], head = "HEAD") {
   if (!(typeof baseCommit === "string" && baseCommit)) return { paths: [], note: "本批武装时没记基点——「承重面零决定」核对跳过" };
   //   --no-renames:改名时两侧路径都列出(红队 r4 BP-4:把 skill 挪出承重面,原先 diff 只剩新路径)
-  let r; try { r = git(["diff", "--name-only", "--no-renames", "-z", baseCommit, "HEAD"]); } catch (e) { return { unknown: true, why: e.message }; }
+  let r; try { r = git(["diff", "--name-only", "--no-renames", "-z", baseCommit, head]); } catch (e) { return { unknown: true, why: e.message }; }
   if (!r || r.status !== 0) return { unknown: true, why: String(r?.stderr || "git diff 失败").trim() || "git diff 失败" };
   const paths = String(r.stdout || "").split("\0").map((x) => x.trim().replace(/\\/g, "/")).filter(Boolean)
     //   红队 r6 BP-20:手抄表只是子集(漏 package.json / verify-laws / perm-match…)⇒ 并上 P 实际用的判据面,不再另抄;
     //   codex 276-r6-fix-audit 附 3:用 isCarrierPath(CARRIER_SURFACE, …)(排除暂存 / 依赖 / 构建区),不用裸 isLoadBearing
-    .filter((p) => (LOAD_BEARING_PATH.test(p) || isCarrierPath(CARRIER_SURFACE, p)) && !/\.(?:selftest|test|spec)\.[cm]?[jt]s$/i.test(p));
+    .filter((p) => (isLoadBearingPath(p, extra) || isCarrierPath(CARRIER_SURFACE, p)) && !/\.(?:selftest|test|spec)\.[cm]?[jt]s$/i.test(p));
   return { paths };
 }
 
@@ -556,27 +748,40 @@ export const isTemplateReason = (t) => /批\s*N\b|<为什么本批没有决定>|
 /** --clear 的检查。io 可注入:{git, readDiary():string|null(不存在=null), adrNames():string[]}。 */
 export function obligationCheck(goal, io = {}) {
   const git = io.git || gitRun;
-  const out = { notes: [], missingDecisions: [], diaryMissing: false, noDecisionTouched: [], unknown: null };
+  // 批 298:unknownParts 按部位记判不了(义务账据此只把那一类义务记成 UNKNOWN);unknown 串照旧。
+  const out = { notes: [], missingDecisions: [], diaryMissing: false, noDecisionTouched: [], unknown: null, unknownParts: {} };
   const decisions = arr(goal?.decisions), outcomes = arr(goal?.outcomes);
   const unk = [];
-  if (decisions.length) {
-    const c = adrCoverage(decisions, goal?.baseCommit, git);
-    if (c.unknown) unk.push(`ADR 覆盖:${c.why || "git 不可用"}`);
+  const conf = io.config || effectiveConfig(goal, git);
+  if (conf.error) {
+    out.unknown = `安装方配置判不了:${conf.error}(出路:修好仓根 ${INSTALL_CONFIG_FILE})`;
+    out.unknownParts = { config: true, adr: true, diary: true, loadBearing: true };
+    return out;
+  }
+  if (conf.mergedFromBase) out.notes.push(`${INSTALL_CONFIG_FILE} 在本批基点之后关掉或改动了核对——按基点那一版并入(批内改配置关不掉基点时已开着的核对)`);
+  if (!conf.adrDir) {
+    if (decisions.length || goal?.baseCommit) out.notes.push(`本仓没配 ADR 目录(${INSTALL_CONFIG_FILE} 缺或无 adrDir)——决定的 ADR 覆盖与承重面零决定核对都不做`);
+  } else if (decisions.length) {
+    const c = adrCoverage(decisions, goal?.baseCommit, git, conf.adrDir);
+    if (c.unknown) { unk.push(`ADR 覆盖:${c.why || "git 不可用"}`); out.unknownParts.adr = true; }
     else { out.notes.push(...c.notes); out.missingDecisions = c.missing; }
   } else if (!goal?.noDecision || isTemplateReason(goal.noDecision.text)) {
-    const lb = loadBearingTouched(goal?.baseCommit, git);
-    if (lb.unknown) unk.push(`承重面零决定核对:${lb.why}`);
+    const lb = loadBearingTouched(goal?.baseCommit, git, conf.loadBearingExtra || []);
+    if (lb.unknown) { unk.push(`承重面零决定核对:${lb.why}`); out.unknownParts.loadBearing = true; }
     else { if (lb.note) out.notes.push(lb.note); out.noDecisionTouched = lb.paths; }
   }
-  if (outcomes.length) {
+  if (outcomes.length && !conf.diary) out.notes.push(`本仓没配产品日记(${INSTALL_CONFIG_FILE} 缺或无 diary)——成果的日记核对不做`);
+  else if (outcomes.length) {
+    const DIARY = conf.diary;
     // BP-4:只有 ENOENT 算「这个仓没有日记」;其它读错误判不了 ⇒ unknown 拒清(与 ADR 一侧同口径)。
     let md = null, readErr = null;
     try { md = io.readDiary ? io.readDiary() : fs.readFileSync(DIARY, "utf8"); }
     catch (e) { if (e?.code !== "ENOENT") readErr = e; md = null; }
-    if (readErr) unk.push(`日记读不了(${readErr?.code || readErr?.message})`);
-    else if (md === null) out.notes.push(`${DIARY} 不存在——成果核对跳过(只提示,不拒清)`);
+    if (readErr) { unk.push(`日记读不了(${readErr?.code || readErr?.message})`); out.unknownParts.diary = true; }
+    // 批 298 r2(猎手 FB-4):配置写了日记路径、文件却不在 ⇒ 按「缺」报(建出来、加本批行、提交);只有读错误才判不了
+    else if (md === null) { out.diaryMissing = true; out.notes.push(`${DIARY} 不存在(配置写了这个路径)——按缺报:建出这份日记、加本批行并提交`); }
     else {
-      const d = diaryAddedLines(goal?.baseCommit, git);
+      const d = diaryAddedLines(goal?.baseCommit, git, DIARY);
       if (d.lines) out.diaryMissing = !diaryHasBatch(d.lines.join("\n"), goal?.batch);
       else { out.notes.push(d.note); out.diaryMissing = !diaryHasBatch(md, goal?.batch); }
     }
@@ -591,11 +796,13 @@ function localDate(d = new Date()) {
 }
 function nextAdrNumber() {
   let max = 0;
-  try { for (const f of fs.readdirSync(ADR_DIR)) { const m = f.match(/^(\d{4})-/); if (m) max = Math.max(max, Number(m[1])); } } catch { /* 无目录 ⇒ 0001 */ }
+  const ADR_DIR = installConfig().adrDir;
+  if (ADR_DIR) try { for (const f of fs.readdirSync(ADR_DIR)) { const m = f.match(/^(\d{4})-/); if (m) max = Math.max(max, Number(m[1])); } } catch { /* 无目录 ⇒ 0001 */ }
   return String(max + 1).padStart(4, "0");
 }
 function printObligationRefusal(goal, obl) {
   const batch = goal?.batch;
+  const ADR_DIR = cfgAdrDir(), DIARY = cfgDiary();
   if (obl.noDecisionTouched.length) {
     console.error(`拒绝结清:本批基点到 HEAD 之间触及承重面(${obl.noDecisionTouched.slice(0, 5).join("、")}${obl.noDecisionTouched.length > 5 ? ` 等 ${obl.noDecisionTouched.length} 个` : ""};按树差判,含合并带入的别批改动),却一条决定都没登记(D177)。`);
     console.error(`  若这些改动是合并带入、不是本批做的(另一会话的批里已登记过决定),\`--no-decision "合并带入,决定在批 <那一批的真实批号>"\` 即可(占位原样贴回会被拒)。`);
@@ -629,6 +836,239 @@ function printObligationRefusal(goal, obl) {
   console.error(`出路:补好、提交,再 --clear。登记错了的决定/成果用 --withdraw <编号|O序号> --reason "<理由>" 撤回(记台账),不得靠改状态文件删。`);
 }
 
+// ── 批 298:义务账接线(格式与状态机见 lib/obligations.mjs 头注;本文件负责三类保留类型的求值与批归属)──────────
+const sidEnv = () => (typeof process.env.CLAUDE_CODE_SESSION_ID === "string" && /^[\w-]{8,80}$/.test(process.env.CLAUDE_CODE_SESSION_ID) ? process.env.CLAUDE_CODE_SESSION_ID : null);
+export function normCheckout(p) {
+  if (!p) return null;
+  let s = String(p);
+  try { s = fs.realpathSync.native(s); } catch { /* 不存在就按原样 */ }
+  s = s.replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? s.toLowerCase() : s;
+}
+function checkoutRoot(git = gitRun) {
+  try { const r = git(["rev-parse", "--show-toplevel"]); if (r && r.status === 0 && String(r.stdout).trim()) return normCheckout(String(r.stdout).trim()); } catch { /* 退回 cwd */ }
+  return normCheckout(process.cwd());
+}
+const oblCtx = () => ({ sid: sidEnv(), checkout: checkoutRoot() });
+/** 批键 = 批号 + 武装时刻(同号重放保留 armedAt ⇒ 键不变;结清后同号重开 ⇒ 新键)。 */
+export const batchKeyOf = (g) => (g && g.batch !== undefined && g.batch !== null ? { batch: String(g.batch), armedAt: typeof g.armedAt === "string" ? g.armedAt : null } : null);
+export const sameKey = (a, b) => !!(a && b && String(a.batch) === String(b.batch) && (a.armedAt || null) === (b.armedAt || null));
+/** 未归属的义务并入谁:**只看 checkout**——同一 checkout 的并入,别的 checkout 的不并入(批 298 r2;会话号每次换会话都变,不作判据)。 */
+//   批 298 r2(红队 BP-1 / codex ⑤ / 猎手 FB-1):统一判据 = **checkout 相同**,不看会话号。会话号每次换会话都变,
+//   按它认领会让到期债谁都认不回;owner 只作记录(换批带入时更新为经手会话)。sid 参数保留签名、不参与判定。
+export const ownerMatches = (rec, sid, checkout) => !!checkout && rec.checkout === checkout;
+const isDone = (r) => r.status === "cleared" || r.status === "withdrawn";
+const recLabel = (r) => r.type === "decision-adr" ? `决定 ${r.payload?.id}` : r.type === "outcome-diary" ? `成果 ${r.origin?.batch}:O${r.payload?.n}` : r.type === "load-bearing-decision" ? `批 ${r.origin?.batch} 承重面零决定` : `${r.type}${r.payload?.path ? ` ${r.payload.path}` : ""}`;
+const OUTLETS = {
+  "decision-adr": (id) => `写 / 改一张 ADR,在声明语境里写「决定编号:${id}」(或旧 ADR 上「被 ${id} 取代」)并提交;登记错了 --withdraw ${id} --reason "…"`,
+  "outcome-diary": (b, n) => `产品日记加一行、事项栏第一个批号标记是「批 ${b}」,并提交;登记错了 --withdraw ${b}:O${n} --reason "…"`,
+  "load-bearing-decision": (b) => `批 ${b} 触及承重面却零决定:--decision "<一句话>" 登记并写 ADR,或 --no-decision "<为什么没有决定>"`,
+};
+
+/** 把一份批状态里的决定 / 成果 / 承重面核对导入成义务记录(已有的不重复建);状态里的已撤项同步成 withdrawn。 */
+//   confSnap(批 298 r1 配置冻结):本批求值配置的快照(调用方在锁外算好,snapshotConfig 形);本批已有记录带快照的,沿用那一份
+export function syncCurrent(draft, g, ctx, by = "batch-goal:sync", confSnap = null) {
+  const key = batchKeyOf(g);
+  if (!key || g.cleared || !Array.isArray(g.conditions) || !g.conditions.length) return;
+  const origin = { ...key, baseCommit: typeof g.baseCommit === "string" && g.baseCommit ? g.baseCommit : null };
+  const owner = typeof g.armedBy === "string" && g.armedBy ? g.armedBy : ctx.sid;
+  const mine = () => draft.list().filter((r) => sameKey(r.origin, key));
+  let m = mine();
+  const snap = (m.find((r) => r.type === "load-bearing-decision" && r.config) || m.find((r) => r.config))?.config || confSnap;
+  const mk = (type, payload, outlet, trigger) => OB.createObligation(draft, { type, owner, checkout: ctx.checkout, origin, batch: key, payload, outlet, trigger, config: snap, op: "import" }, by);
+  for (const d of arr(g.decisions)) if (d?.id && !m.some((r) => r.type === "decision-adr" && r.payload?.id === d.id)) mk("decision-adr", { id: d.id, text: d.text }, OUTLETS["decision-adr"](d.id), { via: "--decision", at: d.at || null });
+  for (const o of numberOutcomes(g.outcomes)) if (!m.some((r) => r.type === "outcome-diary" && r.payload?.n === o.n)) mk("outcome-diary", { n: o.n, text: o.text }, OUTLETS["outcome-diary"](key.batch, o.n), { via: "--outcome", at: o.at || null });
+  if (!m.some((r) => r.type === "load-bearing-decision")) mk("load-bearing-decision", {}, OUTLETS["load-bearing-decision"](key.batch), { via: "--arm", baseCommit: origin.baseCommit });
+  m = mine();
+  for (const w of arr(g.withdrawn)) {
+    const r = m.find((x) => (w?.kind === "decision" ? x.type === "decision-adr" && x.payload?.id === w.id : x.type === "outcome-diary" && x.payload?.n === w.n));
+    if (r && r.status !== "withdrawn") draft.put({ ...r, status: "withdrawn", lastResult: { at: new Date().toISOString(), result: "withdrawn", by: "batch-goal --withdraw", why: w.reason } }, { op: "withdraw", by: "batch-goal --withdraw", why: w.reason });
+  }
+}
+
+/** `--arm` 时的带入:上一批(本 checkout)名下未清的义务原样并入新批;未归属、属于本 checkout 的并入;转欠账到期的回到开着,同 checkout 的并入(只看 checkout)。 */
+//   key0:被换掉 / 重放的那一批的键(调用方按武装台账定,不信状态文件);curConf:那一批导入时用的配置快照
+export function armCarry(draft, cur, newKey, ctx, { head = null, forced = false, key0 = batchKeyOf(cur), curConf = null } = {}) {
+  if (cur && !cur.cleared) syncCurrent(draft, { ...cur, ...(key0 ? { armedAt: key0.armedAt } : {}) }, ctx, "batch-goal:arm-import", curConf);
+  const switching = !!key0 && !sameKey(key0, newKey);
+  const num = OB.batchNumber(newKey.batch);
+  const out = { carried: [], adopted: [], reopened: [], reopenedOthers: [] };
+  for (const r of draft.list()) {
+    if (isDone(r)) continue;
+    if (r.status === "settled") {
+      if (Number.isFinite(num) && Number(r.settle?.expiry) < num) {
+        // 批 298 r2(红队 BP-1 / codex ⑤):到期回到开着;同一 checkout 的并入本批(不看会话号),别的 checkout 的回到「未归属」只在 --status 列出
+        const same = ownerMatches(r, ctx.sid, ctx.checkout);
+        draft.put({ ...r, status: "open", unknownStreak: 0, batch: same ? newKey : null, ...(same && ctx.sid ? { owner: ctx.sid } : {}), settle: { ...r.settle, expiredAt: new Date().toISOString() } },
+          { op: "reopen", by: "batch-goal --arm", why: `转欠账 ${r.settle?.debtId}(≤${r.settle?.expiry})到期未结,回到开着${same ? `,并入批 ${newKey.batch}` : "(别的 checkout 的,不并入,等那个 checkout 开批认领)"}` });
+        (same ? out.reopened : out.reopenedOthers).push(r);
+      }
+      continue;
+    }
+    if (switching && sameKey(r.batch, key0)) {
+      const next = { ...r, batch: newKey, ...(ctx.sid ? { owner: ctx.sid } : {}) };   // owner 更新为经手会话(只作记录)
+      if (r.type === "load-bearing-decision" && sameKey(r.origin, key0) && !r.payload?.carriedHead) {
+        next.payload = { ...r.payload, carriedHead: head, hadDecision: arr(cur?.decisions).length > 0,
+          noDecision: cur?.noDecision && !isTemplateReason(cur.noDecision.text) ? String(cur.noDecision.text) : null };
+      }
+      draft.put(next, { op: "adopt", by: "batch-goal --arm", why: `批 ${key0.batch} ${cur?.cleared ? "已结清" : "未结清"}即${forced ? " --force " : ""}换批 ${newKey.batch},原样带入` });
+      out.carried.push(r);
+    } else if (!r.batch && ownerMatches(r, ctx.sid, ctx.checkout)) {
+      draft.put({ ...r, batch: newKey, ...(ctx.sid ? { owner: ctx.sid } : {}) }, { op: "adopt", by: "batch-goal --arm", why: "未归属、属于本 checkout 的义务并入本批" });
+      out.adopted.push(r);
+    }
+  }
+  return out;
+}
+
+/** --clear 用:批状态 ∪ 义务账里本批自己的决定 / 成果(手改状态文件删掉的那条照样核)。 */
+export function unionGoal(prev, recs) {
+  const key = batchKeyOf(prev);
+  const mine = arr(recs).filter((r) => sameKey(r.origin, key) && r.status !== "withdrawn");
+  const decisions = arr(prev?.decisions).slice();
+  for (const r of mine) if (r.type === "decision-adr" && r.payload?.id && !decisions.some((d) => d?.id === r.payload.id)) decisions.push({ id: r.payload.id, text: r.payload.text });
+  const outcomes = numberOutcomes(prev?.outcomes);
+  for (const r of mine) if (r.type === "outcome-diary" && Number.isInteger(r.payload?.n) && !outcomes.some((o) => o.n === r.payload.n)) outcomes.push({ n: r.payload.n, text: r.payload.text });
+  return { ...prev, decisions, outcomes };
+}
+
+/** 本批自己的保留类型:结论取自 obligationCheck(与原核对同一份判定,行为不变)。 */
+export function currentResult(r, obl) {
+  const u = obl.unknownParts || {};
+  if (u.config) return { result: "unknown", why: obl.unknown };
+  if (r.type === "decision-adr") return u.adr ? { result: "unknown", why: obl.unknown } : arr(obl.missingDecisions).includes(r.payload?.id) ? { result: "open", why: "ADR 里没有声明这个编号" } : { result: "cleared", why: "ADR 覆盖核对通过" };
+  if (r.type === "outcome-diary") return u.diary ? { result: "unknown", why: obl.unknown } : obl.diaryMissing ? { result: "open", why: "日记缺本批行" } : { result: "cleared", why: "日记核对通过(或本仓不做)" };
+  if (r.type === "load-bearing-decision") return u.loadBearing ? { result: "unknown", why: obl.unknown } : arr(obl.noDecisionTouched).length ? { result: "open", why: `触及承重面零决定:${obl.noDecisionTouched.slice(0, 3).join("、")}` } : { result: "cleared", why: "承重面零决定核对通过(或已登记决定 / 已声明)" };
+  return null;
+}
+
+/** 带进来的(别的批产生的)保留类型:按它产生时那一批的基点与批号求值。 */
+export function carriedResult(r, goalU, confIn, io = {}) {
+  const git = io.git || gitRun;
+  // 批 298 r1(配置冻结):按记录自己的快照求值,不按现行 / 新批配置;旧记录没快照才用调用方给的
+  const conf = confIn || configFromSnapshot(r.config);   // 调用方给的是「快照 + 改名跟随」(recConfig),优先用它
+  if (!conf || conf.error) return { result: "unknown", why: `安装方配置判不了:${conf?.error || "缺"}` };
+  const o = r.origin || {};
+  if (r.type === "decision-adr") {
+    if (!conf.adrDir) return { result: "cleared", why: "本仓不做 ADR 核对" };
+    const c = adrCoverage([{ id: r.payload?.id }], o.baseCommit, git, conf.adrDir);
+    if (c.unknown) return { result: "unknown", why: `ADR 覆盖:${c.why}` };
+    return c.missing.length ? { result: "open", why: `ADR 里没有声明 ${r.payload?.id}(按批 ${o.batch} 的基点 ${String(o.baseCommit || "无").slice(0, 10)} 起算)` } : { result: "cleared", why: "ADR 覆盖核对通过" };
+  }
+  if (r.type === "outcome-diary") {
+    if (!conf.diary) return { result: "cleared", why: "本仓不做日记核对" };
+    let md;
+    try { md = io.readDiary ? io.readDiary() : fs.readFileSync(conf.diary, "utf8"); }
+    catch (e) { return e?.code === "ENOENT" ? { result: "open", why: `${conf.diary} 不存在(配置写了这个路径)——按缺报` } : { result: "unknown", why: `日记读不了(${e?.code || e?.message})` }; }
+    const d = diaryAddedLines(o.baseCommit, git, conf.diary);
+    const ok = d.lines ? diaryHasBatch(d.lines.join("\n"), o.batch) : diaryHasBatch(md, o.batch);
+    return ok ? { result: "cleared", why: "日记核对通过" } : { result: "open", why: `日记缺「批 ${o.batch}」行${d.lines ? `(只认基点 ${String(o.baseCommit).slice(0, 10)} 之后新增的行)` : ""}` };
+  }
+  if (r.type === "load-bearing-decision") {
+    if (!conf.adrDir) return { result: "cleared", why: "本仓不做承重面零决定核对" };
+    if (r.payload?.hadDecision || r.payload?.noDecision) return { result: "cleared", why: `批 ${o.batch} 换批前已登记决定 / 已声明无决定` };
+    if (arr(goalU?.decisions).length || (goalU?.noDecision && !isTemplateReason(goalU.noDecision.text))) return { result: "cleared", why: `由批 ${goalU?.batch} 的决定登记 / 无决定声明承接` };
+    const lb = loadBearingTouched(o.baseCommit, git, conf.loadBearingExtra || [], r.payload?.carriedHead || "HEAD");
+    if (lb.unknown) return { result: "unknown", why: `承重面零决定核对:${lb.why}` };
+    return lb.paths.length ? { result: "open", why: `批 ${o.batch} 触及承重面零决定:${lb.paths.slice(0, 3).join("、")}` } : { result: "cleared", why: "未触及承重面(或无基点)" };
+  }
+  return null;
+}
+
+/** 批 298 r1:--clear 的锁外计划。所有 git / 读文件(取证)在这里做完;返回锁内落笔要用的结论与本批相关记录的指纹。 */
+export function planClear(prev, recs, ctx, io = {}) {
+  const git = io.git || gitRun;
+  const key = batchKeyOf(prev);
+  const adoptable = (r) => !isDone(r) && r.status !== "settled" && ((prev.carriedFrom && sameKey(r.batch, prev.carriedFrom)) || (!r.batch && ownerMatches(r, ctx.sid, ctx.checkout)));
+  const relevant = (list) => list.filter((r) => sameKey(r.batch, key) || sameKey(r.origin, key) || adoptable(r));
+  const rel = relevant(arr(recs));
+  const conf = io.config || followConfPaths(batchConfig(prev, recs, git), prev.baseCommit, git);
+  const goalU = unionGoal(prev, recs);
+  const obl = obligationCheck(goalU, { ...io, git, config: conf });
+  if (conf.followed?.length) obl.notes.push(`配置快照里的路径在基点之后被改名,且现行配置也指向新路径 ⇒ 按新路径核:${conf.followed.join(";")}`);
+  const carried = {};
+  for (const r of rel) if (OB.RESERVED_TYPES.has(r.type) && !sameKey(r.origin, key) && r.status !== "withdrawn") carried[r.id] = carriedResult(r, goalU, recConfig(r, git), io);
+  const tables = {};
+  for (const r of rel.filter((x) => x.status === "settling")) {
+    const t = r.settle?.table || conf.debtTable || "docs/gate-debts.md";
+    if (!(t in tables)) { let g; try { g = git(["show", `HEAD:${t}`]); } catch { g = null; } tables[t] = g && g.status === 0 ? String(g.stdout || "") : null; }
+  }
+  const fpOf = (list) => relevant(arr(list)).map((r) => `${r.id}:${r.rev}`).sort().join(",");
+  return { key, conf, confSnap: snapshotConfig(conf), goalU, obl, carried, tables, fp: fpOf(recs), fpOf, head: headCommit(git), writeChecks: io.writeChecks || null };
+}
+/** 批 298 r1:--clear 的锁内落笔。不做 git;本批相关记录的指纹变了 ⇒ CONFLICT(调用方重读重算一次)。 */
+export function applyClearPlan(draft, prev, plan, ctx) {
+  if (plan.fpOf(draft.list()) !== plan.fp) throw new OB.ObligationError("CONFLICT", "本批名下的义务在读与写之间被别的进程改过");
+  const key = plan.key;
+  syncCurrent(draft, prev, ctx, "batch-goal:clear-import", plan.confSnap);
+  for (const r of draft.list()) {
+    if (isDone(r) || r.status === "settled") continue;
+    const fromPrev = prev.carriedFrom && sameKey(r.batch, prev.carriedFrom);
+    if (fromPrev || (!r.batch && ownerMatches(r, ctx.sid, ctx.checkout))) draft.put({ ...r, batch: key }, { op: "adopt", by: "batch-goal --clear", why: fromPrev ? `换批时没带过来(上一批 ${prev.carriedFrom.batch}),结清时补带` : "未归属、属于本 checkout 的义务并入本批" });
+  }
+  // 保留类型每次 --clear 都重算(「已清」对它们不是粘性的:批没结清前把 ADR 删掉,照原口径要再拒);产生器的「已清」是粘性的
+  for (const r0 of draft.list().filter((r) => sameKey(r.batch, key) && r.status !== "withdrawn" && (r.status !== "cleared" || OB.RESERVED_TYPES.has(r.type)))) {
+    const res = !OB.RESERVED_TYPES.has(r0.type) ? null : sameKey(r0.origin, key) ? currentResult(r0, plan.obl)
+      : (plan.carried[r0.id] || { result: "unknown", why: "这条带入义务不在锁外计划里(读写之间新增)——重跑 --clear" });
+    if (res && r0.status === "cleared" && res.result !== "cleared") {
+      draft.put({ ...r0, status: res.result, unknownStreak: res.result === "unknown" ? 1 : 0, lastResult: { at: new Date().toISOString(), result: res.result, by: `evaluator:${r0.type}@clear`, why: res.why } }, { op: "reopen", by: `evaluator:${r0.type}@clear`, why: res.why });
+    } else if (res) OB.applyEvaluation(draft, r0, res, `evaluator:${r0.type}@clear`);
+    const r = draft.get(r0.id);
+    if (r.status === "settling") {
+      const text = plan.tables[r.settle?.table || plan.conf.debtTable || "docs/gate-debts.md"];
+      if (text != null && OB.debtRowCommitted(text, r)) draft.put({ ...r, status: "settled", settle: { ...r.settle, confirmedAt: new Date().toISOString(), confirmedHead: plan.head } }, { op: "settle", by: "batch-goal --clear", why: `HEAD 里已提交债表行 ${r.settle.debtId}(≤${r.settle.expiry})` });
+    }
+  }
+  if (plan.writeChecks) applyWriteChecks(draft, prev, plan.writeChecks, key, ctx);   // 批 301:写入类义务(T / MF / J / M)
+  return draft.list().filter((r) => sameKey(r.batch, key));
+}
+
+/** 义务账不可信时的拒清原因与出路。 */
+function storeRefusal(kind, why) {
+  if (kind === "tampered") return { reason: "obligations-tampered", msg: `义务账的状态文件与台账对不上(${why})`, outlet: "node --no-warnings scripts/batch-goal.mjs --repair-obligations(只按台账重建状态文件,不改任何结论),再 --clear" };
+  if (kind === "ledger-broken") return { reason: "obligations-ledger-broken", msg: why, outlet: "停下告诉用户:台账行被改写,自动修会把改写过的历史洗成真相——只有用户能裁(--repair-obligations 对这种情况拒做)" };
+  if (kind === "torn") return { reason: "obligations-unknown", msg: why, outlet: "node --no-warnings scripts/batch-goal.mjs --repair-obligations(截掉撕裂残片,原样备份),再 --clear" };
+  // 批 298 r3(猎手 FB-3):与 requireAnchorOk 同一句出路
+  if (kind === "anchor") return { reason: "obligations-tampered", msg: why, outlet: "停下告诉用户:义务账被整本换过或截短,本层无法自证——只有用户能裁。**须用户确认后才用**:`--arm <批号> <原条件…> --accept-obligation-loss \"<理由>\"` 记一行并重开锚" };
+  if (kind === "identity") return { reason: "obligations-tampered", msg: why, outlet: "照武装时的条件逐字原样重放 `--arm <批号> --cond …`(批身份从武装台账恢复);对不上就 --history 对照,停下告诉用户" };
+  // 批 298 r1(猎手附二①):按真实原因分三种说,不写「无人续」(锁没有续租)
+  if (kind === "conflict") return { reason: "obligations-unknown", msg: why, outlet: "别的进程在本次读与写之间改了本批名下的义务——直接重跑 --clear(会重读重算)" };
+  if (kind === "lock-timeout") return { reason: "obligations-unknown", msg: why, outlet: "等持有写锁的那个进程结束后重跑;它若已死,拿锁满 30 s 后锁会被当陈锁夺走,届时重跑即可" };
+  return { reason: "obligations-unknown", msg: why, outlet: "义务账目录 / 文件读不了:查权限、杀毒占用、磁盘;修好后重跑" };
+}
+/** 库错误码 ⇒ storeRefusal 的 kind。 */
+const errKind = (e) => (e?.code === "PARTIAL" ? (e.chainBroken ? "ledger-broken" : "torn")   // 批 298 r3:写到一半——链断 ⇒ 停下告诉用户;只是 state 落后 ⇒ repair
+  : ({ CONFLICT: "conflict", "LOCK-TIMEOUT": "lock-timeout", TAMPERED: "tampered", "LEDGER-BROKEN": "ledger-broken", TORN: "torn" })[e?.code] || "unknown");
+
+/** 本 checkout 当前批状态(结清态也返回)的义务摘要。readStore 结果 + 批状态 ⇒ { key, mine, unassignedMine, unassignedOthers, settledAll }。 */
+function oblView(snap, g, ctx) {
+  const key = g && !g.cleared ? batchKeyOf(g) : null;
+  const all = arr(snap?.obligations);
+  return {
+    key,
+    mine: key ? all.filter((r) => sameKey(r.batch, key) && !isDone(r)) : [],
+    unassignedMine: all.filter((r) => !r.batch && !isDone(r) && ownerMatches(r, ctx.sid, ctx.checkout)),
+    unassignedOthers: all.filter((r) => !r.batch && !isDone(r) && !ownerMatches(r, ctx.sid, ctx.checkout)),
+    settledAll: all.filter((r) => r.status === "settled"),
+  };
+}
+const statusZh = { open: "开着", unknown: "判不了", settling: "转欠账待提交", settled: "已转欠账", cleared: "已清", withdrawn: "已撤" };
+const fmtRec = (r) => `${r.id} [${statusZh[r.status] || r.status}${r.status === "unknown" ? ` ×${r.unknownStreak || 0}` : ""}] ${recLabel(r)}${r.settle?.debtId ? `(${r.settle.debtId} ≤${r.settle.expiry})` : ""}`;
+
+/** --decision / --outcome / --withdraw 之后把批状态同步进义务账。失败只出声(--clear 时会从状态文件补导入)。 */
+//   返回新的 oblHead({h, version})或 null;调用方把它记进批台账那一行(批 298 r1 外部锚覆盖每个写点)
+function syncStoreQuiet(g) {
+  const sd = OB.storeDir();
+  if (sd.unknown) { console.error(`⚠ 义务账没记上(${sd.why})——--clear 时会从状态文件补导入;在那之前手改状态文件删掉的项核不到`); return null; }
+  try {
+    const ctx = oblCtx();
+    const snap0 = OB.readStore(sd.dir);
+    const confSnap = snapshotConfig(batchConfig(g, snap0.obligations));   // git 在锁外
+    const r = OB.mutateStore(sd.dir, (d) => syncCurrent(d, g, ctx, "batch-goal:sync", confSnap));
+    return r.head ? { h: r.head, version: r.version } : null;
+  } catch (e) { console.error(`⚠ 义务账没记上(${e.code || ""} ${e.message})——--clear 时会从状态文件补导入;在那之前手改状态文件删掉的项核不到`); return null; }
+}
+
 /** --decision / --outcome 共用:往未结清的当前批追加一项。 */
 function appendItem(kind, argv) {
   const flag = kind === "decision" ? "--decision" : "--outcome";
@@ -658,10 +1098,14 @@ function appendItem(kind, argv) {
   }
   const list = (kind === "outcome" ? numberOutcomes(cur[key]) : arr(cur[key]).slice());
   list.push(item);
+  requireAnchorOk(kind === "decision" ? "登记决定" : "登记成果");   // 批 298 r2(codex ②):写前核锚,不在丢过的账上重建
   try { atomicWrite({ ...cur, [key]: list }, Number(cur.version) || 0); } catch (e) { console.error(e.message); process.exit(2); }
-  journal(kind, { batch: cur.batch, ...item });
-  if (kind === "decision") console.log(`已登记决定 ${item.id}:${item.text}\n  --clear 时要求 ${ADR_DIR}/NNNN-*.md(本批基点之后新增或修改)里有一行「决定编号:${item.id}」或「被 ${item.id} 取代」。`);
-  else console.log(`已登记可见成果 O${item.n}:${item.text}\n  --clear 时要求 ${DIARY} 有一行(基点之后新增)的事项栏第一个批号标记是「批 ${cur.batch}」(文件不存在则只提示)。`);
+  const oh = syncStoreQuiet({ ...cur, [key]: list });   // 批 298:同时记进义务账(换批 / --force 带得走,手改状态文件删不掉)
+  journal(kind, { batch: cur.batch, ...item, ...(oh ? { oblHead: oh } : {}) });   // oblHead:外部锚(批 298 r1)
+  // 批 298 r2:提示按本批冻结的配置快照说(武装时那一版),与 --clear 的求值同口径
+  const conf = (() => { const sd = OB.storeDir(); const recs = sd.unknown ? [] : OB.readStore(sd.dir).obligations; return batchConfig(cur, recs); })();
+  if (kind === "decision") console.log(`已登记决定 ${item.id}:${item.text}\n  ${conf.adrDir ? `--clear 时要求 ${conf.adrDir}/NNNN-*.md(本批基点之后新增或修改、且已提交)里有一行「决定编号:${item.id}」或「被 ${item.id} 取代」(目录按本批武装时的配置快照;目录不在算缺)。` : `本批武装时的配置没配 ADR 目录(${INSTALL_CONFIG_FILE}),--clear 不核 ADR。`}`);
+  else console.log(`已登记可见成果 O${item.n}:${item.text}\n  ${conf.diary ? `--clear 时要求 ${conf.diary}(本批武装时的配置快照;改名会跟随)有一行基点之后新增、且已提交的事项栏第一个批号标记是「批 ${cur.batch}」;文件不在算缺,读不了才算判不了。` : `本批武装时的配置没配产品日记(${INSTALL_CONFIG_FILE}),--clear 不核日记。`}`);
   process.exit(0);
 }
 
@@ -694,15 +1138,38 @@ function withdrawItem(argv) {
   let cur;
   try { cur = load(); } catch (e) { console.error(`拒绝撤回:${e.message}`); process.exit(2); }
   if (!cur || cur.cleared || !Array.isArray(cur.conditions) || !cur.conditions.length) { console.error("拒绝撤回:盘上没有未结清的批。"); process.exit(2); }
+  requireAnchorOk("撤回");   // 批 298 r2(codex ②)
   const loc = locateWithdraw(cur, a.target);
-  if (loc.error) { console.error(`拒绝撤回:${loc.error}`); process.exit(2); }
+  if (loc.error) {
+    // 批 298:本批状态里没有 ⇒ 再找换批带进来的(别的批登记的决定 / 成果;成果写 <批号>:O<n>)
+    const sd = OB.storeDir();
+    if (!sd.unknown) {
+      const snap = OB.readStore(sd.dir);
+      const key = batchKeyOf(cur);
+      const om = String(a.target).match(/^(.+):O0*(\d+)$/i);
+      const hit = OB.TRUSTED.has(snap.kind) ? arr(snap.obligations).find((r) => sameKey(r.batch, key) && !sameKey(r.origin, key) && !isDone(r) &&
+        (om ? r.type === "outcome-diary" && String(r.origin?.batch) === om[1] && r.payload?.n === Number(om[2])
+          : r.type === "decision-adr" && decisionNo(r.payload?.id) === decisionNo(a.target) && hasDecisionId(String(r.payload?.id), a.target))) : null;
+      if (hit) {
+        let wr;
+        try {
+          wr = OB.mutateStore(sd.dir, (d) => { const r = d.get(hit.id); if (!r || r.rev !== hit.rev) throw new OB.ObligationError("CONFLICT", "读后这条义务被改过"); d.put({ ...r, status: "withdrawn", lastResult: { at: new Date().toISOString(), result: "withdrawn", by: "batch-goal --withdraw", why: a.reason } }, { op: "withdraw", by: "batch-goal --withdraw", why: a.reason }); });
+        } catch (e) { console.error(`拒绝撤回:义务账写不进去(${e.code || ""} ${e.message})——重跑一次`); process.exit(2); }
+        journal("withdraw", { batch: hit.origin?.batch ?? null, intoBatch: cur.batch, kind: hit.type === "decision-adr" ? "decision" : "outcome", ...(hit.type === "decision-adr" ? { id: hit.payload.id } : { o: a.target }), text: hit.payload?.text, reason: a.reason, oblHead: { h: wr.head, version: wr.version } });
+        console.log(`已撤回带入本批的${recLabel(hit)}「${String(hit.payload?.text || "").slice(0, 60)}」——理由:${a.reason}(义务账记 withdraw 行)`);
+        process.exit(0);
+      }
+    }
+    console.error(`拒绝撤回:${loc.error}`); process.exit(2);
+  }
   const item = loc.list[loc.index];
   const rest = loc.list.filter((_, k) => k !== loc.index);
   const w = { kind: loc.kind, ...item, reason: a.reason, withdrawnAt: new Date().toISOString() };
   const key = loc.kind === "decision" ? "decisions" : "outcomes";
   try { atomicWrite({ ...cur, [key]: rest, withdrawn: [...arr(cur.withdrawn), w] }, Number(cur.version) || 0); } catch (e) { console.error(e.message); process.exit(2); }
+  const oh = syncStoreQuiet({ ...cur, [key]: rest, withdrawn: [...arr(cur.withdrawn), w] });
   const label = loc.kind === "decision" ? item.id : `O${item.n}`;
-  journal("withdraw", { batch: cur.batch, kind: loc.kind, ...(loc.kind === "decision" ? { id: item.id } : { o: label }), text: item.text, reason: a.reason });
+  journal("withdraw", { batch: cur.batch, kind: loc.kind, ...(loc.kind === "decision" ? { id: item.id } : { o: label }), text: item.text, reason: a.reason, ...(oh ? { oblHead: oh } : {}) });
   console.log(`已撤回${loc.kind === "decision" ? "决定" : "成果"} ${label}「${String(item.text || "").slice(0, 60)}」——理由:${a.reason}\n  --clear 不再核它;台账留 withdraw 行;编号/序号不复用。`);
   process.exit(0);
 }
@@ -724,25 +1191,8 @@ export function debtTableIssues(text) {
   if (heads.length) out.push(`${heads.length} 个小节标题重复(${heads.slice(0, 3).map(([k, n]) => `「${k.replace(/^## /, "")}」×${n}`).join(" ")})`);
   return out;
 }
-/** 批 285(D133):债表一行切成列。反引号代码段里的 `|` 与转义的 `\|` 不是列分隔(坏行里的竖线几乎都出在代码段里),
- *  先换成占位再切、切完还原。返回去掉首尾空串的各列;列数由调用方判(到期腿要求恰为 6)。
- *  天花板:代码段外的裸竖线(描述里直接写 a|b)仍会把行切多——那种行被点名跳过,不猜。 */
-export function debtRowCells(line) {
-  const P = "\u0001";
-  return String(line || "")
-    .replace(/`[^`\n]*`/g, (s) => s.replace(/\|/g, P))
-    .replace(/\\\|/g, "\\" + P)
-    .split("|").slice(1, -1)
-    .map((c) => c.split(P).join("|"));
-}
-
-/** 批 286(D193④,grill 285 外审附报):这一行是不是「已撤销 / 待用户裁」而不追到期——只看**失效期列与出路列**。
- *  原来按整行查,描述里随口提到这几个字(D159)整行就永不到期提示。切不出 6 列 ⇒ 退回整行(偏松,同旧口径)。 */
-export function debtRowParked(line) {
-  let c = debtRowCells(line);
-  if (c.length !== 6) { const n = String(line).split("|").slice(1, -1); if (n.length === 6) c = n; }
-  return /已撤销|待用户裁/.test(c.length === 6 ? `${c[3]} ${c[5]}` : String(line));
-}
+// 批 301:debtRowCells(批 285 D133)/ debtRowParked(批 286 D193④)挪进 scripts/lib/debt-schema.mjs(欠账表整份校验的同一份切列),
+//   这里原名再导出,调用方不变。
 
 /** 到期腿的逐行判定(批 285 D133 从 --arm 分支抽出)。rows = 债表里 `| Dnn |` 起头的行;cur = 本批号(数)。
  *  返回 { mine, yours, colBad }:到期未结的【我做】/【需你裁】条目,与列数异常被跳过的 D 号。 */
@@ -770,18 +1220,23 @@ export function debtDue(rows, cur) {
 
 function debtTableWarn() {
   try {
-    const issues = debtTableIssues(fs.readFileSync("docs/gate-debts.md", "utf8"));
-    if (issues.length) console.log(`🔴 欠账表结构坏了(docs/gate-debts.md):${issues.join(";")}——先看 git log -p -- docs/gate-debts.md 找哪笔提交弄坏的,以那笔之前的版本为底重建`);
+    const issues = debtTableIssues(fs.readFileSync(cfgDebtTable(), "utf8"));
+    if (issues.length) console.log(`🔴 欠账表结构坏了(${cfgDebtTable()}):${issues.join(";")}——先看 git log -p -- docs/gate-debts.md 找哪笔提交弄坏的,以那笔之前的版本为底重建`);
   } catch { /* 表读不到由到期腿报 */ }
 }
+
+// 自测用的安装方配置:HostApp 的取值,写成字面量(不读 cwd 那份,自测在哪跑都一样)。沙盒仓里写同一份进 gate-install.json。
+const TEST_INSTALL_JSON = JSON.stringify({ format: "gate-install/v1", diary: "docs/product-diary.md", adrDir: "docs/adr", debtTable: "docs/gate-debts.md",
+  loadBearingExtra: ["^docs/gate/AGENTS\\.md$", "^docs/laws/", "^docs/archive/laws-[^/]+/(?:collab|reporting|constitution-[\\w-]+)\\.md$", "^scripts/verify-prod\\.mjs$", "^docs/(?:constraint|tool)-register\\.md$"] }, null, 2) + "\n";
 
 function selfTest() {
   const cases = [];
   const t = (name, got, want) => {
     const ok = JSON.stringify(got) === JSON.stringify(want);
     cases.push(ok);
-    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : `\n      实得 ${JSON.stringify(got)}\n      期待 ${JSON.stringify(want)}`}`);
   };
+  CONFIG_OVERRIDE = parseInstallConfig(TEST_INSTALL_JSON, "selftest");
   const goal = { batch: "053", conditions: ["九项落地", "逐文件提交", "工作树为空"] };
   t("零确认 ⇒ 三条全 pending", evaluate(goal, "干完了").pending.map((p) => p.n), [1, 2, 3]);
   t("逐条确认 ⇒ 无 pending", evaluate(goal, "条件1:达成\n条件2:达成\n条件3:达成").pending.length, 0);
@@ -940,7 +1395,8 @@ function selfTest() {
   t("BP-7:「批 255 和用户讨论 256」不把 256 并进来", diaryHasBatch("| d | 批 255 和用户讨论 256 | y | e |", "256"), false);
   t("BP-7:正序在前时反序量词不抢位(批 255:回顾 256 批)", diaryHasBatch("| d | 批 255:回顾 256 批 | y | e |", "256"), false);
   t("BP-4:日记读错误(非 ENOENT)⇒ unknown", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => { const e = new Error("busy"); e.code = "EBUSY"; throw e; } }); return [!!o.unknown, o.diaryMissing]; })(), [true, false]);
-  t("BP-4:日记 ENOENT ⇒ 只提示", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => { const e = new Error("no"); e.code = "ENOENT"; throw e; } }); return [!!o.unknown, o.notes.filter((n) => /product-diary|日记/.test(n)).length]; })(), [false, 1]);
+  // 批 298 r2(猎手 FB-4):配置写了日记路径、文件不在 ⇒ 按「缺」报(不判不了、也不只提示);没配日记的仓才跳过
+  t("298 r2(原 BP-4 改):配置了日记而 ENOENT ⇒ 缺(diaryMissing),不是判不了", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => { const e = new Error("no"); e.code = "ENOENT"; throw e; } }); return [!!o.unknown, o.diaryMissing]; })(), [false, true]);
   const diffGit = (added) => (a) => a[0] === "diff" ? { status: 0, stdout: `--- a/docs/product-diary.md\n+++ b/docs/product-diary.md\n@@ -9 +9,1 @@\n${added.map((l) => "+" + l).join("\n")}\n` } : { status: 1, stdout: "" };
   t("BP-2:有基点时日记行须在新增行里(旧行不抵)", obligationCheck({ batch: "256", baseCommit: "abc1234", outcomes: [{ text: "x" }] }, { readDiary: () => "| d | 批 256:旧 | y | e |", git: diffGit(["| d | 批 255:别的 | y | e |"]) }).diaryMissing, true);
   t("BP-2:有基点、新增行有本批 ⇒ 过", obligationCheck({ batch: "256", baseCommit: "abc1234", outcomes: [{ text: "x" }] }, { readDiary: () => "| d | 批 256:新 | y | e |", git: diffGit(["| d | 批 256:新 | y | e |"]) }).diaryMissing, false);
@@ -948,7 +1404,7 @@ function selfTest() {
   t("BP-9:--withdraw 必须带非空 --reason", (() => { try { parseWithdraw(["--withdraw", "256-D1"]); return "no-throw"; } catch { return "throw"; } })(), "throw");
   t("BP-9:定位决定(前导零也认)与成果序号", [locateWithdraw({ decisions: [{ id: "256-D1" }, { id: "256-D2" }] }, "256-D02").index, locateWithdraw({ outcomes: [{ n: 3, text: "a" }] }, "O3").index, !!locateWithdraw({ decisions: [{ id: "256-D1" }] }, "257-D1").error], [1, 0, true]);
   t("ADR:没登记决定 ⇒ 不查(不调 git)", adrCoverage([], "abc", () => { throw new Error("不该调"); }).missing, []);
-  t("义务:日记不存在 ⇒ 只提示不拒", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => null }); return [o.diaryMissing, o.notes.filter((n) => /product-diary|日记/.test(n)).length]; })(), [false, 1]);
+  t("298 r2(原「日记不存在只提示」改):配置了日记而不存在 ⇒ 缺、不是判不了", (() => { const o = obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => null }); return [o.diaryMissing, !!o.unknownParts.diary]; })(), [true, false]);
   t("义务:没登记成果 ⇒ 不读日记", obligationCheck({ batch: "256" }, { readDiary: () => { throw new Error("不该读"); } }).diaryMissing, false);
   t("义务:登记了成果、日记无本批 ⇒ 缺", obligationCheck({ batch: "256", outcomes: [{ text: "x" }] }, { readDiary: () => "| d | 批 2560:x | y | e |" }).diaryMissing, true);
   t("义务:git 判不了 ⇒ unknown", !!obligationCheck({ batch: "256", decisions: dec }, { git: () => ({ status: 128, stdout: "" }) }).unknown, true);
@@ -958,7 +1414,38 @@ function selfTest() {
     const g0 = { batch: "276", baseCommit: "abc1234" };
     t("D177:触及承重面且零决定 ⇒ 列出", obligationCheck(g0, { git: names(["scripts/hook-remote-check.mjs", "docs/x.md"]) }).noDecisionTouched, ["scripts/hook-remote-check.mjs"]);
     t("D177:触及法典 / AGENTS.md / 闸引擎 / 推送钩子都算", obligationCheck(g0, { git: names(["docs/laws/collab.md", "AGENTS.md", "scripts/lib/gate-rules.mjs", "scripts/git-hooks/pre-push.mjs", "scripts/install-git-hooks.mjs"]) }).noDecisionTouched.length, 5);
-    t("D177:只改自测文件与普通文档 ⇒ 不拦", obligationCheck(g0, { git: names(["scripts/hook-remote-check.selftest.mjs", "docs/gate-debts.md", "app/page.tsx"]) }).noDecisionTouched, []);
+    // 批 292:候选台账汇总(结清时的唯一必经读点)
+    {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bg-cand-"));
+      const f = path.join(dir, "c.jsonl");
+      t("292 候选汇总:台账不存在 ⇒ 零(台账未建)", /零\(台账未建\)/.test(candidateSummary("2026-11-06T00:00:00Z", f)), true);
+      // (批 292 codex r1:文案「本批」改「武装以来,各会话合计」——只按时间归集,不按会话 / 批次)
+      fs.writeFileSync(f, [
+        { ts: "2026-11-05T23:00:00Z", hits: [{ id: "E2" }] },                       // 武装之前,不计
+        { ts: "2026-11-06T01:00:00Z", hits: [{ id: "E2" }, { id: "S" }] },
+        { ts: "2026-11-06T02:00:00Z", hits: [{ id: "E2" }] },
+      ].map((x) => JSON.stringify(x)).join("\n") + "\n坏行\n");
+      const s = candidateSummary("2026-11-06T00:00:00Z", f);
+      t("292 候选汇总:只计武装之后、按次数降序", /2 轮;坏行 1\(未计入,台账可能缺损\)\):E2×2、S×1/.test(s), true);
+      t("292 codex r1 §3:汇总带可追溯样本与回放前提", /· E2 @/.test(s) && /真阳性回放,再定删不删/.test(s) && !/⇒ 删检测/.test(s), true);
+      fs.writeFileSync(f, JSON.stringify({ ts: "2026-11-05T23:00:00Z", hits: [{ id: "Q" }] }) + "\n");
+      t("292 候选汇总:武装之后无命中 ⇒ 零(也出声)", /武装以来命中:零 ──$/.test(candidateSummary("2026-11-06T00:00:00Z", f)), true);
+      fs.writeFileSync(f, "坏行\n坏行二\n");
+      t("292 codex r1 §5:全是坏行 ⇒ 不报成干净的零", /零;坏行 2/.test(candidateSummary("2026-11-06T00:00:00Z", f)), true);
+      fs.writeFileSync(f, JSON.stringify({ ts: "2026-11-06T01:00:00Z", hits: "broken" }) + "\n" + JSON.stringify({ ts: "坏时刻", hits: [] }) + "\n");
+      t("292 codex fix-r1 §4:合法 JSON 但结构坏 ⇒ 计坏行", /零;坏行 2/.test(candidateSummary("2026-11-06T00:00:00Z", f)), true);
+      fs.writeFileSync(f, JSON.stringify({ ts: "2026-11-06T01:00:00Z", hits: [null, {}] }) + "\n");
+      t("292 codex fix2-r1:hits 元素结构坏 ⇒ 计坏行,不报干净的零", /零;坏行 2/.test(candidateSummary("2026-11-06T00:00:00Z", f)), true);
+      t("292 红队 附三④:武装时刻缺 ⇒ 不汇总(不把历史全量计进来)", /武装时刻缺,不汇总/.test(candidateSummary(undefined, f)), true);
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 临时目录留着无害 */ }
+      // 红队 BP-1:worktree 里结清时读主树那一份(git 公共目录的上一级)
+      t("292 红队 BP-1:台账路径按 git 公共目录定主树",
+        candidateLedgerPath(() => ({ status: 0, stdout: "/repo/.git\n" })).replace(/\\/g, "/"), "/repo/.claude/.gate-candidates.jsonl");
+      t("292 红队 BP-1:git 取不到 ⇒ 退回 cwd 相对", candidateLedgerPath(() => ({ status: 128, stdout: "" })), ".claude/.gate-candidates.jsonl");
+    }
+    t("290 FB-15:只改存档 README ⇒ 不列",obligationCheck(g0, { git: names(["docs/archive/laws-2026-11/README.md"]) }).noDecisionTouched, []);
+    t("290 FB-15 对照:改规则锚着的存档法典 ⇒ 列出", obligationCheck(g0, { git: names(["docs/archive/laws-2026-11/collab.md"]) }).noDecisionTouched, ["docs/archive/laws-2026-11/collab.md"]);
+    t("D177:只改自测文件与普通文档 ⇒ 不拦",obligationCheck(g0, { git: names(["scripts/hook-remote-check.selftest.mjs", "docs/gate-debts.md", "app/page.tsx"]) }).noDecisionTouched, []);
     t("D177:声明过 --no-decision ⇒ 不核", obligationCheck({ ...g0, noDecision: { text: "只修笔误" } }, { git: names(["scripts/hook-guard.mjs"]) }).noDecisionTouched, []);
     t("D177 r6 BP-23:照抄消息模板的理由不算声明", obligationCheck({ ...g0, noDecision: { text: "合并带入,决定在批 N" } }, { git: names(["scripts/hook-guard.mjs"]) }).noDecisionTouched.length, 1);
     t("D177 r6 BP-20:手抄表外的承重件(package.json / verify-laws / perm-match)也核", obligationCheck(g0, { git: names(["package.json", "scripts/verify-laws.mjs", "scripts/lib/perm-match.mjs"]) }).noDecisionTouched.length, 3);
@@ -974,7 +1461,7 @@ function selfTest() {
   // ── 批 256 集成:真 CLI 跑在临时 git 仓里(**不碰真台账**:cwd=临时目录,状态与台账都写在那里)──
   const integ = (() => {
     const J = path.join; const tmp = fs.mkdtempSync(J(os.tmpdir(), "bg256-"));
-    const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" };
+    const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid", GIT_CEILING_DIRECTORIES: path.dirname(tmp) };   // r2:沙盒一律设天花板(本机用户目录是 git 仓)
     const g = (...a) => spawnSync("git", a, { cwd: tmp, encoding: "utf8", env, windowsHide: true });
     const cli = (...a) => spawnSync(process.execPath, ["--no-warnings", fileURLToPath(import.meta.url), ...a], { cwd: tmp, encoding: "utf8", env, windowsHide: true, timeout: 60_000 });
     const w = (rel, s) => { fs.mkdirSync(path.dirname(J(tmp, rel)), { recursive: true }); fs.writeFileSync(J(tmp, rel), s); };
@@ -982,7 +1469,7 @@ function selfTest() {
     const st = () => JSON.parse(fs.readFileSync(J(tmp, ".claude", ".batch-goal.json"), "utf8"));
     const res = {};
     try {
-      g("init", "-q"); w(".gitignore", ".claude/\n"); w("docs/adr/0008-old.md", "# 0008\n"); w("docs/product-diary.md", "| 日期 | 事项 | 结果 | 证据 |\n|---|---|---|---|\n| d | 批 2560:x | y | e |\n");
+      g("init", "-q"); w(".gitignore", ".claude/\n"); w("gate-install.json", TEST_INSTALL_JSON); w("docs/adr/0008-old.md", "# 0008\n"); w("docs/product-diary.md", "| 日期 | 事项 | 结果 | 证据 |\n|---|---|---|---|\n| d | 批 2560:x | y | e |\n");
       commit("init");
       const base = g("rev-parse", "HEAD").stdout.trim();
       res.arm = cli("--arm", "256", "--cond", "甲").status;
@@ -1003,7 +1490,7 @@ function selfTest() {
       // 日记文件不存在 ⇒ 只提示
       res.arm2 = cli("--arm", "257", "--cond", "乙").status;
       cli("--outcome", "某成果"); g("rm", "-q", "docs/product-diary.md"); commit("rm diary");
-      const r3 = cli("--clear"); res.noDiary = r3.status === 0 && /不存在/.test(r3.stderr);
+      const r3 = cli("--clear"); res.noDiary = r3.status === 2 && /reason=diary-missing/.test(r3.stderr) && /不存在/.test(r3.stderr);
     } catch (e) { res.err = String(e && e.message); }
     finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 临时目录清不掉不判 */ } }
     return res;
@@ -1013,25 +1500,42 @@ function selfTest() {
   t("集成:同号重武装保留基点与决定", integ.rearmKeepsBase, true);
   t("集成:缺 ADR 与日记行 ⇒ 拒清(exit 2)、点名编号、给日记行模板、状态未结清", [integ.refuse, integ.refuseMsg, integ.notCleared], [2, true, true]);
   t("集成:补 ADR + 日记行并提交 ⇒ 结清", [integ.clear, integ.cleared], [0, true]);
-  t("集成:日记文件不存在 ⇒ 只提示、照常结清", [integ.arm2, integ.noDiary], [0, true]);
+  t("集成 298 r2(原「日记不存在只提示」改):配置了日记而文件被删 ⇒ 按缺拒清 diary-missing", [integ.arm2, integ.noDiary], [0, true]);
   if (integ.err) console.log("  集成段异常:" + integ.err);
 
   // ── 批 256b 集成:每个回件一个独立临时 git 仓(cwd=临时目录 ⇒ 状态与台账都写在那里,不碰真台账)──
-  const sandbox = (fn) => {
+  const sandbox = (fn, opt = {}) => {
     const J = path.join; const tmp = fs.mkdtempSync(J(os.tmpdir(), "bg256b-"));
-    const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" };
+    const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid", GIT_CEILING_DIRECTORIES: path.dirname(tmp) };   // r2:沙盒一律设天花板(本机用户目录是 git 仓)
     const g = (...a) => spawnSync("git", a, { cwd: tmp, encoding: "utf8", env, windowsHide: true });
-    const cli = (...a) => spawnSync(process.execPath, ["--no-warnings", fileURLToPath(import.meta.url), ...a], { cwd: tmp, encoding: "utf8", env, windowsHide: true, timeout: 60_000 });
+    const cliEnv = (extra, ...a) => spawnSync(process.execPath, ["--no-warnings", fileURLToPath(import.meta.url), ...a], { cwd: tmp, encoding: "utf8", env: { ...env, ...extra }, windowsHide: true, timeout: 60_000 });
+    const cli = (...a) => cliEnv({}, ...a);
     const w = (rel, s) => { fs.mkdirSync(path.dirname(J(tmp, rel)), { recursive: true }); fs.writeFileSync(J(tmp, rel), s); };
     const commit = (m) => { g("add", "-A"); return g("commit", "-q", "-m", m); };
     const st = () => JSON.parse(fs.readFileSync(J(tmp, ".claude", ".batch-goal.json"), "utf8"));
     const jrows = () => fs.readFileSync(J(tmp, ".claude", ".batch-goal.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return {}; } });
+    const oblDir = J(tmp, ".claude", ".obligations");
+    const ost = () => JSON.parse(fs.readFileSync(J(oblDir, "state.json"), "utf8"));
+    // 产生器替身:在沙盒仓里经 lib 建义务 / 回报取证(本批不新增真产生器;这只是测通用拒绝与出路)
+    const probeFile = J(tmp, "..", `${path.basename(tmp)}-probe.mjs`);
+    fs.writeFileSync(probeFile, `import * as OB from ${JSON.stringify(new URL("./lib/obligations.mjs", import.meta.url).href)};
+const [cmd, a1, a2, a3] = process.argv.slice(2);
+import { spawnSync as __sp } from "node:child_process"; import __fs from "node:fs";
+const here = () => { let p = String(__sp("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8", windowsHide: true }).stdout || "").trim(); try { p = __fs.realpathSync.native(p); } catch {} p = p.split(String.fromCharCode(92)).join("/"); while (p.endsWith("/")) p = p.slice(0, -1); return process.platform === "win32" ? p.toLowerCase() : p; };
+const { dir } = OB.storeDir();
+const r = OB.mutateStore(dir, (d) => cmd === "create"
+  ? OB.createObligation(d, { type: "selftest-probe", owner: a1 === "-" ? null : a1, checkout: a2 === "-" ? null : (a2 || here()), outlet: "probe evidence <id> cleared", binding: a3 ? { hash: a3 } : null }, "selftest")
+  : OB.recordEvidence(d, a1, { producer: "selftest-probe", result: a2, ...(a3 ? { boundHash: a3 } : {}), why: "probe" }));
+console.log(JSON.stringify(cmd === "create" ? { id: r.result.id } : r.result));
+`);
+    const probe = (...a) => { const r = spawnSync(process.execPath, ["--no-warnings", probeFile, ...a], { cwd: tmp, encoding: "utf8", env, windowsHide: true, timeout: 60_000 }); try { return JSON.parse(r.stdout); } catch { return { err: r.stderr }; } };
     const DIARY0 = "| 日期 | 事项 | 结果 | 证据 |\n|---|---|---|---|\n| d | 批 1:x | y | e |\n";
     try {
-      g("init", "-q"); g("config", "core.autocrlf", "false"); w(".gitignore", ".claude/\n"); w("docs/adr/0008-old.md", "# 0008\n"); w("docs/product-diary.md", DIARY0); commit("init");
-      return fn({ tmp, g, cli, w, commit, st, jrows });
+      g("init", "-q"); g("config", "core.autocrlf", "false"); w(".gitignore", ".claude/\n"); if (opt.config !== false) w("gate-install.json", opt.config || TEST_INSTALL_JSON);
+      w("docs/adr/0008-old.md", "# 0008\n"); w("docs/product-diary.md", DIARY0); commit("init");
+      return fn({ tmp, g, cli, cliEnv, w, commit, st, jrows, oblDir, ost, probe });
     } catch (e) { return { err: String(e && e.message) }; }
-    finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 清不掉不判 */ } }
+    finally { try { fs.rmSync(tmp, { recursive: true, force: true }); fs.rmSync(probeFile, { force: true }); } catch { /* 清不掉不判 */ } }
   };
   t("集成 BP-5:中文短名 ADR 写了编号 ⇒ 结清(此前被 quotePath 转义丢掉报缺)", sandbox(({ cli, w, commit, st }) => {
     cli("--arm", "300", "--cond", "甲"); cli("--decision", "中文名决定");
@@ -1086,12 +1590,19 @@ function selfTest() {
     const c3 = cli("--clear").status;
     return [c1, id2, refused, c3];
   }), [0, "302-D2", [2, true, true], 0]);
-  t("集成 BP-3:--force 换批覆盖带决定/成果的批 ⇒ 点名丢失项并记 force-over-obligations", sandbox(({ cli, jrows }) => {
-    cli("--arm", "303", "--cond", "甲"); cli("--decision", "会丢的决定"); cli("--outcome", "会丢的成果");
+  // 批 298:原 BP-3 是「点名丢失项」——现在不丢:带进新批,新批 --clear 照样核;补上 ADR 与日记行(按批 303 的基点算)才放行
+  t("集成 298(原 BP-3 改):--force 换批 ⇒ 决定 / 成果带进新批、记 force-carry-obligations;新批 --clear 拒 obligation-open;补齐后放行", sandbox(({ tmp, cli, w, commit, jrows }) => {
+    cli("--arm", "303", "--cond", "甲"); cli("--decision", "会带走的决定"); cli("--outcome", "会带走的成果");
     const r = cli("--arm", "304", "--cond", "乙", "--force");
-    const row = jrows().find((o) => o.action === "force-over-obligations");
-    return [r.status, /303-D1/.test(r.stderr) && /O1/.test(r.stderr), row?.batch, row?.newBatch, row?.decisions?.[0]?.id];
-  }), [0, true, "303", "304", "303-D1"]);
+    const row = jrows().find((o) => o.action === "force-carry-obligations");
+    const stat = cli("--status").stdout;
+    cli("--no-decision", "自测:本批无决定");
+    const c1 = cli("--clear");
+    w("docs/adr/0009-a.md", "# 0009\n- 决定编号:303-D1\n"); fs.appendFileSync(path.join(tmp, "docs/product-diary.md"), "| d | 批 303:会带走的成果 | y | e |\n"); commit("adr+diary for 303");
+    const c2 = cli("--clear");
+    return [r.status, /303-D1/.test(r.stderr) && /原样带进批 304/.test(r.stderr), row?.batch, row?.newBatch, row?.decisions?.[0]?.id,
+      /决定 303-D1\S来自批 303/.test(stat) && /成果 303:O1/.test(stat), c1.status, /reason=obligation-open/.test(c1.stderr) && /303-D1/.test(c1.stderr), c2.status];
+  }), [0, true, "303", "304", "303-D1", true, 2, true, 0]);
   t("集成 BP-4:日记读错误(EISDIR)⇒ 拒清 obligation-unknown,不再放行", sandbox(({ g, cli, w, commit }) => {
     g("rm", "-q", "docs/product-diary.md"); w("docs/product-diary.md/keep.txt", "x"); commit("diary becomes dir");
     cli("--arm", "305", "--cond", "甲"); cli("--outcome", "某成果");
@@ -1128,10 +1639,637 @@ function selfTest() {
     const c = cli("--clear").status;
     return [noReason, wd, wo, /已撤 309-D2/.test(stat) && /已撤 O1/.test(stat), id3, rows.map((o) => o.reason), c];
   }), [2, 0, 0, true, "309-D3", ["登记错了,不是决定", "纯调查无成果"], 0]);
+  oblSelfTest(t, sandbox);
+  CONFIG_OVERRIDE = null;
   const pass = cases.filter(Boolean).length;
   console.log(`\n自测 ${pass}/${cases.length}`);
   return pass === cases.length ? 0 : 1;
 }
+
+// ── 批 298 自测:义务账 / 安装方配置 / --clear 通用拒绝 / --settle / 带入(拆批稿「297」节测试矩阵四类:成功、边界、拒绝点实测、出路)──
+//   拒绝点一律**主动造一次**该拦的事件看退出码与 reason,不以「没报错」为准。沙盒仓 cwd=临时目录 ⇒ 义务账也在那里,不碰主树。
+function oblSelfTest(t, sandbox) {
+  const J = path.join;
+  const SID = { CLAUDE_CODE_SESSION_ID: "selftest-sess-me-0298" };
+  const OTHER = "selftest-sess-other-0298";
+  // ── 安装方配置 ──
+  const K = parseInstallConfig(TEST_INSTALL_JSON);
+  t("298 配置:HostApp 那份解析成功、取值照旧", [K.found, K.diary, K.adrDir, K.debtTable, K.loadBearingExtra.length], [true, "docs/product-diary.md", "docs/adr", "docs/gate-debts.md", 5]);
+  t("298 配置:仓里那份 gate-install.json 与自测字面量逐项相等(仓里没有这份文件 ⇒ 不比)", (() => { const f = fileURLToPath(new URL("../gate-install.json", import.meta.url)); if (!fs.existsSync(f)) return [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]; const r = parseInstallConfig(fs.readFileSync(f, "utf8")); return [r.diary, r.adrDir, r.debtTable, r.loadBearingSrc]; })(), [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]);
+  t("298 配置:未知键(拼错 diray)⇒ 整份判坏", !!parseInstallConfig(JSON.stringify({ format: "gate-install/v1", diray: "x.md" })).error, true);
+  t("298 配置:路径带 .. / 绝对路径 ⇒ 判坏", [!!parseInstallConfig(JSON.stringify({ format: "gate-install/v1", diary: "../x.md" })).error, !!parseInstallConfig(JSON.stringify({ format: "gate-install/v1", adrDir: "/abs" })).error], [true, true]);
+  t("298 配置:format 不对 / 不是 JSON ⇒ 判坏", [!!parseInstallConfig("{}").error, !!parseInstallConfig("{oops").error], [true, true]);
+  t("298 配置:文件不存在 ⇒ 不做日记 / ADR,欠账表取缺省", (() => { const r = readInstallConfig(() => { const e = new Error("no"); e.code = "ENOENT"; throw e; }); return [r.found, r.diary, r.adrDir, r.debtTable]; })(), [false, null, null, "docs/gate-debts.md"]);
+  t("298 配置:读错误(非 ENOENT)⇒ error(判不了)", !!readInstallConfig(() => { const e = new Error("busy"); e.code = "EBUSY"; throw e; }).error, true);
+  t("298 配置绕过面:批内把 diary 改成 null ⇒ 并入基点版仍要日记", (() => { const m = mergeInstallConfig(parseInstallConfig(JSON.stringify({ format: "gate-install/v1", adrDir: "docs/adr" })), K); return [m.diary, m.mergedFromBase]; })(), ["docs/product-diary.md", true]);
+  // ── 承重面拆分等价(行为零变化的机器判据)──
+  const OLD = /^(?:AGENTS\.md$|CLAUDE\.md$|docs\/gate\/AGENTS\.md$|docs\/laws\/|docs\/archive\/laws-[^/]+\/(?:collab|reporting|constitution-[\w-]+)\.md$|scripts\/verify-prod\.mjs$|docs\/(?:constraint|tool)-register\.md$|\.claude\/(?:agents|skills|commands)\/|\.claude\/settings(?:\.[\w-]+)?\.json$|scripts\/hook-[^/]+\.mjs$|scripts\/lib\/(?:gate-[^/]+|write-effects)\.mjs$|scripts\/(?:fp-audit|gate-replay|batch-goal|install-git-hooks)\.mjs$|scripts\/gate-deps\/package(?:-lock)?\.json$|scripts\/git-hooks\/)/i;
+  const PATHS = ["AGENTS.md", "CLAUDE.md", "docs/gate/AGENTS.md", "docs/laws/collab.md", "docs/archive/laws-2026-11/collab.md", "docs/archive/laws-2026-11/README.md", "docs/archive/laws-x/constitution-core.md",
+    "scripts/verify-prod.mjs", "scripts/verify-prod.mjs.bak", "docs/constraint-register.md", "docs/tool-register.md", "docs/tool-index.md", ".claude/agents/a.md", ".claude/skills/x/SKILL.md", ".claude/commands/kplan.md",
+    ".claude/settings.json", ".claude/settings.tplan-exec.json", ".claude/settings.local.json", "scripts/hook-guard.mjs", "scripts/hook-guard.selftest.mjs", "scripts/lib/gate-rules.mjs", "scripts/lib/write-effects.mjs",
+    "scripts/lib/ledger-chain.mjs", "scripts/fp-audit.mjs", "scripts/gate-replay.mjs", "scripts/batch-goal.mjs", "scripts/install-git-hooks.mjs", "scripts/gate-deps/package.json", "scripts/gate-deps/package-lock.json",
+    "scripts/git-hooks/pre-push.mjs", "docs/gate-debts.md", "docs/product-diary.md", "app/page.tsx", "sub/AGENTS.md", "Docs/Laws/x.md", "docs/adr/0001-x.md"];
+  t("298 承重面拆分等价:通用面 ∪ HostApp 配置 与原表在 36 条路径上逐条相等", PATHS.filter((p) => OLD.test(p) !== isLoadBearingPath(p, K.loadBearingExtra)), []);
+  t("298 承重面:无配置时 HostApp 专属项不算(docs/laws、verify-prod)", [isLoadBearingPath("docs/laws/collab.md", []), isLoadBearingPath("scripts/verify-prod.mjs", []), isLoadBearingPath("scripts/hook-guard.mjs", [])], [false, false, true]);
+  t("298 承重面:本批新文件也算(obligations / install-config / gate-install.json)", ["scripts/lib/obligations.mjs", "scripts/lib/install-config.mjs", "gate-install.json"].map((p) => isLoadBearingPath(p, [])), [true, true, true]);
+  t("298 无配置:obligationCheck 不核日记 / ADR / 承重面零决定(只出声)", (() => { const o = obligationCheck({ batch: "330", baseCommit: "abc1234", decisions: [{ id: "330-D1" }], outcomes: [{ text: "x" }] }, { config: absentInstallConfig(), git: () => { throw new Error("不该调 git"); }, readDiary: () => { throw new Error("不该读日记"); } }); return [o.missingDecisions, o.diaryMissing, o.noDecisionTouched, !!o.unknown, o.notes.length >= 2]; })(), [[], false, [], false, true]);
+  t("298 配置坏 ⇒ obligationCheck 判不了(unknownParts.config)", (() => { const o = obligationCheck({ batch: "330" }, { config: { error: "坏了" } }); return [!!o.unknown, !!o.unknownParts.config]; })(), [true, true]);
+  // ── 纯函数:批号 / 失效期 / 债表行 / 裁决参数 ──
+  t("298 边界:批号带后缀 292b ⇒ 数字部分 292,失效期 ≤295", [OB.batchNumber("292b"), OB.batchNumber("292b") + 3, OB.batchNumber("hk-1")], [292, 295, NaN]);
+  {
+    const rec = { id: "OB-x-1", type: "outcome-diary", origin: { batch: "320", baseCommit: "abcdef123456" }, unknownStreak: 3, lastResult: { why: "日记读不了(EISDIR)| 带竖线" }, outlet: "做完它" };
+    const row = OB.settleRow(rec, { debtId: "D900", batch: "320", expiry: 323 });
+    t("298 债表行:恰 6 列、失效期在第 4 列、竖线被替换", [debtRowCells(row).length, debtRowCells(row)[3].trim(), row.includes("| 带竖线")], [6, "**≤323**", false]);
+    t("298 债表行:到期腿在批 324 列出、323 不列", [debtDue([row], 324).mine, debtDue([row], 323).mine], [["D900(≤323)"], []]);
+    const tbl = "# x\n## 在账欠账\n\n| # | a | b | c | d | e |\n|---|---|---|---|---|---|\n| D7 | a | 1 | **≤2** | s | o |\n\n## 已销账\n| D9 | x | y | z |\n";
+    const ins = OB.insertDebtRow(tbl, row);
+    t("298 债表行:插在「在账欠账」节表尾、最大 D 号全表算", [ins.split("\n").indexOf(row), ins.split("\n").indexOf("| D7 | a | 1 | **≤2** | s | o |") + 1, OB.maxDebtId(tbl)], [ins.split("\n").indexOf(row), ins.split("\n").indexOf(row), 9]);
+    t("298 债表行:HEAD 版认行要 D 号 + 义务 id + 失效期同在一行", [OB.debtRowCommitted(ins, { ...rec, settle: { debtId: "D900", expiry: 323 } }), OB.debtRowCommitted(ins, { ...rec, settle: { debtId: "D900", expiry: 324 } }), OB.debtRowCommitted(tbl, { ...rec, settle: { debtId: "D900", expiry: 323 } })], [true, false, false]);
+  }
+  {
+    const pv = (a, n) => { try { return parseVerdicts(a, n); } catch { return "throw"; } };
+    t("298 裁决参数:不给 ⇒ null;全给 ⇒ 排好序", [pv(["--clear"], 2), pv(["--clear", "--verdict", "2=不适用:没有日记", "--verdict", "1=达成"], 2)], [null, [{ n: 1, verdict: "达成" }, { n: 2, verdict: "不适用", why: "没有日记" }]]);
+    t("298 裁决参数:缺条 / 越界 / 重复 / 未达成不带理由 / 乱写 ⇒ 抛", [pv(["--verdict", "1=达成"], 2), pv(["--verdict", "3=达成"], 2), pv(["--verdict", "1=达成", "--verdict", "1=达成"], 1), pv(["--verdict", "1=未达成"], 1), pv(["--verdict", "1=done"], 1)], ["throw", "throw", "throw", "throw", "throw"]);
+  }
+  // ── 义务账库(临时目录,不经 git)──
+  {
+    const dir = fs.mkdtempSync(J(os.tmpdir(), "obl298-"));
+    const L = J(dir, "ledger.jsonl"), S = J(dir, "state.json");
+    const env0 = process.env.OBLIGATIONS_LOCK_WAIT_MS;
+    try {
+      t("298 库:空目录 ⇒ empty(可信、零条)", [OB.readStore(dir).kind, OB.readStore(dir).obligations.length], ["empty", 0]);
+      const a = OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "t-probe", owner: "s1", outlet: "x", binding: { hash: "h1" } }, "selftest")).result;
+      t("298 库:建一条 ⇒ ok、版本 1、台账验链过", [OB.readStore(dir).kind, OB.readStore(dir).version, verifyChainOk(L)], ["ok", 1, true]);
+      const v1 = OB.readStore(dir).version;
+      OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "t-probe", outlet: "y" }, "selftest"));
+      t("298 库 并发:跨长操作持有旧版本再写 ⇒ CONFLICT,不覆盖", (() => { try { OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "t-probe" }, "x"), { expectVersion: v1 }); return "no-throw"; } catch (e) { return [e.code, OB.readStore(dir).obligations.length]; } })(), ["CONFLICT", 2]);
+      t("298 库 回件绑定:哈希对不上 ⇒ 作废重开(void-stale),不写结论", (() => { const r = OB.mutateStore(dir, (d) => OB.recordEvidence(d, a.id, { producer: "p", result: "cleared", boundHash: "h0" })).result; return [r.voided, OB.readStore(dir).obligations.find((x) => x.id === a.id).status]; })(), [true, "open"]);
+      t("298 库 回件绑定:旧 rev 的回件 ⇒ 作废", OB.mutateStore(dir, (d) => OB.recordEvidence(d, a.id, { producer: "p", result: "cleared", boundHash: "h1", seenRev: 1 })).result.voided, true);
+      t("298 库:判不了 3 次 ⇒ 可转欠账;中间一次「开着」把连续计数归零", (() => {
+        const ev = (res) => OB.mutateStore(dir, (d) => OB.recordEvidence(d, a.id, { producer: "p", result: res, boundHash: "h1" })).result.rec;
+        ev("unknown"); ev("unknown"); const mid = OB.settleEligible(ev("open")); ev("unknown"); ev("unknown"); const two = OB.settleEligible(ev("unknown") && OB.readStore(dir).obligations.find((x) => x.id === a.id)); return [mid, two, OB.readStore(dir).obligations.find((x) => x.id === a.id).unknownStreak];
+      })(), [false, true, 3]);
+      t("298 库:保留类型不收外部回报(调库自助标已清的最短路)", (() => { const id = OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "decision-adr", payload: { id: "1-D1" } }, "x")).result.id; try { OB.mutateStore(dir, (d) => OB.recordEvidence(d, id, { producer: "p", result: "cleared" })); return "no-throw"; } catch (e) { return e.code; } })(), "RESERVED");
+      const good = fs.readFileSync(S, "utf8");
+      fs.writeFileSync(S, good.replace(/"status": "unknown"/, '"status": "cleared"'));
+      t("298 库 拒绝点:手改 state.json 把义务改成已清 ⇒ tampered", OB.readStore(dir).kind, "tampered");
+      t("298 库 拒绝点:tampered 时写入一律拒(不在被改过的状态上叠写)", (() => { try { OB.mutateStore(dir, () => 0); return "no-throw"; } catch (e) { return e.code; } })(), "TAMPERED");
+      t("298 库 出路:repair 按台账重建 ⇒ ok,结论回到台账里的那个(未清)", (() => { OB.repairStore(dir); const s = OB.readStore(dir); return [s.kind, s.obligations.find((x) => x.id === a.id).status]; })(), ["ok", "unknown"]);
+      fs.writeFileSync(S, "");
+      t("298 库 边界:state.json 为空 ⇒ tampered(判不了,不当没有)", OB.readStore(dir).kind, "tampered");
+      fs.rmSync(S);
+      t("298 库 边界:state.json 缺(写到一半崩了)⇒ lag,以台账为准", [OB.readStore(dir).kind, OB.readStore(dir).obligations.length], ["lag", 3]);
+      OB.repairStore(dir);
+      const raw = fs.readFileSync(L, "utf8");
+      fs.writeFileSync(L, raw + '{"at":"x","op":"transition","id":"OB-torn"');
+      t("298 库 边界:台账末行撕裂 ⇒ torn(不可信);repair 截掉后恢复", (() => { const k1 = OB.readStore(dir).kind; OB.repairStore(dir); return [k1, OB.readStore(dir).kind, OB.readStore(dir).obligations.length]; })(), ["torn", "ok", 3]);
+      fs.writeFileSync(L, raw.replace(/"to":"unknown"/, '"to":"cleared"'));
+      t("298 库 拒绝点:改台账行 ⇒ ledger-broken;repair 拒做", [OB.readStore(dir).kind, (() => { try { OB.repairStore(dir); return "no-throw"; } catch (e) { return e.code; } })()], ["ledger-broken", "LEDGER-BROKEN"]);
+      fs.writeFileSync(L, raw);
+      fs.mkdirSync(J(dir, "state.lock"));
+      process.env.OBLIGATIONS_LOCK_WAIT_MS = "150";
+      t("298 库 拒绝点:锁被占(未过期)⇒ LOCK-TIMEOUT,盘上不变", (() => { const v = OB.readStore(dir).version; try { OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "t-probe" }, "x")); return "no-throw"; } catch (e) { return [e.code, OB.readStore(dir).version === v]; } })(), ["LOCK-TIMEOUT", true]);
+      const old = new Date(Date.now() - 60_000); fs.utimesSync(J(dir, "state.lock"), old, old);
+      t("298 库 出路:陈锁(>30 s)可夺 ⇒ 写入成功", (() => { try { OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "t-probe" }, "x")); return OB.readStore(dir).kind; } catch (e) { return e.code; } })(), "ok");
+    } finally {
+      if (env0 === undefined) delete process.env.OBLIGATIONS_LOCK_WAIT_MS; else process.env.OBLIGATIONS_LOCK_WAIT_MS = env0;
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 留着无害 */ }
+    }
+  }
+  // 多进程真并发:6 个进程同时建义务 ⇒ 6 条都在、台账链完好、版本 6(锁真起作用;原 CAS「近乎装饰」)
+  {
+    const dir = fs.mkdtempSync(J(os.tmpdir(), "obl298c-"));
+    const w = J(dir, "..", `${path.basename(dir)}-race.mjs`);
+    try {
+      fs.writeFileSync(w, `import * as OB from ${JSON.stringify(new URL("./lib/obligations.mjs", import.meta.url).href)};
+import { spawn } from "node:child_process";
+const dir = ${JSON.stringify(dir)};
+if (process.argv[2] === "one") { OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "race" }, "race")); process.exit(0); }
+const kids = Array.from({ length: 6 }, () => new Promise((res) => { const c = spawn(process.execPath, [process.argv[1], "one"], { stdio: "ignore", windowsHide: true }); c.on("exit", (code) => res(code)); }));
+Promise.all(kids).then((codes) => { console.log(JSON.stringify(codes)); });
+`);
+      const r = spawnSync(process.execPath, ["--no-warnings", w], { encoding: "utf8", windowsHide: true, timeout: 120_000 });
+      const s = OB.readStore(dir);
+      t("298 库 并发:6 进程同时写 ⇒ 全部成功、6 条、版本 6、链完好", [r.stdout.trim(), s.kind, s.obligations.length, s.version, verifyChainOk(J(dir, "ledger.jsonl"))], ["[0,0,0,0,0,0]", "ok", 6, 6, true]);
+    } finally { try { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(w, { force: true }); } catch { /* 无害 */ } }
+  }
+
+  // ── CLI 集成(沙盒 git 仓)──
+  t("298 成功:产生器在未武装时建义务 ⇒ 武装并入 ⇒ --clear 拒(obligation-open)⇒ 产生器写已清 ⇒ 放行", sandbox(({ cliEnv, probe }) => {
+    const { id } = probe("create", SID.CLAUDE_CODE_SESSION_ID);
+    const arm = cliEnv(SID, "--arm", "310", "--cond", "甲");
+    const c1 = cliEnv(SID, "--clear");
+    const ev = probe("evidence", id, "cleared");
+    const c2 = cliEnv(SID, "--clear");
+    return [arm.status, /并入本批/.test(arm.stdout), c1.status, /reason=obligation-open/.test(c1.stderr) && c1.stderr.includes(id), ev.applied, c2.status, /义务:已清 \d+ 条/.test(c2.stdout)];
+  }), [0, true, 2, true, true, 0, true]);
+  t("298 拒绝点:只有 UNKNOWN ⇒ 拒(obligation-unknown);换批 --force 后新批 --clear 仍拒", sandbox(({ cliEnv, probe }) => {
+    cliEnv(SID, "--arm", "311", "--cond", "甲");
+    const { id } = probe("create", SID.CLAUDE_CODE_SESSION_ID); probe("evidence", id, "unknown");
+    const c1 = cliEnv(SID, "--clear");
+    const f = cliEnv(SID, "--arm", "312", "--cond", "乙", "--force");
+    const c2 = cliEnv(SID, "--clear");
+    const stat = cliEnv(SID, "--status").stdout;
+    return [c1.status, /reason=obligation-unknown/.test(c1.stderr), f.status, c2.status, /reason=obligation-unknown/.test(c2.stderr), stat.includes(id)];
+  }), [2, true, 0, 2, true, true]);
+  // 批 298 r2(红队 BP-1 / codex ⑤):归属只看 checkout——别的 checkout 的不并入、只在 --status 列;同 checkout 换了会话照样认回
+  t("298 r2 边界:别的 checkout 未归属的义务不并入本批(不挡本批)、--status 单列;同 checkout 别的会话建的 ⇒ 认回并挡关账", sandbox(({ cliEnv, probe }) => {
+    const { id } = probe("create", OTHER, "c:/elsewhere/checkout");
+    const arm = cliEnv(SID, "--arm", "313", "--cond", "甲");
+    const stat = cliEnv(SID, "--status").stdout;
+    const c = cliEnv(SID, "--clear");
+    const { id: id2 } = probe("create", OTHER);   // 同 checkout、别的会话
+    const arm2 = cliEnv(SID, "--arm", "314", "--cond", "乙");
+    const c2 = cliEnv(SID, "--clear");
+    return [arm.status, /并入本批/.test(arm.stdout), /别的 checkout 未归属 1 条/.test(stat) && stat.includes(id), c.status, /并入本批/.test(arm2.stdout), c2.status, c2.stderr.includes(id2)];
+  }), [0, false, true, 0, true, 2, true]);
+  t("298 边界:同号未结清重放 ⇒ 义务与 armedAt 原样保留", sandbox(({ cliEnv, st, ost }) => {
+    cliEnv(SID, "--arm", "315", "--cond", "甲"); cliEnv(SID, "--decision", "甲决定"); const a1 = st().armedAt;
+    const r = cliEnv(SID, "--arm", "315", "--cond", "甲");
+    const rec = ost().obligations.find((x) => x.type === "decision-adr");
+    return [r.status, st().armedAt === a1, rec?.payload?.id, rec?.batch?.armedAt === a1, /315-D1/.test(cliEnv(SID, "--status").stdout)];
+  }), [0, true, "315-D1", true, true]);
+  t("298 拒绝点:手改义务账 state.json 把义务改成已清 ⇒ 拒(obligations-tampered);--repair-obligations 后照台账仍开着 ⇒ 拒 obligation-open", sandbox(({ cliEnv, probe, oblDir }) => {
+    cliEnv(SID, "--arm", "316", "--cond", "甲");
+    const { id } = probe("create", SID.CLAUDE_CODE_SESSION_ID);
+    cliEnv(SID, "--status");
+    const S = J(oblDir, "state.json"); fs.writeFileSync(S, fs.readFileSync(S, "utf8").replace(/"status": "open"/g, '"status": "cleared"'));
+    const c1 = cliEnv(SID, "--clear");
+    const rp = cliEnv(SID, "--repair-obligations");
+    const c2 = cliEnv(SID, "--clear");
+    return [c1.status, /reason=obligations-tampered/.test(c1.stderr) && /--repair-obligations/.test(c1.stderr), rp.status, c2.status, /reason=obligation-open/.test(c2.stderr) && c2.stderr.includes(id)];
+  }), [2, true, 0, 2, true]);
+  t("298 拒绝点:改义务账台账行 ⇒ 拒(obligations-ledger-broken);repair 拒做(停下告诉用户)", sandbox(({ cliEnv, probe, oblDir }) => {
+    cliEnv(SID, "--arm", "317", "--cond", "甲"); probe("create", SID.CLAUDE_CODE_SESSION_ID);
+    const L = J(oblDir, "ledger.jsonl"); fs.writeFileSync(L, fs.readFileSync(L, "utf8").replace('"status":"open"', '"status":"cleared"'));
+    const c = cliEnv(SID, "--clear"); const rp = cliEnv(SID, "--repair-obligations");
+    return [c.status, /reason=obligations-ledger-broken/.test(c.stderr) && /告诉用户/.test(c.stderr), rp.status];
+  }), [2, true, 2]);
+  t("298 拒绝点:义务账锁被别的进程占着 ⇒ 拒(obligations-unknown)、批状态不动、不覆盖", sandbox(({ cliEnv, st, oblDir }) => {
+    cliEnv(SID, "--arm", "318", "--cond", "甲"); cliEnv(SID, "--no-decision", "自测");
+    fs.mkdirSync(J(oblDir, "state.lock"));
+    const c = cliEnv({ ...SID, OBLIGATIONS_LOCK_WAIT_MS: "200" }, "--clear");
+    const notCleared = st().cleared !== true && !!st().clearRefusedAt;
+    fs.rmSync(J(oblDir, "state.lock"), { recursive: true, force: true });
+    const c2 = cliEnv(SID, "--clear");
+    return [c.status, /reason=obligations-unknown/.test(c.stderr), notCleared, c2.status];
+  }), [2, true, true, 0]);
+  t("298 拒绝点:武装后整本义务账被删 ⇒ 外部锚对不上 ⇒ 拒(obligations-tampered)", sandbox(({ cliEnv, oblDir }) => {
+    cliEnv(SID, "--arm", "319", "--cond", "甲"); cliEnv(SID, "--no-decision", "自测");
+    fs.rmSync(oblDir, { recursive: true, force: true });
+    const c = cliEnv(SID, "--clear");
+    return [c.status, /reason=obligations-tampered/.test(c.stderr) && /不在义务账里/.test(c.stderr)];
+  }), [2, true]);
+  t("298 出路(完整):判不了 3 次 ⇒ --settle 写债表行(≤批号+3)⇒ 未提交 --clear 拒(D116)⇒ 提交 ⇒ --clear 放行;不足 3 次 --settle 拒;到期开批回到开着", sandbox(({ tmp, g, cliEnv, w, commit }) => {
+    g("rm", "-q", "docs/product-diary.md"); w("docs/product-diary.md/keep.txt", "x");
+    w("docs/gate-debts.md", "# 欠账\n\n## 在账欠账\n\n| # | 欠账 | 登记批 | 失效期 | 复核来源 | 到期动作 |\n|---|---|---|---|---|---|\n| D7 | 旧 | 1 | **≤2** | s | o |\n\n## 已销账\n"); commit("diary becomes dir");
+    cliEnv(SID, "--arm", "320", "--cond", "甲"); cliEnv(SID, "--outcome", "某成果");
+    const k1 = cliEnv(SID, "--clear"), k2 = cliEnv(SID, "--clear");
+    const early = cliEnv(SID, "--settle");
+    const k3 = cliEnv(SID, "--clear");
+    const s = cliEnv(SID, "--settle");
+    const table = fs.readFileSync(J(tmp, "docs/gate-debts.md"), "utf8");
+    const row = table.split("\n").find((l) => /^\| D8 \|/.test(l)) || "";
+    const dirty = cliEnv(SID, "--clear");
+    commit("settle row");
+    const ok = cliEnv(SID, "--clear");
+    const a321 = cliEnv(SID, "--arm", "321", "--cond", "乙"); const c321 = cliEnv(SID, "--clear");
+    const a324 = cliEnv(SID, "--arm", "324", "--cond", "丙"); const c324 = cliEnv(SID, "--clear");
+    return [[k1.status, /reason=obligation-unknown/.test(k1.stderr), k2.status], [early.status, /还差 1 次/.test(early.stderr)], k3.status,
+      [s.status, debtRowCells(row).length, debtRowCells(row)[3]?.trim(), /\| 320 \|/.test(row), /## 已销账/.test(table.split(row)[1] || "")],
+      [dirty.status, /reason=uncommitted/.test(dirty.stderr)], [ok.status, ok.stdout.includes("转欠账 1 条(D8 ≤323")],
+      [a321.status, /回到开着/.test(a321.stdout), c321.status], [a324.status, /回到开着/.test(a324.stdout), c324.status, /reason=obligation-unknown/.test(c324.stderr)]];
+  }), [[2, true, 2], [2, true], 2, [0, 6, "**≤323**", true, true], [2, true], [0, true], [0, false, 0], [0, true, 2, true]]);
+  t("298 拒绝点:转欠账行写了又被丢掉(工作树干净、HEAD 里没有)⇒ 拒(settle-uncommitted);重跑 --settle 用同一 D 号补行 ⇒ 提交 ⇒ 放行", sandbox(({ tmp, g, cliEnv, w, commit }) => {
+    g("rm", "-q", "docs/product-diary.md"); w("docs/product-diary.md/keep.txt", "x");
+    w("docs/gate-debts.md", "## 在账欠账\n\n| # | 欠账 | 登记批 | 失效期 | 复核来源 | 到期动作 |\n|---|---|---|---|---|---|\n"); commit("diary becomes dir");
+    cliEnv(SID, "--arm", "326", "--cond", "甲"); cliEnv(SID, "--outcome", "某成果");
+    cliEnv(SID, "--clear"); cliEnv(SID, "--clear"); cliEnv(SID, "--clear");
+    const s1 = cliEnv(SID, "--settle");
+    const id1 = (s1.stdout.match(/(D\d+) ≤329/) || [])[1];
+    g("checkout", "--", "docs/gate-debts.md");   // 把写进去的那一行丢掉 ⇒ 工作树干净、HEAD 里也没有
+    const lost = cliEnv(SID, "--clear");
+    const s2 = cliEnv(SID, "--settle");
+    const id2 = (s2.stdout.match(/(D\d+) ≤329/) || [])[1];
+    commit("settle row");
+    const ok = cliEnv(SID, "--clear");
+    return [s1.status, lost.status, /reason=settle-uncommitted/.test(lost.stderr), s2.status, !!id1 && id1 === id2, fs.existsSync(J(tmp, "docs/gate-debts.md")), ok.status];
+  }), [0, 2, true, 0, true, true, 0]);
+  t("298 拒绝点:开着(不是判不了)的义务 --settle 拒,出路写「做完它」", sandbox(({ cliEnv, probe }) => {
+    cliEnv(SID, "--arm", "325", "--cond", "甲"); probe("create", SID.CLAUDE_CODE_SESSION_ID); cliEnv(SID, "--clear");
+    const s = cliEnv(SID, "--settle"); return [s.status, /做完它/.test(s.stderr)];
+  }), [2, true]);
+  t("298 无配置的临时仓:登记了决定与成果、没有 ADR 也没有日记行 ⇒ --clear 放行(只出声)", sandbox(({ cliEnv }) => {
+    cliEnv(SID, "--arm", "330", "--cond", "甲"); cliEnv(SID, "--decision", "某决定"); cliEnv(SID, "--outcome", "某成果");
+    const c = cliEnv(SID, "--clear"); return [c.status, /没配 ADR 目录/.test(c.stderr) && /没配产品日记/.test(c.stderr)];
+  }, { config: false }), [0, true]);
+  t("298 绕过面:批内把配置的 diary 改成 null 并提交 ⇒ 按基点版仍要日记行(diary-missing)", sandbox(({ cliEnv, w, commit }) => {
+    cliEnv(SID, "--arm", "331", "--cond", "甲"); cliEnv(SID, "--outcome", "某成果"); cliEnv(SID, "--decision", "改配置");
+    w("docs/adr/0009-a.md", "# 0009\n- 决定编号:331-D1\n");
+    w("gate-install.json", JSON.stringify({ format: "gate-install/v1", adrDir: "docs/adr" })); commit("disable diary");
+    const c = cliEnv(SID, "--clear"); return [c.status, /reason=diary-missing/.test(c.stderr)];
+  }), [2, true]);
+  t("298 r1 配置冻结:批内把 diary 改指到一份有本批行的别的文件 ⇒ 仍按武装时的 product-diary.md 核(diary-missing)", sandbox(({ cliEnv, w, commit }) => {
+    cliEnv(SID, "--arm", "345", "--cond", "甲"); cliEnv(SID, "--outcome", "某成果"); cliEnv(SID, "--no-decision", "自测");
+    w("docs/other-diary.md", "| 日期 | 事项 | 结果 | 证据 |\n|---|---|---|---|\n| d | 批 345:某成果 | y | e |\n");
+    w("gate-install.json", TEST_INSTALL_JSON.replace("docs/product-diary.md", "docs/other-diary.md")); commit("repoint diary");
+    const c = cliEnv(SID, "--clear"); return [c.status, /reason=diary-missing/.test(c.stderr)];
+  }), [2, true]);
+  t("298 r1 拒绝点:本批把 gate-install.json 改坏(基点版合法)⇒ 拒 config-broken-in-batch、不计判不了、--settle 也拒;改回后放行", sandbox(({ g, cliEnv, w, commit, ost }) => {
+    cliEnv(SID, "--arm", "346", "--cond", "甲"); cliEnv(SID, "--no-decision", "自测");
+    w("gate-install.json", "{坏了"); commit("break config");
+    const c1 = cliEnv(SID, "--clear"), c2 = cliEnv(SID, "--clear"), c3 = cliEnv(SID, "--clear");
+    const streak = Math.max(0, ...ost().obligations.map((r) => r.unknownStreak || 0));
+    const s = cliEnv(SID, "--settle");
+    w("gate-install.json", TEST_INSTALL_JSON); commit("fix config");
+    const ok = cliEnv(SID, "--clear");
+    return [c1.status, /reason=config-broken-in-batch/.test(c1.stderr) && /改回 gate-install\.json/.test(c1.stderr), c3.status, streak, s.status, ok.status, !!g];
+  }), [2, true, 2, 0, 2, 0, true]);
+  t("298 拒绝点:手改批状态文件删掉已登记的决定 ⇒ 义务账里还在 ⇒ 照样拒(adr-missing)", sandbox(({ tmp, cliEnv }) => {
+    cliEnv(SID, "--arm", "332", "--cond", "甲"); cliEnv(SID, "--decision", "会被手删的决定");
+    const F = J(tmp, ".claude", ".batch-goal.json"); const o = JSON.parse(fs.readFileSync(F, "utf8")); o.decisions = []; fs.writeFileSync(F, JSON.stringify(o));
+    const c = cliEnv(SID, "--clear"); return [c.status, /reason=adr-missing/.test(c.stderr) && /332-D1/.test(c.stderr)];
+  }), [2, true]);
+  t("298 迁移:旧版批状态(带决定、义务账里没有)⇒ --clear 导入并照常核;补 ADR 后放行", sandbox(({ tmp, g, cliEnv, w, commit }) => {
+    const base = g("rev-parse", "HEAD").stdout.trim();
+    w(".claude/.batch-goal.json", JSON.stringify({ batch: "333", conditions: ["甲"], checks: [], shell: "bash", armedAt: "2026-11-01T00:00:00.000Z", baseCommit: base, decisions: [{ id: "333-D1", text: "旧决定" }], outcomes: [], withdrawn: [], version: 3 }));
+    ledgerAppend(J(tmp, ".claude", ".batch-goal.jsonl"), { at: "2026-11-01T00:00:00.000Z", action: "arm", batch: "333", conditions: ["甲"], checks: [], shell: "bash", baseCommit: base });   // 旧版 arm 行:没有 armedAt / oblHead
+    const c1 = cliEnv(SID, "--clear");
+    const stat = cliEnv(SID, "--status").stdout;
+    w("docs/adr/0009-a.md", "# 0009\n- 决定编号:333-D1\n"); commit("adr");
+    const c2 = cliEnv(SID, "--clear");
+    return [c1.status, /reason=adr-missing/.test(c1.stderr), /决定 333-D1/.test(stat), c2.status, fs.existsSync(J(tmp, ".claude", ".obligations", "ledger.jsonl"))];
+  }), [2, true, true, 0, true]);
+  t("298 --context:一行、带路径与哈希;内容不变哈希不变,义务变了哈希变", sandbox(({ cliEnv, probe }) => {
+    cliEnv(SID, "--arm", "334", "--cond", "甲");
+    const a = cliEnv(SID, "--context").stdout.trim(), b = cliEnv(SID, "--context").stdout.trim();
+    probe("create", SID.CLAUDE_CODE_SESSION_ID);
+    const c = cliEnv(SID, "--context").stdout.trim();
+    const h = (s) => (s.match(/sha256=([0-9a-f]{16})/) || [])[1];
+    return [a.split("\n").length, /^BATCH-CONTEXT 批 334 已武装/.test(a) && /path=\S+state\.json/.test(a), h(a) === h(b), h(a) !== h(c), /本 checkout 未归属 1/.test(c)];
+  }), [1, true, true, true, true]);
+  t("298 裁决参数:--clear --verdict 全给 ⇒ 记进台账 clear 行;缺条 ⇒ 拒(verdict-usage)且留拒清痕迹", sandbox(({ cliEnv, st, jrows }) => {
+    cliEnv(SID, "--arm", "335", "--cond", "甲", "--cond", "乙"); cliEnv(SID, "--no-decision", "自测");
+    const bad = cliEnv(SID, "--clear", "--verdict", "1=达成");
+    const trace = !!st().clearRefusedAt;
+    const ok = cliEnv(SID, "--clear", "--verdict", "1=达成", "--verdict", "2=不适用:本仓无此项");
+    const row = jrows().filter((o) => o.action === "clear").pop();
+    return [bad.status, /reason=verdict-usage/.test(bad.stderr), trace, ok.status, row?.verdicts?.map((v) => v.verdict)];
+  }), [2, true, true, 0, ["达成", "不适用"]]);
+  t("298 withdraw:带进来的决定可按编号撤回(出路之一),撤后新批 --clear 放行", sandbox(({ cliEnv }) => {
+    cliEnv(SID, "--arm", "336", "--cond", "甲"); cliEnv(SID, "--decision", "登记错了的决定");
+    cliEnv(SID, "--arm", "337", "--cond", "乙", "--force"); cliEnv(SID, "--no-decision", "自测");
+    const c1 = cliEnv(SID, "--clear");
+    const wd = cliEnv(SID, "--withdraw", "336-D1", "--reason", "不是决定");
+    const c2 = cliEnv(SID, "--clear");
+    return [c1.status, wd.status, /带入本批/.test(wd.stdout), c2.status];
+  }), [2, 0, true, 0]);
+  oblSelfTestR1(t, sandbox, SID, OTHER);
+  oblSelfTestR2(t, sandbox, SID);
+  oblSelfTestR3(t, sandbox, SID);
+}
+// ── 批 298 r3(codex 298-review-r3 ①②§3 另项 / 红队 r3 BP-1)──
+function oblSelfTestR3(t, sandbox, SID) {
+  const J = path.join;
+  t("298 r3 拒绝点(codex ①):重武装时批状态写失败(arm 行已落盘)→ 删账 → --clear ⇒ arm 行自带的锚抓住(obligations-tampered)", sandbox(({ tmp, cliEnv, oblDir }) => {
+    cliEnv(SID, "--arm", "391", "--cond", "甲"); cliEnv(SID, "--decision", "某决定");
+    const F = J(tmp, ".claude", ".batch-goal.json"); fs.chmodSync(F, 0o444);
+    const re = cliEnv(SID, "--arm", "391", "--cond", "甲");
+    fs.chmodSync(F, 0o666);
+    fs.rmSync(oblDir, { recursive: true, force: true });
+    const c = cliEnv(SID, "--clear");
+    return [re.status, c.status, /reason=obligations-tampered/.test(c.stderr)];
+  }), [2, 2, true]);
+  t("298 r3 拒绝点(红队 BP-1):截账 + 弄坏 state → 账坏时 --arm(arm 行记 anchorUnknown)→ repair → --clear ⇒ 越过 anchorUnknown 用更早的锚抓住", sandbox(({ cliEnv, oblDir }) => {
+    cliEnv(SID, "--arm", "392", "--cond", "甲"); cliEnv(SID, "--no-decision", "自测"); const c0 = cliEnv(SID, "--clear");
+    const L = J(oblDir, "ledger.jsonl"), S = J(oblDir, "state.json");
+    fs.writeFileSync(L, fs.readFileSync(L, "utf8").split("\n").slice(0, 2).join("\n") + "\n"); fs.writeFileSync(S, "坏");
+    const a = cliEnv(SID, "--arm", "393", "--cond", "乙");
+    const rp = cliEnv(SID, "--repair-obligations");
+    const c = cliEnv(SID, "--clear");
+    return [c0.status, a.status, rp.status, c.status, /reason=obligations-tampered/.test(c.stderr)];
+  }), [0, 0, 0, 2, true]);
+  t("298 r3(codex ②):写到一半失锁——链断 ⇒ 「停下告诉用户」不推荐 repair;只是 state 落后 ⇒ 推荐 repair", (() => {
+    const run = (inject) => {
+      const dir = fs.mkdtempSync(J(os.tmpdir(), "obl298r3-"));
+      try {
+        OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "t" }, "x"));
+        let err = null;
+        try { OB.mutateStore(dir, (d) => { OB.createObligation(d, { type: "t" }, "x"); OB.createObligation(d, { type: "t" }, "x"); }, { onStep: ({ phase, appended }) => { if (phase === "ledger" && appended === 1) inject(J(dir, "ledger.jsonl")); } }); }
+        catch (e) { err = e; }
+        fs.rmSync(J(dir, "state.lock"), { recursive: true, force: true });
+        return [err?.code, !!err?.chainBroken, /停下告诉用户/.test(err?.message || ""), /--repair-obligations/.test(err?.message || "")];
+      } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 无害 */ } }
+    };
+    return [run((L) => fs.appendFileSync(L, "garbage\n")), run((L) => ledgerAppend(L, { foreign: 1 }))];
+  })(), [["PARTIAL", true, true, false], ["PARTIAL", false, false, true]]);
+  t("298 r3(codex §3):确认义务账丢失看得见——--status 列理由、--clear 首行写明、--history 显示理由", sandbox(({ cliEnv, w, commit, oblDir }) => {
+    cliEnv(SID, "--arm", "394", "--cond", "甲"); cliEnv(SID, "--decision", "某决定");
+    fs.rmSync(oblDir, { recursive: true, force: true });
+    const acc = cliEnv(SID, "--arm", "394", "--cond", "甲", "--accept-obligation-loss", "理由X");
+    const stat = cliEnv(SID, "--status").stdout;
+    w("docs/adr/0009-a.md", "# 0009\n- 决定编号:394-D1\n"); commit("adr");
+    const c = cliEnv(SID, "--clear");
+    const hist = cliEnv(SID, "--history", "50").stdout;
+    return [acc.status, /本批曾确认义务账丢失:.*理由「理由X」/.test(stat), c.status, String(c.stdout).split("\n")[0].startsWith("本批曾确认义务账丢失(理由:理由X)"), /理由:理由X/.test(hist)];
+  }), [0, true, 0, true, true]);
+  // 猎手 r3 FB-1 / FB-3 / FB-4 / FB-6③(只改文案或一行判定)
+  t("298 r3 FB-1:确认丢失已记、武装因批状态写失败而失败 ⇒ 文案说「确认已记,重跑时去掉 --accept-obligation-loss」;照做 ⇒ 放行", sandbox(({ tmp, cliEnv, oblDir }) => {
+    cliEnv(SID, "--arm", "396", "--cond", "甲"); cliEnv(SID, "--decision", "某决定");
+    fs.rmSync(oblDir, { recursive: true, force: true });
+    const F = J(tmp, ".claude", ".batch-goal.json"); fs.chmodSync(F, 0o444);
+    const a1 = cliEnv(SID, "--arm", "396", "--cond", "甲", "--accept-obligation-loss", "确认");
+    fs.chmodSync(F, 0o666);
+    const a2 = cliEnv(SID, "--arm", "396", "--cond", "甲");
+    return [a1.status, /确认已记进批台账/.test(a1.stderr) && /重跑时去掉 --accept-obligation-loss/.test(a1.stderr), a2.status];
+  }), [2, true, 0]);
+  t("298 r3 FB-3:--clear 的锚类拒绝出路带 accept 命令且写明须用户确认", sandbox(({ cliEnv, oblDir }) => {
+    cliEnv(SID, "--arm", "397", "--cond", "甲"); cliEnv(SID, "--decision", "某决定");
+    fs.rmSync(oblDir, { recursive: true, force: true });
+    const c = cliEnv(SID, "--clear"); return [c.status, /--accept-obligation-loss/.test(c.stderr) && /须用户确认后才用/.test(c.stderr)];
+  }), [2, true]);
+  t("298 r3 FB-4:基点版也解析不了 ⇒ 文案说「基点那一版也解析不了」,不说「是本批改坏的」", sandbox(({ cliEnv, w, commit }) => {
+    w("gate-install.json", "{基点就坏"); commit("bad base");
+    cliEnv(SID, "--arm", "398", "--cond", "甲"); cliEnv(SID, "--no-decision", "自测");
+    w("gate-install.json", "{还是坏"); commit("still bad");
+    const c = cliEnv(SID, "--clear"); return [c.status, /reason=config-broken-in-batch/.test(c.stderr), /基点那一版也解析不了/.test(c.stderr), /基点时是合法的/.test(c.stderr)];
+  }), [2, true, true, false]);
+  t("298 r3 FB-6③:改名跟随时 git diff 失败(基点不可达)⇒ 判不了,不落成「缺」", (() => {
+    const g = (a) => (a[0] === "ls-tree" ? { status: 0, stdout: "" } : { status: 128, stdout: "", stderr: "bad object" });
+    return [followRename("docs/a.md", "dead", "docs/b.md", g) === FOLLOW_UNKNOWN, followRename("docs/a.md", "dead", "docs/a.md", g)];
+  })(), [true, null]);
+  t("298 r3(codex 另项):基点没有配置时的坏配置文案不说「基点合法、本批改坏」、不给 git show 基点", sandbox(({ cliEnv, w, commit }) => {
+    cliEnv(SID, "--arm", "395", "--cond", "甲"); cliEnv(SID, "--no-decision", "自测");
+    w("gate-install.json", "{坏"); commit("bad config");
+    const c = cliEnv(SID, "--clear");
+    return [c.status, /reason=config-broken-in-batch/.test(c.stderr), /基点无此文件/.test(c.stderr), /基点时是合法的|git show/.test(c.stderr)];
+  }, { config: false }), [2, true, true, false]);
+}
+// ── 批 298 r2 复审修复的夹具(codex 298-review-r2 / 红队 BP-1、BP-6、附三 / 误拦猎手 FB-1~6)──
+function oblSelfTestR2(t, sandbox, SID) {
+  const J = path.join;
+  const DT = "## 在账欠账\n\n| # | 欠账 | 登记批 | 失效期 | 复核来源 | 到期动作 |\n|---|---|---|---|---|---|\n";
+  // ② 锚覆盖所有写入口 + 人工确认出路
+  t("298 r2 拒绝点:删账后走 --outcome 重建 ⇒ 写前核锚就拒;--accept-obligation-loss 只在锚对不上时可用;确认后记一行、放行、下一批不被旧锚锁死", sandbox(({ cliEnv, oblDir, jrows }) => {
+    cliEnv(SID, "--arm", "380", "--cond", "甲"); cliEnv(SID, "--decision", "某决定");
+    fs.rmSync(oblDir, { recursive: true, force: true });
+    const o = cliEnv(SID, "--outcome", "想重建");
+    const a0 = cliEnv(SID, "--arm", "380", "--cond", "甲");
+    const acc = cliEnv(SID, "--arm", "380", "--cond", "甲", "--accept-obligation-loss", "测试:用户确认丢账");
+    const row = jrows().find((r) => r.action === "accept-obligation-loss");
+    const bad = cliEnv(SID, "--arm", "380", "--cond", "甲", "--accept-obligation-loss", "锚对得上时不许用");
+    const d2 = cliEnv(SID, "--decision", "丢账之后的决定");
+    return [o.status, /拒绝登记成果/.test(o.stderr), a0.status, acc.status, /义务账丢失已由执行者确认/.test(acc.stdout), row?.reason, !!row?.lostAnchor?.h, bad.status, d2.status];
+  }), [2, true, 2, 0, true, "测试:用户确认丢账", true, 2, 0]);
+  // ② 锚范围只到当前批 arm 行(猎手 FB-2:更早批记的锚不再约束,否则一次丢账永久锁死这个 checkout)
+  t("298 r2 锚范围:最后一条 arm / accept-obligation-loss 行之前记的锚不算;之后记的才算", (() => {
+    const f = J(os.tmpdir(), `bg298-anchor-${process.pid}.jsonl`);
+    const put = (rows) => fs.writeFileSync(f, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    try {
+      put([{ action: "decision", oblHead: { h: "old", version: 3 } }, { action: "arm", batch: "2" }, { action: "decision", batch: "2" }]); const a = lastOblAnchor(f);
+      put([{ action: "decision", oblHead: { h: "old", version: 3 } }, { action: "accept-obligation-loss" }]); const b = lastOblAnchor(f);
+      put([{ action: "arm", batch: "2" }, { action: "obl-head", oblHead: { h: "new", version: 5 } }]); const c = lastOblAnchor(f);
+      return [a, b, c?.h];
+    } finally { try { fs.rmSync(f, { force: true }); } catch { /* 无害 */ } }
+  })(), [null, null, "new"]);
+  // ③ --force 换批:导入用武装台账的基点
+  t("298 r2 边界:旧版批状态的基点被手改后 --force 换批 ⇒ 带入的决定按武装台账的基点记", sandbox(({ tmp, g, cliEnv, w, commit, ost }) => {
+    const base1 = g("rev-parse", "HEAD").stdout.trim();
+    w("x.txt", "1"); commit("c2"); const base2 = g("rev-parse", "HEAD").stdout.trim();
+    w(".claude/.batch-goal.json", JSON.stringify({ batch: "381", conditions: ["甲"], checks: [], shell: "bash", armedAt: "2026-11-01T00:00:00.000Z", baseCommit: base2, decisions: [{ id: "381-D1", text: "旧决定" }], outcomes: [], withdrawn: [], version: 3 }));
+    ledgerAppend(J(tmp, ".claude", ".batch-goal.jsonl"), { at: "2026-11-01T00:00:00.000Z", action: "arm", batch: "381", conditions: ["甲"], checks: [], shell: "bash", baseCommit: base1, armedAt: "2026-11-01T00:00:00.000Z" });
+    const f = cliEnv(SID, "--arm", "382", "--cond", "乙", "--force");
+    const rec = ost().obligations.find((r) => r.type === "decision-adr" && r.payload?.id === "381-D1");
+    return [f.status, /对不上/.test(f.stderr), rec?.origin?.baseCommit === base1, rec?.batch?.batch];
+  }), [0, true, true, "382"]);
+  // ④ arm 行写不进 ⇒ 拒武装、批状态与义务账都不动
+  t("298 r2 拒绝点:--arm 时批台账写不进 ⇒ 拒(exit 2)、批状态仍是旧批、义务账没多行", sandbox(({ tmp, cliEnv, st, ost }) => {
+    cliEnv(SID, "--arm", "383", "--cond", "甲"); cliEnv(SID, "--no-decision", "自测"); cliEnv(SID, "--clear");
+    const v0 = ost().version, s0 = JSON.stringify(st());
+    const Jf = J(tmp, ".claude", ".batch-goal.jsonl"); fs.chmodSync(Jf, 0o444);
+    const a = cliEnv(SID, "--arm", "384", "--cond", "乙");
+    fs.chmodSync(Jf, 0o666);
+    return [a.status, /批台账 .* 写不进去/.test(a.stderr), JSON.stringify(st()) === s0, ost().version === v0];
+  }), [2, true, true, true]);
+  // ⑤a 现行配置解析坏 ⇒ broken-in-batch(基点没有配置也一样)
+  t("298 r2 拒绝点:基点没有配置、本批写了一份坏的 gate-install.json ⇒ config-broken-in-batch", sandbox(({ cliEnv, w, commit }) => {
+    cliEnv(SID, "--arm", "385", "--cond", "甲"); cliEnv(SID, "--no-decision", "自测");
+    w("gate-install.json", "{坏"); commit("bad config");
+    const c = cliEnv(SID, "--clear"); return [c.status, /reason=config-broken-in-batch/.test(c.stderr)];
+  }, { config: false }), [2, true]);
+  // ⑤b 读错误 ⇒ 判不了(不是 broken)
+  t("298 r2 误拦:gate-install.json 读不了(变成目录 EISDIR)⇒ obligation-unknown、不算本批改坏", sandbox(({ g, cliEnv, w, commit }) => {
+    cliEnv(SID, "--arm", "386", "--cond", "甲"); cliEnv(SID, "--no-decision", "自测");
+    g("rm", "-q", "gate-install.json"); w("gate-install.json/keep.txt", "x"); commit("config becomes dir");
+    const c = cliEnv(SID, "--clear"); return [c.status, /reason=obligation-unknown/.test(c.stderr), /config-broken-in-batch/.test(c.stderr)];
+  }), [2, true, false]);
+  // ⑤c 诚实迁移:改名跟随
+  t("298 r2 误拦:日记在本批被 git mv 改名、现行配置也指向新路径 ⇒ 按新路径核(有本批行就放行);现行配置没跟上 ⇒ 按缺拒", sandbox(({ tmp, g, cliEnv, w, commit }) => {
+    cliEnv(SID, "--arm", "387", "--cond", "甲"); cliEnv(SID, "--outcome", "某成果"); cliEnv(SID, "--no-decision", "自测:只改配置路径");
+    g("mv", "docs/product-diary.md", "docs/diary2.md"); fs.appendFileSync(J(tmp, "docs/diary2.md"), "| d | 批 387:某成果 | y | e |\n"); commit("rename diary");
+    const c1 = cliEnv(SID, "--clear");
+    w("gate-install.json", TEST_INSTALL_JSON.replace("docs/product-diary.md", "docs/diary2.md")); commit("config follows");
+    const c2 = cliEnv(SID, "--clear");
+    return [c1.status, /reason=diary-missing/.test(c1.stderr), c2.status, /按新路径核/.test(c2.stderr)];
+  }), [2, true, 0, true]);
+  // ⑤d ADR 目录不在 ⇒ 按缺(给模板),不是判不了
+  t("298 r2 误拦:配置的 ADR 目录在 HEAD 里不存在 ⇒ adr-missing(给模板),不是 obligation-unknown", sandbox(({ cliEnv }) => {
+    cliEnv(SID, "--arm", "388", "--cond", "甲"); cliEnv(SID, "--decision", "某决定");
+    const c = cliEnv(SID, "--clear"); return [c.status, /reason=adr-missing/.test(c.stderr) && /决定编号:388-D1/.test(c.stderr)];
+  }, { config: TEST_INSTALL_JSON.replace('"docs/adr"', '"docs/adr2"') }), [2, true]);
+  // ⑥ 落盘逐步核锁:写到一半失锁 ⇒ PARTIAL、报写到第几行、立即停;repair 可修
+  t("298 r2 拒绝点:追加第 2 行前锁被夺 ⇒ PARTIAL(台账已写 1 行、state 未同步、指向 --repair-obligations),第 2 行没写", (() => {
+    const dir = fs.mkdtempSync(J(os.tmpdir(), "obl298r2p-"));
+    try {
+      OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "t" }, "x"));
+      const v0 = OB.readStore(dir).version;
+      let err = null;
+      try {
+        OB.mutateStore(dir, (d) => { OB.createObligation(d, { type: "t" }, "x"); OB.createObligation(d, { type: "t" }, "x"); },
+          { onStep: ({ phase, appended }) => { if (phase === "ledger" && appended === 1) fs.writeFileSync(J(dir, "state.lock", "owner"), JSON.stringify({ token: "thief" })); } });
+      } catch (e) { err = e; }
+      fs.rmSync(J(dir, "state.lock"), { recursive: true, force: true });
+      const k = OB.readStore(dir).kind, v1 = OB.readStore(dir).version;
+      OB.repairStore(dir);
+      return [err?.code, err?.phase, err?.appended, /--repair-obligations/.test(err?.message || ""), v1 - v0, k, OB.readStore(dir).kind];
+    } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 无害 */ } }
+  })(), ["PARTIAL", "ledger", 1, true, 1, "lag", "ok"]);
+  // ⑦ --settle 分阶段如实报:台账已追加、state 同步失败
+  t("298 r2 出路:--settle 时 state 写失败 ⇒ 报「债表已写、台账已追加、state 未同步」(不说「义务账未记」);repair 后重跑同号补齐", sandbox(({ tmp, g, cliEnv, w, commit, oblDir }) => {
+    g("rm", "-q", "docs/product-diary.md"); w("docs/product-diary.md/keep.txt", "x"); w("docs/gate-debts.md", DT); commit("setup");
+    cliEnv(SID, "--arm", "389", "--cond", "甲"); cliEnv(SID, "--outcome", "某成果");
+    cliEnv(SID, "--clear"); cliEnv(SID, "--clear"); cliEnv(SID, "--clear");
+    const S = J(oblDir, "state.json"); fs.chmodSync(S, 0o444);
+    const s1 = cliEnv(SID, "--settle");
+    fs.chmodSync(S, 0o666);
+    const rp = cliEnv(SID, "--repair-obligations"), s2 = cliEnv(SID, "--settle");
+    const rows = fs.readFileSync(J(tmp, "docs/gate-debts.md"), "utf8").split("\n").filter((l) => /^\| D\d+ \|/.test(l));
+    return [s1.status, /债表已写 D1/.test(s1.stderr) && /台账已追加 1 行/.test(s1.stderr) && /state 未同步/.test(s1.stderr) && !/义务账未记/.test(s1.stderr), rp.status, s2.status, rows.length];
+  }), [2, true, 0, 0, 1]);
+  // ⑧ 被拒的 --clear 也记锚
+  t("298 r2:被拒的 --clear 写过义务账 ⇒ 批台账也记 obl-head;截掉那几行 ⇒ 下次 --clear 被锚抓住", sandbox(({ cliEnv, probe, oblDir, jrows }) => {
+    cliEnv(SID, "--arm", "390", "--cond", "甲"); probe("create", SID.CLAUDE_CODE_SESSION_ID);
+    const L = J(oblDir, "ledger.jsonl"); const before = fs.readFileSync(L, "utf8");
+    const c1 = cliEnv(SID, "--clear");
+    const last = jrows().filter((r) => r.oblHead).pop();
+    fs.writeFileSync(L, before); fs.rmSync(J(oblDir, "state.json"), { force: true });
+    const c2 = cliEnv(SID, "--clear");
+    return [c1.status, last?.action, c2.status, /reason=obligations-tampered/.test(c2.stderr)];
+  }), [2, "obl-head", 2, true]);
+}
+// ── 批 298 r1 复审修复的夹具(codex 298-review-r1 / 红队 BP-1~6 / 误拦猎手 FB-1~8)──
+function oblSelfTestR1(t, sandbox, SID, OTHER) {
+  const J = path.join;
+  // 配置方言 / 裁决方言(FB-2 / FB-3 / FB-8)
+  t("298 r1 配置:UTF-8 BOM 剥掉照常解析;./ 前缀归一", (() => { const r = parseInstallConfig(String.fromCharCode(0xFEFF) + JSON.stringify({ format: "gate-install/v1", diary: "./docs/product-diary.md" })); return [r.error || null, r.diary]; })(), [null, "docs/product-diary.md"]);
+  t("298 r1 配置:UTF-16 给可读报错", /UTF-16/.test(parseInstallConfig("��{\u0000\"\u0000").error || ""), true);
+  t("298 r1 配置:debtTable 批内去掉 ⇒ 并基点版", mergeInstallConfig(parseInstallConfig(JSON.stringify({ format: "gate-install/v1" })), parseInstallConfig(JSON.stringify({ format: "gate-install/v1", debtTable: "docs/x-debts.md" }))).debtTable, "docs/x-debts.md");
+  t("298 r1 裁决:全角数字 / 全角等号 / 句末标点", (() => { try { return parseVerdicts(["--verdict", "１＝达成。", "--verdict", "2=不适用:没有日记。"], 2); } catch (e) { return `throw:${e.message}`; } })(), [{ n: 1, verdict: "达成" }, { n: 2, verdict: "不适用", why: "没有日记" }]);
+  // 库:绑定必填、读错重试、锁令牌、窄冲突、重放性能
+  {
+    const dir = fs.mkdtempSync(J(os.tmpdir(), "obl298r1-"));
+    try {
+      const a = OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "t-probe", binding: { hash: "h1" } }, "x")).result;
+      t("298 r1 绑定:义务带 binding 而回报不给 boundHash ⇒ 拒(BINDING-REQUIRED)", (() => { try { OB.mutateStore(dir, (d) => OB.recordEvidence(d, a.id, { producer: "p", result: "cleared" })); return "no-throw"; } catch (e) { return e.code; } })(), "BINDING-REQUIRED");
+      let n = 0;
+      const flaky = (f, enc) => { if (n++ < 2) { const e = new Error("busy"); e.code = "EBUSY"; throw e; } return fs.readFileSync(f, enc); };
+      t("298 r1 锁外读:前两次 EBUSY ⇒ 重试后读到 ok(不归 tampered)", [OB.readStore(dir, 5, flaky).kind, n > 2], ["ok", true]);
+      t("298 r1 锁外读:一直 EBUSY ⇒ unreadable(不是 tampered)", OB.readStore(dir, 3, () => { const e = new Error("busy"); e.code = "EBUSY"; throw e; }).kind, "unreadable");
+      const lock = J(dir, "state.lock");
+      t("298 r1 锁令牌:临界区里锁被别人夺走 ⇒ 写入前再核 ⇒ CONFLICT、不写、不删别人的锁", (() => {
+        const v = OB.readStore(dir).version;
+        try { OB.mutateStore(dir, (d) => { fs.writeFileSync(J(lock, "owner"), JSON.stringify({ token: "someone-else" })); OB.createObligation(d, { type: "t-probe" }, "x"); }); return "no-throw"; }
+        catch (e) { const left = fs.existsSync(lock); fs.rmSync(lock, { recursive: true, force: true }); return [e.code, OB.readStore(dir).version === v, left]; }
+      })(), ["CONFLICT", true, true]);
+      // 窄冲突(FB-1):别批的记录变了不算冲突;本批的变了才算
+      const prevG = { batch: "350", armedAt: "2026-11-07T00:00:00.000Z", conditions: ["甲"], baseCommit: null };
+      const key = batchKeyOf(prevG);
+      const mine = OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "t-probe", batch: key }, "x")).result;
+      const other = OB.mutateStore(dir, (d) => OB.createObligation(d, { type: "t-probe", batch: { batch: "999", armedAt: "z" } }, "x")).result;
+      const ctx = { sid: null, checkout: "nowhere" };
+      const plan = planClear(prevG, OB.readStore(dir).obligations, ctx, { config: absentInstallConfig(), git: () => ({ status: 128, stdout: "" }) });
+      OB.mutateStore(dir, (d) => OB.recordEvidence(d, other.id, { producer: "p", result: "unknown" }));
+      const okUnrelated = (() => { try { OB.mutateStore(dir, (d) => applyClearPlan(d, prevG, plan, ctx)); return "ok"; } catch (e) { return e.code; } })();
+      const plan2 = planClear(prevG, OB.readStore(dir).obligations, ctx, { config: absentInstallConfig(), git: () => ({ status: 128, stdout: "" }) });
+      OB.mutateStore(dir, (d) => OB.recordEvidence(d, mine.id, { producer: "p", result: "unknown" }));
+      const conflict = (() => { try { OB.mutateStore(dir, (d) => applyClearPlan(d, prevG, plan2, ctx)); return "ok"; } catch (e) { return e.code; } })();
+      t("298 r1 窄冲突:别批记录变了 ⇒ 照常落笔;本批记录变了 ⇒ CONFLICT", [okUnrelated, conflict], ["ok", "CONFLICT"]);
+    } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 无害 */ } }
+  }
+  {
+    // 重放性能(FB-4):300 批 × 3 条 × 2 行 = 1800 行台账,readStore 一次 < 300 ms
+    const dir = fs.mkdtempSync(J(os.tmpdir(), "obl298p-"));
+    try {
+      const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
+      const enabled = "2026-11-07", gh = sha("GENESIS" + enabled);
+      const out = [`{"genesis":"v1","enabled":"${enabled}","h":"${gh}"}`];
+      let prevH = gh;
+      const recs = new Map();
+      for (let b = 0; b < 300; b++) for (let k = 0; k < 3; k++) for (let step = 0; step < 2; step++) {
+        const id = `OB-p${b}-${k}`;
+        const rec = { id, type: "decision-adr", status: step ? "cleared" : "open", owner: null, checkout: null, origin: { batch: String(b), armedAt: "a", baseCommit: null }, batch: { batch: String(b), armedAt: "a" }, trigger: {}, payload: { id: `${b}-D${k + 1}`, text: "x".repeat(40) }, outlet: "o", createdAt: "t", due: null, binding: null, unknownStreak: 0, lastResult: null, settle: null, config: null, rev: step + 1 };
+        recs.set(id, rec);
+        const body = JSON.stringify({ at: "t", op: step ? "transition" : "create", id, from: step ? "open" : null, to: rec.status, by: "perf", rec });
+        const h = sha(Buffer.concat([Buffer.from(prevH, "utf8"), Buffer.from(body, "utf8")]));
+        out.push(body.slice(0, -1) + `,"h":"${h}"}`); prevH = h;
+      }
+      fs.writeFileSync(J(dir, "ledger.jsonl"), out.join("\n") + "\n");
+      OB.repairStore(dir);
+      OB.readStore(dir);   // 预热
+      const t0 = process.hrtime.bigint(); const s = OB.readStore(dir); const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      const rssMb = Math.round(process.memoryUsage().rss / 1048576);
+      console.log(`      (298 r1 重放读数:1800 行台账 readStore ${ms.toFixed(1)} ms,rss ${rssMb} MB)`);
+      t("298 r1 性能:1800 行台账 readStore 一次 < 300 ms、结论 ok、900 条", [ms < 300, s.kind, s.obligations.length], [true, "ok", 900]);
+    } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 无害 */ } }
+  }
+  // CLI:批身份绑定(codex §1 / BP-1 / BP-6)
+  t("298 r1 拒绝点:手改状态文件的基点 ⇒ 拒(obligations-tampered);--settle 也拒;照原条件原样重放 --arm 从台账恢复 ⇒ 放行", sandbox(({ tmp, g, cliEnv, w, commit, st }) => {
+    w("x.txt", "1"); commit("c1"); const base1 = g("rev-parse", "HEAD").stdout.trim();
+    cliEnv(SID, "--arm", "351", "--cond", "甲"); cliEnv(SID, "--no-decision", "自测");
+    w("y.txt", "2"); commit("c2");
+    const F = J(tmp, ".claude", ".batch-goal.json"); const o = st(); o.baseCommit = g("rev-parse", "HEAD").stdout.trim(); fs.writeFileSync(F, JSON.stringify(o));
+    const c1 = cliEnv(SID, "--clear"), s1 = cliEnv(SID, "--settle");
+    const re = cliEnv(SID, "--arm", "351", "--cond", "甲");
+    const restored = st().baseCommit === base1;
+    const c2 = cliEnv(SID, "--clear");
+    return [c1.status, /reason=obligations-tampered/.test(c1.stderr) && /基点/.test(c1.stderr), s1.status, re.status, restored, c2.status];
+  }), [2, true, 2, 0, true, 0]);
+  t("298 r1 拒绝点:手改状态文件的 armedAt(想把义务挂到假键上)⇒ 拒(obligations-tampered)", sandbox(({ tmp, cliEnv, st }) => {
+    cliEnv(SID, "--arm", "352", "--cond", "甲"); cliEnv(SID, "--decision", "某决定");
+    const F = J(tmp, ".claude", ".batch-goal.json"); const o = st(); o.armedAt = "2020-01-01T00:00:00.000Z"; o.decisions = []; fs.writeFileSync(F, JSON.stringify(o));
+    const c = cliEnv(SID, "--clear"); return [c.status, /reason=obligations-tampered/.test(c.stderr) && /armedAt/.test(c.stderr)];
+  }), [2, true]);
+  // 外部锚覆盖每个写点(codex §2)
+  t("298 r1 拒绝点:义务账截尾(保留武装时前缀、删掉后加的决定)⇒ 拒(obligations-tampered)", sandbox(({ tmp, cliEnv, oblDir }) => {
+    cliEnv(SID, "--arm", "353", "--cond", "甲");
+    const L = J(oblDir, "ledger.jsonl"); const atArm = fs.readFileSync(L, "utf8");
+    cliEnv(SID, "--decision", "会被截掉的决定");
+    fs.writeFileSync(L, atArm); fs.rmSync(J(oblDir, "state.json"), { force: true });
+    const F = J(tmp, ".claude", ".batch-goal.json"); const o = JSON.parse(fs.readFileSync(F, "utf8")); o.decisions = []; fs.writeFileSync(F, JSON.stringify(o));
+    const c = cliEnv(SID, "--clear"); return [c.status, /reason=obligations-tampered/.test(c.stderr) && /截短|不在义务账里/.test(c.stderr)];
+  }), [2, true]);
+  t("298 r1 拒绝点:整本义务账删除后同号重武装 ⇒ --arm 就拒", sandbox(({ cliEnv, oblDir }) => {
+    cliEnv(SID, "--arm", "354", "--cond", "甲"); cliEnv(SID, "--decision", "某决定");
+    fs.rmSync(oblDir, { recursive: true, force: true });
+    const a = cliEnv(SID, "--arm", "354", "--cond", "甲"); return [a.status, /不在义务账里|截短/.test(a.stderr)];
+  }), [2, true]);
+  // --settle 半写(codex 另项):债表写了、义务账追加失败 ⇒ 如实报;重跑用同一 D 号补记、不多写一行
+  t("298 r1 出路:--settle 半写如实报「债表已写 Dn、义务账未记」;重跑沿用同一 D 号补记", sandbox(({ tmp, g, cliEnv, w, commit, oblDir }) => {
+    g("rm", "-q", "docs/product-diary.md"); w("docs/product-diary.md/keep.txt", "x");
+    w("docs/gate-debts.md", "## 在账欠账\n\n| # | 欠账 | 登记批 | 失效期 | 复核来源 | 到期动作 |\n|---|---|---|---|---|---|\n"); commit("setup");
+    cliEnv(SID, "--arm", "355", "--cond", "甲"); cliEnv(SID, "--outcome", "某成果");
+    cliEnv(SID, "--clear"); cliEnv(SID, "--clear"); cliEnv(SID, "--clear");
+    const L = J(oblDir, "ledger.jsonl"); fs.chmodSync(L, 0o444);
+    const s1 = cliEnv(SID, "--settle");
+    fs.chmodSync(L, 0o666);
+    const s2 = cliEnv(SID, "--settle");
+    const rows = fs.readFileSync(J(tmp, "docs/gate-debts.md"), "utf8").split("\n").filter((l) => /^\| D\d+ \|/.test(l));
+    return [s1.status, /债表已写 D1/.test(s1.stderr) && /台账(未追加|只追加了)/.test(s1.stderr) && !/都没写/.test(s1.stderr), s2.status, rows.length, /D1 ≤358/.test(s2.stdout)];
+  }), [2, true, 0, 1, true]);
+  // 批 298 r2(红队 BP-1 / codex ⑤ / 猎手 FB-1):到期回开着按 checkout 认——原 r1 这条把「同 checkout 换了会话的到期债落成未归属」写成了正确行为,改掉
+  t("298 r2 边界:同 checkout 换了会话,转欠账到期 ⇒ 认回并入本批、挡关账", sandbox(({ g, cliEnv, w, commit }) => {
+    g("rm", "-q", "docs/product-diary.md"); w("docs/product-diary.md/keep.txt", "x");
+    w("docs/gate-debts.md", "## 在账欠账\n\n| # | 欠账 | 登记批 | 失效期 | 复核来源 | 到期动作 |\n|---|---|---|---|---|---|\n"); commit("setup");
+    const O = { CLAUDE_CODE_SESSION_ID: OTHER };
+    cliEnv(O, "--arm", "360", "--cond", "甲"); cliEnv(O, "--outcome", "某成果");
+    cliEnv(O, "--clear"); cliEnv(O, "--clear"); cliEnv(O, "--clear"); cliEnv(O, "--settle"); commit("settle"); const c0 = cliEnv(O, "--clear");
+    const a = cliEnv(SID, "--arm", "364", "--cond", "乙");
+    const stat = cliEnv(SID, "--status").stdout;
+    const c = cliEnv(SID, "--clear");
+    return [c0.status, /回到开着/.test(a.stdout) && /并入本批/.test(a.stdout), /成果 360:O1/.test(stat), c.status, /reason=obligation-unknown/.test(c.stderr)];
+  }), [0, true, true, 2, true]);
+  // 别的 checkout 的到期债:库层直接造(另起一个 checkout 跑完整个转欠账流程太重)
+  t("298 r2 边界:别的 checkout 的转欠账到期 ⇒ 回到开着但未归属、不并入本批", (() => {
+    const dir = fs.mkdtempSync(J(os.tmpdir(), "obl298r2-"));
+    try {
+      const mk = (checkout) => OB.mutateStore(dir, (d) => { const r = OB.createObligation(d, { type: "outcome-diary", checkout, owner: "s-old", origin: { batch: "360" }, batch: { batch: "360", armedAt: "a" } }, "x"); return d.put({ ...r, status: "settled", settle: { debtId: "D9", expiry: 363 } }, { op: "settle", by: "x" }); }).result;
+      const mine = mk("c:/here"), theirs = mk("c:/there");
+      const out = OB.mutateStore(dir, (d) => armCarry(d, null, { batch: "364", armedAt: "b" }, { sid: "s-new", checkout: "c:/here" })).result;
+      const s = OB.readStore(dir).obligations;
+      const m = s.find((r) => r.id === mine.id), o = s.find((r) => r.id === theirs.id);
+      return [out.reopened.length, out.reopenedOthers.length, m.status, m.batch?.batch, m.owner, o.status, o.batch];
+    } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 无害 */ } }
+  })(), [1, 1, "open", "364", "s-new", "open", null]);
+  // 没有冻结快照的旧批(本功能之前武装)⇒ 按「现行 ∪ 基点」求值:批内关掉日记也关不掉
+  t("298 r1 绕过面(旧批无快照):批内把配置的 diary 去掉并提交 ⇒ 按基点版仍要日记行", sandbox(({ tmp, g, cliEnv, w, commit }) => {
+    const base = g("rev-parse", "HEAD").stdout.trim();
+    w(".claude/.batch-goal.json", JSON.stringify({ batch: "347", conditions: ["甲"], checks: [], shell: "bash", armedAt: "2026-11-01T00:00:00.000Z", baseCommit: base, decisions: [], outcomes: [{ n: 1, text: "旧成果" }], withdrawn: [], noDecision: { text: "自测" }, version: 3 }));
+    ledgerAppend(J(tmp, ".claude", ".batch-goal.jsonl"), { at: "2026-11-01T00:00:00.000Z", action: "arm", batch: "347", conditions: ["甲"], checks: [], shell: "bash", baseCommit: base });
+    w("gate-install.json", JSON.stringify({ format: "gate-install/v1", adrDir: "docs/adr" })); commit("drop diary");
+    const c = cliEnv(SID, "--clear"); return [c.status, /reason=diary-missing/.test(c.stderr)];
+  }), [2, true]);
+  // 非 git 目录 --arm --force、旧批名下本来没东西(FB-7)
+  {
+    const dir = fs.mkdtempSync(J(os.tmpdir(), "bg298ng-"));
+    try {
+      // GIT_CEILING_DIRECTORIES:不让 git 往上找(本机用户目录本身是 git 仓,临时目录在它下面——不设的话「非 git」夹具会把义务账写进用户目录)
+      const run = (...a) => spawnSync(process.execPath, ["--no-warnings", fileURLToPath(import.meta.url), ...a], { cwd: dir, encoding: "utf8", windowsHide: true, timeout: 60_000, env: { ...process.env, ...SID, GIT_CEILING_DIRECTORIES: path.dirname(dir) } });
+      const a1 = run("--arm", "370", "--cond", "甲"), a2 = run("--arm", "371", "--cond", "乙", "--force");
+      t("298 r1 误拦:非 git 目录 --arm --force、旧批名下没东西可带 ⇒ 不拒(且确实走的是「取不到义务账」那条路)", [a1.status, a2.status, /义务账判不了/.test(a1.stderr + a2.stderr)], [0, 0, true]);
+    } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 无害 */ } }
+  }
+}
+const verifyChainOk = (f) => { try { return verifyFileChain(f).ok; } catch { return false; } };
 
 // ⚠️ **主模块守卫**(grill:edge-cases F23):本文件 export 了 load/confirmedIndices/evaluate,
 //   而下面的 CLI 段原先**无条件执行** ⇒ 任何 import 它的进程当场退出(0 或 2),
@@ -1141,7 +2279,7 @@ const IS_MAIN = !!process.argv[1] &&
   import.meta.url.endsWith(process.argv[1].split(/[\\/]/).pop());
 const argv = IS_MAIN ? process.argv.slice(2) : ["--imported-noop"];
 if (argv.includes("--self-test")) process.exit(selfTest());
-{ const modes = ["--arm", "--status", "--dry-check", "--clear", "--history", "--decision", "--outcome", "--withdraw"].filter((m) => argv.includes(m));
+{ const modes = ["--arm", "--status", "--dry-check", "--clear", "--history", "--decision", "--outcome", "--withdraw", "--settle", "--repair-obligations", "--context"].filter((m) => argv.includes(m));
   if (modes.length > 1) { console.error(`一次只能一个模式,得到:${modes.join(" ")}`); process.exit(2); } }
 
 if (argv.includes("--clear")) {
@@ -1181,6 +2319,44 @@ if (argv.includes("--clear")) {
       console.error("拒绝结清:状态文件里的可执行判据与武装时的台账不一致——有人改过状态文件。用 --history 对照后重新 --arm。");
       refuse("checks-tampered"); process.exit(2);
     }
+    // 批 298(2.2 K 行):逐条裁决参数,可选;给了就须覆盖全部条件
+    let verdicts = null;
+    try { verdicts = parseVerdicts(argv, prev.conditions.length); }
+    catch (e) {
+      refuse("verdict-usage");
+      console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev.batch} reason=verdict-usage`);
+      console.error(`拒绝结清:${e.message}\n出路:每条条件给一个 --verdict "N=达成|未达成|不适用[:理由]",或一个都不给(文字对照「条件N:达成」照旧认)。`);
+      process.exit(2);
+    }
+    // 批 298:义务账可信性先查(拒清口径同 checks-tampered:状态与台账对不上就拒,不猜)
+    const oblDir = OB.storeDir();
+    const refuseStore = (kind, why) => {
+      const s = storeRefusal(kind, why);
+      refuse(s.reason);
+      console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev.batch} reason=${s.reason}`);
+      console.error(`拒绝结清:义务账判不了——${s.msg}。判不了按开着算。\n出路:${s.outlet}`);
+      process.exit(2);
+    };
+    // 批 298 r1(codex §1 / BP-1 / BP-6):批身份必须与武装台账最后一条 arm 行一致(状态文件 gitignore、可被改)
+    { const id = armIdentity(prev); if (!id.ok) refuseStore("identity", `批身份与武装台账对不上:${id.why}`); }
+    if (oblDir.unknown) refuseStore("unknown", `取不到义务账目录(${oblDir.why})`);
+    let oblSnap = OB.readStore(oblDir.dir);
+    if (!OB.TRUSTED.has(oblSnap.kind)) refuseStore(oblSnap.kind, oblSnap.why);
+    { const p = anchorProblem(oblSnap); if (p) refuseStore("anchor", p); }   // 批 298 r1(codex §2):每个写点都记锚
+    // 批 298 r1(红队 BP-4):本批把配置改坏(基点版合法)⇒ 直接拒,不计判不了、不能 --settle
+    // 批 298 r2(猎手 FB-6):配置读错误(EBUSY / EPERM / EISDIR…)⇒ 判不了、可重试;不算改坏,也不动义务账
+    if (effectiveConfig(prev).readError) {
+      refuse("obligation-unknown");
+      console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev.batch} reason=obligation-unknown`);
+      console.error(`拒绝结清:${installConfig().error}——读错误不是配置坏了,判不了。\n出路:查占用 / 权限后重跑 --clear。`);
+      process.exit(2);
+    }
+    if (effectiveConfig(prev).brokenInBatch) {
+      refuse("config-broken-in-batch");
+      console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev.batch} reason=config-broken-in-batch`);
+      console.error(`拒绝结清:${brokenConfigText(prev.baseCommit)}\n这一项不计入判不了次数,不能 --settle。`);
+      process.exit(2);
+    }
     const fails = runChecks(prev);
     if (fails.length) {
       refuse("checks-failed");
@@ -1200,31 +2376,102 @@ if (argv.includes("--clear")) {
     if (wt.paths.length) {
       refuse("uncommitted");
       console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev?.batch} reason=uncommitted n=${wt.paths.length}`);
-      console.error(`拒绝结清:还有 ${wt.paths.length} 个已跟踪文件的改动没提交(生产法三:收尾清账不征询,提交是清账的一部分):`);
+      console.error(`拒绝结清:还有 ${wt.paths.length} 个已跟踪文件的改动没提交(AGENTS.md「三、生产」收尾清部署欠账不用问,提交是清账的一部分):`);
       for (const f of wt.paths.slice(0, 10)) console.error(`  ${f}`);
       if (wt.paths.length > 10) console.error(`  …另 ${wt.paths.length - 10} 个`);
       console.error("出路:本批的改动先提交再 --clear。**不是本批做的改动(可能是用户自己的)不得撤销、不得丢弃**——停下告诉用户,由用户决定。");
       process.exit(2);
     }
     // 批 256:登记过的决定要有 ADR、登记过的成果要有日记行——写入 cleared 之前查,缺 ⇒ 拒清并给模板。
-    const obl = obligationCheck(prev);
-    for (const n of obl.notes) console.error("提示:" + n);
-    if (obl.unknown) {
-      refuse("obligation-unknown");
-      console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev?.batch} reason=obligation-unknown`);
-      console.error(`拒绝结清:决定 / 成果 / 承重面的核对判不了(${obl.unknown})。判不了按没过算。`);
-      process.exit(2);
+    // 批 298:判据照旧是 obligationCheck(同一份判定),但对象是「批状态 ∪ 义务账里本批的记录」;结论写回义务账,
+    //   拒不拒按义务账里本批名下的记录定(带进来的、产生器建的都在内);转欠账且已提交的不再挡。
+    // 批 298 r1(codex §4 / 猎手 FB-1、附二⑤):取证(git)全在锁外算成计划;锁内只核「本批名下的记录没被别人动过」再落笔。
+    //   只有本批相关记录的 rev 变了才算冲突;冲突 ⇒ 重读重算一次,还冲突才拒。
+    const key = batchKeyOf(prev);
+    const ctx = oblCtx();
+    let evalOut = null, goalU, obl;
+    let lastWriteHints = [];   // 批 301:写入类取证里只提示、不产生义务的(M 全部;仓外 memory 的 shell 写入)
+    for (let attempt = 0; attempt < 2 && !evalOut; attempt++) {
+      oblSnap = OB.readStore(oblDir.dir);
+      if (!OB.TRUSTED.has(oblSnap.kind)) refuseStore(oblSnap.kind, oblSnap.why);
+      // 批 301:写入类取证(T / MF / J / M)在锁外做(异步:要载入 MF / verify-laws 判据),含本批名下与待并入的既有写入类义务;
+      //   结论在锁内由 applyClearPlan 落笔(同一次指纹核对;冲突重读时连同它重算)。取证自身抛错 ⇒ 一条 UNKNOWN,不当「没事」。
+      let writeChecks, existing = [];
+      try {
+        //   本批名下的连已清的也重判(已清后文件又回到坏内容、且退出了净 diff ⇒ 要能重开;codex 301 r1 F2)
+        existing = oblSnap.obligations.filter((r) => isWriteCheckType(r.type) && r.status !== "withdrawn" &&
+          ((sameKey(r.batch, key)) || (!isDone(r) && ((prev.carriedFrom && sameKey(r.batch, prev.carriedFrom)) || (!r.batch && ownerMatches(r, ctx.sid, ctx.checkout))))));
+        writeChecks = await planWriteChecks(prev, { conf: followConfPaths(batchConfig(prev, oblSnap.obligations), prev.baseCommit), existing });
+      } catch (e) {
+        // codex 301 r4 ①:取证抛错的兜底也先把已撤回的 T / MF / M 写清,再放一条 J 的 UNKNOWN
+        let wc = []; try { wc = withdrawnClears(existing); } catch { wc = []; }
+        writeChecks = { items: [...wc, { type: "write-law-verify", path: "(写入类取证)", result: "unknown", why: `取证抛错:${String(e && e.message || e).slice(0, 160)}` }], hints: [] };
+      }
+      lastWriteHints = writeChecks.hints || [];
+      const plan = planClear(prev, oblSnap.obligations, ctx, { writeChecks });
+      ({ goalU, obl } = plan);
+      if (attempt === 0) for (const n of obl.notes) console.error("提示:" + n);
+      try { evalOut = OB.mutateStore(oblDir.dir, (draft) => applyClearPlan(draft, prev, plan, ctx)); }
+      catch (e) { if (e.code === "CONFLICT" && attempt === 0) continue; refuseStore(errKind(e), `${e.code || ""} ${e.message}`.trim()); }
     }
-    if (obl.missingDecisions.length || obl.diaryMissing || obl.noDecisionTouched.length) {
-      const why = [obl.missingDecisions.length ? "adr-missing" : "", obl.diaryMissing ? "diary-missing" : "", obl.noDecisionTouched.length ? "no-decision" : ""].filter(Boolean).join("+");
+    for (const h of lastWriteHints.slice(0, 12)) console.error("提示:" + h);
+    if (lastWriteHints.length > 12) console.error(`提示:写入类另有 ${lastWriteHints.length - 12} 条只提示项未列`);
+    const recs = evalOut.result;
+    const blocking0 = recs.filter((r) => OB.BLOCKING.has(r.status));
+    // 批 298 r2(红队附三):求值已写进义务账、而本次又被拒 ⇒ 也记锚(否则拒清后截掉这几行查不出);放行的那次锚记在 clear 行里
+    if (blocking0.length && evalOut.changed?.length) journal("obl-head", { batch: prev.batch, oblHead: { h: evalOut.head, version: evalOut.version } });
+    const blocking = recs.filter((r) => OB.BLOCKING.has(r.status));
+    if (blocking.length) {
+      const own = blocking.filter((r) => sameKey(r.origin, key) && OB.RESERVED_TYPES.has(r.type) && r.status !== "settling");
+      const other = blocking.filter((r) => !own.includes(r));
+      const reasons = [];
+      const ownUnknown = own.some((r) => r.status === "unknown");
+      if (ownUnknown) reasons.push("obligation-unknown");   // 原口径:本批核对判不了时只报判不了
+      else {
+        if (own.some((r) => r.type === "decision-adr")) reasons.push("adr-missing");
+        if (own.some((r) => r.type === "outcome-diary")) reasons.push("diary-missing");
+        if (own.some((r) => r.type === "load-bearing-decision")) reasons.push("no-decision");
+      }
+      for (const r of other) reasons.push(r.status === "settling" ? "settle-uncommitted" : r.status === "unknown" ? "obligation-unknown" : "obligation-open");
+      const why = [...new Set(reasons)].join("+");
       refuse(why);
       console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev?.batch} reason=${why}`);
-      printObligationRefusal(prev, obl);
+      if (ownUnknown) {
+        const u = own.filter((r) => r.status === "unknown");
+        console.error(`拒绝结清:决定 / 成果 / 承重面的核对判不了(${obl.unknown})。判不了按没过算。`);
+        console.error(`  连续判不了:${u.map((r) => `${recLabel(r)} ×${r.unknownStreak || 0}`).join("、")};到 ${OB.UNKNOWN_LIMIT} 次(首次 + 重试 ${OB.MAX_RETRIES} 次)后可 \`--settle\` 转欠账 ⇒ 提交 ⇒ 再 --clear。`);
+      } else if (own.length) {
+        const ownObl = { ...obl,
+          missingDecisions: own.filter((r) => r.type === "decision-adr").map((r) => r.payload?.id),
+          diaryMissing: own.some((r) => r.type === "outcome-diary"),
+          noDecisionTouched: own.some((r) => r.type === "load-bearing-decision") ? obl.noDecisionTouched : [] };
+        printObligationRefusal(goalU, ownObl);
+      }
+      if (other.length) {
+        console.error(`拒绝结清:本批名下还有 ${other.length} 条未清的义务(带进来的 / 产生器建的;判不了按开着算):`);
+        for (const r of other) {
+          const outlet = r.status === "settling" ? `把债表行 ${r.settle?.debtId} 提交(git add ${r.settle?.table || cfgDebtTable()} && git commit),再 --clear;行丢了就重跑 --settle`
+            : OB.RESERVED_TYPES.has(r.type) ? (r.type === "decision-adr" ? OUTLETS["decision-adr"](r.payload?.id) : r.type === "outcome-diary" ? OUTLETS["outcome-diary"](r.origin?.batch, r.payload?.n) : OUTLETS["load-bearing-decision"](r.origin?.batch).replace(/:/, `(由本批 ${prev.batch} 承接):`))
+            : (r.outlet || "让产生它的流程重跑取证");
+          console.error(`  · ${fmtRec(r)}${r.origin?.batch && r.origin.batch !== prev.batch ? `(来自批 ${r.origin.batch})` : ""} —— ${r.lastResult?.why ? `${String(r.lastResult.why).slice(0, 120)};` : ""}出路:${outlet}`);
+          if (r.status === "unknown") console.error(`    连续判不了 ×${r.unknownStreak || 0};到 ${OB.UNKNOWN_LIMIT} 次后可 --settle 转欠账`);
+        }
+      }
+      console.error("没有任何命令能把义务直接标成已清:已清只由取证结果写(做完它再 --clear),卡住的转欠账(--settle)。");
       process.exit(2);
     }
+    // 批 298 r3(codex §3):结清报告首行写明本批曾确认义务账丢失(要在写 clear 行之前取,否则「本批期间」就空了)
+    const accNow = acceptLossRows().current;
+    if (accNow.length) console.log(`本批曾确认义务账丢失(理由:${accNow.map((r) => r.reason).join(";")})——收尾报告须写明`);
+    const oblCleared = recs.filter((r) => r.status === "cleared").map((r) => r.id);
+    const oblSettled = recs.filter((r) => r.status === "settled").map((r) => ({ id: r.id, debtId: r.settle?.debtId, expiry: r.settle?.expiry }));
     journal("clear", { batch: prev?.batch ?? null, conditions: prev?.conditions ?? null,
       checks: prev?.checks ?? null, armedAt: prev?.armedAt ?? null, baseCommit: prev?.baseCommit ?? null,
-      decisions: prev?.decisions ?? null, outcomes: prev?.outcomes ?? null, withdrawn: prev?.withdrawn ?? null });
+      decisions: prev?.decisions ?? null, outcomes: prev?.outcomes ?? null, withdrawn: prev?.withdrawn ?? null,
+      obligations: { cleared: oblCleared.length, settled: oblSettled, head: evalOut.head ?? null, version: evalOut.version },
+      ...(evalOut.head ? { oblHead: { h: evalOut.head, version: evalOut.version } } : {}),
+      ...(verdicts ? { verdicts } : {}) });
+    console.log(`义务:已清 ${oblCleared.length} 条;转欠账 ${oblSettled.length} 条${oblSettled.length ? `(${oblSettled.map((s) => `${s.debtId} ≤${s.expiry}`).join("、")};到期未结会在开批时回到开着)` : ""}`);
     // ⚠️ **批号要留在状态文件里**(2026-08-20,grill:edge-cases E6)。
     //   闸判「这次关账是真的」靠台账末行,但  的 catch 会把写失败整个吞掉
     //   (Windows 上文件被占用即触发),而 atomicWrite 照常成功、CLI 照常 exit 0
@@ -1240,6 +2487,11 @@ if (argv.includes("--clear")) {
     // 批 258 条件 4:收尾自动出一张报警量 × 误报率表(按规则),待修行下一批 --arm 会再列一次
     const rep = fpReport();
     if (rep) console.log("\n── 收尾误报率表 ──\n" + rep.trim());
+    // 批 292(287 设计 2.6 / 2.8;用户 11-06「记账了真的还有人去看嘛」):「只记账」档(E0 / E2 / S / Q)不进模型上下文,
+    //   命中落在 `.claude/.gate-candidates.jsonl`;结清这一步是它唯一的必经读点——按本批武装时刻起汇总一行。
+    //   失效条件:连续 5 批这行的命中没有一次引起改动 ⇒ 真阳性回放后删检测(债表 D200)。读不到 ⇒ 说出来,不拦结清。
+    try { const line = candidateSummary(prev?.armedAt); if (line) console.log("\n" + line); }
+    catch (e) { console.log(`⚠ 候选台账读不到(${String(e && e.message || e).slice(0, 120)})——「只记账」档本批的命中没法汇总`); }
     // 2026-10-12:自签误报交 codex 盲审(scripts/fp-audit.mjs)——独立核对由另一个模型做,不靠用户按按钮
     //   (用户:「有问题不应该自己解决嘛」)。审不了 ⇒ 说出来,不拦结清。
     fpAudit();
@@ -1270,12 +2522,154 @@ if (argv.includes("--decision")) appendItem("decision", argv);
 if (argv.includes("--outcome")) appendItem("outcome", argv);
 if (argv.includes("--withdraw")) withdrawItem(argv);
 
+/** 批 298:义务账的只读视图(--status / --context 共用)。返回 { kind, why, dir, view, all }。 */
+function oblRead(g) {
+  const sd = OB.storeDir();
+  if (sd.unknown) return { kind: "unknown", why: sd.why, dir: null, view: oblView(null, g, oblCtx()) };
+  const snap = OB.readStore(sd.dir);
+  return { kind: snap.kind, why: snap.why, dir: sd.dir, view: oblView(OB.TRUSTED.has(snap.kind) ? snap : null, g, oblCtx()) };
+}
+function printOblStatus(g) {
+  const o = oblRead(g);
+  const v = o.view;
+  console.log(`  义务账(${o.dir ? path.join(o.dir, "state.json") : "取不到"}):${OB.TRUSTED.has(o.kind) ? "可信" : `判不了(${o.kind}:${o.why})——--clear 会拒`}`);
+  {
+    const acc = acceptLossRows();
+    for (const r of acc.current) console.log(`  ⚠ 本批曾确认义务账丢失:${fmtAccept(r)}——收尾报告须写明`);
+    if (acc.latest && !acc.current.includes(acc.latest)) console.log(`  最近一次确认义务账丢失:${fmtAccept(acc.latest)}`);
+  }
+  if (g) { const id = armIdentity(g); if (!id.ok) console.log(`  ⚠ 批身份与武装台账对不上(${id.why})——--clear / --settle 会拒(obligations-tampered);下面按状态文件列,可能不准`); }
+  if (v.key) {
+    const s = OB.summarize(v.mine);
+    console.log(`  本批名下未清 ${v.mine.length} 条:开着 ${s.open} / 判不了 ${s.unknown} / 转欠账待提交 ${s.settling} / 已转欠账 ${s.settled}${s.blocking ? `  ⇒ --clear 会拒(挡关账 ${s.blocking} 条)` : ""}`);
+    for (const r of v.mine) console.log(`    ${fmtRec(r)}${r.origin?.batch && String(r.origin.batch) !== String(g.batch) ? `(来自批 ${r.origin.batch})` : ""}${OB.settleEligible(r) && r.status === "unknown" ? "  ← 可 --settle 转欠账" : ""}`);
+  }
+  if (v.unassignedMine.length) console.log(`  本 checkout 未归属 ${v.unassignedMine.length} 条(下次 --arm / --clear 并入):${v.unassignedMine.map(fmtRec).join(";")}`);
+  if (v.unassignedOthers.length) console.log(`  别的 checkout 未归属 ${v.unassignedOthers.length} 条(不并入本批):${v.unassignedOthers.map((r) => `${fmtRec(r)} @${String(r.owner || r.checkout || "?").slice(0, 12)}`).join(";")}`);
+  const settledElsewhere = v.settledAll.filter((r) => !v.mine.includes(r));
+  if (settledElsewhere.length) console.log(`  已转欠账 ${settledElsewhere.length} 条(到期未结会在开批时回到开着):${settledElsewhere.map(fmtRec).join(";")}`);
+}
+
+if (argv.includes("--context")) {
+  // 批 298(2.1「每轮给模型一份上下文」):一行摘要 + 一个路径 + 内容哈希。只读。哈希只随内容变(给注入去重用)。
+  let g = null, gErr = null;
+  try { g = load(); } catch (e) { gErr = e.message; }
+  const o = oblRead(g && !g.cleared ? g : null);
+  const armed = g && !g.cleared && Array.isArray(g.conditions) && g.conditions.length;
+  const s = OB.summarize(o.view.mine);
+  const content = { batch: armed ? g.batch : null, gErr, store: o.kind, mine: o.view.mine.map((r) => [r.id, r.status, r.unknownStreak || 0]), un: o.view.unassignedMine.map((r) => [r.id, r.status]) };
+  const line = gErr ? `批状态读不了(${gErr})` : armed ? `批 ${g.batch} 已武装(${g.conditions.length} 条条件)` : g?.cleared ? `批 ${g.batch} 已结清,未武装新批` : "未武装";
+  console.log(`BATCH-CONTEXT ${line};义务:挡关账 ${s.blocking}(开着 ${s.open} / 判不了 ${s.unknown} / 转欠账待提交 ${s.settling})、已转欠账 ${s.settled}、本 checkout 未归属 ${o.view.unassignedMine.length}${OB.TRUSTED.has(o.kind) ? "" : `;义务账判不了(${o.kind})`} path=${o.dir ? path.join(o.dir, "state.json") : "-"} sha256=${OB.digest(content).slice(0, 16)}`);
+  process.exit(0);
+}
+
+if (argv.includes("--repair-obligations")) {
+  // 批 298:只按台账重建状态文件 / 截掉台账末尾撕裂残片。不改任何一条义务的结论;链断(台账行被改写)拒做。
+  const sd = OB.storeDir();
+  if (sd.unknown) { console.error(`取不到义务账目录:${sd.why}`); process.exit(2); }
+  try {
+    const notes = OB.repairStore(sd.dir);
+    for (const n of notes) console.log(`修复:${n}`);
+    // 不往批台账 .batch-goal.jsonl 记行:结清后收尾闸要求台账末行就是 clear 行(hook-stop-closure K0 证据),
+    //   在那之后追加任何行都会让一次正常关账被 K0 误拦。修复的痕迹是 ledger / state 的 *.bak 备份。
+    process.exit(0);
+  } catch (e) {
+    console.error(`拒绝修复:${e.message}`);
+    process.exit(2);
+  }
+}
+
+if (argv.includes("--settle")) {
+  // 批 298(287 设计 2.7「卡住以后自动转成欠账」;拆批稿 0.5):连续判不了 ≥3 次的义务写一行债表(失效期 ≤ 批号数字部分 + 3),
+  //   状态改「转欠账待提交」。不提交、不结清:提交以后 --clear 只认 HEAD 里那一行(不在 --clear 里写债表,D116 自锁)。
+  const i = argv.indexOf("--settle");
+  const target = argv[i + 1] && !/^--/.test(argv[i + 1]) ? argv[i + 1] : null;
+  const extra = argv.filter((a, k) => k !== i && !(target && k === i + 1));
+  if (extra.length) { console.error(`用法错误:--settle [<义务 id>],多余参数:${extra.join(" ")}`); process.exit(2); }
+  let g;
+  try { g = load(); } catch (e) { console.error(`拒绝转欠账:${e.message}`); process.exit(2); }
+  if (!g || g.cleared || !Array.isArray(g.conditions) || !g.conditions.length) { console.error("拒绝转欠账:盘上没有未结清的批(转欠账要记在某一批名下,失效期按批号算)。"); process.exit(2); }
+  const num = OB.batchNumber(g.batch);
+  if (!Number.isFinite(num)) { console.error(`拒绝转欠账:批号「${g.batch}」没有数字部分,算不出失效期(≤批号+3)。出路:--arm <数字批号> --cond … --force 换到数字批号(义务会原样带过去),再 --settle。`); process.exit(2); }
+  const expiry = num + OB.MAX_RETRIES + 1;   // = 批号 + 3(287 设计 2.7「默认 ≤ 当前批号 + 3」)
+  { const id = armIdentity(g); if (!id.ok) { const s = storeRefusal("identity", id.why); console.error(`拒绝转欠账:批身份与武装台账对不上——${s.msg}\n出路:${s.outlet}`); process.exit(2); } }
+  const sd = OB.storeDir();
+  if (sd.unknown) { console.error(`拒绝转欠账:取不到义务账目录(${sd.why})`); process.exit(2); }
+  const snap = OB.readStore(sd.dir);
+  if (!OB.TRUSTED.has(snap.kind)) { const s = storeRefusal(snap.kind, snap.why); console.error(`拒绝转欠账:义务账判不了——${s.msg}\n出路:${s.outlet}`); process.exit(2); }
+  { const p = anchorProblem(snap); if (p) { const s = storeRefusal("anchor", p); console.error(`拒绝转欠账:${s.msg}\n出路:${s.outlet}`); process.exit(2); } }
+  const key = batchKeyOf(g);
+  const mine = arr(snap.obligations).filter((r) => sameKey(r.batch, key) && !isDone(r) && (!target || r.id === target));
+  const eligible = mine.filter(OB.settleEligible);
+  if (!eligible.length) {
+    console.error(`拒绝转欠账:${target ? `义务 ${target} 不在本批名下,或` : "本批名下"}没有可转欠账的义务——只有**连续判不了 ≥${OB.UNKNOWN_LIMIT} 次**(首次 + 重试 ${OB.MAX_RETRIES} 次)的才转;开着的是「没做」,不是「卡住」。`);
+    for (const r of mine.filter((x) => OB.BLOCKING.has(x.status))) {
+      const why = r.status === "open" ? "开着(取证给出了「没做」):做完它再 --clear" : r.status === "unknown" ? `判不了 ×${r.unknownStreak || 0}:再跑 --clear 重试(还差 ${OB.UNKNOWN_LIMIT - (r.unknownStreak || 0)} 次),或先修好取证条件` : r.status;
+      console.error(`  · ${fmtRec(r)} —— ${why}`);
+    }
+    process.exit(2);
+  }
+  // 批 298 r1:债表路径按本批冻结的配置(武装时快照 ∪ 基点版);配置写了路径而文件不在 ⇒ 判不了,拒(不悄悄新建)
+  if (effectiveConfig(g).brokenInBatch) { console.error(`拒绝转欠账:${brokenConfigText(g.baseCommit)}\n这一项不能拿转欠账绕过。`); process.exit(2); }
+  const bconf = batchConfig(g, snap.obligations);
+  if (bconf.error) { console.error(`拒绝转欠账:安装方配置判不了(${bconf.error})${bconf.brokenInBatch ? "——是本批改坏的,改回 gate-install.json 再来(不能拿转欠账绕过)" : ""}`); process.exit(2); }
+  const table = bconf.debtTable || "docs/gate-debts.md";
+  let text0 = "";
+  try { text0 = fs.readFileSync(table, "utf8"); }
+  catch (e) {
+    if (e.code !== "ENOENT") { console.error(`拒绝转欠账:债表读不了(${e.code}):${table}`); process.exit(2); }
+    if (bconf.debtTableExplicit) { console.error(`拒绝转欠账:配置写了债表 ${table},文件却不存在——判不了。出路:确认路径(gate-install.json 的 debtTable)或把债表建出来并提交,再 --settle`); process.exit(2); }
+  }
+  const tableWritten = [];
+  let written;
+  try {
+    written = OB.mutateStore(sd.dir, (draft) => {
+      let text = text0;
+      let next = OB.maxDebtId(text);
+      const done = [];
+      for (const r0 of eligible) {
+        const r = draft.get(r0.id);
+        if (!r || r.rev !== r0.rev) throw new OB.ObligationError("CONFLICT", `义务 ${r0.id} 在读后被改过`);
+        // 工作树里已有写着这条义务 id 的行(上次「债表已写、义务账未记」,或待提交时重跑)⇒ 沿用那个 D 号、不重复写
+        const existing = (text.match(new RegExp(`^\\|\\s*(D\\d+)\\s*\\|[^\\n]*${r.id}`, "m")) || [])[1];
+        const debtId = existing || (r.status === "settling" && r.settle?.debtId) || `D${++next}`;
+        if (!existing) text = OB.insertDebtRow(text, OB.settleRow(r, { debtId, batch: g.batch, expiry: r.settle?.expiry ?? expiry }));
+        draft.put({ ...r, status: "settling", settle: { debtId, expiry: r.settle?.expiry ?? expiry, table, at: new Date().toISOString(), batch: g.batch } },
+          { op: "settle", by: "batch-goal --settle", why: `连续判不了 ${r.unknownStreak || 0} 次,转欠账 ${debtId}(≤${r.settle?.expiry ?? expiry})` });
+        done.push({ id: r.id, debtId, expiry: r.settle?.expiry ?? expiry, label: recLabel(r) });
+      }
+      if (text !== text0) { fs.mkdirSync(path.dirname(table) || ".", { recursive: true }); fs.writeFileSync(table, text, "utf8"); tableWritten.push(...done.map((d) => d.debtId)); }
+      return done;
+    }, { expectVersion: snap.version });
+  } catch (e) {
+    // 批 298 r1(codex 另项):债表写了、义务账追加失败 ⇒ 如实说,不说「什么都没写」
+    // 批 298 r2(codex ⑥):三步(债表 / 义务账台账 / state)各自成败如实报
+    const ledgerSt = e.phase === "state" ? `台账已追加 ${e.appended} 行` : e.phase === "ledger" && e.appended ? `台账只追加了 ${e.appended} 行(没写完)` : "台账未追加";
+    const stateSt = e.chainBroken ? "台账链已断(不能自动修复,停下告诉用户)" : e.phase === "state" || (e.phase === "ledger" && e.appended) ? "state 未同步(--repair-obligations 按台账重建)" : "state 未动";
+    if (tableWritten.length || e.phase) {
+      console.error(`转欠账半写:${tableWritten.length ? `债表已写 ${tableWritten.join("、")}(${table})` : "债表未写"};${ledgerSt};${stateSt}。原因:${e.code || ""} ${e.message}`);
+      if (e.chainBroken) { console.error("恢复:台账链已断,不能自动修复(--repair-obligations 对链断拒做)——停下告诉用户。"); process.exit(2); }
+      console.error(`恢复:${e.phase === "state" || (e.phase === "ledger" && e.appended) ? "先 `node --no-warnings scripts/batch-goal.mjs --repair-obligations`,再" : ""}重跑 \`node --no-warnings scripts/batch-goal.mjs --settle\`——它会认出债表里写着这条义务 id 的行,用同一个 D 号补记,不会再写一行。`);
+    } else console.error(`拒绝转欠账:${e.code || ""} ${e.message}——债表、台账、state 都没写;重跑一次`);
+    process.exit(2);
+  }
+  journal("settle", { batch: g.batch, settled: written.result, oblHead: { h: written.head, version: written.version } });
+  console.log(`已转欠账 ${written.result.length} 条(写进 ${table},状态「转欠账待提交」):`);
+  for (const d of written.result) console.log(`  ${d.debtId} ≤${d.expiry}:${d.label}(义务 ${d.id})`);
+  const issues = (() => { try { return debtTableIssues(fs.readFileSync(table, "utf8")); } catch { return []; } })();
+  if (issues.length) console.log(`🔴 写完后债表结构有问题:${issues.join(";")}`);
+  console.log(`下一步:git add ${table} && git commit -m "…"(提交本批其余改动时一起),然后 --clear——它只认 HEAD 里已提交的这几行。`);
+  console.log("转欠账不等于完成:报告里与「已清」分开列;到期未结的,开批时回到开着。");
+  process.exit(0);
+}
+
 if (argv.includes("--status")) {
   const g = load();
   if (!g || g.cleared || !Array.isArray(g.conditions)) {
     // F25: 之后状态是 {cleared:true},truthy 但没有 conditions ⇒ 原实现在
     //   **每两批之间那个必然存在的状态**上崩溃。--status 是文档写明的检视口。
     console.log(g?.cleared ? "已结清:上一批已关账,尚未武装新批" : "未武装:本批没有完成条件(开工时应 --arm)");
+    printOblStatus(null);
     process.exit(0);
   }
   console.log(`批 ${g.batch} · ${g.conditions.length} 条完成条件:`);
@@ -1285,6 +2679,7 @@ if (argv.includes("--status")) {
   for (const d of arr(g.decisions)) console.log(`  决定 ${d.id}: ${d.text}`);
   for (const o of numberOutcomes(g.outcomes)) console.log(`  成果 O${o.n}: ${o.text}`);
   for (const w of arr(g.withdrawn)) console.log(`  已撤 ${w?.kind === "decision" ? w.id : `O${w?.n}`}: ${w?.text}  ——理由:${w?.reason}`);
+  printOblStatus(g);
   process.exit(0);
 }
 
@@ -1347,18 +2742,11 @@ if (argv.includes("--arm")) {
   // 批 276(误拦猎手 FB-13):同号重放时 --no-decision 声明一并保留,原先被静默丢掉 ⇒ --clear 拒清
   const kept = sameOpen ? { decisions: arr(cur.decisions), outcomes: arr(cur.outcomes), withdrawn: arr(cur.withdrawn), ...(cur.noDecision ? { noDecision: cur.noDecision } : {}) } : { decisions: [], outcomes: [], withdrawn: [] };
   if (!baseCommit) console.log(sameOpen ? "注意:本批武装于基点功能之前,基点保持空;--clear 的 ADR 核对会退回全部 ADR。" : "注意:取不到 HEAD(非 git 仓或零提交),本批没有基点;--clear 的 ADR 核对会退回全部 ADR。");
-  // 批 256b BP-3:--force 换批覆盖带决定/成果的未结清批 ⇒ 点名丢了什么,并记台账(此前静默丢掉)。
-  if (cur && !cur.cleared && !sameOpen && (arr(cur.decisions).length || arr(cur.outcomes).length)) {
-    const lostD = arr(cur.decisions).map((d) => d?.id).filter(Boolean);
-    const lostO = numberOutcomes(cur.outcomes).map((o) => ({ o: `O${o.n}`, text: o.text }));
-    journal("force-over-obligations", { batch: cur.batch, newBatch: batch, decisions: arr(cur.decisions), outcomes: lostO });
-    console.error(`注意:--force 覆盖了批 ${cur.batch} 未结清的义务,以下不再被任何 --clear 核对(已记台账 force-over-obligations):`);
-    for (const d of arr(cur.decisions)) console.error(`  决定 ${d?.id}: ${String(d?.text || "").slice(0, 80)}`);
-    for (const o of lostO) console.error(`  成果 ${o.o}: ${String(o.text || "").slice(0, 80)}`);
-    if (!lostD.length && !lostO.length) console.error("  (清单形状异常,未能列出)");
-  }
-  journal("arm", { batch, conditions: conds, checks, shell: "bash", overwrote: cur?.batch ?? null, baseCommit, ...(argv.includes("--force") ? { forced: true } : {}),
-    ...(typeof process.env.CLAUDE_CODE_SESSION_ID === "string" && /^[\w-]{8,80}$/.test(process.env.CLAUDE_CODE_SESSION_ID) ? { armedBy: process.env.CLAUDE_CODE_SESSION_ID } : {}) });   // forced:批 278(误拦猎手附节二 6);armedBy:批 281(与状态文件同一校验,误拦猎手 281 附节二 ①)
+  // 批 256b BP-3 → 批 298:--force 换批覆盖未结清的批,原先点名「以下不再被任何 --clear 核对」后丢掉;
+  //   现在它名下未清的义务(决定 / 成果 / 承重面零决定,以及产生器建的)原样带进新批,新批 --clear 照样核(287 设计 2.7 禁丢)。
+  //   台账行改名 force-carry-obligations(字段不变,续排编号照认)。
+  const forced = argv.includes("--force");
+  const needCarry = !!(cur && !cur.cleared && !sameOpen);
   // ⚠️ `armedAt` 是 2026-08-20 加的:开工面闸要判「**本批**跑过哪几条通道」,
   //   而状态文件此前**不记武装时刻**,于是那个窗口起点取不到 ⇒ 闸只能闭嘴。
   //   台账 .jsonl 里有时间,但让读者去 join 两份文件是把简单的事做复杂了。
@@ -1372,8 +2760,104 @@ if (argv.includes("--arm")) {
   //   这时收尾闸看本会话转录里有没有武装过该批号(没有 ⇒ 外来,判法见 hook-stop-closure.mjs isForeignBatch)
   const sidEnv = typeof process.env.CLAUDE_CODE_SESSION_ID === "string" && /^[\w-]{8,80}$/.test(process.env.CLAUDE_CODE_SESSION_ID) ? process.env.CLAUDE_CODE_SESSION_ID : null;
   const armedBy = sameOpen && typeof cur.armedBy === "string" && cur.armedBy ? cur.armedBy : sidEnv;
-  try { atomicWrite({ batch, conditions: conds, checks, shell: "bash", armedAt, baseCommit, ...(armedBy ? { armedBy } : {}), ...kept, ...carry }, seenVersion); }
-  catch (e) { console.error(e.message); process.exit(2); }
+  // 批 298:carriedFrom = 被本批换掉的那一批的键。义务账带入若在写台账那一步失败,--clear 按它补带(不留孤儿)。
+  // 批 298 r1(codex §1 / BP-1):上一批的身份以武装台账为准(状态文件可被改);同号重放沿用台账里的 armedAt / 基点
+  const curRow = cur && cur.batch ? lastArmRow(cur.batch) : null;
+  const trueCur = cur && curRow ? { ...cur, ...(typeof curRow.armedAt === "string" ? { armedAt: curRow.armedAt } : {}), ...(!cur.cleared ? { baseCommit: curRow.baseCommit ?? null } : {}) } : cur;
+  const armedAtT = sameOpen && typeof trueCur.armedAt === "string" && trueCur.armedAt ? trueCur.armedAt : armedAt;
+  const baseCommitT = sameOpen ? (typeof trueCur.baseCommit === "string" ? trueCur.baseCommit : null) : baseCommit;
+  const key0 = batchKeyOf(trueCur);
+  const carriedFrom = needCarry ? key0 : (sameOpen && cur.carriedFrom ? cur.carriedFrom : null);
+  const newState = { batch, conditions: conds, checks, shell: "bash", armedAt: armedAtT, baseCommit: baseCommitT, ...(armedBy ? { armedBy } : {}), ...kept, ...carry, ...(carriedFrom ? { carriedFrom } : {}) };
+  const newKey = { batch: String(batch), armedAt: armedAtT };
+  // 批 298 r2(codex ③ / 红队 BP-6):--arm 自身也核上一批的身份;对不上 ⇒ 按武装台账恢复(trueCur),并说出来
+  if (cur && !cur.cleared) { const id = armIdentity(cur, curRow); if (!id.ok && curRow) console.error(`注意:批 ${cur.batch} 的状态文件与武装台账对不上(${id.why})——按武装台账的身份${needCarry ? "导入并带入" : "重放"}`); }
+  // 批 298 r2(codex ② / 猎手 FB-2):义务账丢失的人工确认出路——只在锚对不上时可用,记进 hash 链台账
+  const acceptLoss = argv.includes("--accept-obligation-loss") ? String(argv[argv.indexOf("--accept-obligation-loss") + 1] || "").trim() : null;
+  // 批 298 r2(猎手 FB-5):arm 行在写批状态**之前**、同一把义务账锁里写;写不进去 ⇒ 拒武装、批状态与义务账都不动(无需事后回滚)
+  const armRow = { batch, conditions: conds, checks, shell: "bash", overwrote: cur?.batch ?? null, baseCommit: baseCommitT, armedAt: armedAtT, ...(forced ? { forced: true } : {}), ...(sidEnv ? { armedBy: sidEnv } : {}) };   // forced:批 278;armedBy:批 281;armedAt:批 298 r1
+  let armRowErr = null;
+  // 批 298 r3(codex ① / 红队 BP-1):arm 行自带武装那一刻的锚(义务账当时的末行);义务账不可信 / 取不到 ⇒ anchorUnknown:true
+  //   (lastOblAnchor 遇到它继续往前找,不让「账坏时武装」或「arm 行落盘后批状态写失败」把旧锚抹掉)。义务账可信但还空 ⇒ oblHead:null
+  let armAnchor = { anchorUnknown: true };
+  const writeArmRow = () => { try { fs.mkdirSync(path.dirname(JOURNAL), { recursive: true }); ledgerAppend(JOURNAL, { at: new Date().toISOString(), action: "arm", ...armRow, ...armAnchor }); } catch (e) { armRowErr = e; throw e; } };
+  // 批 298 r3(猎手 FB-1):确认丢失那一行已落盘、武装又因别的原因失败 ⇒ 如实说,并告诉重跑时去掉 --accept-obligation-loss
+  //   (那一行是扫锚的停点,重跑不带它即可放行;再带一次会因「锚对得上」被拒)
+  let acceptWritten = false;
+  const acceptNote = () => { if (acceptWritten) console.error("  注意:义务账丢失的确认已记进批台账(多了一行 accept-obligation-loss)——重跑时去掉 --accept-obligation-loss。"); };
+  const refuseArmRow = () => { console.error(`拒绝武装:批台账 ${JOURNAL} 写不进去(${armRowErr.code || armRowErr.message})——批状态与义务账都没动${acceptWritten ? "(批台账只多了那一行确认)" : ""}。\n  出路:查文件占用 / 只读属性 / 磁盘后重跑同一条 --arm。`); acceptNote(); process.exit(2); };
+  let wrote = false, writeErr = null, carryOut = null, oblErr = null, oblHead = null;
+  const doWrite = () => { try { atomicWrite(newState, seenVersion); wrote = true; } catch (e) { writeErr = e; throw e; } };
+  {
+    const sd = OB.storeDir();
+    if (sd.unknown) oblErr = sd.why;
+    else {
+      const snap = OB.readStore(sd.dir);
+      if (OB.TRUSTED.has(snap.kind)) armAnchor = snap.ledgerHead ? { oblHead: { h: snap.ledgerHead, version: snap.version } } : { oblHead: null };
+      // 批 298 r1(codex §2):每次 --arm 前核外部锚(整本删后同号重武装、截尾都在这里被抓)
+      const ap = OB.TRUSTED.has(snap.kind) ? anchorProblem(snap) : null;
+      if (ap && !acceptLoss) {
+        console.error(`拒绝武装:${ap}。\n  出路:停下告诉用户——义务账被整本换过或截短,本层无法自证;不得删批台账绕过。用户确认丢失后:原命令加 \`--accept-obligation-loss "<理由>"\`(记一行,收尾报告须写明)。`);
+        process.exit(2);
+      }
+      if (acceptLoss !== null && !ap) { console.error("用法错误:--accept-obligation-loss 只在义务账锚对不上时可用;现在锚对得上,去掉它。"); process.exit(2); }
+      if (ap && acceptLoss) {
+        try { fs.mkdirSync(path.dirname(JOURNAL), { recursive: true }); ledgerAppend(JOURNAL, { at: new Date().toISOString(), action: "accept-obligation-loss", batch, reason: acceptLoss, lostAnchor: lastOblAnchor(), problem: ap, storeHead: { h: snap.ledgerHead, version: snap.version }, ...(sidEnv ? { by: sidEnv } : {}) }); }
+        catch (e) { console.error(`拒绝武装:确认丢失的那一行写不进批台账(${e.code || e.message})——不记就不放行`); process.exit(2); }
+        acceptWritten = true;
+        console.log(`\n████ 义务账丢失已由执行者确认 ████\n  ${ap}\n  理由:${acceptLoss}\n  已记入批台账(accept-obligation-loss 行,含丢失前的锚)。**收尾报告须写明这一项。**\n`);
+      }
+      try {
+        const ctx = oblCtx();
+        // 锁外先算好慢活(git):HEAD、两批的配置快照
+        const headNow = headCommit();
+        const recs0 = OB.TRUSTED.has(snap.kind) ? snap.obligations : [];
+        const curConf = cur && !cur.cleared ? snapshotConfig(batchConfig(trueCur, recs0)) : null;
+        const newConf = snapshotConfig(sameOpen ? batchConfig(newState, recs0) : effectiveConfig(newState));
+        // 带入、arm 行、写批状态在同一把锁里:任一步失败 ⇒ fn 抛 ⇒ 义务账一行不落;arm 行写不进 ⇒ 批状态也不写
+        //   批 298 r2(codex ③):带入时导入用 trueCur(武装台账的基点),不用状态文件里可被改的那个
+        const res = OB.mutateStore(sd.dir, (draft) => { const c = armCarry(draft, trueCur, newKey, ctx, { head: headNow, forced, key0, curConf }); syncCurrent(draft, newState, ctx, "batch-goal:arm", newConf); writeArmRow(); doWrite(); return c; });
+        carryOut = res.result; oblHead = { h: res.head, version: res.version };
+      } catch (e) {
+        if (armRowErr) refuseArmRow();
+        if (writeErr) { console.error(writeErr.message); acceptNote(); process.exit(2); }
+        oblErr = `${e.code || ""} ${e.message}`.trim();
+      }
+    }
+  }
+  // 批 298 r1(猎手 FB-7):非 git 目录取不到义务账、而旧批名下本来就没有可带的东西(没登记决定 / 成果,也没有更早的带入)⇒ 不拒
+  const nothingToCarry = needCarry && !arr(cur.decisions).length && !arr(cur.outcomes).length && !cur.carriedFrom;
+  if (oblErr && !wrote) {
+    if (needCarry && !(nothingToCarry && OB.storeDir().unknown)) {
+      console.error(`拒绝武装:批 ${cur.batch} 还没结清,换批要把它名下未清的义务带进批 ${batch},可义务账判不了(${oblErr})。`);
+      console.error(`  不带就换批 = 把义务悄悄丢掉(287 设计 2.7 禁止)。出路:义务账被改过 ⇒ \`--repair-obligations\`;锁被占 ⇒ 过一会儿重跑;链断 ⇒ 停下告诉用户。`);
+      acceptNote();
+      process.exit(2);
+    }
+    console.error(`⚠ 义务账判不了(${oblErr})——本次武装照常(没有要带的);在它恢复可信之前 --clear 会拒清,出路见那时的提示`);
+    try { writeArmRow(); } catch { refuseArmRow(); }
+    try { atomicWrite(newState, seenVersion); } catch (e) { console.error(e.message); acceptNote(); process.exit(2); }
+  } else if (oblErr) console.error(`⚠ 批状态已写,义务账台账没写全(${oblErr})——新批记了 carriedFrom,--clear 时补带`);
+  if (needCarry && (arr(cur.decisions).length || arr(cur.outcomes).length)) {
+    journal("force-carry-obligations", { batch: cur.batch, newBatch: batch, decisions: arr(cur.decisions), outcomes: numberOutcomes(cur.outcomes).map((o) => ({ o: `O${o.n}`, text: o.text })) });
+  }
+  // 外部锚:arm 行已在锁里写过(那时还不知道义务账新末行),这里补记一行 obl-head;写不进只出声(锚落后但仍在台账里)
+  if (oblHead) journal("obl-head", { batch, oblHead });
+  if (carryOut) {
+    if (carryOut.carried.length) {
+      console.error(`注意:批 ${cur?.batch} ${cur?.cleared ? "" : "未结清就"}被换掉,它名下 ${carryOut.carried.length} 条未清的义务原样带进批 ${batch}(--clear 照样核;已记义务账 adopt 行):`);
+      for (const r of carryOut.carried) console.error(`  ${fmtRec(r)}`);
+    }
+    if (carryOut.reopened.length) {
+      console.log(`⚠ **转欠账到期未结的义务 ${carryOut.reopened.length} 条回到开着**,并入本批(本批 --clear 照样核):`);
+      for (const r of carryOut.reopened) console.log(`  ${fmtRec({ ...r, status: "open" })}`);
+    }
+    if (carryOut.reopenedOthers.length) console.log(`⚠ 转欠账到期未结、但是别的 checkout 的义务 ${carryOut.reopenedOthers.length} 条回到开着(未归属,不并入本批,--status 列出):${carryOut.reopenedOthers.map((r) => fmtRec({ ...r, status: "open" })).join(";")}`);
+    if (carryOut.adopted.length) {
+      console.log(`本 checkout 未归属的义务 ${carryOut.adopted.length} 条并入本批:`);
+      for (const r of carryOut.adopted) console.log(`  ${fmtRec(r)}`);
+    }
+  }
   console.log(`已武装批 ${batch} 的 ${conds.length} 条完成条件${checks.length ? `(其中 ${checks.length} 条带可执行判据,--clear 时经 bash 跑)` : ""};收尾时须逐条写「条件N:达成/未达成/不适用」`);
   for (const c of checks) console.log(`  条件${c.i + 1} ⇐ $ ${c.cmd}${c.expect !== undefined ? `  期待含「${c.expect}」` : ""}${c.expectRe !== undefined ? `  期待匹配 /${c.expectRe}/` : ""}`);
   // ── 到期债强制腿(2026-08-22,用户逼出:「失效期是装饰品——D34/D35 ≤080 早到期,没人查」)──
@@ -1382,7 +2866,7 @@ if (argv.includes("--arm")) {
   //   本腿在**开工时刻**(--arm = 唯一必经的结构点)机械列出到期未结的债,不靠散文不靠词表。
   //   一期只警不拦(拦会把「开工」堵死在还债上——比例归人判);连续多批仍列 ⇒ 升级另议。
   try {
-    const rows = fs.readFileSync("docs/gate-debts.md", "utf8").split(/\r?\n/)
+    const rows = fs.readFileSync(cfgDebtTable(), "utf8").split(/\r?\n/)
       .filter((l) => /^\| D\d+ \|/.test(l) && !debtRowParked(l));
     const cur = parseInt(batch, 10);
     // 分诊(2026-08-23 批 099,用户点破「到期腿跑出一堆我看不懂的」):
@@ -1423,6 +2907,49 @@ if (argv.includes("--arm")) {
     for (const l of hot) console.log("  " + l.replace(/^待修 /, "").replace(/\s*← 下一批待修\s*$/, ""));
   }
   process.exit(0);
+}
+
+/** 批 292 红队 BP-1:候选台账由 Stop hook 写在**主树**(`$CLAUDE_PROJECT_DIR` 即主 checkout)的 `.claude/` 下;
+ *  在 worktree 里跑 `--clear` 时按 cwd 相对路径读,读到的是 worktree 里不存在的那一份 ⇒ 永远「零」。
+ *  改按 git 公共目录定主树:`git rev-parse --path-format=absolute --git-common-dir` 的上一级。取不到 ⇒ 退回 cwd 相对(旧行为)。 */
+export function candidateLedgerPath(git = (args) => spawnSync("git", args, { encoding: "utf8", windowsHide: true })) {
+  try {
+    const r = git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    const d = r && r.status === 0 ? String(r.stdout || "").trim() : "";
+    if (d) return path.join(path.dirname(d), ".claude", ".gate-candidates.jsonl");
+  } catch { /* 退回 */ }
+  return ".claude/.gate-candidates.jsonl";
+}
+
+/** 批 292:候选台账(只记账档命中)按 `since` 起汇总成一行;没有命中 ⇒ 「零命中」一行(也要出声,沉默分不清是零还是没读)。
+ *  台账文件不存在 ⇒ 「零命中(台账未建)」。纯读,`file` 可注入供自测。 */
+export function candidateSummary(since, file = candidateLedgerPath()) {
+  const t0 = Date.parse(String(since || ""));
+  // 红队 附节三④:武装时刻缺 ⇒ 原来 t0=NaN 把历史全量计进来;现在明说不汇总(不给一个会误导的数)
+  if (!Number.isFinite(t0)) return "── 只记账档本批命中:本批武装时刻缺,不汇总 ──";
+  if (!fs.existsSync(file)) return "── 只记账档武装以来命中:零(台账未建)──";
+  const n = {}, samples = [];
+  let rows = 0, bad = 0;
+  for (const ln of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!ln.trim()) continue;
+    let x; try { x = JSON.parse(ln); } catch { bad++; continue; }
+    // codex fix-r1 §4:合法 JSON 但结构坏(不是对象 / 时刻解析不了 / hits 不是数组)也算坏行,不能报成干净的零
+    if (!x || typeof x !== "object" || !Number.isFinite(Date.parse(String(x.ts || ""))) || !Array.isArray(x.hits)) { bad++; continue; }
+    if (!(Date.parse(String(x.ts || "")) >= t0)) continue;
+    rows++;
+    for (const h of Array.isArray(x.hits) ? x.hits : []) {
+      if (!h || typeof h !== "object" || typeof h.id !== "string" || !h.id) { bad++; continue; }   // codex fix2-r1:元素结构坏也计坏行
+      n[h.id] = (n[h.id] || 0) + 1;
+      // codex 292-wording-review-r1 §3:一行数字之外给少量可追溯样本(规则 + 原句片段 + 会话 / 条目位置),供逐条判拦对 / 拦错
+      if (samples.length < 3) samples.push(`  · ${h.id} @${String(x.sid || "?").slice(0, 8)}#${x.at ?? "?"}:${String(h.msg || h.first || "").replace(/\s+/g, " ").slice(0, 90)}`);
+    }
+  }
+  // codex §3 / §5:只按时间归集(武装以来,各会话合计)——并发会话的命中也在内,文案照实说,不叫「本批」;坏行不报成零
+  const badNote = bad ? `;坏行 ${bad}(未计入,台账可能缺损)` : "";
+  const parts = Object.entries(n).sort((a, b) => b[1] - a[1]).map(([id, c]) => `${id}×${c}`);
+  return parts.length
+    ? `── 只记账档武装以来命中(各会话合计,${rows} 轮${badNote}):${parts.join("、")} ── 明细 ${file}\n${samples.join("\n")}\n  (D200:连续 5 批无人据此改动 ⇒ 做真阳性回放,再定删不删)`
+    : `── 只记账档武装以来命中:零${badNote} ──`;
 }
 
 /** 结清时后台发车 scripts/fp-audit.mjs(自签误报的 codex 盲审)。grill 259 F11:同步跑最长约 16 分钟,Bash 工具 2 分钟就转后台,
@@ -1488,6 +3015,7 @@ if (argv.includes("--history")) {
     const extra = o.overwrote ? `  ⚠️ 覆盖了批 ${o.overwrote}` : "";
     console.log(`  ${when}  ${o.action.padEnd(5)} 批 ${o.batch ?? "—"}  ${(o.conditions || []).length} 条${extra}`);
     for (const c of (o.conditions || [])) console.log(`           · ${typeof c === "string" ? c : c.text}`);
+    if (o.action === "accept-obligation-loss") console.log(`           ⚠ 确认义务账丢失 —— 理由:${o.reason};丢失前锚 ${o.lostAnchor ? `第 ${o.lostAnchor.version} 行` : "无"}`);
   }
   process.exit(0);
 }
@@ -1495,6 +3023,6 @@ if (argv.includes("--history")) {
 // ⚠️ 被 import 时到此**什么都不做**。原实现在这里无条件 `exit(2)`,
 //   于是守卫算对了也没用——调用方照样被这句用法错误杀掉(实测复现)。
 if (IS_MAIN) {
-  console.error("用法: --arm <批号> --cond \"…\" [--check \"命令\" [--expect \"子串\" | --expect-re \"正则\"]] [--force] | --decision \"<决定>\" | --no-decision \"<为什么本批没有决定>\" | --outcome \"<成果>\" | --withdraw <批号-Dn | On> --reason \"<理由>\" | --status | --dry-check | --clear | --history [n] | --self-test");
+  console.error("用法: --arm <批号> --cond \"…\" [--check \"命令\" [--expect \"子串\" | --expect-re \"正则\"]] [--force] | --decision \"<决定>\" | --no-decision \"<为什么本批没有决定>\" | --outcome \"<成果>\" | --withdraw <批号-Dn | On | 批号:On> --reason \"<理由>\" | --status | --context | --dry-check | --clear [--verdict \"N=达成|未达成|不适用[:理由]\"]… | --settle [<义务 id>] | --repair-obligations | --history [n] | --self-test");
   process.exit(2);
 }

@@ -36,7 +36,7 @@ const noEsc = [];
 for (const r of RULES) {
   const es = r.escapes || [];
   if (!es.length) { noEsc.push(r); continue; }
-  lines.push(`### ${r.id} ${r.blocking ? "(阻断)" : "(提示)"}`, "");
+  lines.push(`### ${r.id} ${(r.blocking ? "(阻断)" : r.logOnly ? "(只记账)" : "(提示)")}`, "");
   const fl = firstLine(r);
   if (fl) lines.push(`拦什么:${fl}`, "");
   for (const e of es) lines.push(`- 〔${kind(e.say)}〕${e.say}`);
@@ -44,7 +44,7 @@ for (const r of RULES) {
   lines.push("");
 }
 lines.push("## 没有写出路字段的规则(欠账:被拦时按拦截文本里的说明办)", "");
-for (const r of noEsc) lines.push(`- **${r.id}** ${r.blocking ? "(阻断)" : "(提示)"}:${firstLine(r) || "(拦截文本需具体命中才生成)"}`);
+for (const r of noEsc) lines.push(`- **${r.id}** ${(r.blocking ? "(阻断)" : r.logOnly ? "(只记账)" : "(提示)")}:${firstLine(r) || "(拦截文本需具体命中才生成)"}`);
 lines.push("");
 const body = lines.join("\n");
 

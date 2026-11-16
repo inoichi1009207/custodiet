@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/core/schema/stryker-schema.json",
+  "_comment": "闸引擎变异测试 · 目标 2 的补充口径:同样变异 gate-ctx.mjs 的 buildCtx(区间与 gate-ctx.stryker.json 一致,coverage-check 自测比对),判据换成「hook-stop-closure 整份自测 && gate-ctx 自测」。buildCtx 的主要消费者是 hook-stop-closure 的规则自测,只用 gate-ctx 自己的自测(118 项上下)当判据会把「别处已测」也算成存活;两份报告对照着读:只在 gate-ctx.json 里存活、本份里被杀的,是「gate-ctx 自测薄、但全套有守」;两份都存活的才是全套盲区。",
+  "_inPlace_why": "inPlace=true,**只许在 git worktree 里跑,绝不在主树跑**;理由同 hook-stop-closure-codexledger.stryker.json(hook-stop-closure 自测要读 AGENTS.md、docs/laws/ 与真 git 仓,沙箱跑不绿)。",
+  "testRunner": "command",
+  "commandRunner": { "command": "node --no-warnings scripts/hook-stop-closure.mjs --self-test && node --no-warnings scripts/lib/gate-ctx.mjs --self-test" },
+  "coverageAnalysis": "off",
+  "disableTypeChecks": false,
+  "inPlace": true,
+  "mutate": ["scripts/lib/gate-ctx.mjs:168-768"],
+  "concurrency": 8,
+  "timeoutMS": 30000,
+  "reporters": ["clear-text", "progress", "json"],
+  "jsonReporter": { "fileName": "reports/mutation/gate-ctx-fullsuite.json" },
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": true
+}

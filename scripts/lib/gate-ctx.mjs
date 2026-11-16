@@ -184,9 +184,35 @@ export function buildCtx(entries, extra = {}) {
    *  立它的理由(红队 a2155edb BP-1/4/5):ND 的出路要「晚于最近一次**名词提问**」才算——旧实现窗口内的写入不分先后、
    *  窗口前只带写入不带声明、任何排队消息都当提问切。「哪句算提问」由规则自己判(句式是规则的事),这里只给顺序。 */
   const turnLog = [];
+  // 批 299(287 设计 2.5):命令截在 8000 字时**显式**标 `cut: true`——截断后的命令不能再当「看清了」用,
+  //   (批 299b 起 write-state 改用自己的动作区间收集器、任何 shell 执行都判看不清,不再读这个键;键留作规则侧的截断标记。)
+  //   只在截断时才有这个键,未截断的条目形状不变(ND 等消费者只读 k / v / d)。
+  const logBash = (name, cmd) => turnLog.push({ k: "bash", v: cmd.slice(0, 8000), d: name === "PowerShell" ? "ps" : "bash", ...(cmd.length > 8000 ? { cut: true } : {}) });
   const logAction = (name, input) => {
     if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(String(name || "")) && typeof input?.file_path === "string") turnLog.push({ k: "write", v: input.file_path });
-    if (/^(Bash|PowerShell)$/.test(String(name || "")) && typeof input?.command === "string") turnLog.push({ k: "bash", v: input.command.slice(0, 8000), d: name === "PowerShell" ? "ps" : "bash" });
+    if (/^(Bash|PowerShell)$/.test(String(name || "")) && typeof input?.command === "string") logBash(name, input.command);
+  };
+  /** 批 299(287 设计 2.3「实现前置」):**调用 → 结果**关联通道。tool_result 按 `tool_use_id` 收进这张表,
+   *  循环结束后按调用编号接到对应动作上(同一轮两次同名调用各对各的,不按名字、不按顺序猜)。
+   *  只收**无正文的结构化事实**:`isError`(tool_result.is_error)、`exitCode`(只取 toolUseResult 里的**数字**字段
+   *  exitCode / exit_code / returnCode,取不到 ⇒ null;**不从输出文本解析**「Exit code N」——codex 299-review-r1 地基③:
+   *  成功的 `echo Exit code 17` 会被当成退出码 17。本机转录的 Bash 结果里没有数字退出码字段 ⇒ 实际上恒为 null,如实)、
+   *  `truncated`(正文以 <persisted-output> 开头,或 toolUseResult 带 persistedOutputPath;只会多报截断)、`interrupted`、`background`(转去后台 / 异步子代理)。
+   *  工具输出正文一律不进(本模块契约:那是别人说的话)。 */
+  const results = new Map();
+  const resultFacts = (b, tur) => {
+    const c = b.content;
+    const text = typeof c === "string" ? c : Array.isArray(c) ? c.filter((x) => x?.type === "text").map((x) => String(x.text || "")).join("\n") : "";
+    const head = text.slice(0, 200);
+    const o = tur && typeof tur === "object" && !Array.isArray(tur) ? tur : null;
+    const code = o ? [o.exitCode, o.exit_code, o.returnCode].find((v) => Number.isInteger(v)) : undefined;
+    return Object.freeze({
+      isError: b.is_error === true,
+      exitCode: code === undefined ? null : code,
+      truncated: /^\s*<persisted-output>/.test(head) || !!(o && o.persistedOutputPath),
+      interrupted: !!(o && o.interrupted === true),
+      background: !!(o && (o.backgroundTaskId || o.isAsync === true)),
+    });
   };
 
   for (const e of entries) {
@@ -199,6 +225,12 @@ export function buildCtx(entries, extra = {}) {
       continue;
     }
     if (e?.type === "user") {
+      // 批 299:先收工具结果(下面几条 continue 之前;tool_result 挂在 user 型条目下)。toolUseResult 是整条条目一份,
+      //   只在本条只有一个 tool_result 时才归给它(多个时归属不清,不用)。
+      if (Array.isArray(e.message?.content)) {
+        const trs = e.message.content.filter((b) => b?.type === "tool_result" && typeof b.tool_use_id === "string");
+        for (const b of trs) results.set(b.tool_use_id, resultFacts(b, trs.length === 1 ? e.toolUseResult : undefined));
+      }
       // 压缩摘要是模型转述,不是用户原话(红队 BP-11:摘要里的「用户问过 X 是什么」误拦 ND)
       if (e.isCompactSummary === true) continue;
       const uc = e.message?.content;
@@ -235,11 +267,17 @@ export function buildCtx(entries, extra = {}) {
     for (const b of c) {
       if (b?.type === "text") { text += (b.text || "") + "\n"; turnLog.push({ k: "say", v: b.text || "" }); }
       else if (b?.type === "tool_use") {
-        actions.push({ name: b.name, input: b.input || {}, at });
+        const act = { name: b.name, input: b.input || {}, at };
+        // 批 299:调用编号与结果挂成**不可枚举**属性——七条规则拿 `JSON.stringify(ctx.actions)` 当文本面做正则
+        //   (gate-rules actionText / acted 等),可枚举字段会改变它们的输入、进而可能改判决;本批不许改任何判决。
+        //   读法:`a.id`(tool_use.id,无则 null)、`a.result`(见 resultFacts;本轮条目里没有对应结果 ⇒ null)。
+        Object.defineProperty(act, "id", { value: typeof b.id === "string" ? b.id : null, enumerable: false });
+        actions.push(act);
         logAction(b.name, b.input);
       }
     }
   }
+  for (const a of actions) Object.defineProperty(a, "result", { value: (a.id && results.get(a.id)) || null, enumerable: false });
   if (typeof extra.lastAssistantMessage === "string") {
     text += extra.lastAssistantMessage + "\n";
     turnLog.push({ k: "say", v: extra.lastAssistantMessage });
@@ -465,7 +503,7 @@ export function buildCtx(entries, extra = {}) {
           else if (b?.type === "tool_use") {
             const one = [];
             if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(String(b.name || "")) && typeof b.input?.file_path === "string") one.push({ k: "write", v: b.input.file_path });
-            if (/^(Bash|PowerShell)$/.test(String(b.name || "")) && typeof b.input?.command === "string") one.push({ k: "bash", v: b.input.command.slice(0, 8000), d: b.name === "PowerShell" ? "ps" : "bash" });
+            if (/^(Bash|PowerShell)$/.test(String(b.name || "")) && typeof b.input?.command === "string") one.push({ k: "bash", v: b.input.command.slice(0, 8000), d: b.name === "PowerShell" ? "ps" : "bash", ...(b.input.command.length > 8000 ? { cut: true } : {}) });
             prior.push(...one);
           }
         }
@@ -614,7 +652,9 @@ export function buildCtx(entries, extra = {}) {
             // 聚合项的去重键是范围 `agg:<基点sha>..<HEAD sha>`(codex 257-p-agg-r1 断言 2),与普通提交 sha 同表
             shas: Array.isArray(extra.pLedger.shas) ? extra.pLedger.shas.filter((s) => typeof s === "string" && /^(agg:[0-9a-f]{40,64}\.\.)?[0-9a-f]{40,64}$/i.test(s)).slice(-400) : [],
             // 批 278(D173③):两猎手覆盖过的改闸提交 sha(只收普通 sha,不收聚合键);缺/坏 ⇒ 空数组(不认任何 ⇒ 照旧要猎手,偏严)
-            hunted: Array.isArray(extra.pLedger.hunted) ? extra.pLedger.hunted.filter((s) => typeof s === "string" && /^[0-9a-f]{40,64}$/i.test(s)).slice(-400) : [] }
+            hunted: Array.isArray(extra.pLedger.hunted) ? extra.pLedger.hunted.filter((s) => typeof s === "string" && /^[0-9a-f]{40,64}$/i.test(s)).slice(-400) : [],
+            // 批 297 r2:本会话上次 P 账结清(三通道齐、清零)的时刻 → ms;P 跨模型格在本批没武装时拿它当作业记录下界。缺 / 坏 ⇒ null
+            settledAt: (() => { const t = Date.parse(String(extra.pLedger.settledAt ?? "")); return Number.isFinite(t) ? t : null; })() }
         : null),
     /** 批 279:本会话「修闸 tag」(PreToolUse 按动作记的 `.claude/.gate-touch.jsonl`,见 lib/gate-touch.mjs)。
      *  三态:undefined=通道没接(夹具 / 回放 ⇒ P 保持旧判法);true / false=账里有 / 没有本会话;null=账读不了(P 按碰过算)。 */
@@ -646,6 +686,42 @@ export function buildCtx(entries, extra = {}) {
      *  形状不对 ⇒ null(不透传任意结构)。 */
     // 批 266(codex 266-r2 §1):把 rev 解析成 sha(hook 实时路径注入 `git rev-parse`);P 拿它核误拦猎手 `--base` 是否早于本批改闸
     resolveRev: typeof extra.resolveRev === "function" ? extra.resolveRev : undefined,
+    /** 批 297(D203):codex-run 作业记录(P 的跨模型格取证面)。惰性 `(since) => { root, jobs } | null`,按 since 缓存。
+     *  三态:undefined=没接(夹具 / 自测 / 回放 ⇒ P 该格只剩 MCP 通路)/ 返回 null=接了但取不到或形状不对 / 对象。
+     *  只交出判据要的字段:startedAt→ms、cwd 斜杠归一、threadId / state 只收字符串、exitCode 只收有限数、
+     *  resultBytes(取数方 stat 结果件得到)只收非负有限数;单条记录形状不对 ⇒ 剔掉,不透传任意结构。取数抛错 ⇒ null。 */
+    codexJobs: typeof extra.codexJobs === "function" ? (() => {
+      const memo = new Map();
+      const str = (x) => (typeof x === "string" ? x : null);
+      const num = (x) => (typeof x === "number" && Number.isFinite(x) ? x : null);
+      const ms = (x) => { const t = typeof x === "number" ? x : (typeof x === "string" && x ? Date.parse(x) : NaN); return Number.isFinite(t) ? t : null; };
+      const path = (x) => (str(x) === null || !x ? null : x.replace(/\\/g, "/"));
+      // r2:startedAt / endedAt / resultAt → ms(上下界与「写过结果件」三条腿);top = 取数方找到的 cwd 所在 git 顶层(归属腿);
+      //   failLines = 取数方从该作业日志抽出的失败行(不可用出路;只收字符串、每行截 400、至多 40 行)
+      // 批 302(D205):failLines(日志尾窗解析)撤掉;改收 codex-run 从完整事件流写的结构化字段——
+      //   binSource ∈ env / vendor / path(其余 ⇒ null = 旧记录);unavailable = { reason } 只收 reason 字符串(其余丢弃)。
+      const one = (j) => {
+        if (!j || typeof j !== "object") return null;
+        const un = j.unavailable && typeof j.unavailable === "object" && typeof j.unavailable.reason === "string" && j.unavailable.reason ? { reason: j.unavailable.reason } : null;
+        return { id: str(j.id), state: str(j.state), startedAt: ms(j.startedAt), endedAt: ms(j.endedAt), resultAt: ms(j.resultAt),
+          cwd: path(j.cwd), top: path(j.top), threadId: str(j.threadId), exitCode: num(j.exitCode),
+          binSource: ["env", "vendor", "path"].includes(j.binSource) ? j.binSource : null, unavailable: un };
+      };
+      return (since) => {
+        const k = Number.isFinite(since) ? since : null;
+        if (memo.has(k)) return memo.get(k);
+        let v = null;
+        try {
+          const g = extra.codexJobs(k);
+          if (g && typeof g === "object" && typeof g.root === "string" && g.root && Array.isArray(g.jobs)) {
+            // upper(r2):实时 = Stop 此刻,离线 = 本轮结束;取不到 ⇒ null(P 一条都不认)
+            v = { root: g.root.replace(/\\/g, "/"), upper: ms(g.upper), jobs: g.jobs.map(one).filter(Boolean) };
+          }
+        } catch { v = null; }
+        memo.set(k, v);
+        return v;
+      };
+    })() : undefined,
     headFacts: typeof extra.headFacts === "function" ? (() => {
       let done = false, v = null;
       const ms = (x) => (typeof x === "number" ? (Number.isFinite(x) ? x : null) : (x == null ? null : (Number.isFinite(Date.parse(String(x))) ? Date.parse(String(x)) : null)));
@@ -775,6 +851,32 @@ export function selfTest() {
   const pl = (v) => buildCtx([A([txt("x")])], { pLedger: v }).pLedger;
   chk("pLedger.shas 只留合法 sha", JSON.stringify(pl({ carriers: 2, shas: ["d".repeat(40), "HEAD", 5] }).shas), JSON.stringify(["d".repeat(40)]));
   chk("pLedger 缺 shas ⇒ 空数组", JSON.stringify(pl({ carriers: 1 }).shas), "[]");
+  // 批 297(D203):codexJobs 通道三态与归一
+  const cj = (v) => buildCtx([A([txt("x")])], v === undefined ? {} : { codexJobs: v }).codexJobs;
+  chk("297:codexJobs 未接 ⇒ undefined", cj(undefined), undefined);
+  chk("297:codexJobs 取数抛错 ⇒ null(不抛)", cj(() => { throw new Error("盘坏了"); })(0), null);
+  chk("297:codexJobs 缺 root ⇒ null", cj(() => ({ jobs: [] }))(0), null);
+  chk("297:codexJobs jobs 不是数组 ⇒ null", cj(() => ({ root: "/repo", jobs: "x" }))(0), null);
+  {
+    const v = cj(() => ({ root: "\\repo", upper: "2026-11-07T09:00:00Z", jobs: [
+      { id: "J1", state: "done", startedAt: "2026-11-07T00:00:00Z", endedAt: "2026-11-07T00:05:00Z", resultAt: "2026-11-07T00:04:59Z",
+        cwd: "\\repo\\scripts", top: "\\repo", threadId: "t", exitCode: 0, failLines: ["429", 5], binSource: "env", unavailable: { reason: "rate-limit", text: "x" } },
+      7, null,
+      { state: "done", exitCode: "0", threadId: 5, startedAt: "不是时刻", resultAt: "", binSource: "evil", unavailable: { reason: 5 } }] }))(0);
+    chk("297/302:codexJobs 归一(ISO→ms、斜杠、坏条目剔掉、字符串退出码 / 非串 threadId / 坏时刻 / 空 resultAt ⇒ null;302:failLines 不再透传,binSource / unavailable.reason 只收合法值)",
+      JSON.stringify([v.root, v.upper, v.jobs.length, v.jobs[0].startedAt, v.jobs[0].endedAt, v.jobs[0].resultAt, v.jobs[0].cwd, v.jobs[0].top, v.jobs[0].failLines,
+        v.jobs[0].binSource, v.jobs[0].unavailable,
+        v.jobs[1].exitCode, v.jobs[1].threadId, v.jobs[1].startedAt, v.jobs[1].resultAt, v.jobs[1].binSource, v.jobs[1].unavailable]),
+      JSON.stringify(["/repo", Date.parse("2026-11-07T09:00:00Z"), 2, Date.parse("2026-11-07T00:00:00Z"), Date.parse("2026-11-07T00:05:00Z"), Date.parse("2026-11-07T00:04:59Z"),
+        "/repo/scripts", "/repo", undefined, "env", { reason: "rate-limit" }, null, null, null, null, null, null]));
+    chk("297 r2:codexJobs 缺 upper ⇒ upper=null", cj(() => ({ root: "/repo", jobs: [] }))(0).upper, null);
+    chk("297 r2:pLedger.settledAt ISO → ms;坏值 ⇒ null", JSON.stringify([pl({ carriers: 0, settledAt: "2026-11-07T07:00:00Z" }).settledAt, pl({ carriers: 0, settledAt: "x" }).settledAt]),
+      JSON.stringify([Date.parse("2026-11-07T07:00:00Z"), null]));
+    let calls = 0;
+    const c = cj(() => { calls++; return { root: "/repo", jobs: [] }; });
+    c(5); c(5); c(6);
+    chk("297:codexJobs 同一 since 只取一次", calls, 2);
+  }
 
   // S2-b:文件里提到 codex-run.mjs ⇒ 旧实现让跨模型复核那一半消失
   chk("文件内容提到 codex-run.mjs ⇒ ranBash 为假",
@@ -1060,6 +1162,43 @@ export function selfTest() {
     chk("285 D138⑥ trackedIn 抛错 ⇒ 新建", inj({ trackedIn: () => { throw new Error("x"); } }).isNew(`${M}/docs/a.md`), true);
     // hookCheckout 未注入 ⇒ justAdded 照旧参与(sameAsHook 默认真;改成默认假即红)
     chk("285 D138⑥ 未注入 hookCheckout ⇒ justAdded 照旧参与", buildCtx([A([txt("x")])], { tracked: idx[M], checkoutOf, trackedIn, justAdded: new Set(["docs/a.md"]) }).isNew(`${W}/docs/a.md`), true);
+  }
+
+  // ── 批 299:调用 → 结果关联通道(287 设计 2.3 实现前置;拆批稿「298」完成条件 1)──────────────
+  {
+    const U = (id, name, input) => ({ type: "tool_use", id, name, input });
+    const R = (id, content, isErr, tur) => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content, ...(isErr === undefined ? {} : { is_error: isErr }) }] }, ...(tur === undefined ? {} : { toolUseResult: tur }) });
+    // 同一轮两次同名 Bash:第二次的结果先到(转录里顺序颠倒也要各对各的),第三次截断
+    const c = buildCtx([
+      A([U("toolu_a", "Bash", { command: "ls" }), U("toolu_b", "Bash", { command: "false" }), U("toolu_c", "Bash", { command: "cat big" })]),
+      R("toolu_b", "Exit code 1\n", true, "Error: Exit code 1\n"),
+      R("toolu_a", "a.md\n", false, { stdout: "a.md", stderr: "", interrupted: false }),
+      R("toolu_c", "<persisted-output>\nOutput too large (40KB).", false, { stdout: "…", persistedOutputPath: "x.txt" }),
+    ]);
+    const facts = c.actions.map((a) => [a.id, a.result && a.result.isError, a.result && a.result.exitCode, a.result && a.result.truncated]);
+    chk("299 两次同名调用各对各的结果(成功 / 失败 / 截断)", JSON.stringify(facts),
+      JSON.stringify([["toolu_a", false, null, false], ["toolu_b", true, null, false], ["toolu_c", false, null, true]]));
+    chk("299 没有结果的调用 ⇒ result 为 null", buildCtx([A([U("toolu_x", "Read", { file_path: "a" })])]).actions[0].result, null);
+    // 批 299 r2(codex 299-review-r1 地基③):退出码只认结构化数字字段,不从输出文本解析
+    chk("299r2 成功命令输出「Exit code 17」⇒ exitCode 仍为 null", buildCtx([A([U("e1", "Bash", { command: "echo Exit code 17" })]), R("e1", "Exit code 17\n", false, { stdout: "Exit code 17", stderr: "" })]).actions[0].result.exitCode, null);
+    chk("299r2 toolUseResult 带数字 exitCode ⇒ 采信", buildCtx([A([U("e2", "Bash", { command: "false" })]), R("e2", "x", true, { exitCode: 3 })]).actions[0].result.exitCode, 3);
+    chk("299r2 字符串退出码不采信", buildCtx([A([U("e3", "Bash", { command: "false" })]), R("e3", "x", true, { exitCode: "3" })]).actions[0].result.exitCode, null);
+    chk("299 没有编号的老转录 ⇒ id 为 null", buildCtx([A([use("Read", { file_path: "a" })])]).actions[0].id, null);
+    // 不可枚举:七条规则拿 JSON.stringify(ctx.actions) 当文本面,编号与结果不得混进去(否则可能改判决)
+    chk("299 编号与结果不进 JSON.stringify(actions)", JSON.stringify(c.actions[1]), JSON.stringify({ name: "Bash", input: { command: "false" }, at: null }));
+    chk("299 结果的 toolUseResult 只在单结果条目上采信", (() => {
+      const two = { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "p1", content: "ok" }, { type: "tool_result", tool_use_id: "p2", content: "ok" }] }, toolUseResult: { persistedOutputPath: "x" } };
+      const cc = buildCtx([A([U("p1", "Read", {}), U("p2", "Read", {})]), two]);
+      return cc.actions.map((a) => a.result.truncated).join(",");
+    })(), "false,false");
+    chk("299 后台 / 打断标记", (() => {
+      const cc = buildCtx([A([U("g1", "Bash", { command: "sleep 9", run_in_background: true })]), R("g1", "Command running in background with ID: x", false, { backgroundTaskId: "x", interrupted: false })]);
+      return [cc.actions[0].result.background, cc.actions[0].result.interrupted].join(",");
+    })(), "true,false");
+    // turnLog 截断显式标 cut(287 设计 2.5:截断时显式产出「看不清」)
+    const long = "echo " + "x".repeat(8100);
+    const lc = buildCtx([A([use("Bash", { command: long }), use("Bash", { command: "ls" })])]);
+    chk("299 超 8000 字的命令在 turnLog 上带 cut、短命令不带", lc.turnLog.filter((x) => x.k === "bash").map((x) => x.cut === true).join(","), "true,false");
   }
 
   let pass = 0;

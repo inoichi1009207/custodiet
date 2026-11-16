@@ -29,6 +29,18 @@ import { CARRIER_SURFACE, normPath } from "./lib/gate-carriers.mjs";
 //   (形态:旧=[] 新=[D],新引擎在旧的看不到的文本上响)。
 //   并行 diff 的价值正在于此:它逮的是**我的迁移错误**,不是规则错误。
 
+// P 三通道配额阈值:缺省 2026-11-08 起为 10(ADR 0041)。P 的正反例是按「第五笔」写的(验的是计数逻辑本身),
+//   所以跑用例时把阈值钉回 5;缺省值另由下面这一条单独断言,两件事各验各的。H.rearm() 每次调用现读环境变量。
+{
+  const P_RULE = RULES.find((r) => r.id === "P");
+  const saved = process.env.STOP_CLOSURE_P_REARM;
+  delete process.env.STOP_CLOSURE_P_REARM;
+  const dflt = P_RULE?._p?.rearm?.();
+  if (dflt !== 10) { console.error(`FAIL  P 三通道配额缺省阈值应为 10(ADR 0041),实为 ${dflt}`); process.exitCode = 1; }
+  else console.log("PASS  P 三通道配额缺省阈值 = 10(ADR 0041)");
+  process.env.STOP_CLOSURE_P_REARM = saved ?? "5";
+}
+
 // 已知且**刻意**的行为分歧:key=规则 id,value=为什么。
 // 空表示「该条应当与旧实现完全等价」。
 // ⚠️ 指名必须**带方向**(codex 060 §4.2:「只按规则 id 白名单,没有绑定方向/旧值/新值,
@@ -288,7 +300,14 @@ console.log("正反例:");
 //   第十八次:`justAdded`(批 285,D136②)——「同轮造件分两次提交」这一漏放形态原先在夹具层无机器证人(只能拿 tracked 近似);
 //     注入面与 tracked / preExisted 同形,值为仓根相对路径数组。只补夹具通道,不改任何判据。
 //   第十七次:`batchEverArmed`(批 265,K0 在「从没立过批的仓」不判;实时 hook 才注入,夹具不加写不出这一形)。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "justAdded", "preExisted", "batchGoal", "batchEverArmed", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "resolveRev", "hookCheckout", "gateTouched", "at", "then", "expectBlock", "priorFar"]);
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "justAdded", "preExisted", "batchGoal", "batchEverArmed", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "resolveRev", "hookCheckout", "gateTouched", "at", "then", "expectBlock", "priorFar", "codexJobs"]);
+//   第十九次:`codexJobs`(批 297,D203)——P 跨模型格改认 codex-run 自己写的作业记录后,「命令长这样、有 / 没有合格记录」
+//     两半在夹具里要分得开;注入通道,不进 entries。值 `{ root, upper?, jobs:[{ id?, state, startedAt, endedAt?, resultAt?, cwd?, top, threadId,
+//     exitCode, failLines? }] }`(r2:upper = 此刻 / 本轮结束;top = cwd 所在 git 顶层;failLines = 失败行),
+//     这里包成惰性函数交 ctx.codexJobs;顶层与记录子键都做白名单校验(拼错的键同样会被静默丢弃)。不写 ⇒ 不传(该格只剩 MCP 通路)。
+// 批 302(D205):加 binSource / unavailable(codex-run 结构化字段);failLines 留着认旧夹具(P 已不读它)
+const CODEX_JOB_KEYS = new Set(["id", "state", "startedAt", "endedAt", "resultAt", "cwd", "top", "threadId", "exitCode", "failLines", "binSource", "unavailable"]);
+const CODEX_JOBS_TOP_KEYS = new Set(["root", "upper", "jobs"]);
 //   第十八次:`expectBlock`(批 285,D128④)——**断言键,不是注入通道**:正例原来只断言「命中一条」,不断言阻断级
 //     ⇒ 修法若落在 `blocking:false` 或一条到不了升阻断的分支上照样全绿(与 D126 同族)。写了 `expectBlock: true/false`
 //     的正例,命中那条的 `block` 必须与之相等;不写 ⇒ 不断言(旧夹具逐字不变)。只许写在 pos 里(反例零命中,无阻断级可断)。
@@ -331,6 +350,14 @@ const mkEntries = (c) => {
     }
   }
   if ("expectBlock" in c && typeof c.expectBlock !== "boolean") throw new Error(`夹具 expectBlock 须是 true / false:${JSON.stringify(c.expectBlock)}`);
+  if ("codexJobs" in c) {
+    const g = c.codexJobs;
+    if (!g || typeof g !== "object" || typeof g.root !== "string" || !Array.isArray(g.jobs)) throw new Error(`夹具 codexJobs 须是 { root: 串, upper?, jobs: [] }:${JSON.stringify(g)}`);
+    for (const k of Object.keys(g)) if (!CODEX_JOBS_TOP_KEYS.has(k)) throw new Error(`codexJobs 顶层键不认识:「${k}」—— 合法键:${[...CODEX_JOBS_TOP_KEYS].join(", ")}`);
+    for (const j of g.jobs) for (const k of Object.keys(j || {})) {
+      if (!CODEX_JOB_KEYS.has(k)) throw new Error(`codexJobs 记录子键不认识:「${k}」—— 合法键:${[...CODEX_JOB_KEYS].join(", ")}`);
+    }
+  }
   const blocks = [{ type: "text", text: c.text }];
   if (c.commit) blocks.push({ type: "tool_use", name: "Bash", input: { command: "git commit -m x" } });
   // `written` = 写进文件的**正文**(J 需要:触发层声明写进法条正文同样算数)。
@@ -468,6 +495,8 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...("pLedger" in c ? { pLedger: c.pLedger } : {}),
   // `gateTouched` = 批 279「修闸 tag」注入(true / false / null);不写 ⇒ 不传(P 保持旧判法)
   ...("gateTouched" in c ? { gateTouched: c.gateTouched } : {}),
+  // `codexJobs` = 批 297 作业记录注入(取数方不按 since 预筛:窗口判据全在规则侧,夹具要能写出「早于窗口」的记录)
+  ...("codexJobs" in c ? { codexJobs: () => c.codexJobs } : {}),
   // `prior` = [{text, write?, …}, …] ⇒ 拼成 assistant entries 交给 priorEntries。
   // 没写 `prior` 就**不传**(window() 保持 null),与生产上「取不到窗口」一致。
   ...(Array.isArray(c.prior) ? (() => {
@@ -534,7 +563,8 @@ if (process.argv.includes("--migrate-check")) {
     if (!ok) go = false;
     console.log(`  ${ok ? "过  " : "未过"}  ${name}${ok ? "" : "  ← " + (typeof why === "function" ? why() : why)}`);
   }
-  console.log(`\n结论:${go ? `规则 ${id} **可算搬完**(全语料 diff 每三四条统一跑一次)` : `规则 ${id} **未搬完**`}`);
+  if (process.exitCode) go = false;   // codex p0-close r2 ④ / r3:文件头的缺省阈值断言只置 exitCode——结论文字与退出码都要跟着它
+  console.log(`\n结论:${go ? `规则 ${id} **可算搬完**(全语料 diff 每三四条统一跑一次)` : `规则 ${id} **未搬完**${process.exitCode ? "(文件头的缺省阈值断言 FAIL,见上)" : ""}`}`);
   process.exit(go ? 0 : 1);
 }
 
@@ -785,7 +815,7 @@ for (const r of RULES) {
 //   365/365 分歧全部逐片指名。本件余下的活面 = 装载期校验 + §2 正反例 + --migrate-check
 //   (纯引擎回归套件,失效条件照旧:变异验收若从未拒过任何规则 ⇒ 空文,复议)。
 console.log("\n[已切换] §3–§6 退役(对照组已删,史料见 git);活面 = 装载期校验 + 正反例 + 变异验收 + --migrate-check。");
-process.exit(fail ? 1 : 0);
+process.exit(fail || process.exitCode ? 1 : 0);   // codex p0-close r2 ④:缺省阈值断言只置 exitCode,这里不得覆盖
 // ── §3 并行 diff / §4 影子流量 / §5-6 切换判定:退役段已迁出(2026-08-25,批 101/D54)──
 //   上一行 process.exit 起原有 325 行不可达代码,agent 对着死代码学契约(codex 对抗审 §4)。
 //   快照:docs/archive/gate-migrate-check-retired.md;演化史:git 21b0152 前后。

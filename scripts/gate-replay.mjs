@@ -35,6 +35,8 @@
 //   · 不写真台账:run() 不传 live,台账 / 心跳 / journal 的落盘都在 live 门后(hook-stop-closure.mjs)。
 //   · **MF 在 detect 里直接读此刻盘面**上那条 memory 的全文(D179):回放历史回合时读到的是今天的文件内容,不是当时的;
 //     那条 memory 后来补了执行面行 ⇒ 历史回合也判成不拦。MF 的回放读数只反映「今天的 memory 盘面」。
+//   · **P 的跨模型格在回放里是盲的**(批 297):该格只认 codex-run 的作业记录(ctx.codexJobs),回放进程设了 STOP_CLOSURE_SELFTEST=1,
+//     hook 不读作业目录 ⇒ codexJobs 冻结为未接 ⇒ 该格只剩 MCP 通路;改这一格的判据,回放的「新增 / 解除」读数不作数,只能靠夹具与 live 探针。
 //   · **「修闸 tag」零覆盖**(批 279):回放里 `gateTouched` 恒为 undefined ⇒ P 的 selfTouched 恒真 ⇒ 修闸 tag 与 PF 一条都回放不到,
 //     只能靠读 diff、hook 自测与内存探针(误拦猎手 279 终版附节二 4)。
 //   · 输出:缺省写 `.claude/.gate-replay/run-<时刻>-<pid>.json` 并抄一份到 last.json;并发时 last.json 只留最后写的那次,以摘要里「全量:」那行的路径为准(批 279)。
