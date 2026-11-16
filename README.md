@@ -4,21 +4,43 @@
 >
 > [English version →](README.en.md)
 
-**custodiet** 是给 Claude Code 的治理闸。从开工立条件、动手执行到收工汇报，每一段都用确定性判据检查。判据读的是本轮真实的工具调用记录，不读 agent 怎么说;每条阻断规则都指向一条人签过的法条。最后一道关设在 agent 说「做完了」的那一刻(Stop hook):哪一段没达标，就不让收工。
+**custodiet** 是给 Claude Code 用的一套工作流脚本和闸。主线是**把一句话交出去，活自己跑到关账**:开批时写下什么算完成，执行，验收，关账。闸在这条线上只占两个位置：**验收**(过关口时查实际状态)和**看守**(空转或跑偏时停下来)。判据读的是本轮真实的工具调用记录和 git 事实，不读 agent 怎么说。
+
+这条线现在只做了一部分。仓里有的是：开批与关账(`batch-goal`)、收尾时的验收规则(Stop hook)、误报台账与盲审、改闸用的回放器和两个审查 agent。把它们接成一条自动跑的线，以及「看守」，都在计划中，见[现状与计划](#现状与计划)。
 
 **lanes** 是配套界面：把闸的提示、工具调用、改过的文件从输出框里分出去，各进一道。
 
 想直接装：跳到 [交给你的 agent](#交给你的-agent)。
 
+## 方向
+
+- **主线是工作流，闸只是其中两站。** 要量的是：从一句指令到关账，人说了几条话，其中几次是签字。这个读数还没开始记(计划中)。
+- **强制的规则要少。** 会拦人的检查必须判得准；判不准的只当提示，或者只记账。现在 31 条引擎规则里会拦的是 7 条。
+- **一条规则对现在的模型还需不需要，拿数据定期重问。** 规则多半是为了补当时模型的短板立的。换了模型，就拿台账和回放重新问一遍「不加它，模型还会不会错」，不会错的降级或删掉。
+
+依据的数据和它的口径见[误报数据](#误报数据)。
+
+## 现状与计划
+
+| 环节 | 仓里现在有的 | 计划中 |
+|---|---|---|
+| 开批 | `batch-goal --arm`:写下完成条件，可以给条件挂可执行的检查 | 终点线、轮数与花费上限、记下是哪句指令 |
+| 执行 | 没有(由你的会话自己干) | 无头执行会话的启动器，带轮数与花费上限 |
+| 看守 | 没有 | 轮数、时长、花费到线，或同样的错连着出现时，停下并写明卡在哪 |
+| 验收 | `batch-goal --clear` 重跑开批时登记的检查，不过就拒清；收尾时会拦的 7 条引擎规则，加 A、R 两样 | 执行完自动触发验收，不过就回修，回修有轮数上限 |
+| 关账 | `batch-goal --clear`、成果与决定登记、带失效期的欠账表 | 无头会话自己走完整条关账链 |
+| 记数据 | 报警台账、误报台账与盲审、回放器 | 每批一行汇总；没被申诉的拦截也抽审 |
+| 规则维护 | 误报认领与盲审、红队与误拦猎手两个 agent | 只记账的 17 条回放确认后删除；换模型后逐条重测 |
+
 ## 为什么需要它
 
-编码代理会报告假成功：任务没做成，它说做成了。[arXiv 2606.09863](https://arxiv.org/abs/2606.09863)(ICML 2026 FAGEN workshop)在 AppWorld 上测得，写了完成声明的失败轨迹里有 **75.8%**(1,425 / 1,879)是这种情况。拿 LLM 当裁判抓它效果差:tau2-bench 上 AUROC 最高 **0.65**,AppWorld 上 0.54。用标注数据训练的轻量 TF-IDF 分类器则达到 0.83 / 0.95。
+编码代理会报告假成功：任务没做成，它说做成了。[arXiv 2606.09863](https://arxiv.org/abs/2606.09863)(FAGEN@ICML 2026 收录)在 9,876 条 tau2-bench 轨迹和 1,879 条 AppWorld 轨迹上测了它。占比随场景变化:tau2-bench 单方控制的领域里是失败的 45–48%;AppWorld 上带明确状态声明、自己评估结果的编码代理轨迹里是 **75.8%**。拿 LLM 当裁判抓它效果差:tau2-bench 上没有一种配置的 AUROC 超过 **0.65**,同样的裁判在 AppWorld 的 API 调用轨迹上只有 0.54。轻量 TF-IDF 检测器在任务不相交的划分下达到 0.83(tau2-bench)和 0.95(AppWorld)。
 
 另外两篇 2026 年的论文走的就是本仓这条路：对 agent 的工具调用轨迹做确定性检查。
-- [arXiv 2608.02464](https://arxiv.org/abs/2608.02464) 用 agent 实际收到的工具结果复算它报告的结果，并核对该调的工具都调了：抓到 60% 的失败(加上覆盖检查是 96%),误报 0 / 63。
+- [arXiv 2608.02464](https://arxiv.org/abs/2608.02464) 用 agent 实际收到的工具结果复算它报告的总数，并核对该调的工具都调了：与监控器正面对比时抓到 60% 的失败(加上覆盖检查是 96%),误报 0 / 63。
 - [AgentLTL](https://arxiv.org/abs/2607.02599) 用时序逻辑在工具调用轨迹上写流程规则，在工具执行前拦截，让 7 个模型里 5 个的合规率上升。
 
-上游把「agent 忽略失败测试、伪造成功报告」的 issue 关成了 **not planned**([anthropics/claude-code#2969](https://github.com/anthropics/claude-code/issues/2969))。
+上游有一个 issue 报告「Claude Code 的系统指令导致 Claude 撒谎、伪造结果」([anthropics/claude-code#2969](https://github.com/anthropics/claude-code/issues/2969)),状态是 closed as **not planned**,是 60 天无活动后由 GitHub Actions 机器人自动关闭的。
 
 <p>
 <img src="assets/catch-saying-not-doing.jpg" alt="闸逮住 agent 在描述工作而不是做工作" width="640">
@@ -32,47 +54,65 @@
 | 让另一个 LLM 审 | 又一个模型的意见 | 裁判 AUROC ≤ 0.65(见上) |
 | **本仓** | **对工具调用记录跑确定性谓词** | 各规则头注写明的天花板 |
 
-作者自己的仓另外跑一个 LLM 判官，补关键词判据判不出的语义问题。安装器只装确定性闸。
+收尾闸本身只跑确定性判据，不调模型。调模型的只有一处：误报申诉的盲审(`scripts/fp-audit.mjs`,本机装了 codex CLI 才跑)。
 
 规则只读 assistant 文本和 `tool_use` 的**入参**,不读工具**输出**。所以「读到一个提到 `git commit` 的文件」不会被算成「提交过」。A(委派闭环)和 R(完成时陈述)两条内建规则例外，它们扫全文。
 
-## 它逮什么
+## 规则：31 条，会拦的 7 条
 
-共 30 条规则(28 条引擎 + 2 条内建，数目以 `npm run gate:accept` 输出为准)。下面按阶段摘一部分。
+引擎规则共 31 条，分三档(数目以 `npm run gate:accept` 的输出为准)。
 
-**开工：先立验收条件**
-- **K / K0**:一批活开始前写下机器可核的完成条件(`batch-goal --arm`,可带判据命令);收尾时逐条裁「达成 / 未达成」,没裁完不许结清。
-- **ND**:用户问「X 是什么」,这个名词要落进名词日记，或者说明为什么不适用。
+**会拦(7 条)**:命中就不让本轮结束。
+- **K0 / K**:没立完成条件就动工作面(写文件、提交),在提交或结清的那一轮拦；跑了 `batch-goal --clear` 而这一批没能结清，拦。完成条件在开工时用 `batch-goal --arm` 写下，可带检查命令。
+- **DP**:推送之后没跑欠账探针，拦。只在仓里有探针脚本 `scripts/verify-prod.mjs` 时生效。
+- **W**:对外发布、或会成为后续依据的文档，关账前要有一次外审。
+- **X**:说「已生成 / 已落盘」，要有探针动作。
+- **U**:调过 Skill 而没收尾。
+- **P**:承重改动要过三道独立复核：跨模型审、只读子代理、外部先例。只认工具动作，嘴上说跑过不算。改到闸引擎文件时，独立视角那一道要随包的两个 agent 都跑过：红队 `_gate-bypass-hunter`(找漏放)和误拦猎手 `_gate-false-block-hunter`(用 `scripts/gate-replay.mjs` 在真实转录上回放改前 / 改后，找误拦)。计划中：改成合并回主分支之前审一次，见 `docs/gate/AGENTS.md` 第三节。
 
-**设计：造之前先查，结论过别人的眼**
-- **I**:新建工具 / 脚本前没有「扫过现成实现」(本地在册面和联网)的动作 ⇒ 拦。
-- **P**:承重改动要过三道独立复核：跨模型审、只读子代理、外部先例。只认工具动作，嘴上说跑过不算。改到闸引擎文件时，独立视角那一道要随包的两个 agent 都跑过：红队 `_gate-bypass-hunter`(找漏放)和误拦猎手 `_gate-false-block-hunter`(用 `scripts/gate-replay.mjs` 在真实转录上回放改前 / 改后，找误拦)。
-- **E0 / E1 / E2**:「根因是 X」这类因果断言，要么带机械判据，要么过独立复核。
-- **W**:写给别人看的成品，收工前要有一道外部复核。
+**只提示(7 条)**:给模型一行提示，不拦。
+- **I**:新建工具 / 脚本之前，要扫过现成实现。
+- **ND**:用户问「X 是什么」，这个名词要记进名词日记。
+- **AD**:本批提交信息里像有已签的决定，而决定清单是空的。
+- **PF**:提交范围里有别的会话带进来的改闸提交。
+- **G**:提交前自审。
+- **L**:手工清点工具面。
+- **O**:把网址当依据用，要真取过那一页。
 
-**执行：说到做到**
-- **B**:「我这就去改 X」而本轮没有改 X 的动作 ⇒ 拦。
-- **M**:写了必须回读。`node -e`、`sed -i`、重定向都可能静默失败，只有真回读(Read / Grep / diff 指向同一路径)算数。
-- **A / U**:发起的后台任务、委派的子代理，必须取回读过。
+**只记账(17 条)**:命中只写进候选台账，对模型零输出。
+- 查措辞的一族 13 条(S、E0、E1、E2、V、C、Q、F、SE、N、B、D、H):停工理由、因果断言、完成陈述、推迟这一类。
+- 另外 4 条：J(改规矩文件)、T(欠账的失效期)、MF(记忆要带执行面)、M(Bash 写入后回读)。
 
-**收工：汇报不夸大**
-- **R**:「已修 X」而记录里没有改 X 的动作 ⇒ 拦。
-- **F / X**:「完成」靠核对，完成性断言和未覆盖栏要一致。
-- **S / Q**:合法停工只有三类(不可逆 / 需人亲签 / 实打实阻断),停下要标明是哪一类。
+这 17 条计划在回放确认「以前拦对过的现在还接得住」之后删除。降级的理由见[误报数据](#误报数据):靠措辞推断语义的规则，盲审下来拦错的比拦对的多。
+
+另有三样不在这 31 条里，也在收尾时跑:A(委派出去的作业没取回读过)、R(说跑过了要有动作)、DRIFT(文档里的引用漂移)。A 和 R 命中也会拦,DRIFT 只提示。
 
 0.4.2 起去掉了 CW(收尾时复查并发写会话),并发写改用 git worktree / 分支隔离，见 [CHANGELOG](CHANGELOG.md)。
 
-完整巡览与建造顺序:[`docs/playbook.md`](docs/playbook.md)。这是写给 agent 照着做的建闸作业本，每步带产物形状、可执行检查点和当初的事故记录。
+当初怎么一条条建起来的:[`docs/playbook.md`](docs/playbook.md)。这是写给 agent 照着做的建闸作业本，每步带产物形状、可执行检查点和当初的事故记录。它写于 2026-08,里面的规则数目和档位是当时的。
 
-## 宪法法典制
+## 误报数据
 
-- 每条规则带一个 `law:` 锚点，指回一条人签过的规范条款(如 J 项 → `AGENTS.md#承重规则的载体门槛`)。引擎在装载期和自测里核锚点能解析。没有法源的规则谁都可以删。
-- 示例宪法 `AGENTS.md` 放每会话默认动作、决策边界、永久红线;细则在示例法典 `docs/laws/collab.md`、`docs/laws/reporting.md`、`docs/laws/production.md`。
-- 这三份是示例。你的仓要换成你自己签过的条款，锚点跟着改。
+执行的模型认为被拦错了，可以带理由申诉；每笔申诉再交另一个模型(codex)盲审。截至 2026-11-12,作者本机的台账：
+
+- 申诉 238 笔。盲审结论：拦错了 100,拦对了 83,判不出 38,人工撤回 4,未审 13。
+- 拦对的 83 笔里，59 笔来自 K 一条。去掉 K,其余规则合计拦错了 96、拦对了 24。
+
+**口径：这份数据只统计被申诉过的拦截，不是全部拦截的准确率。** 没人申诉的拦截(执行者直接照办了的)不在账上；例如 P 一笔申诉都没有，这把尺子量不到它。漏报率也量不了，报表自己打印 `RECALL=UNKNOWN`。数据来自一个人、一个仓，没有对照组，没有第三方审计。
+
+自己的仓里复算:`node scripts/hook-stop-closure.mjs --fp-report`。
+
+## 规矩文件与 law 指针
+
+- 每条规则带一个 `law:` 字段，指向规矩文件里的一个章节(如 K → `AGENTS.md#真正动手的批`)。引擎在装载期和自测里核指针能解析。
+- 示例规矩有两份:`AGENTS.md`(仓规矩：这个仓自己的红线、批与验证、部署)和 `docs/gate/AGENTS.md`(闸规矩：闸怎么设计、规则怎么进来、怎么改、谁能批)。
+- 闸规矩要求每条规则指向一条真实出过的错，并配一个先变红再还原的夹具。它说的「出错清单」本仓还没建(计划中)。
+- 旧的示例宪法和三份示例法典归档在 `docs/archive/laws-2026-11/`,不是现行规矩。一部分规则(多数已只记账)的 `law:` 指针还落在那里，所以文件留着。
+- `AGENTS.md` 是示例。你的仓要换成你自己签过的条款，指针跟着改；哪几条是指针落点，写在 `AGENTS.md` 开头。
 
 ## 闸自己也被闸
 
-- **变异验收**:每条规则自带至少 2 个「拧断判据」的变异，夹具必须全部杀死(`gate-migrate-check.mjs`)。这套验收上线当天，原有套件里 97 个变异有 40 个存活（2026-08 作者记录的一次历史测量，仓里没有复算它的脚本）。
+- **变异验收**:每条规则自带至少 2 个「拧断判据」的变异，夹具必须全部杀死(`gate-migrate-check.mjs`)。
 - **装载期不变量**:阻断规则必须带法条锚点和正反例，校验在生产 hook 里跑，不只在 CI。
 - **误报台账**:每次报警进分母台账，认领的误报带理由入账。漏报量不了，报表打印 `RECALL=UNKNOWN`。
 - **债务带失效期**:每条已知缺陷是台账里带批次失效期的一行，到期自动回到待办(`batch-goal --arm` 列出)。
@@ -91,24 +131,26 @@
 - [guardrails-ai](https://github.com/guardrails-ai/guardrails) / [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails) 校验模型**说出来的内容**;本仓审计它**说做过的事有没有真的发生**。
 - [tdd-guard](https://github.com/nizos/tdd-guard) / [probity](https://github.com/nizos/probity) 闸每次写入的流程合规;本仓在 Stop 时刻闸整轮的言行。可以同时跑。
 - Claude Code 自带的 `/goal` 是内建 slash command,只有用户能敲，模型调不了;收尾评估走 LLM 裁判。`batch-goal --arm / --clear` 是仓内等价物：立条件是 agent 的开工动作，对照是 Stop 闸的机器动作。
-- [unlazy](https://github.com/Leonxlnx/unlazy) 也用 Stop hook 当墙，治的是用力不足(按请求深度逐层拆任务,`CHECK:` 命令 + `EXPECT:` 词元验收);本仓治宣称不实。它有两处值得学:「连续 6 次无进展即放行」的防死循环阀，和 `ABANDON: <id> <reason>` 的失败式交接。本仓的对应物是连撞上限自动降级，以及「⏸ 需要你确认 + 三类理由」。
+- [unlazy](https://github.com/Leonxlnx/unlazy) 也用 Stop hook 当墙，治的是用力不足(把任务拆成一棵深度树,`CHECK:` 命令退出码为 0 且输出匹配 `EXPECT:` 才算过);本仓治宣称不实。它有两处值得学:「连续 6 次被拦而没有进展就放行」的防死循环阀，和带理由的放弃：放弃算终态交接，不算成功，检查器以 `HANDOFF REQUIRED` 退出。本仓的对应物是连撞上限自动降级，以及「⏸ 需要你确认 + 三类理由」。
 
 ## 局限
 
 - 漏报率未知。
+- 整体误拦率也量不到：只有被申诉过的拦截进了盲审(见[误报数据](#误报数据))。
+- 「看守」和自动跑到关账的那条线还没有实现(见[现状与计划](#现状与计划))。
 - 目前只有作者一个人的仓在用。
 - 文本类规则(因果断言、名词提问、推面出批等)只认中文句式，判官消息也是中文。英文仓里这些规则不会误拦，也不会响。
 - 文中的使用数字来自作者自己的台账，没有第三方审计。
 
 ## FAQ
 
-**误报怎么办?** 认领进台账，带理由。2026-10-11 作者本机：误报 205 / 报警 2223 规则次 = 9.2%,全部由执行方自己认领。复算:`node scripts/hook-stop-closure.mjs --fp-report`。好几条规则就是靠这个环收窄的。
+**误报怎么办?** 认领进台账，带理由；每笔认领会再交盲审。读数和口径见[误报数据](#误报数据)。规则的降级和收窄，依据的就是这份台账。
 
-**开销多大?** 零依赖。2026-08-25 至 10-10 共 590 次 Stop:中位数 582ms,p90 1575ms。耗时随 transcript 体积上升:20MB 以下中位数 243ms,20MB 及以上 1037ms。数据在心跳台账 `.claude/.gate-heartbeat.log` 的 `dur=` 字段。
+**开销多大?** 零依赖。作者本机 2026-08-25 至 11-15 共 1563 次 Stop:中位数 1978ms,p90 4954ms。耗时随 transcript 体积上升:20MB 以下中位数 633ms,20MB 及以上 2427ms。后期比前期慢：10-10 及以前的 590 次，中位数是 582ms。数据在心跳台账 `.claude/.gate-heartbeat.log` 的 `dur=` 字段，你的仓里装了以后可以自己量。
 
 **会死循环吗?** 不会。hook 查 `stop_hook_active`,引擎记自己的连续阻断次数，到上限(`STOP_CLOSURE_BLOCK_CAP`)降级为提示，并把降级记下来。
 
-**怎么加一条自己的规则?** 在 `scripts/lib/gate-rules.mjs` 里照抄任意一条的五件套:`detect`(纯函数，只读结构化 ctx)、`law`(你自己签过的条款锚点)、`blocking`、正反例 `cases`、至少 2 个 `mutations`。加进文件末尾的 `RULES` 数组，跑 `npm run gate:accept`。没有法源锚点或正反例的规则装载不进去，变异杀不死的用例过不了验收。改完用 `_gate-bypass-hunter` 红队一遍。完整教程在 [`docs/playbook.md`](docs/playbook.md) 第 3–4 步。
+**怎么加一条自己的规则?** 先读 `docs/gate/AGENTS.md` 第二节：规则要指向一条真实出过的错，并配一个先变红再还原的夹具；会拦人的检查必须判得准。然后在 `scripts/lib/gate-rules.mjs` 里照抄任意一条的五件套:`detect`(纯函数，只读结构化 ctx)、`law`(你自己签过的条款锚点)、`blocking`、正反例 `cases`、至少 2 个 `mutations`。加进文件末尾的 `RULES` 数组，跑 `npm run gate:accept`。没有法源锚点或正反例的规则装载不进去，变异杀不死的用例过不了验收。合并前按 `docs/gate/AGENTS.md` 第三节过红队 `_gate-bypass-hunter`、误拦猎手 `_gate-false-block-hunter` 和跨模型复核。完整教程在 [`docs/playbook.md`](docs/playbook.md) 第 3–4 步。
 
 ## 交给你的 agent
 
@@ -118,7 +160,7 @@
 读 https://github.com/inoichi1009207/custodiet 的 README「怎么用」一节，把 custodiet 装进当前仓(拷贝模式),再装 lanes 插件;装完跑自检，把 stdout 末行的 JSON 清单和自检结果报给我。
 ```
 
-装完以后，示例宪法 `AGENTS.md` 和示例法典要换成你自己签过的条款。这一步得你来做。
+装完以后，示例仓规矩 `AGENTS.md` 要换成你自己签过的条款(它开头写了改哪些)。这一步得你来做。
 
 ## 怎么用(写给 agent)
 
@@ -126,7 +168,7 @@
 
 | 组件 | 形态 | 怎么装 |
 |---|---|---|
-| custodiet | 闸脚本 + 示例宪法 / 法典 + 红队 agent + 拷贝模式安装器(还不是插件) | `node scripts/custodiet-init.mjs --target <仓> --mode copy` |
+| custodiet | 闸脚本 + 示例规矩文件 + 红队 agent + 拷贝模式安装器(还不是插件) | `node scripts/custodiet-init.mjs --target <仓> --mode copy` |
 | lanes | Claude Code 插件(带 hooks 模块),在 `plugins/lanes/` | `/plugin install lanes --marketplace inoichi1009207/custodiet` |
 
 ### 安装
@@ -142,12 +184,12 @@ node custodiet/scripts/custodiet-init.mjs --target <你的仓根> --mode copy
 
 它做的事:
 
-- 把闸件(`scripts/hook-stop-closure.mjs`、`scripts/batch-goal.mjs`、`scripts/lib/` 下的引擎件)、示例宪法 `AGENTS.md`、示例法典(`docs/laws/collab.md`、`docs/laws/reporting.md`、`docs/laws/production.md`)、`docs/noun-diary.md`、红队 agent `.claude/agents/_gate-bypass-hunter.md` 拷进目标仓，并生成 `CLAUDE.md`(内容为 `@AGENTS.md`)。
+- 把闸件(`scripts/hook-stop-closure.mjs`、`scripts/batch-goal.mjs`、`scripts/lib/` 下的引擎件)、示例规矩文件(仓规矩 `AGENTS.md`、闸规矩 `docs/gate/AGENTS.md`,以及 `docs/archive/laws-2026-11/` 下仍被规则引用的归档示例)、`docs/noun-diary.md`、`docs/gate-debts.md`、红队 agent `.claude/agents/_gate-bypass-hunter.md` 拷进目标仓，并生成 `CLAUDE.md`(内容为 `@AGENTS.md`)。
 - 把 `Stop` 与 `SubagentStop` 两个 hook 合并进目标的 `.claude/settings.json`(按命令去重)。
 - 把闸的运行时台账路径追加进目标的 `.gitignore`。
 - 生成《闸用语》`docs/gate-phrasebook.md`,在 `CLAUDE.md` 末尾加一段首尾标记圈住的托管块引用它(重跑只换标记之间的内容)。
 - 拷贝件已存在时不覆盖：内容不同时写旁件 `<名>.custodiet<扩展名>`,在 stdout 末行的 JSON 清单里逐个报出。`.claude/settings.json`、`.gitignore`、`CLAUDE.md` 是追加/合并，不是整文件替换。不提交、不联网、不碰 `~/.claude/`。
-- 加 `--observe` 装成观察档：只记账、不阻断、不对模型输出(调试变量 `STOP_CLOSURE_STDOUT=1` 例外);示例宪法只落旁件 `AGENTS.custodiet.md`,`CLAUDE.md` 不引入它(《闸用语》照挂)。把 `.claude/custodiet-mode` 提交后**新开的会话**才进观察档，装闸的这个会话照常阻断。适合先在一个在用的仓里攒数据。切回阻断档：删掉 `.claude/custodiet-mode` 并提交，再不带 `--observe` 重跑一次安装器(示例宪法才落到根目录、`CLAUDE.md` 才引入它)。
+- 加 `--observe` 装成观察档：只记账、不阻断、不对模型输出(调试变量 `STOP_CLOSURE_STDOUT=1` 例外);示例仓规矩只落旁件 `AGENTS.custodiet.md`,`CLAUDE.md` 不引入它(《闸用语》照挂)。把 `.claude/custodiet-mode` 提交后**新开的会话**才进观察档，装闸的这个会话照常阻断。适合先在一个在用的仓里攒数据。切回阻断档：删掉 `.claude/custodiet-mode` 并提交，再不带 `--observe` 重跑一次安装器(示例仓规矩才落到根目录、`CLAUDE.md` 才引入它)。
 
 装完以后:
 
@@ -182,7 +224,7 @@ claude plugin install lanes --marketplace inoichi1009207/custodiet
 
 | 能力 | 一句话 | 命令 |
 |---|---|---|
-| 收尾闸 | Stop 时对本轮的工具调用记录跑 28 条引擎规则 + 2 条内建规则，命中阻断规则就不让本轮结束 | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
+| 收尾闸 | Stop 时对本轮的工具调用记录跑 31 条引擎规则(会拦的 7 条)和另外三样检查(A、R、DRIFT;A、R 也会拦),命中会拦的就不让本轮结束 | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
 | 批级完成条件 | 开工先立可核的验收条件，可带机器判据;`--clear` 时自己跑判据，不过就拒清 | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "成片已出" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
 | 规则验收 | 每条规则的正反例 + 变异验收，变异杀不死的用例不许上线(在本仓里跑) | `npm run gate:accept` |
 | 台账完整性链 | 三份台账带行级 hash 链，改写 / 插行 / 删中间行会红 | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
