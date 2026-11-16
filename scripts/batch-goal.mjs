@@ -1257,6 +1257,11 @@ export function debtDue(rows, cur) {
   return { mine, yours, colBad };
 }
 
+/** 批 305:债表里参与到期判定的行(`| Dnn |` 起头、未停放)。读不到 ⇒ 抛(调用方各自处理:--arm 只提示,--handoff 写取不到)。 */
+function debtTableRows() {
+  return fs.readFileSync(cfgDebtTable(), "utf8").split(/\r?\n/).filter((l) => /^\| D\d+ \|/.test(l) && !debtRowParked(l));
+}
+
 function debtTableWarn() {
   try {
     const issues = debtTableIssues(fs.readFileSync(cfgDebtTable(), "utf8"));
@@ -1314,6 +1319,41 @@ export function armMetaLines(g) {
 function pickArmMeta(g) {
   return { ...(g && g.instruction ? { instruction: g.instruction } : {}), ...(g && typeof g.finishLine === "string" ? { finishLine: g.finishLine } : {}), ...(g && g.caps ? { caps: g.caps } : {}) };
 }
+// ── 批 305:工作树里开的批并进主树看得到的地方 ──────────────────────────────────────────
+//   现状(改前实测,自测「305 ③ 现状钉住」):批状态与批台账都按 cwd 相对路径写(`.claude/.batch-goal.json` / `.jsonl`),
+//   在 `git worktree add` 出来的工作树里跑,写的是**工作树自己的**那两份(被忽略、随工作树删除而消失);主树那份一行不多,
+//   主树的 `--history` 只读 cwd 那份,所以看不到。
+//   改法(最小):工作树里每次成功的 --arm / --clear,**另外**往主 checkout 的 `.claude/.batch-goal.worktrees.jsonl` 追加同一行
+//   (多带 checkout / worktree / branch 三个键)。主树的 `--history` 把它按时间并进来显示。工作树自己的台账照旧、仍是它的权威。
+//   为什么不直接追加进主树的 `.batch-goal.jsonl`:收尾闸认「刚结清」靠**台账末行是本批的 clear 行**(hook-stop-closure readBatchGoal),
+//   主树结清以后任何一个工作树追加一行,主树这条证据就没了 ⇒ 改判决;batch-goal 自己的 lastArmRow / batchClearedBefore /
+//   lastOblAnchor 也按批号在这份文件里找行,而同一个批号同时在多个工作树里是常态。所以另放一份、行的结构不变。
+//   并发:追加走 ledger-chain 的 ledgerAppend(按文件加锁、读尾算 h、追加在同一临界区),多个工作树同时写链不断(自测「305 ③ 并发」)。
+//   只是记录:写不进去 ⇒ 出声,本次 --arm / --clear 照常。
+const WORKTREE_JOURNAL = ".batch-goal.worktrees.jsonl";
+export const worktreeJournalFile = (layout) => path.join(layout.main, ".claude", WORKTREE_JOURNAL);
+function mirrorToMain(action, payload) {
+  let layout;
+  try { layout = checkoutLayout(); } catch { return; }
+  if (layout.unknown || !layout.linked) return;   // 主树、非 git 目录:不写
+  const file = worktreeJournalFile(layout);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    let branch = null;
+    try { const r = gitRun(["symbolic-ref", "--short", "-q", "HEAD"]); if (r && r.status === 0) branch = String(r.stdout || "").trim() || null; } catch { branch = null; }
+    ledgerAppend(file, { at: new Date().toISOString(), action, ...payload, checkout: layout.root, worktree: path.basename(layout.root), ...(branch ? { branch } : {}) });
+  } catch (e) {
+    console.error(`⚠ 主树的工作树批日志写不进去(${e.code || String(e.message).slice(0, 120)}):${file}——本次 ${action} 照常,只是主树 --history 看不到这一行`);
+  }
+}
+/** `--history` 用:主树里把各工作树镜像过来的行并进本 checkout 的行,按 `at` 排(同一份内部次序不变;时刻相同按本 checkout 在前)。 */
+export function mergeHistoryRows(own, mirrored) {
+  const all = [];
+  [own, mirrored].forEach((rows, k) => { let prev = 0; (rows || []).forEach((o, i) => { const at = Date.parse(String(o && o.at || "")); prev = Number.isFinite(at) ? Math.max(prev, at) : prev; all.push({ o, at: prev, k, i }); }); });
+  all.sort((a, b) => a.at - b.at || a.k - b.k || a.i - b.i);
+  return all.map((x) => x.o);
+}
+
 /** 批 305:主尺——从指令那一刻到现在,转录里人亲口说了几条(数法与天花板见 lib/batch-ruler.mjs 头注)。只读;任何一步拿不到 ⇒ { ok:false, why },不猜。
  *  读哪几份转录:指令所在会话、武装过本批的会话(批状态的 armedBy 与本批各 arm 行的 armedBy)、现在跑这条命令的会话。 */
 function computeRuler(g) {
@@ -1331,6 +1371,215 @@ function computeRuler(g) {
     return RULER.measureRuler({ instruction: ins, sids, dirs: transcriptDirsHere(), nowMs: Date.now() });
   } catch (e) { return { ok: false, why: `算的时候出错:${String(e && e.message || e).slice(0, 160)}` }; }
 }
+// ── 批 305:`--handoff`——交接文件从事实生成 ─────────────────────────────────────────────
+//   每一段只写查得到的事实(git、批状态、作业目录、转录、债表);任何一段拿不到 ⇒「取不到(原因)」,不留空、不编。
+//   不写任何叙述(「下一步做什么」之类),那是读它的会话自己的事。只读:除 `--out` 指定的那一个文件外不写任何东西。
+const NA = (why) => `取不到(${String(why || "原因未知").replace(/\s+/g, " ").trim().slice(0, 200)})`;
+const gitAt = (cwd, args) => spawnSync("git", ["-c", "core.quotePath=false", ...args], { cwd, encoding: "utf8", windowsHide: true, timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+const gitErr = (r) => (r && (r.error?.message || String(r.stderr || "").trim().split("\n")[0])) || "git 不可用";
+/** 工作区干不干净:{ tracked, untracked } 或 { why }。 */
+function dirtyOf(cwd) {
+  const r = gitAt(cwd, ["status", "--porcelain"]);
+  if (!r || r.status !== 0) return { why: gitErr(r) };
+  const ls = String(r.stdout || "").split(/\r?\n/).filter((l) => l.trim());
+  return { tracked: ls.filter((l) => !l.startsWith("??")).length, untracked: ls.filter((l) => l.startsWith("??")).length };
+}
+const fmtDirty = (d) => d.why ? NA(d.why) : d.tracked || d.untracked ? `不干净(已跟踪文件改动 ${d.tracked} 个,未跟踪 ${d.untracked} 个)` : "干净";
+/** 未推送的提交数。远端名一律从 git 配置读:先看上游(@{u}),再看 branch.<分支>.pushRemote / remote.pushDefault / branch.<分支>.remote,
+ *  都没配而只有一个远端 ⇒ 用它。数的是本地的远端跟踪引用(没联网,没 fetch 过的不算数)。 */
+export function unpushedOf(cwd, branch, git = (a) => gitAt(cwd, a)) {
+  if (!branch) return NA("分离 HEAD,没有分支");
+  const u = git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+  if (u && u.status === 0 && String(u.stdout || "").trim()) {
+    const up = String(u.stdout).trim();
+    const c = git(["rev-list", "--count", "@{u}..HEAD"]);
+    return c && c.status === 0 ? `${String(c.stdout).trim()}(相对上游 ${up};按本地的远端跟踪引用算,没联网)` : NA(`git rev-list 失败:${gitErr(c)}`);
+  }
+  const cfg = (k) => { const r = git(["config", "--get", k]); return r && r.status === 0 ? String(r.stdout || "").trim() || null : null; };
+  let remote = cfg(`branch.${branch}.pushRemote`) || cfg("remote.pushDefault") || cfg(`branch.${branch}.remote`), how = "配置";
+  if (!remote) {
+    const rl = git(["remote"]);
+    const names = rl && rl.status === 0 ? String(rl.stdout || "").split(/\r?\n/).map((x) => x.trim()).filter(Boolean) : null;
+    if (!names) return NA(`git remote 失败:${gitErr(rl)}`);
+    if (!names.length) return NA("本仓没配远端");
+    if (names.length > 1) return NA(`本分支没配上游 / 推送远端,而本仓有 ${names.length} 个远端(${names.join("、")}),不猜推到哪个`);
+    remote = names[0]; how = "本仓唯一的远端";
+  }
+  const ref = `refs/remotes/${remote}/${branch}`;
+  const has = git(["rev-parse", "--verify", "-q", ref]);
+  if (!(has && has.status === 0)) return NA(`远端 ${remote}(${how})上没有 ${branch} 的跟踪引用——可能从没推过`);
+  const c = git(["rev-list", "--count", `${ref}..HEAD`]);
+  return c && c.status === 0 ? `${String(c.stdout).trim()}(相对 ${remote}/${branch},远端名取自${how};按本地的远端跟踪引用算,没联网)` : NA(`git rev-list 失败:${gitErr(c)}`);
+}
+/** 一个 checkout 里的批状态一行(工作树列表用)。 */
+function batchLineAt(root) {
+  let g;
+  try { g = load(path.join(root, ".claude", ".batch-goal.json")); } catch (e) { return NA(e.message); }
+  if (!g) return "未武装(没有批状态文件)";
+  if (g.cleared) return `批 ${g.batch ?? "?"} 已结清`;
+  return Array.isArray(g.conditions) && g.conditions.length ? `批 ${g.batch} 未结清(${g.conditions.length} 条完成条件)` : NA("批状态文件形状不对(没有完成条件)");
+}
+/** 外部作业(codex-run)。复用收尾闸委派闭环那条内建检查的判法(hook-stop-closure 导出的 codexLedger + liveCodexEnv,只读调用):
+ *  本会话转录里发起过的作业按它的六态判;作业目录里另有本仓 checkout 发起的 running 作业也列出。
+ *  收尾闸加载不了 / 本会话转录取不到 ⇒ 只列作业目录里的作业与结果路径,写明「是否读过:未判」。 */
+async function externalJobs(ctx) {
+  const out = [];
+  let H = null, loadWhy = null;
+  try {
+    const f = path.join(path.dirname(fileURLToPath(import.meta.url)), "hook-stop-closure.mjs");
+    if (!fs.existsSync(f)) loadWhy = "本仓没有 scripts/hook-stop-closure.mjs";
+    else { H = await import(new URL("./hook-stop-closure.mjs", import.meta.url).href); if (typeof H.codexLedger !== "function" || typeof H.liveCodexEnv !== "function") { loadWhy = "hook-stop-closure.mjs 没导出 codexLedger / liveCodexEnv"; H = null; } }
+  } catch (e) { loadWhy = `加载 hook-stop-closure.mjs 失败:${String(e && e.message || e).slice(0, 120)}`; H = null; }
+  const env = H ? H.liveCodexEnv() : null;
+  // 作业目录里的记录(与收尾闸同一读法 listJobs;收尾闸加载不了 ⇒ 按 codex-run 的作业目录自己读)
+  let listed = null, listWhy = null;
+  const since = Number.isFinite(Date.parse(String(ctx.since || ""))) ? Date.parse(ctx.since) : Date.now() - 24 * 3600_000;
+  try {
+    if (env && typeof env.listJobs === "function") listed = env.listJobs({ since });
+    else {
+      const root = path.join(os.tmpdir(), "codex-run-jobs");
+      let names = [];
+      try { names = fs.readdirSync(root).filter((n) => /^[A-Za-z0-9_-]{1,64}\.json$/.test(n)); } catch (e) { if (e.code !== "ENOENT") throw e; }
+      listed = [];
+      for (const n of names.slice(-3000)) { try { const j = JSON.parse(fs.readFileSync(path.join(root, n), "utf8")); const t = Date.parse(j.startedAt || ""); if (Number.isFinite(t) && t >= since) listed.push({ ...j, id: n.slice(0, -5), top: null }); } catch { /* 半写 / 坏件跳过 */ } }
+    }
+  } catch (e) { listWhy = String(e && e.message || e).slice(0, 160); }
+  const mineTop = (j) => { const c = normCheckout(j.top || j.cwd || ""); return !!c && ctx.checkouts.some((k) => c === k || c.startsWith(k + "/")); };
+  const here = (listed || []).filter(mineTop);
+  // 本会话的委派账
+  let ledger = null, ledgerWhy = null;
+  if (!H) ledgerWhy = loadWhy;
+  else if (!ctx.sid) ledgerWhy = "取不到本会话的会话号(环境里没有 CLAUDE_CODE_SESSION_ID)";
+  else {
+    const file = ctx.dirs ? RULER.findTranscript(ctx.sid, ctx.dirs) : null;
+    if (!file) ledgerWhy = `找不到本会话 ${ctx.sid} 的转录文件`;
+    else {
+      const entries = [];
+      const r = RULER.eachEntry(file, (e) => { if (e && (e.type === "user" || e.type === "assistant")) entries.push(e); }, { match: /"type"\s*:\s*"(?:user|assistant)"/ });
+      if (r.err) ledgerWhy = r.err;
+      else { try { ledger = H.codexLedger(entries, { ...env, turnStart: 0 }); } catch (e) { ledgerWhy = `委派账算的时候出错:${String(e && e.message || e).slice(0, 120)}`; } }
+    }
+  }
+  const ZH = { running: "运行中", "pending-read": "已产出待读", read: "已读回", "failed-handled": "失败已处理", "failed-open": "失败未处理", unknown: "状态未知" };
+  if (ledger) {
+    const open = ledger.jobs.filter((j) => j.status !== "read" && j.status !== "failed-handled");
+    out.push(`- 本会话发起的 codex 作业:${ledger.jobs.length} 个(判法 = 收尾闸委派闭环那条内建检查,hook-stop-closure 的 codexLedger)`);
+    for (const j of open) out.push(`  - ${j.label}:${ZH[j.status] || j.status}${j.R ? `;结果件 ${j.R}` : ""}${j.L ? `;日志 ${j.L}` : ""}${j.why ? `;${String(j.why).slice(0, 100)}` : ""}`);
+    const done = ledger.jobs.length - open.length;
+    if (done) out.push(`  - 另 ${done} 个已读回 / 失败已处理,不列`);
+    if (!ledger.jobs.length) out.push("  - (零个)");
+  } else out.push(`- 本会话发起的 codex 作业:${NA(ledgerWhy)}`);
+  if (listWhy) out.push(`- 作业目录里本仓发起的作业:${NA(`读作业目录失败:${listWhy}`)}`);
+  else {
+    const known = new Set((ledger ? ledger.jobs : []).map((j) => j.label));
+    const others = here.filter((j) => !known.has(j.id));
+    const running = others.filter((j) => j.state === "running");
+    const doneNot = ledger ? [] : others.filter((j) => j.state === "done" || j.state === "failed");
+    out.push(`- 作业目录里本仓发起、${ledger ? "不在本会话委派账里" : "自 " + new Date(since).toISOString() + " 起"}的作业:running ${running.length} 个${ledger ? "" : `,已完成 / 失败 ${doneNot.length} 个`}(作业目录记录自 ${new Date(since).toISOString()} 起)`);
+    for (const j of [...running, ...doneNot]) out.push(`  - ${j.id}:state=${j.state};结果件 ${j.result || "(未记)"}${j.log ? `;日志 ${j.log}` : ""};任务 ${j.task || "(未记)"}${ledger ? ";别的会话发起的,是否读过:未判(委派账只认发起方会话)" : ";是否读过:未判"}`);
+  }
+  return out;
+}
+/** 组一份交接正文。io 可注入 now / sid(自测用)。 */
+export async function buildHandoff(io = {}) {
+  const now = io.now || new Date();
+  const sid = io.sid !== undefined ? io.sid : sidEnv();
+  const L = [];
+  L.push(`# 交接(生成于 ${now.toISOString()})——本文件由工具从事实生成,不含叙述`);
+  L.push("");
+  L.push(`生成命令:node --no-warnings scripts/batch-goal.mjs --handoff;会话号:${sid || NA("环境里没有 CLAUDE_CODE_SESSION_ID")};工作目录:${normCheckout(process.cwd())}`);
+  // ── 1 当前 checkout ──
+  const layout = checkoutLayout();
+  L.push("", "## 当前分支与工作区");
+  let branch = null;
+  if (layout.unknown) L.push(`- ${NA(layout.why)}`);
+  else {
+    const b = gitRun(["symbolic-ref", "--short", "-q", "HEAD"]); branch = b && b.status === 0 ? String(b.stdout || "").trim() || null : null;
+    const h = gitRun(["log", "-1", "--format=%H%x09%s"]);
+    const [sha, subj] = h && h.status === 0 ? String(h.stdout || "").trim().split("\t") : [null, null];
+    L.push(`- checkout:${normCheckout(layout.root)}${layout.linked ? "(git worktree)" : "(主 checkout)"}`);
+    L.push(`- 分支:${branch || "(分离 HEAD)"}`);
+    L.push(`- HEAD:${sha ? `${sha.slice(0, 12)} ${String(subj || "").slice(0, 120)}` : NA(gitErr(h))}`);
+    L.push(`- 工作区:${fmtDirty(dirtyOf(process.cwd()))}`);
+    L.push(`- 未推送的提交:${unpushedOf(process.cwd(), branch)}`);
+  }
+  // ── 2 全部 worktree ──
+  L.push("", "## 全部 git worktree");
+  const checkouts = [];
+  if (layout.unknown) L.push(`- ${NA(layout.why)}`);
+  else {
+    const r = gitRun(["worktree", "list", "--porcelain"]);
+    if (!r || r.status !== 0) L.push(`- ${NA(gitErr(r))}`);
+    else {
+      const blocks = String(r.stdout || "").split(/\r?\n\r?\n/).map((b) => b.split(/\r?\n/).filter(Boolean)).filter((b) => b.length);
+      for (const b of blocks) {
+        const kv = (k) => { const l = b.find((x) => x === k || x.startsWith(k + " ")); return l === undefined ? undefined : l.slice(k.length + 1); };
+        const p = kv("worktree"); if (!p) continue;
+        const np = normCheckout(p); checkouts.push(np);
+        const br = kv("branch"), head = kv("HEAD");
+        const exists = fs.existsSync(p);
+        const cur = np === normCheckout(layout.root) ? "(当前)" : "";
+        L.push(`- ${np}${cur}:分支 ${br ? br.replace(/^refs\/heads\//, "") : kv("detached") !== undefined ? "(分离 HEAD)" : kv("bare") !== undefined ? "(裸仓)" : "(未知)"};HEAD ${head ? head.slice(0, 12) : "(无)"};` +
+          `${exists ? `工作区 ${fmtDirty(dirtyOf(p))};批状态 ${batchLineAt(p)}` : NA("目录不在了(git worktree prune 可清)")}${kv("locked") !== undefined ? ";已锁定" : ""}`);
+      }
+      if (!checkouts.length) L.push(`- ${NA("git worktree list 没列出任何工作树")}`);
+    }
+  }
+  // ── 3 批状态 ──
+  L.push("", "## 批状态(本 checkout)");
+  let g = null, gWhy = null;
+  try { g = load(); } catch (e) { gWhy = e.message; }
+  if (gWhy) L.push(`- ${NA(gWhy)}`);
+  else if (!g) L.push("- 未武装(没有批状态文件)");
+  else if (g.cleared) {
+    L.push(`- 批 ${g.batch ?? "?"} 已结清,未武装新批`);
+    let row = null;
+    try { for (const l of fs.readFileSync(JOURNAL, "utf8").split("\n")) { if (!l.trim()) continue; let o; try { o = JSON.parse(l); } catch { continue; } if (o && o.action === "clear" && String(o.batch) === String(g.batch)) row = o; } } catch { row = null; }
+    if (row) { for (const l of armMetaLines(row)) L.push(`- ${l}`); L.push(`- ${RULER.formatRuler(row.ruler || { ok: false, why: "这一批关账时还没有主尺" })}`); }
+    else L.push(`- 关账记录:${NA("批台账里没有这批的 clear 行")}`);
+  } else if (!Array.isArray(g.conditions) || !g.conditions.length) L.push(`- ${NA("批状态文件形状不对(没有完成条件)")}`);
+  else {
+    L.push(`- 批号:${g.batch};武装于 ${g.armedAt || "(未记)"};基点 ${g.baseCommit ? String(g.baseCommit).slice(0, 12) : "(无)"};武装者会话 ${g.armedBy || "(未记)"}`);
+    for (const l of armMetaLines(g)) L.push(`- ${l}`);
+    if (!armMetaLines(g).length) L.push("- 指令 / 终点线 / 上限:开批时没记");
+    L.push(`- 完成条件 ${g.conditions.length} 条:`);
+    g.conditions.forEach((c, i) => {
+      L.push(`  ${i + 1}. ${typeof c === "string" ? c : c?.text || ""}`);
+      for (const k of arr(g.checks).filter((x) => x && x.i === i)) L.push(`     判据:$ ${k.cmd}${k.expect !== undefined ? `  期待含「${k.expect}」` : ""}${k.expectRe !== undefined ? `  期待匹配 /${k.expectRe}/` : ""}`);
+    });
+    L.push(`- 已登记的决定:${arr(g.decisions).length ? arr(g.decisions).map((d) => `${d.id}「${d.text}」`).join(";") : g.noDecision ? `无(声明没有决定:${g.noDecision.text})` : "无"}`);
+    L.push(`- 已登记的成果:${numberOutcomes(g.outcomes).length ? numberOutcomes(g.outcomes).map((o) => `O${o.n}「${o.text}」`).join(";") : "无"}`);
+    if (arr(g.withdrawn).length) L.push(`- 已撤回:${arr(g.withdrawn).map((w) => `${w?.kind === "decision" ? w.id : `O${w?.n}`}(${w?.reason})`).join(";")}`);
+    if (g.clearRefusedAt) L.push(`- 上次 --clear 被拒:${g.clearRefusedAt},原因 ${g.clearRefusedReason || "(未记)"}`);
+    try {
+      const o = oblRead(g), s = OB.summarize(o.view.mine);
+      L.push(`- 义务账:${OB.TRUSTED.has(o.kind) ? `本批名下挡关账 ${s.blocking} 条(开着 ${s.open} / 判不了 ${s.unknown} / 转欠账待提交 ${s.settling}),已转欠账 ${s.settled} 条` : NA(`义务账判不了:${o.kind} ${o.why || ""}`)}`);
+    } catch (e) { L.push(`- 义务账:${NA(e.message)}`); }
+    L.push(`- ${RULER.formatRuler(computeRuler(g))}`);
+  }
+  // ── 4 外部作业 ──
+  L.push("", "## 在跑或未读的外部作业(codex-run)");
+  try {
+    let dirs = null; try { dirs = transcriptDirsHere(layout); } catch { dirs = null; }
+    for (const l of await externalJobs({ sid, dirs, since: g && !g.cleared ? g.armedAt : null, checkouts: checkouts.length ? checkouts : [normCheckout(layout.unknown ? process.cwd() : layout.root)] })) L.push(l);
+  } catch (e) { L.push(`- ${NA(e.message)}`); }
+  // ── 5 到期未结的欠账 ──
+  L.push("", "## 到期未结的欠账");
+  {
+    const num = g && g.batch !== undefined && g.batch !== null ? parseInt(g.batch, 10) : NaN;
+    let rows = null, why = null;
+    try { rows = debtTableRows(); } catch (e) { why = `债表 ${cfgDebtTable()} 读不了(${e.code || e.message})`; }
+    if (why) L.push(`- ${NA(why)}`);
+    else if (!Number.isFinite(num)) L.push(`- ${NA(g ? `批号「${g.batch}」没有数字部分,算不出到期` : "没有批号,算不出到期")}`);
+    else {
+      const { mine, yours, colBad } = debtDue(rows, num);
+      L.push(`- 按批号 ${num} 算(与 --arm 开批时那段同一判法):${mine.length + yours.length} 条——【我做】${mine.length ? mine.join(" ") : "无"};【需你裁】${yours.length ? yours.join(" ") : "无"}`);
+      if (colBad.length) L.push(`- 另有 ${colBad.length} 行列数异常、看不见到期:${colBad.join(" ")}`);
+    }
+  }
+  return L.join("\n") + "\n";
+}
+
 /** 主尺结果 ⇒ 写进批日志 clear 行的那一份(不带展示用的长串)。 */
 function rulerRecord(r) {
   if (!r || !r.ok) return { ok: false, why: String((r && r.why) || "没有结果"), ...(r && r.sessions ? { sessions: r.sessions } : {}) };
@@ -2643,6 +2892,53 @@ export function selfTest305(t) {
     const c = cli({ CLAUDE_CODE_SESSION_ID: SB }, "--clear"); const last = jrows().pop() || {};
     return [none.status, none.stdout.includes("主尺:量不出(未武装"), c.status, last.ruler?.count, (last.ruler?.sessions || []).map((s) => [s.sid === SID ? "A" : "B", s.read, s.count])];
   }), [0, true, 0, 3, [["A", true, 2], ["B", true, 1]]]);
+  // ── ③ worktree 里开的批并进主树的批日志 ──
+  const SHARED = (repo) => path.join(repo, ".claude", ".batch-goal.worktrees.jsonl");
+  const addWt = (b, name) => { const p = path.join(b.tmp, name); const r = b.g(b.repo, "worktree", "add", "-q", "-b", `br-${name}`, p); if (r.status !== 0) throw new Error(`worktree add 失败:${r.stderr}`); return p; };
+  t("305 ③ 现状钉住:工作树里 --arm / --clear 写的是工作树自己的台账;主树自己的 .batch-goal.jsonl 一行不多(主树「末行是 clear 行」的结清证据不被工作树的行顶掉)", box305((b) => {
+    b.cli(SIDE, "--arm", "520", "--cond", "主树的批"); b.cli(SIDE, "--clear");
+    const mainBefore = b.jrows().length;
+    const wt = addWt(b, "wt-a");
+    const a = b.cliAt(wt, SIDE, "--arm", "521", "--cond", "工作树的批"), c = b.cliAt(wt, SIDE, "--clear");
+    const mainRows = b.jrows();
+    return [a.status, c.status, b.jrows(wt).filter((x) => x.action === "arm" || x.action === "clear").map((x) => `${x.action}:${x.batch}`), mainRows.length === mainBefore, mainRows[mainRows.length - 1]?.action, mainRows[mainRows.length - 1]?.batch];
+  }), [0, 0, ["arm:521", "clear:521"], true, "clear", "520"]);
+  t("305 ③ 正例:工作树里 --arm / --clear ⇒ 主树的工作树批日志各记一行(带工作树名、路径、分支),hash 链可校验;主树 --history 看得到并标明来自哪个工作树", box305((b) => {
+    b.cli(SIDE, "--arm", "520", "--cond", "主树的批");
+    const wt = addWt(b, "wt-a");
+    const a = b.cliAt(wt, SIDE, "--arm", "521", "--cond", "工作树的批", "--finish-line", "测过就停"), c = b.cliAt(wt, SIDE, "--clear");
+    const rows = b.rowsOf(SHARED(b.repo)).filter((x) => x.action);
+    const hist = b.cli(SIDE, "--history", "20").stdout, histWt = b.cliAt(wt, SIDE, "--history", "20").stdout;
+    return [a.status, c.status, rows.map((x) => `${x.action}:${x.batch}:${x.worktree}:${x.branch}`), rows.every((x) => typeof x.checkout === "string" && x.checkout), rows[0]?.finishLine, typeof rows[1]?.ruler?.ok,
+      verifyChainOk(SHARED(b.repo)), /批 521/.test(hist) && /工作树 wt-a · br-wt-a/.test(hist), /批 520/.test(hist), (hist.match(/批 521/g) || []).length,
+      /工作树 wt-a/.test(histWt), fs.existsSync(SHARED(wt))];
+  }), [0, 0, ["arm:521:wt-a:br-wt-a", "clear:521:wt-a:br-wt-a"], true, "测过就停", "boolean", true, true, true, 2, false, false]);
+  t("305 ③ 反例:主树自己的 --arm / --clear 不往工作树批日志里写(那份文件不出现);非 git 目录照常武装", box305((b) => {
+    const a = b.cli(SIDE, "--arm", "522", "--cond", "甲"), c = b.cli(SIDE, "--clear");
+    const ng = path.join(b.tmp, "plain"); fs.mkdirSync(ng);
+    const n = b.cliAt(ng, SIDE, "--arm", "523", "--cond", "甲");
+    return [a.status, c.status, fs.existsSync(SHARED(b.repo)), n.status, fs.existsSync(SHARED(ng))];
+  }), [0, 0, false, 0, false]);
+  t("305 ③ 反例:主树那份写不进去(路径被一个目录占着)⇒ 工作树里照常武装(退出 0)并出声,不拦", box305((b) => {
+    const wt = addWt(b, "wt-a");
+    fs.mkdirSync(SHARED(b.repo), { recursive: true });
+    const a = b.cliAt(wt, SIDE, "--arm", "524", "--cond", "甲");
+    return [a.status, /主树.*写不进去/.test(a.stderr), b.st(wt).batch];
+  }), [0, true, "524"]);
+  t("305 ③ 并发:4 个工作树同时 --arm、再同时 --clear ⇒ 8 行一行不少、hash 链完好(两个工作树并发写不坏同一份日志)", box305((b) => {
+    const wts = ["wt-a", "wt-b", "wt-c", "wt-d"].map((n) => addWt(b, n));
+    const launcher = path.join(b.tmp, "race305.mjs");
+    fs.writeFileSync(launcher, `import { spawn } from "node:child_process";
+const jobs = JSON.parse(process.argv[2]);
+const run = (j) => new Promise((res) => { const c = spawn(process.execPath, ["--no-warnings", ${JSON.stringify(fileURLToPath(import.meta.url))}, ...j.args], { cwd: j.cwd, stdio: "ignore", windowsHide: true }); c.on("exit", (code) => res(code)); });
+Promise.all(jobs.map(run)).then((codes) => { console.log(JSON.stringify(codes)); });
+`);
+    const fire = (mk) => spawnSync(process.execPath, ["--no-warnings", launcher, JSON.stringify(wts.map((cwd, i) => ({ cwd, args: mk(i) })))], { encoding: "utf8", env: { ...b.env, ...SIDE }, windowsHide: true, timeout: 180_000 }).stdout.trim();
+    const arms = fire((i) => ["--arm", `53${i}`, "--cond", `工作树 ${i} 的批`]);
+    const clears = fire(() => ["--clear"]);
+    const rows = b.rowsOf(SHARED(b.repo)).filter((x) => x.action);
+    return [arms, clears, rows.filter((x) => x.action === "arm").map((x) => x.batch).sort(), rows.filter((x) => x.action === "clear").map((x) => x.batch).sort(), verifyChainOk(SHARED(b.repo))];
+  }), ["[0,0,0,0]", "[0,0,0,0]", ["530", "531", "532", "533"], ["530", "531", "532", "533"], true]);
 }
 const verifyChainOk = (f) => { try { return verifyFileChain(f).ok; } catch { return false; } };
 
@@ -2842,12 +3138,13 @@ if (argv.includes("--clear")) {
     const oblSettled = recs.filter((r) => r.status === "settled").map((r) => ({ id: r.id, debtId: r.settle?.debtId, expiry: r.settle?.expiry }));
     // 批 305:主尺在写 clear 行**之前**算好、记在 clear 行里(收尾闸要求台账末行就是 clear 行,不能事后另追一行)。只读转录,量不出也照常结清。
     const ruler = computeRuler(prev);
-    journal("clear", { batch: prev?.batch ?? null, conditions: prev?.conditions ?? null, ...pickArmMeta(prev), ruler: rulerRecord(ruler),
+    const clearRow = { batch: prev?.batch ?? null, conditions: prev?.conditions ?? null, ...pickArmMeta(prev), ruler: rulerRecord(ruler),
       checks: prev?.checks ?? null, armedAt: prev?.armedAt ?? null, baseCommit: prev?.baseCommit ?? null,
       decisions: prev?.decisions ?? null, outcomes: prev?.outcomes ?? null, withdrawn: prev?.withdrawn ?? null,
       obligations: { cleared: oblCleared.length, settled: oblSettled, head: evalOut.head ?? null, version: evalOut.version },
       ...(evalOut.head ? { oblHead: { h: evalOut.head, version: evalOut.version } } : {}),
-      ...(verdicts ? { verdicts } : {}) });
+      ...(verdicts ? { verdicts } : {}) };
+    journal("clear", clearRow);
     console.log(`义务:已清 ${oblCleared.length} 条;转欠账 ${oblSettled.length} 条${oblSettled.length ? `(${oblSettled.map((s) => `${s.debtId} ≤${s.expiry}`).join("、")};到期未结会在开批时回到开着)` : ""}`);
     // ⚠️ **批号要留在状态文件里**(2026-08-20,grill:edge-cases E6)。
     //   闸判「这次关账是真的」靠台账末行,但  的 catch 会把写失败整个吞掉
@@ -2859,6 +3156,7 @@ if (argv.includes("--clear")) {
     atomicWrite({ cleared: true, batch: prev?.batch ?? null,
       ...(typeof prev?.armedBy === "string" && prev.armedBy ? { armedBy: prev.armedBy } : {}),
       ...(typeof prev?.armedAt === "string" && prev.armedAt ? { armedAt: prev.armedAt } : {}) });
+    mirrorToMain("clear", clearRow);   // 批 305:工作树里结清的批,主树也看得到(只在工作树里才写;写不进只出声)
     console.log("已结清批级完成条件(留结清标记,下次 --arm 覆盖;条件已存入 .batch-goal.jsonl)");
     console.log(RULER.formatRuler(ruler));   // 批 305:主尺一行(量不出也打,写明原因)
     debtTableWarn();
@@ -3269,6 +3567,7 @@ if (argv.includes("--arm")) {
       for (const r of carryOut.adopted) console.log(`  ${fmtRec(r)}`);
     }
   }
+  mirrorToMain("arm", armRow);   // 批 305:工作树里开的批,主树也看得到(只在工作树里才写;写不进只出声)
   console.log(`已武装批 ${batch} 的 ${conds.length} 条完成条件${checks.length ? `(其中 ${checks.length} 条带可执行判据,--clear 时经 bash 跑)` : ""};收尾时须逐条写「条件N:达成/未达成/不适用」`);
   for (const c of checks) console.log(`  条件${c.i + 1} ⇐ $ ${c.cmd}${c.expect !== undefined ? `  期待含「${c.expect}」` : ""}${c.expectRe !== undefined ? `  期待匹配 /${c.expectRe}/` : ""}`);
   for (const l of armMetaLines(metaState)) console.log(`  ${l}`);   // 批 305:记了才打
@@ -3278,8 +3577,7 @@ if (argv.includes("--arm")) {
   //   本腿在**开工时刻**(--arm = 唯一必经的结构点)机械列出到期未结的债,不靠散文不靠词表。
   //   一期只警不拦(拦会把「开工」堵死在还债上——比例归人判);连续多批仍列 ⇒ 升级另议。
   try {
-    const rows = fs.readFileSync(cfgDebtTable(), "utf8").split(/\r?\n/)
-      .filter((l) => /^\| D\d+ \|/.test(l) && !debtRowParked(l));
+    const rows = debtTableRows();   // 批 305:读表抽成 debtTableRows(--handoff 复用;读不到照旧抛到下面的 catch)
     const cur = parseInt(batch, 10);
     // 分诊(2026-08-23 批 099,用户点破「到期腿跑出一堆我看不懂的」):
     //   行含亲签/呈签/归用户/用户裁 ⇒ 【需你裁】,其余 ⇒ 【我做】——用户只须看前一列。
@@ -3418,13 +3716,15 @@ if (argv.includes("--history")) {
   // 「小 git」的 log:任何一次覆盖都能从这儿翻回来
   let lines = [];
   try { lines = fs.readFileSync(JOURNAL, "utf8").split("\n").filter(Boolean); } catch { lines = []; }
-  if (!lines.length) { console.log("无历史(.claude/.batch-goal.jsonl 不存在或为空)"); process.exit(0); }
+  // 批 305:主树里把各工作树镜像过来的 arm / clear 行按时间并进来(工作树里只看自己的;见 mirrorToMain 头注)
+  let mirrored = [];
+  try { const lay = checkoutLayout(); if (!lay.unknown && !lay.linked) mirrored = fs.readFileSync(worktreeJournalFile(lay), "utf8").split("\n").filter(Boolean); } catch { mirrored = []; }
+  if (!lines.length && !mirrored.length) { console.log("无历史(.claude/.batch-goal.jsonl 不存在或为空)"); process.exit(0); }
   const n = Number(argv[argv.indexOf("--history") + 1]) || 10;
-  for (const l of lines.slice(-n)) {
-    let o; try { o = JSON.parse(l); } catch { continue; }
-    if (!o.action) continue;               // genesis/非事件行(ledger-chain 链首)不进历史视图
+  const parse = (ls) => ls.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((o) => o && o.action);   // genesis/非事件行(ledger-chain 链首)不进历史视图
+  for (const o of mergeHistoryRows(parse(lines), parse(mirrored)).slice(-n)) {
     const when = String(o.at).slice(11, 19);
-    const extra = o.overwrote ? `  ⚠️ 覆盖了批 ${o.overwrote}` : "";
+    const extra = (o.overwrote ? `  ⚠️ 覆盖了批 ${o.overwrote}` : "") + (o.worktree ? `  〔工作树 ${o.worktree}${o.branch ? ` · ${o.branch}` : ""}〕` : "");
     console.log(`  ${when}  ${o.action.padEnd(5)} 批 ${o.batch ?? "—"}  ${(o.conditions || []).length} 条${extra}`);
     for (const c of (o.conditions || [])) console.log(`           · ${typeof c === "string" ? c : c.text}`);
     if (o.action === "accept-obligation-loss") console.log(`           ⚠ 确认义务账丢失 —— 理由:${o.reason};丢失前锚 ${o.lostAnchor ? `第 ${o.lostAnchor.version} 行` : "无"}`);

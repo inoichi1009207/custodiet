@@ -123,8 +123,8 @@ export const SCAN_BUDGET = 512 * 1024 * 1024;
 const RE_LINE = /"type"\s*:\s*"(?:user|attachment)"/;
 
 /** 流式逐行读一份转录,只解析像 user / attachment 的行(其余行不解析:转录里大头是请求快照与助理输出)。
- *  返回 { err? }:读不了 / 超过扫描上限 ⇒ err(调用方按量不出处理,不当成零)。`all` = 连 assistant 行也交出去。 */
-export function eachEntry(file, onEntry, { budget = SCAN_BUDGET, all = false } = {}) {
+ *  返回 { err? }:读不了 / 超过扫描上限 ⇒ err(调用方按量不出处理,不当成零)。`all` = 每一行都解析;`match` = 换一条行预筛正则。 */
+export function eachEntry(file, onEntry, { budget = SCAN_BUDGET, all = false, match = null } = {}) {
   let fd;
   try {
     fd = fs.openSync(file, "r");
@@ -132,7 +132,7 @@ export function eachEntry(file, onEntry, { budget = SCAN_BUDGET, all = false } =
     let parts = [], used = 0;   // parts = 还没遇到换行的那一行的字节片(按字节攒、整行再解码:多字节字符落在块边界时不会被切坏)
     const onLine = (line) => {
       if (!line.trim()) return;
-      if (!all && !RE_LINE.test(line)) return;
+      if (!all && !(match || RE_LINE).test(line)) return;
       let e; try { e = JSON.parse(line); } catch { return; }
       onEntry(e);
     };
