@@ -132,7 +132,11 @@ const DELIVERABLE_EXCLUDE = new RegExp(
  *  天花板(D132,按接受风险结清):只认这四个脚本名——绕开 deploy-prod.ps1 直接 ssh 敲部署步不命中。 */
 //  0.10.0:部署脚本认 `deploy-<名>` 这一形(原来写死一个具体脚本名)——安装方的部署脚本各叫各的。
 //  这四个脚本名本该是安装方配置(闸规矩第五节),现在仍写在这里,见 docs/gate-debts.md。
-export const CONTENT_WRITE_RE = /write-node\.mjs|prod-lib\.mjs|bulk[-_]?create|deploy-[\w-]+/;
+//  0.10.1:`deploy-<名>` 后面必须跟脚本扩展名——0.10.0 没带这个限制,名字里含 deploy- 的普通文件
+//  (`docs/deploy-windows.md`、记忆文件名 `…-deploy-is-law`)被当成部署脚本,W 误拦(装回源仓后回放实撞 2 处)。
+//  天花板(照实写):省略扩展名的调用(PowerShell 的 `.\scripts\deploy-x -Apply`、`npm run deploy-x`)不认;
+//  源头项目四个月的转录里这两种写法 0 次,带 `.ps1` 的 112 次。
+export const CONTENT_WRITE_RE = /write-node\.mjs|prod-lib\.mjs|bulk[-_]?create|deploy-[\w-]+\.(?:[Pp][Ss]1|sh|mjs|cjs|js|ts)\b/;
 
 /** 写它算「产出交付物」吗(W 项的判据面)。 */
 export function isDeliverable(p) {

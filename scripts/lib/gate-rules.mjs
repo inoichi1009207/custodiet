@@ -8877,6 +8877,12 @@ export const RULE_W = {
         text: "只读了脚本,收工。",
         bash: ["cat scripts/write-node.mjs | head -50", "Get-Content scripts/deploy-prod.ps1 | Select-Object -First 40",
                "node --no-warnings scripts/batch-goal.mjs --clear"] },
+      // 0.10.1(装回源仓后回放实撞的两处误拦):名字里带 deploy- 的普通文件不是部署脚本
+      { name: "0.10.1:docs/deploy-windows.md、记忆文件名 …-deploy-is-law 不是部署脚本 ⇒ 不算生产写",
+        text: "文档挪好了,收工。",
+        bash: ["git rm --cached docs/deploy-windows.md",
+               "node --no-warnings scripts/batch-goal.mjs --arm 293 --cond \"记忆 default-commit-deploy-is-law 补一句\"",
+               "node --no-warnings scripts/batch-goal.mjs --clear"] },
       // 批 285(D136⑥,误拦):读类段头带目录前缀或 .exe ⇒ 仍是读(变异「读类段头不剥路径前缀」在此翻面)
       { name: "285 D136⑥:/usr/bin/grep、grep.exe、管道下游 /usr/bin/head 读脚本 ⇒ 不算生产写",
         text: "只读了脚本,收工。",
@@ -10259,7 +10265,9 @@ const dpSegOps = (cmd) => {
 const dpSegAway = (u, base, awayOf) => {
   const s = String(u);
   // 0.10.0:私仓名认 `<名>-private` 这一形(原来写死一个具体仓名)——命令里点了私仓名的推送不判成「推去了别仓」。
-  if (/[\w.-]+-private\b/i.test(s) || /\bGIT_(?:DIR|WORK_TREE|COMMON_DIR)\b|--git-dir|--work-tree/i.test(s)) return false;
+  //   0.10.1:只认远端地址里的仓名(前面是 `/` 或 `:`,后面到头、空白、引号或 `.git`)——0.10.0 的写法连 `gh … --private`、
+  //   `check-private-…` 这类旗标和文件名也认。
+  if (/[\/:][\w.-]+-private(?:\.git)?(?=$|[\s"'])/i.test(s) ||/\bGIT_(?:DIR|WORK_TREE|COMMON_DIR)\b|--git-dir|--work-tree/i.test(s)) return false;
   const ts = DP_RAW_TOKS(s);
   const gi = ts.map((t, i) => (/^(?:\S*[\\/])?git(?:\.exe)?$/i.test(t) ? i : -1)).filter((i) => i >= 0);
   if (gi.length > 1) return false;
