@@ -744,29 +744,52 @@ export async function runSelfTest({ self }) {
     const files2 = { "/c/x-r1.md": "---\n---\n一轮\n", "/c/x-r2.md": "---\n---\n二轮\n", "/c/x-r12.md": "---\n---\n十二轮\n", "/c/l.log": "boom\n" };
     const rf2 = (p) => (p in files2 ? files2[p] : null);
     const hintOf = (n) => `这是同一份东西的第 ${n} 轮回件:分拣之前先派 \`_direction-judge\`,只给它用户原话、完成标准、现状、回件,不写你的倾向。`;
-    t("305 第 2 轮 poll done ⇒ BODY 块之后、末行之前多一行固定提示;机器块与末行格式不变", () => {
+    t("305 第 2 轮 poll done ⇒ 提示放进 note(走 stderr);stdout 与第 1 轮同形、逐字不含提示", () => {
       const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r2.md" }, { kind: "poll", readFile: rf2 });
       eq(r.code, 0);
-      const ls = r.out.trimEnd().split("\n");
-      eq(ls[ls.length - 1], "done /c/x-r2.md", "末行保持旧口径");
-      eq(ls[ls.length - 2], hintOf(2));
-      eq(ls[ls.length - 3], "CODEX_BODY_END=J1");
-      if (!r.out.startsWith("CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=/c/x-r2.md\nCODEX_END=J1\nCODEX_BODY_BEGIN=J1\n")) throw new Error(`机器块被打断:${JSON.stringify(r.out)}`);
+      eq(r.note, hintOf(2) + "\n");
+      eq(r.out, "CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=/c/x-r2.md\nCODEX_END=J1\nCODEX_BODY_BEGIN=J1\n---\n---\n二轮\nCODEX_BODY_END=J1\ndone /c/x-r2.md\n", "stdout 不含提示");
       if (/^CODEX_/.test(hintOf(2))) throw new Error("提示行不能以 CODEX_ 开头(会被当成机器字段)");
     });
     t("305 轮次取文件名里的 n(r12 ⇒ 第 12 轮)", () => {
       const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r12.md" }, { kind: "poll", readFile: rf2 });
-      if (!r.out.includes(hintOf(12) + "\n")) throw new Error(r.out);
+      eq(r.note, hintOf(12) + "\n");
+    });
+    t("305(codex r1 第 1 条)前台结束的第 2 轮:stdout 末行仍是 CODEX_BODY_END=<id>(`| tail -1` 取得到作业号)", () => {
+      const r = S.renderOutcome({ id: "J1", state: "done", result: "x-r2.md" }, { kind: "launch", readFile: () => "x" });
+      const ls = r.out.trimEnd().split("\n");
+      eq(ls[ls.length - 1], "CODEX_BODY_END=J1");
+      if (!r.note || !r.note.includes("_direction-judge")) throw new Error("提示要在 note 里");
+    });
+    t("305(codex r1 第 1 条)子进程:提示先于 stdout 写到 stderr,`2>&1` 合流后末行仍是原来那一行", () => {
+      const src = fs.readFileSync(new URL("./codex-run.mjs", import.meta.url), "utf8");
+      const body = src.slice(src.indexOf("function emit(r)"), src.indexOf("function emit(r)") + 600);
+      const iNote = body.indexOf("r.note"), iOut = body.indexOf("process.stdout.write(r.out)");
+      if (!(iNote > 0 && iOut > 0 && iNote < iOut)) throw new Error("emit 必须先写 note(stderr)再写 stdout");
+    });
+    t("305(codex r1 第 2 条)长单行不回溯:10 万个 * 在 1 秒内判完", () => {
+      const t0 = Date.now();
+      S.checkTaskbook("*".repeat(100000));
+      S.checkTaskbook("用途:x\n" + "_".repeat(100000) + "\n");
+      const ms = Date.now() - t0;
+      if (ms > 1000) throw new Error(`耗时 ${ms}ms`);
+    });
+    t("305(codex r1 第 3 条)中文问号与全角括号:6 个「1. 如何实现?」⇒ 计 6 个问题、不过", () => {
+      const base = "用途:x\n完成标准:x\n不用再审\n";
+      const zh = S.checkTaskbook(base + Array.from({ length: 6 }, (_, i) => `${i + 1}. 如何实现？`).join("\n"));
+      eq(zh.questions.length, 6); eq(zh.ok, false);
+      const paren = S.checkTaskbook(base + Array.from({ length: 6 }, (_, i) => `（${i + 1}）这样对吗`).join("\n"));
+      eq(paren.questions.length, 6);
     });
     t("305【反向】第 1 轮 ⇒ 不加提示", () => {
       const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r1.md" }, { kind: "poll", readFile: rf2 });
       if (/_direction-judge/.test(r.out)) throw new Error(r.out);
       eq(r.out, "CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=/c/x-r1.md\nCODEX_END=J1\nCODEX_BODY_BEGIN=J1\n---\n---\n一轮\nCODEX_BODY_END=J1\ndone /c/x-r1.md\n", "第 1 轮输出与改前逐字相同");
     });
-    t("305 前台立即结束的发起带结果、第 2 轮 ⇒ 同样提示(在 BODY 块之后)", () => {
+    t("305 前台立即结束的发起带结果、第 2 轮 ⇒ 同样提示(在 note 里)", () => {
       const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r2.md" }, { kind: "launch", readFile: rf2 });
-      const ls = r.out.trimEnd().split("\n");
-      eq(ls[ls.length - 1], hintOf(2)); eq(ls[ls.length - 2], "CODEX_BODY_END=J1");
+      eq(r.note, hintOf(2) + "\n");
+      if (r.out.includes("_direction-judge")) throw new Error("stdout 不该带提示");
     });
     t("305【反向】第 2 轮但还在跑 / 失败 / 结果件读不到 / 文件名不带 r<n> ⇒ 都不加提示", () => {
       const outs = [
@@ -775,7 +798,7 @@ export async function runSelfTest({ self }) {
         S.renderOutcome({ id: "J1", state: "done", result: "/c/gone-r2.md" }, { kind: "poll", readFile: rf2 }),
         S.renderOutcome({ id: "J1", state: "done", result: "/r.md" }, { kind: "poll", readFile: rf }),
       ];
-      for (const o of outs) if (/_direction-judge/.test(o.out)) throw new Error(o.out);
+      for (const o of outs) if (/_direction-judge/.test(o.out + (o.note || ""))) throw new Error(o.out);
     });
   }
 

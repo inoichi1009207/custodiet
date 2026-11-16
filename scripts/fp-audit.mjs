@@ -300,7 +300,8 @@ function snapshotRules(snap, at) {
 }
 
 function runCodex(taskFile, cwd, outFile) {
-  const r = spawnSync(process.execPath, ["--no-warnings", path.join(HERE, "codex-run.mjs"), "--task", taskFile, "--cwd", cwd, "--out", outFile,
+  // 批 305:任务书由本脚本按固定模板生成(逐条判误报,不是审设计),codex-run 的发车前检查不适用 ⇒ 显式跳过
+  const r = spawnSync(process.execPath, ["--no-warnings", path.join(HERE, "codex-run.mjs"), "--task", taskFile, "--no-taskbook-check", "--cwd", cwd, "--out", outFile,
     "--wait-ms", "900000", "--timeout-ms", "900000"], { encoding: "utf8", timeout: 960000, maxBuffer: 1 << 26, windowsHide: true });
   const out = String(r.stdout || "");
   const m = out.match(/CODEX_BODY_BEGIN=[^\n]*\n([\s\S]*?)\nCODEX_BODY_END/);

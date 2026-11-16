@@ -213,12 +213,15 @@ export const TASKBOOK_REQUIREMENTS = [
     `且有内容的行(不算空行)不超过 ${TASKBOOK_MAX_LINES} 行。核事实类(比副本、核引文、核读数)加 --fact-check 免这一条。`,
 ];
 // 段首:允许 Markdown 前缀(标题 # / 引用 > / 列表 - * + / 加粗 ** __)和一个序号
-const TB_LEAD = String.raw`^[\s>#*_+\-]*(?:\d{1,2}[.、)]\s*)?[*_]*`;
+// 批 305(codex r1 第 2 条):原写法 `^[\s>#*_+\-]*(?:…)?[*_]*` 两段星号量词重叠,长串 `*` 平方级回溯;
+//   收尾那段 `[*_]*` 只放在序号之后,前后两段不再能匹配同一个字符。
+const TB_LEAD = String.raw`^[\s>#*_+\-]*(?:\d{1,2}[.、)]\s*[*_]*)?`;
 const TB_PURPOSE_RE = new RegExp(TB_LEAD + String.raw`(?:用途|purpose\b)`, "i");
 const TB_DONE_RE = new RegExp(TB_LEAD + String.raw`(?:完成标准|done[\s-]+when\b|completion\s+criteri(?:a|on)\b)`, "i");
 const TB_NO_MORE_RE = /不用再审|no\s+further\s+review\s+(?:is\s+)?needed/i;
-const TB_NUMBERED_RE = /^\s*(?:[-*+]\s+)?[*_]*(?:\d{1,2}(?:[.)]\s|、)|[((][0-9A-Za-z]{1,2}[))]|[A-Za-z][.)]\s)/;
-const TB_QUESTION_RE = /[??]|是否|有没有|能否|会不会|对不对|吗|\bwhether\b/i;
+// 批 305(codex r1 第 3 条):全角符号一律写转义——源码里的全角字符曾被写成半角,`[??]` 漏认中文问号
+const TB_NUMBERED_RE = /^\s*(?:[-*+]\s+)?[*_]*(?:\d{1,2}(?:[.)．）]\s?|、)|[(（][0-9A-Za-z]{1,2}[)）]|[A-Za-z][.)]\s)/;
+const TB_QUESTION_RE = /[?？]|是否|有没有|能否|会不会|对不对|吗|\bwhether\b/i;
 
 /** 判一份任务书(纯函数)。返回 { ok, items:[{key,name,ok,exempt,detail,fix}], lines, questions:[行号] }。
  *  detail / fix 里只出现行号与计数,不回显任务书内容(本壳的凭据纪律:不回显任务文件)。 */
@@ -442,8 +445,8 @@ const readText = (p) => { try { return fs.readFileSync(p, "utf8"); } catch { ret
 
 /** 批 305:结果文件名 `<slug>-r<n>.md` 里的轮次 n ≥ 2(同一个 slug 的第二轮及以后)⇒ 一行固定提示;否则空串。
  *  只读代理 `_direction-judge` 专判「不改它,完成标准还成立吗」,原先只靠人想起来才调;取回件是必经点,提示接在这里。
- *  提示行**不以 `CODEX_` 开头**(收尾闸按该前缀解析机器字段),位置在 BODY 块之后、末行状态之前:
- *  机器块、BODY 块与末行(`| tail -1` 的轮询循环)都不变。显式 `--out` 的文件名不带 r<n> ⇒ 不提示。 */
+ *  提示行**不以 `CODEX_` 开头**(收尾闸按该前缀解析机器字段),由 `renderOutcome` 放进 `note`、`emit` 写到 **stderr 且先于 stdout**:
+ *  stdout 与改前逐字相同,`| tail -1` 与 `2>&1 | tail -1` 的末行都不变。显式 `--out` 的文件名不带 r<n> ⇒ 不提示。 */
 export function roundHint(resultPath) {
   const m = /-r(\d+)\.md$/i.exec(String(resultPath || ""));
   const n = m ? Number(m[1]) : 0;
@@ -453,7 +456,7 @@ export function roundHint(resultPath) {
 
 /**
  * 一次发起结束 / 一次 --poll 的完整 stdout 与退出码(v5,纯函数,读文件注入)。
- *   done   ⇒ 机器块 + BODY 块(结果件全文)[+ 第 2 轮起一行 `roundHint`][+ poll 末行 `done <路径>`],0;结果件读不到 ⇒ 不打 BODY、err 说明、1
+ *   done   ⇒ 机器块 + BODY 块(结果件全文)[+ poll 末行 `done <路径>`],0;第 2 轮起另带 `note`(走 stderr);结果件读不到 ⇒ 不打 BODY、err 说明、1
  *   failed ⇒ 机器块 + FAIL 块(日志末 40 行)[+ poll 末行 `failed <原因>`],1
  *   running⇒ 机器块 [+ poll 末行 `running`];waitExpired(--wait-ms 到期)⇒ 3,否则 0
  *   台账缺失(poll)⇒ failed job-missing 机器块 + 末行,1;不打 FAIL 块(没有日志可给)。
@@ -469,7 +472,8 @@ export function renderOutcome(job, { kind = "poll", id, log, waitExpired = false
   if (job.state === "done") {
     const body = job.result ? readFile(job.result) : null;
     if (body == null) return { out: out + (poll ? `done ${job.result}\n` : ""), code: 1, err: `结果件读不到:${job.result}` };
-    return { out: out + formatDelimited("BODY", job.id, body) + roundHint(job.result) + (poll ? `done ${job.result}\n` : ""), code: 0 };
+    const note = roundHint(job.result);
+    return { out: out + formatDelimited("BODY", job.id, body) + (poll ? `done ${job.result}\n` : ""), code: 0, ...(note ? { note } : {}) };
   }
   const lg = log || job.log;
   const raw = lg ? readFile(lg) : null;
@@ -770,6 +774,9 @@ export function copyDrift(self, cwd) {
 // `--poll "$job" 2>&1 | tail -1` 再 `case "$s" in running)…`(本会话转录实见),机器块放在后面会把它们打断。
 // 输出组装在 `renderOutcome`(纯函数,自测直接调)。
 function emit(r) {
+  // 批 305(codex 305-taskbook r1 第 1 条):第二轮提示走 stderr 且**先于** stdout 写——
+  //   这样 stdout 与改前逐字相同,`2>&1 | tail -1` 合流时末行也还是原来那一行。
+  if (r.note) process.stderr.write(r.note);
   process.stdout.write(r.out);
   if (r.err) process.stderr.write(r.err + "\n");
   process.exit(r.code);
