@@ -539,7 +539,8 @@ export async function runSelfTest({ self }) {
     g(["init", "-q"]);
     const libSrc = path.join(path.dirname(self), "lib");
     for (const f of ["obligations.mjs", "ledger-chain.mjs"]) fs.copyFileSync(path.join(libSrc, f), path.join(repo, "scripts", "lib", f));   // 装了闸的仓:旧版会在这里双写公共目录
-    fs.writeFileSync(path.join(repo, "task.md"), "x\n");
+    // 批 305:发车前查任务书 ⇒ 这里的任务书用骨架本身(顺带钉住「骨架能过真实发车那道检查」)
+    fs.writeFileSync(path.join(repo, "task.md"), typeof S.taskbookSkeleton === "function" ? S.taskbookSkeleton("design") : "x\n");
     const env = { ...process.env, CODEX_BIN: process.execPath, GIT_CEILING_DIRECTORIES: lab };
     const r = spawnSync(process.execPath, [self, "--task", path.join(repo, "task.md"), "--out", path.join(lab, "r.md"), "--cwd", repo, "--wait-ms", "60000"], { encoding: "utf8", windowsHide: true, env, cwd: repo });
     const J = (/CODEX_JOB=(\S+)/.exec(r.stdout || "") || [])[1];
@@ -557,7 +558,355 @@ export async function runSelfTest({ self }) {
       const p = spawnSync(process.execPath, [self, "--poll", J], { encoding: "utf8", windowsHide: true, env, cwd: repo });
       if (!/CODEX_STATE=failed/.test(p.stdout || "")) throw new Error(p.stdout + p.stderr);
     });
+    // 批 305:--no-taskbook-check 整体豁免——不合格的任务书照发;跳过只记在作业台账,结果件头部仍是 8 行
+    //   (codex 305-int r1 第 1 条:多一行会让收尾闸「第 9 行起是正文」的兜底把头部分隔符当成读过的正文)
+    fs.writeFileSync(path.join(repo, "bare.md"), "x\n");
+    const r2 = spawnSync(process.execPath, [self, "--task", path.join(repo, "bare.md"), "--no-taskbook-check", "--out", path.join(lab, "skip.md"), "--cwd", repo, "--wait-ms", "60000"], { encoding: "utf8", windowsHide: true, env, cwd: repo });
+    t("305 --no-taskbook-check:不合格的任务书照发(有 CODEX_JOB);结果件头部 8 行、第 9 行起是正文", () => {
+      if (!/^CODEX_JOB=\S+/m.test(r2.stdout || "")) throw new Error(`没发车:${(r2.stdout || "") + (r2.stderr || "")}`);
+      const head = fs.readFileSync(path.join(lab, "skip.md"), "utf8");
+      if (/任务书检查/.test(head)) throw new Error(`头部不该多行:${JSON.stringify(head.slice(0, 400))}`);
+      eq(head.split("\n")[7], "---", "第 8 行是头部收尾的 ---");
+    });
+    t("305【反向】正常过检的发起:结果件头部没有「任务书检查」行(头部仍是 8 行)", () => {
+      const head = fs.readFileSync(path.join(lab, "r.md"), "utf8");
+      if (/任务书检查/.test(head)) throw new Error(JSON.stringify(head.slice(0, 400)));
+      eq(head.split("\n")[7], "---", "第 8 行应是收尾的 ---");
+    });
+    // 批 305 回修:每次发车的检查结果记进作业台账(过 / 跳过);--no-taskbook-check 连提醒也不要
+    const recOf = (out) => { const j = (/CODEX_JOB=(\S+)/.exec(out || "") || [])[1]; return j ? JSON.parse(fs.readFileSync(path.join(S.JOB_ROOT, `${j}.json`), "utf8")) : null; };
+    t("305 回修 台账:过检的发车记 taskbookCheck=pass、不带 taskbookFailed;stderr 没有提醒", () => {
+      const rec = recOf(r.stdout); if (!rec) throw new Error("没拿到作业记录");
+      eq(rec.taskbookCheck, "pass"); eq("taskbookFailed" in rec, false);
+      if (/任务书检查/.test(r.stderr || "")) throw new Error(r.stderr);
+    });
+    t("305 回修 台账:--no-taskbook-check 记 taskbookCheck=skipped;连提醒也不打", () => {
+      const rec = recOf(r2.stdout); if (!rec) throw new Error("没拿到作业记录");
+      eq(rec.taskbookCheck, "skipped"); eq("taskbookFailed" in rec, false);
+      if (/任务书检查/.test(r2.stderr || "")) throw new Error(`跳过时不该提醒:${r2.stderr}`);
+    });
     try { fs.rmSync(lab, { recursive: true, force: true }); } catch { /* worker 可能还占着日志 */ }
+  }
+
+  // ── 批 305 乙包:发车前查任务书 / 出骨架 / 第二轮起提示先派方向复核 ─────────────────────────
+  // 防的失败:任务书没写用途和完成标准、结论选项里没有「不用再审」⇒ 审查者越审越多(同一份稿子审五轮,
+  //   第五轮报 27 条、逐条看 0 条要改)。改进办法写在备忘里到不了发车的人眼前,所以接在发车这个必经点上。
+  //   检查只看形(有没有这几段、有多长),不判内容。
+  {
+    const S = selfMod;
+    const need = (name) => { if (typeof S[name] === "undefined") throw new Error(`codex-run.mjs 没导出 ${name}`); return S[name]; };
+    // 一份合格的设计类任务书(5 行有内容);over 里给 null 就去掉那一行,extra 是插在中间的行
+    const TB = (over = {}) => {
+      const p = { purpose: "用途:合并前确认安装器不会覆盖用户文件;我会拿结论当合并依据。", done: "完成标准:**照 README 走普通安装,不会丢掉目标仓里的东西。**",
+        ask: "请读 diff,先回答一个是非题:**完成标准成立吗?**", last: "最后一行三选一:`可以合并,不用再审` / `有会翻转的,要改` / `判不了`。", extra: [], ...over };
+      return ["# 审一个提交(只读)", "", p.purpose, "", p.done, "", p.ask, "", ...p.extra, "", p.last, ""].filter((l) => l != null).join("\n");
+    };
+    const failed = (res) => res.items.filter((i) => !i.ok).map((i) => i.key).join("");
+    const chk = (text, o) => need("checkTaskbook")(text, o);
+
+    t("305 任务书四条齐 ⇒ 过", () => { const r = chk(TB()); eq(r.ok, true, JSON.stringify(r.items)); eq(failed(r), ""); });
+    t("305【反向】缺用途 ⇒ 不过,只缺 a", () => { const r = chk(TB({ purpose: null })); eq(r.ok, false); eq(failed(r), "a"); });
+    t("305【反向】缺完成标准 ⇒ 不过,只缺 b", () => { const r = chk(TB({ done: null, ask: "请读 diff,判断有没有问题。" })); eq(r.ok, false); eq(failed(r), "b"); });
+    t("305【反向】结论选项里没有「不用再审」⇒ 不过,只缺 c", () => {
+      const r = chk(TB({ last: "最后一行三选一:`可以合并` / `要改` / `判不了`。" })); eq(r.ok, false); eq(failed(r), "c");
+    });
+    t("305【反向】「用途」「完成标准」只在句子中间出现、不是一段的开头 ⇒ 不算", () => {
+      const r = chk(TB({ purpose: "这份稿子的用途以后再说。", done: "请判断完成标准成立吗。" }));
+      eq(failed(r), "ab");
+    });
+    t("305 「用途」「完成标准」写成标题 / 加粗 / 列表项 ⇒ 认", () => {
+      eq(chk(TB({ purpose: "## 用途\n拿结论当合并依据。", done: "**完成标准**:照 README 安装不丢文件。" })).ok, true);
+      eq(chk(TB({ purpose: "- 用途:拿结论当合并依据。", done: "> 完成标准:照 README 安装不丢文件。" })).ok, true);
+    });
+    // 批 305 回修:编号问题只数以问号结尾的编号行 ⇒ 三种编号形态都写成问句(句末带问号)
+    const qs = (n) => Array.from({ length: n }, (_, i) => [`${i + 1}. 第 ${i + 1} 处的顺序对吗?`, `(${"abcdefgh"[i]}) 第 ${i + 1} 节是否自洽?`, `${i + 1}) 这一步有没有漏掉条件?`][i % 3]);
+    t("305 d:编号问题 5 个 ⇒ 过", () => { const r = chk(TB({ extra: qs(5) })); eq(r.ok, true, JSON.stringify(r.items)); eq(r.questions.length, 5); });
+    t("305【反向】d:编号问题 6 个 ⇒ 不过,只缺 d,且报出是哪几行", () => {
+      const r = chk(TB({ extra: qs(6) })); eq(failed(r), "d"); eq(r.questions.length, 6);
+      const d = r.items.find((i) => i.key === "d");
+      if (!/6 个/.test(d.detail) || !/第 \d+/.test(d.detail)) throw new Error(d.detail);
+    });
+    t("305 d:带编号但不是问题的行(已知差异、被审文件清单)不计入 ⇒ 7 条也过", () => {
+      const known = Array.from({ length: 7 }, (_, i) => `${i + 1}. 第 ${i + 1} 处差异是有意的:夹具里的名字换成了中性写法。`);
+      const r = chk(TB({ extra: ["已知差异(有意的,不用报):", ...known] })); eq(r.ok, true, JSON.stringify(r.items)); eq(r.questions.length, 0);
+    });
+    const filler = (n) => Array.from({ length: n }, (_, i) => `- 第 ${i + 1} 条已知的局限,不用报。`);
+    t("305 d:有内容的行刚好到上限 ⇒ 过;空行不计", () => {
+      const max = need("TASKBOOK_MAX_LINES");
+      const r = chk(TB({ extra: filler(max - 5) })); eq(r.lines, max); eq(r.ok, true, JSON.stringify(r.items));
+    });
+    t("305【反向】d:有内容的行超上限 1 行 ⇒ 不过,只缺 d,报错里写明上限那个数", () => {
+      const max = need("TASKBOOK_MAX_LINES");
+      const r = chk(TB({ extra: filler(max - 4) })); eq(r.lines, max + 1); eq(failed(r), "d");
+      if (!r.items.find((i) => i.key === "d").detail.includes(String(max))) throw new Error("报错里没写上限");
+    });
+    t("305 --fact-check:核事实类豁免 d(又长又多问也过)", () => {
+      const long = TB({ extra: [...qs(8), ...filler(30)] });
+      eq(failed(chk(long)), "d", "不带 --fact-check 应卡在 d");
+      const r = chk(long, { factCheck: true }); eq(r.ok, true, JSON.stringify(r.items));
+    });
+    t("305【反向】--fact-check 不豁免 a、b、c", () => {
+      eq(failed(chk(TB({ purpose: null, done: null, ask: "请比对两份文件。", last: "最后一行二选一:一致 / 不一致。" }), { factCheck: true })), "abc");
+    });
+    t("305 英文等价写法(Purpose / Done when / no further review needed)⇒ 过", () => {
+      const en = ["# Review one commit (read-only)", "", "Purpose: decide whether this branch can be merged.", "", "Done when: a normal install never deletes files in the target repo.",
+        "", "First answer one yes/no question: does the completion criterion hold?", "", "Last line, pick one: `mergeable, no further review needed` / `must change` / `cannot tell`.", ""].join("\n");
+      eq(chk(en).ok, true, JSON.stringify(chk(en).items));
+      eq(chk(en.replace("Done when:", "Completion criteria:")).ok, true);
+      eq(failed(chk(en.replace(", no further review needed", ""))), "c");
+    });
+    t("305 CRLF 与 BOM 的任务书照常判", () => { eq(chk("﻿" + TB().replace(/\n/g, "\r\n")).ok, true); });
+    t("305 新退出码 4,与现有退出码(0 / 1 / 2 / 3)不冲突", () => {
+      eq(need("TASKBOOK_CHECK_EXIT"), 4);
+      if ([0, 1, 2, S.POLL_EXPIRED_EXIT].includes(S.TASKBOOK_CHECK_EXIT)) throw new Error("撞了现有退出码");
+    });
+
+    // 骨架:开头几行稳定逐字;骨架自己必须能过检查
+    const FIXED = ["用途:", "完成标准:", "先回答一个是非题:**完成标准成立吗?**", "- 成立:一句话说你怎么验的", "- 不成立:列出会让答案翻转的发现,**至多 5 条**",
+      "只收会翻转答案的。", "两类错的代价:", "拿不准的报出来,并写明拿不准在哪。", "最后一行三选一:", "不用再审"];
+    t("305 骨架 design:稳定句逐字在场,且自己能过设计类检查", () => {
+      const sk = need("taskbookSkeleton")("design");
+      for (const s of FIXED) if (!sk.includes(s)) throw new Error(`骨架缺「${s}」`);
+      const r = chk(sk); eq(r.ok, true, JSON.stringify(r.items));
+    });
+    t("305 骨架 fact:稳定句逐字在场,带 --fact-check 能过", () => {
+      const sk = need("taskbookSkeleton")("fact");
+      for (const s of FIXED) if (!sk.includes(s)) throw new Error(`骨架缺「${s}」`);
+      eq(chk(sk, { factCheck: true }).ok, true);
+    });
+    t("305 --skeleton:只打骨架到 stdout、退出 0、不发车(缺省 = design)", () => {
+      const a = run(["--skeleton"]), b = run(["--skeleton", "design"]), c = run(["--skeleton", "fact"]);
+      for (const r of [a, b, c]) { eq(r.status, 0); if (/CODEX_JOB=/.test(r.stdout)) throw new Error("出骨架不该发车"); }
+      eq(a.stdout, b.stdout, "缺省应等于 design");
+      eq(b.stdout, need("taskbookSkeleton")("design")); eq(c.stdout, S.taskbookSkeleton("fact"));
+      if (b.stdout === c.stdout) throw new Error("两类骨架不该相同");
+    });
+    t("305【反向】--skeleton 给了不认识的类型 ⇒ 非零退出,不打骨架", () => {
+      const r = run(["--skeleton", "essay"]);
+      if (r.status === 0 || /用途/.test(r.stdout)) throw new Error(`应拒:${r.status} ${r.stdout}`);
+      if (!/design \| fact/.test(r.stderr)) throw new Error(r.stderr);
+    });
+
+    // 子进程:只判不发的入口与真实发车那道检查
+    const tbDir = fs.mkdtempSync(path.join(sandbox, "tb-"));
+    const put = (name, text) => { const p = path.join(tbDir, name); fs.writeFileSync(p, text, "utf8"); return p; };
+    const good = put("good-task.md", TB());
+    const MARK = "SELFTEST-MARKER-7f3a";
+    const bad = put("bad-task.md", `# 任务:找问题\n\n请仔细审这份稿子,漏报代价很高。${MARK}\n`);
+    const longQ = put("long-task.md", TB({ extra: [...qs(8), ...filler(30)] }));
+    t("305 --check-taskbook:合格 ⇒ 退出 0,四条逐条打出,不发车", () => {
+      const r = run(["--check-taskbook", good]);
+      eq(r.status, 0, r.stderr);
+      for (const k of ["a ", "b ", "c ", "d "]) if (!new RegExp(`^\\s*${k}`, "m").test(r.stdout)) throw new Error(`没列 ${k}:${r.stdout}`);
+      if (/CODEX_JOB=/.test(r.stdout)) throw new Error("只判不发");
+    });
+    t("305【反向】--check-taskbook:不合格 ⇒ 退出 4,逐条标出哪条不过", () => {
+      const r = run(["--check-taskbook", bad]);
+      eq(r.status, 4);
+      if (!/a [^\n]*不过/.test(r.stdout) || !/b [^\n]*不过/.test(r.stdout) || !/c [^\n]*不过/.test(r.stdout)) throw new Error(r.stdout);
+    });
+    t("305 --check-taskbook --fact-check:长任务书 d 豁免 ⇒ 0;不带 ⇒ 4", () => {
+      eq(run(["--check-taskbook", longQ, "--fact-check"]).status, 0);
+      eq(run(["--check-taskbook", longQ]).status, 4);
+    });
+    t("305【反向】--check-taskbook 文件不存在 ⇒ 退出 1(不是 4)", () => { eq(run(["--check-taskbook", path.join(tbDir, "none.md")]).status, 1); });
+    // 发车类用例一律带 CODEX_BIN 替身(node 本身,必失败)+ 短等待:检查哪怕退化成放行,也只会红在这里,不会真调 codex
+    //   (本批先红阶段实撞:没带替身、检查还没接线时,这两条把占位任务书真发了出去)
+    const runStub = (args) => spawnSync(process.execPath, [self, ...args, "--wait-ms", "20000"], { windowsHide: true, encoding: "utf8", env: { ...process.env, CODEX_BIN: process.execPath } });
+    // 批 305 回修(用户裁定「误拦比漏放贵」):发车时只提醒、不拦。对照组 = 同一替身下过检的任务书
+    const outBad = path.join(tbDir, "bad-out.md");
+    const launchBad = runStub(["--task", bad, "--cwd", tbDir, "--out", outBad]);
+    const launchGood = runStub(["--task", good, "--cwd", tbDir, "--out", path.join(tbDir, "good-out.md")]);
+    const keysOf = (out) => String(out || "").split(/\r?\n/).map((l) => (/^(CODEX_[A-Z_]+)=/.exec(l) || [])[1]).filter(Boolean).join(",");
+    const recOf = (out) => { const j = (/CODEX_JOB=(\S+)/.exec(out || "") || [])[1]; return j ? JSON.parse(fs.readFileSync(path.join(S.JOB_ROOT, `${j}.json`), "utf8")) : null; };
+    t("305 回修 发车:任务书不过 ⇒ 照常发车(stdout 有 CODEX_JOB、结果件槽位照占)", () => {
+      if (!/^CODEX_JOB=\S+/m.test(launchBad.stdout || "")) throw new Error(`没发车:${launchBad.stdout}${launchBad.stderr}`);
+      if (!fs.existsSync(outBad)) throw new Error("结果件槽位没占(没发车)");
+    });
+    t("305 回修【反向】发车:任务书不过时退出码与过检时相同(从不是 4)、stdout 机器字段同形且不含提醒", () => {
+      if (launchBad.status === S.TASKBOOK_CHECK_EXIT) throw new Error("发车不该用退出码 4");
+      eq(launchBad.status, launchGood.status, "退出码应与过检时相同");
+      eq(keysOf(launchBad.stdout), keysOf(launchGood.stdout), "stdout 机器字段键序列应与过检时相同");
+      if (/任务书/.test(launchBad.stdout)) throw new Error("提醒不该进 stdout");
+    });
+    t("305 回修 发车提醒的 stderr:首行说明只提醒、已照常发车;写明缺哪条 + 四条要求原文 + 怎么补(骨架命令)", () => {
+      const e = launchBad.stderr;
+      const first = String(e || "").split(/\r?\n/)[0];
+      if (!first.startsWith("任务书检查:有 3 条没过(只提醒,不拦;已照常发车)")) throw new Error(first);
+      for (const s of ["缺 a", "缺 b", "缺 c"]) if (!e.includes(s)) throw new Error(`stderr 缺「${s}」:${e}`);
+      if (/缺 d/.test(e)) throw new Error("这份不长,不该报 d");
+      for (const req of need("TASKBOOK_REQUIREMENTS")) if (!e.includes(req)) throw new Error(`四条要求原文没打全:缺「${req.slice(0, 20)}…」`);
+      eq(S.TASKBOOK_REQUIREMENTS.length, 4);
+      if (!e.includes("--skeleton")) throw new Error("没告诉怎么补");
+      if (/任务书检查/.test(launchGood.stderr || "")) throw new Error("过检时不该提醒");
+    });
+    t("305 回修【反向】提醒不被收尾闸认成参数错误:首行不以「拒绝入参」开头,收尾闸的 CODEX_ARG_ERROR 整段都不命中", () => {
+      const first = String(launchBad.stderr || "").split(/\r?\n/)[0];
+      if (/^拒绝入参/.test(first)) throw new Error(first);
+      // 与收尾闸的 CODEX_ARG_ERROR 同一认法(那边改了这里要跟):车真的发了,不能被当成「不是发起」
+      const hook = fs.readFileSync(new URL("./hook-stop-closure.mjs", import.meta.url), "utf8");
+      const m = /const CODEX_ARG_ERROR = (\/.*\/);/.exec(hook);
+      if (!m) throw new Error("收尾闸里找不到 CODEX_ARG_ERROR");
+      const re = new Function(`return ${m[1]}`)();
+      if (re.test(launchBad.stderr)) throw new Error("收尾闸的 CODEX_ARG_ERROR 把这次提醒认成了参数错误");
+      for (const k of ["a", "b", "c", "d"]) {   // 每条单独没过的提醒文字也核一遍(d 的补法文字最长)
+        const res = { ok: false, items: S.checkTaskbook(TB()).items.map((i) => ({ ...i, ok: i.key !== k })) };
+        if (re.test(S.taskbookWarnText(res, "x.md"))) throw new Error(`缺 ${k} 的提醒命中了 CODEX_ARG_ERROR`);
+      }
+    });
+    t("305 回修 台账:不过的发车记 taskbookCheck=warn + taskbookFailed=没过的条目", () => {
+      const rec = recOf(launchBad.stdout); if (!rec) throw new Error("没拿到作业记录");
+      eq(rec.taskbookCheck, "warn"); eq(JSON.stringify(rec.taskbookFailed), JSON.stringify(["a", "b", "c"]));
+      const ok = recOf(launchGood.stdout); eq(ok && ok.taskbookCheck, "pass");
+    });
+    t("305 回修 结果件头部不因提醒加行(收尾闸按第 9 行认正文)", () => {
+      const head = fs.readFileSync(outBad, "utf8");
+      if (/任务书检查/.test(head.split("\n").slice(0, 8).join("\n"))) throw new Error(JSON.stringify(head.slice(0, 400)));
+      eq(head.split("\n")[0], "---"); eq(head.split("\n")[7], "---", "第 8 行是头部收尾的 ---");
+    });
+    t("305【反向】提醒文字不劝人绕过(不提 --no-taskbook-check)、不回显任务书内容", () => {
+      if (/--no-taskbook-check/.test(launchBad.stderr)) throw new Error("提醒里不该递绕过旗标");
+      if ((launchBad.stderr + launchBad.stdout).includes(MARK)) throw new Error("回显了任务书内容");
+    });
+    t("305 回修 发车:设计类过长 ⇒ 照常发车、只提醒 d;提醒里指到 --fact-check;--fact-check 下不提醒、记 pass", () => {
+      const r = runStub(["--task", longQ, "--cwd", tbDir, "--out", path.join(tbDir, "long-out.md")]);
+      if (!/^CODEX_JOB=/m.test(r.stdout || "")) throw new Error("没发车");
+      eq(r.status, launchGood.status);
+      if (!/缺 d/.test(r.stderr) || /缺 [abc]/.test(r.stderr)) throw new Error(r.stderr);
+      if (!r.stderr.includes("--fact-check")) throw new Error("没指到 --fact-check");
+      eq(JSON.stringify(recOf(r.stdout).taskbookFailed), JSON.stringify(["d"]));
+      const f = runStub(["--task", longQ, "--fact-check", "--cwd", tbDir, "--out", path.join(tbDir, "long-fact-out.md")]);
+      if (/任务书检查/.test(f.stderr || "")) throw new Error(f.stderr);
+      eq(recOf(f.stdout).taskbookCheck, "pass");
+    });
+    t("305 回修 taskbookLedger:pass / warn+没过的条目 / skipped;--resume 不记(与改前同形)", () => {
+      const L = need("taskbookLedger");
+      eq(JSON.stringify(L("check", S.checkTaskbook(TB()))), JSON.stringify({ taskbookCheck: "pass" }));
+      eq(JSON.stringify(L("check", S.checkTaskbook(TB({ purpose: null })))), JSON.stringify({ taskbookCheck: "warn", taskbookFailed: ["a"] }));
+      eq(JSON.stringify(L("skipped", null)), JSON.stringify({ taskbookCheck: "skipped" }));
+      eq(JSON.stringify(L("resume", null)), "{}");
+      eq(JSON.stringify(L("check", null)), "{}", "读不了任务书 ⇒ 不记、不拦");
+    });
+    t("305 哪些入口查任务书:只有不带 --resume、不带 --no-taskbook-check 的 --task 发车", () => {
+      const mode = need("taskbookMode");
+      eq(mode(S.parseArgs(["--task", "a.md"])), "check");
+      eq(mode(S.parseArgs(["--task", "a.md", "--fact-check"])), "check");
+      eq(mode(S.parseArgs(["--task", "a.md", "--resume", "tid"])), "resume");
+      eq(mode(S.parseArgs(["--task", "a.md", "--no-taskbook-check"])), "skipped");
+      eq(S.parseArgs(["--task", "a.md", "--fact-check"]).factCheck, true);
+    });
+    t("305 --poll 不受任务书检查影响(缺失作业照旧退出 1,不是 4)", () => { eq(run(["--poll", `selftest-305-${process.pid}`]).status, 1); });
+    t("305(codex 305-int r1 第 1 条)结果件头部恒为 8 行:跳过检查与否都一样(收尾闸按第 9 行认正文)", () => {
+      const skip = S.resultHeader({ codexVersion: "v", taskbookCheck: "skipped" }, "t");
+      const dft = S.resultHeader({ codexVersion: "v" }, "t");
+      eq(skip, dft, "跳过检查不改头部");
+      eq(dft.split("\n").length, 9, "头部 8 行 + 收尾换行");
+    });
+
+    // 第二轮起:--poll 取到 done 时提示先派方向复核
+    const files2 = { "/c/x-r1.md": "---\n---\n一轮\n", "/c/x-r2.md": "---\n---\n二轮\n", "/c/x-r12.md": "---\n---\n十二轮\n", "/c/l.log": "boom\n" };
+    const rf2 = (p) => (p in files2 ? files2[p] : null);
+    const hintOf = (n) => `这是同一份东西的第 ${n} 轮回件:分拣之前先派 \`_direction-judge\`,只给它用户原话、完成标准、现状、回件,不写你的倾向。`;
+    t("305 第 2 轮 poll done ⇒ 提示放进 note(走 stderr);stdout 与第 1 轮同形、逐字不含提示", () => {
+      const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r2.md" }, { kind: "poll", readFile: rf2 });
+      eq(r.code, 0);
+      eq(r.note, hintOf(2) + "\n");
+      eq(r.out, "CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=/c/x-r2.md\nCODEX_END=J1\nCODEX_BODY_BEGIN=J1\n---\n---\n二轮\nCODEX_BODY_END=J1\ndone /c/x-r2.md\n", "stdout 不含提示");
+      if (/^CODEX_/.test(hintOf(2))) throw new Error("提示行不能以 CODEX_ 开头(会被当成机器字段)");
+    });
+    t("305 轮次取文件名里的 n(r12 ⇒ 第 12 轮)", () => {
+      const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r12.md" }, { kind: "poll", readFile: rf2 });
+      eq(r.note, hintOf(12) + "\n");
+    });
+    t("305(codex r1 第 1 条)前台结束的第 2 轮:stdout 末行仍是 CODEX_BODY_END=<id>(`| tail -1` 取得到作业号)", () => {
+      const r = S.renderOutcome({ id: "J1", state: "done", result: "x-r2.md" }, { kind: "launch", readFile: () => "x" });
+      const ls = r.out.trimEnd().split("\n");
+      eq(ls[ls.length - 1], "CODEX_BODY_END=J1");
+      if (!r.note || !r.note.includes("_direction-judge")) throw new Error("提示要在 note 里");
+    });
+    t("305(codex r1 第 1 条)子进程:提示先于 stdout 写到 stderr,`2>&1` 合流后末行仍是原来那一行", () => {
+      const src = fs.readFileSync(new URL("./codex-run.mjs", import.meta.url), "utf8");
+      const body = src.slice(src.indexOf("function emit(r)"), src.indexOf("function emit(r)") + 600);
+      const iNote = body.indexOf("r.note"), iOut = body.indexOf("process.stdout.write(r.out)");
+      if (!(iNote > 0 && iOut > 0 && iNote < iOut)) throw new Error("emit 必须先写 note(stderr)再写 stdout");
+    });
+    t("305(codex r1 第 2 条)长单行不回溯:10 万个 * 在 1 秒内判完", () => {
+      const t0 = Date.now();
+      S.checkTaskbook("*".repeat(100000));
+      S.checkTaskbook("用途:x\n" + "_".repeat(100000) + "\n");
+      const ms = Date.now() - t0;
+      if (ms > 1000) throw new Error(`耗时 ${ms}ms`);
+    });
+    t("305(codex r1 第 3 条)中文问号与全角括号:6 个「1. 如何实现?」⇒ 计 6 个问题、不过", () => {
+      const base = "用途:x\n完成标准:x\n不用再审\n";
+      const zh = S.checkTaskbook(base + Array.from({ length: 6 }, (_, i) => `${i + 1}. 如何实现？`).join("\n"));
+      eq(zh.questions.length, 6); eq(zh.ok, false);
+      const paren = S.checkTaskbook(base + Array.from({ length: 6 }, (_, i) => `（${i + 1}）这样对吗？`).join("\n"));
+      eq(paren.questions.length, 6);
+    });
+    // 批 305 回修:三处已复现的认法
+    t("305 回修 段首:中文数字序号「## 一、用途 / ## 二、完成标准」+「可以用,无需再审」⇒ 过", () => {
+      const r = S.checkTaskbook("# 审一个提交\n\n## 一、用途\n合并前确认。\n\n## 二、完成标准\n照 README 安装不丢文件。\n\n最后一行:`可以用,无需再审` / `要改`。\n");
+      eq(r.ok, true, JSON.stringify(r.items));
+    });
+    t("305 回修 段首:括号 / 圈号序号、【】、表格行都认", () => {
+      const ok = (purpose, done) => S.checkTaskbook(`${purpose}\n${done}\n不用再审\n`).ok;
+      eq(ok("(1) 用途:x", "(2) 完成标准:x"), true, "半角括号");
+      eq(ok("（一）用途:x", "（二）完成标准:x"), true, "全角括号 + 中文数字");
+      eq(ok("① 用途:x", "② 完成标准:x"), true, "圈号");
+      eq(ok("【用途】x", "**【完成标准】**x"), true, "方头括号(含加粗)");
+      eq(ok("| 用途 | 合并依据 |", "| **完成标准** | 不丢文件 |"), true, "表格行");
+      eq(ok("十二、用途:x", "3、完成标准:x"), true, "十二、/ 3、");
+    });
+    t("305 回修【反向】段首:「用途」仍要在段首(序号后接正文、表格非首列、句中提到都不算)", () => {
+      const fails = (line) => S.checkTaskbook(`${line}\n完成标准:x\n不用再审\n`).items.find((i) => i.key === "a").ok === false;
+      eq(fails("一、本次用途:x"), true, "序号后不是用途开头");
+      eq(fails("| 字段 | 用途 |"), true, "表格非首列");
+      eq(fails("这份稿子的用途以后再说。"), true, "句中");
+      eq(fails("一用途:x"), true, "中文数字后没有顿号");
+    });
+    t("305 回修 「不用再审」的同义:无需 / 不必 / 不需要再审 都认;「还要再审」不认", () => {
+      for (const w of ["不用再审", "无需再审", "不必再审", "不需要再审"]) eq(S.checkTaskbook(`用途:x\n完成标准:x\n${w}\n`).ok, true, w);
+      eq(S.checkTaskbook("用途:x\n完成标准:x\n还要再审\n").ok, false);
+    });
+    t("305 回修 编号问题只数以问号结尾的:带「是否 / 有没有」的编号陈述句不计;句末问号后跟加粗 / 代码 / 引号仍计", () => {
+      const base = "用途:x\n完成标准:x\n不用再审\n";
+      const stmts = ["1. 核对两份文件是否一致。", "2. 看有没有漏掉的条目", "3) 能否复现写进表里", "(a) 列出会不会翻转的", "4. 对不对得上都记下", "5. whether it holds, note it", "6. 结论写成「吗」字句也不算"];
+      const r = S.checkTaskbook(base + stmts.join("\n"));
+      eq(r.questions.length, 0, JSON.stringify(r.questions)); eq(r.ok, true);
+      const q = S.checkTaskbook(base + ["1. **完成标准成立吗?**", "2. 这样对吗?`", "3. 「是否一致？」", "4. 漏了没有? ", "(b) 顺序对吗?)", "6) 还有吗?"].join("\n"));
+      eq(q.questions.length, 6, JSON.stringify(q.questions)); eq(q.ok, false);
+      eq(S.checkTaskbook(base + "1. 问号在中间? 后面还有话").questions.length, 0, "问号不在行尾不计");
+    });
+    t("305 回修 新认法不回溯:竖线 / 括号序号 / 方头括号 / 问号后长串 在 1 秒内判完", () => {
+      const t0 = Date.now();
+      S.checkTaskbook("| ".repeat(50000));
+      S.checkTaskbook("(1)" + "*".repeat(100000));
+      S.checkTaskbook("【".repeat(100000));
+      S.checkTaskbook("1. " + "?*".repeat(50000) + "x");
+      S.checkTaskbook("一" + "、".repeat(100000));
+      const ms = Date.now() - t0;
+      if (ms > 1000) throw new Error(`耗时 ${ms}ms`);
+    });
+    t("305【反向】第 1 轮 ⇒ 不加提示", () => {
+      const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r1.md" }, { kind: "poll", readFile: rf2 });
+      if (/_direction-judge/.test(r.out)) throw new Error(r.out);
+      eq(r.out, "CODEX_JOB=J1\nCODEX_STATE=done\nCODEX_RESULT=/c/x-r1.md\nCODEX_END=J1\nCODEX_BODY_BEGIN=J1\n---\n---\n一轮\nCODEX_BODY_END=J1\ndone /c/x-r1.md\n", "第 1 轮输出与改前逐字相同");
+    });
+    t("305 前台立即结束的发起带结果、第 2 轮 ⇒ 同样提示(在 note 里)", () => {
+      const r = S.renderOutcome({ id: "J1", state: "done", result: "/c/x-r2.md" }, { kind: "launch", readFile: rf2 });
+      eq(r.note, hintOf(2) + "\n");
+      if (r.out.includes("_direction-judge")) throw new Error("stdout 不该带提示");
+    });
+    t("305【反向】第 2 轮但还在跑 / 失败 / 结果件读不到 / 文件名不带 r<n> ⇒ 都不加提示", () => {
+      const outs = [
+        S.renderOutcome({ id: "J1", state: "running", result: "/c/x-r2.md" }, { kind: "poll", readFile: rf2 }),
+        S.renderOutcome({ id: "J1", state: "failed", error: "x", log: "/c/l.log", result: "/c/x-r2.md" }, { kind: "poll", readFile: rf2 }),
+        S.renderOutcome({ id: "J1", state: "done", result: "/c/gone-r2.md" }, { kind: "poll", readFile: rf2 }),
+        S.renderOutcome({ id: "J1", state: "done", result: "/r.md" }, { kind: "poll", readFile: rf }),
+      ];
+      for (const o of outs) if (/_direction-judge/.test(o.out + (o.note || ""))) throw new Error(o.out);
+    });
   }
 
   fs.rmSync(sandbox, { recursive: true, force: true });

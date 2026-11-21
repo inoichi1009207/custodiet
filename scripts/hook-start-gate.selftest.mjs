@@ -267,6 +267,98 @@ try {
   check("Q4 git 仓里 UserPromptSubmit ⇒ 注入照旧", has(q4, "开工三问"), true);
   check("Q5 git 仓里 UserPromptSubmit ⇒ 不写 .turn-snapshot/(连 git 路径缓存也没有)", fs.existsSync(SNAPDIR), false);
   check("Q6 git 仓里 UserPromptSubmit 2 秒内返回(不等快照)", el4 < 2000, true);
+
+  // ── 批 305:收尾闸的「只提示」随下一条用户消息送达(读端;寄存库 lib/gate-hint-relay.mjs)──
+  //   写端在收尾钩子里;这里用库的 stashHint 直接往迷你仓的信箱里放,最后一组用真的 emit() 走一遍全程。
+  const relay = await import("./lib/gate-hint-relay.mjs");
+  const DROPS = path.join(dir, relay.DROP_LOG);
+  const dropRows = () => { try { return fs.readFileSync(DROPS, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  const HEAD = "上一轮收尾闸的提示";
+  const NOTE = (id) => `收尾闭环闸命中 1 项:\n  [${id}] 承诺未兑现(自测 ${id})`;
+  unarmed(); resetSeen();
+  check("H1 读端没跑过 ⇒ 不在场(写端据此不寄存)", relay.receiverSeen(dir, "h1"), false);
+  const h1 = run(msg("h1"));
+  check("H2 第一条消息之后读端在场;没有寄存的提示时注入照旧", [relay.receiverSeen(dir, "h1"), has(h1, "开工三问"), has(h1, HEAD)].join(":"), "true:true:false");
+  relay.stashHint(dir, "h1", { text: NOTE("B"), ids: ["B"] });
+  const h3 = run(msg("h1"));
+  check("H3 下一条消息取走提示(全文在;开工三问已说过不重复)", [has(h3, HEAD), has(h3, "[B] 承诺未兑现"), has(h3, "开工三问")].join(":"), "true:true:false");
+  check("H4 再下一条消息不再送(同一条只送一次)", run(msg("h1")).ctx, "");
+  // 与开工上下文同一条消息里一起说:一份合法 JSON、两段都在(run() 自带 JSON 形状断言)
+  relay.markReceiver(dir, "h5"); relay.stashHint(dir, "h5", { text: NOTE("C"), ids: ["C"] });
+  const h5 = run(msg("h5"));
+  check("H5 新会话首条消息:提示与开工三问合在一次输出里", [has(h5, HEAD), has(h5, "[C] 承诺未兑现"), has(h5, "开工三问")].join(":"), "true:true:true");
+  check("H6 之后两样都不重复", run(msg("h5")).ctx, "");
+  // 会话隔离
+  run(msg("h7a")); run(msg("h7b"));
+  relay.stashHint(dir, "h7a", { text: NOTE("D"), ids: ["D"] });
+  check("H7 别的会话的消息拿不到本会话的提示", has(run(msg("h7b")), HEAD), false);
+  check("H8 本会话的下一条消息照样拿到", has(run(msg("h7a")), "[D] 承诺未兑现"), true);
+  // 只有 UserPromptSubmit 取:工具调用、会话起点、子代理都不取
+  run(msg("h9")); relay.stashHint(dir, "h9", { text: NOTE("F"), ids: ["F"] });
+  check("H9 PreToolUse 不取", has(run(tool("h9", "Bash", { command: "ls" })), HEAD), false);
+  check("H10 SessionStart(compact)不取", has(run(start("h9")), HEAD), false);
+  check("H11 带 agent_id 的 UserPromptSubmit(子代理)不取", has(run(msg("h9", { agent_id: "sub-1" })), HEAD), false);
+  check("H12 主会话的下一条消息才取到", has(run(msg("h9")), "[F] 承诺未兑现"), true);
+  // 取不到的三种:过期、会话换了、信箱损坏 —— 都要在丢弃账里留一行
+  const OLD = Date.now() - relay.HINT_TTL_MS - 3600e3;
+  run(msg("h13")); relay.stashHint(dir, "h13", { text: NOTE("G"), ids: ["G"] }, OLD);
+  const d0 = dropRows().length;
+  const h13 = run(msg("h13"));
+  check("H13 寄存超期 ⇒ 不送", has(h13, HEAD), false);
+  check("H14 超期的记进丢弃账(原因、条数、规则 id)", (() => { const r = dropRows(); const x = r[r.length - 1] || {}; return [r.length - d0, x.reason, x.n, (x.ids || []).join(",")].join(":"); })(), "1:expired:1:G");
+  check("H15 记账之后不再重复记", (() => { run(msg("h13")); return dropRows().length - d0; })(), 1);
+  relay.markReceiver(dir, "h16-gone"); relay.stashHint(dir, "h16-gone", { text: NOTE("H"), ids: ["H"] }, OLD);
+  const d1 = dropRows().length;
+  const h16 = run(msg("h16-new"));
+  check("H16 会话换了:旧会话的提示不会送给新会话", has(h16, "[H] 承诺未兑现"), false);
+  check("H17 旧会话超期的提示由别的会话清掉并记账(带原会话号)", (() => { const r = dropRows(); const x = r[r.length - 1] || {}; return [r.length - d1, x.reason, x.sid, fs.existsSync(relay.boxFile(dir, "h16-gone"))].join(":"); })(), "1:expired:h16-gone:false");
+  relay.markReceiver(dir, "h18-live"); relay.stashHint(dir, "h18-live", { text: NOTE("J"), ids: ["J"] });
+  run(msg("h16-new"));
+  check("H18 别的会话没超期的提示不动(等它自己的下一条消息)", has(run(msg("h18-live")), "[J] 承诺未兑现"), true);
+  run(msg("h19")); fs.writeFileSync(relay.boxFile(dir, "h19"), "{坏的");
+  const d2 = dropRows().length;
+  const h19 = run(msg("h19"));
+  check("H19 信箱损坏 ⇒ 不崩、不送,记一笔并重置", [has(h19, HEAD), dropRows().length - d2, (dropRows().pop() || {}).reason, relay.receiverSeen(dir, "h19")].join(":"), "false:1:corrupt:true");
+  check("H20 没有 session_id ⇒ 不取、不崩(开工三问照旧)", [has(run(msg("")), HEAD), has(run(msg("")), "开工三问")].join(":"), "false:true");
+  // 丢弃账写不进去 ⇒ 过期件留着,不静默删
+  run(msg("h21")); relay.stashHint(dir, "h21", { text: NOTE("K"), ids: ["K"] }, OLD);
+  const dropsBak = fs.existsSync(DROPS) ? fs.readFileSync(DROPS, "utf8") : "";
+  fs.rmSync(DROPS, { force: true }); fs.mkdirSync(DROPS, { recursive: true });
+  run(msg("h21"));
+  check("H21 丢弃账写不成 ⇒ 过期件还在信箱(下次再记)", relay.takeHints(dir, "h21").expired, 1);
+  fs.rmSync(DROPS, { recursive: true, force: true }); fs.writeFileSync(DROPS, dropsBak);
+  run(msg("h21"));
+  check("H22 丢弃账恢复后补记", (dropRows().pop() || {}).ids?.join(","), "K");
+
+  // 全程:真的收尾钩子 emit() 寄存 → 下一次 UserPromptSubmit 取走、只送一次;无头会话与开关都不走新通道
+  const stopHook = await import("./hook-stop-closure.mjs");
+  const capture = (fn) => { const w = process.stdout.write.bind(process.stdout), e = process.stderr.write.bind(process.stderr); let buf = "";
+    process.stdout.write = (s) => { buf += String(s); return true; }; process.stderr.write = () => true;
+    try { fn(); } finally { process.stdout.write = w; process.stderr.write = e; } return buf; };
+  const hintF = [{ id: "DRIFT", block: false, msg: "文档漂移(全程自测)" }];
+  // 批 305 回修:寄存还要「本轮由人亲口说的一条消息开始」⇒ 缺省转录是一轮人打字开始的交互会话
+  const humanTurn = [{ type: "user", entrypoint: "cli", origin: { kind: "human" }, promptSource: "typed", message: { role: "user", content: "收个尾" } },
+    { type: "assistant", entrypoint: "cli", message: { role: "assistant", content: [{ type: "text", text: "好" }] } }];
+  const stopAs = (sid, over = {}) => capture(() => stopHook.emit(hintF, 0, { hintRelay: { root: dir, sid, entries: humanTurn, env: {}, ...over } }));
+  const firstStop = stopAs("z1");
+  check("Z1 会话还没发过消息(读端没跑过)⇒ 收尾钩子走老通道", firstStop.includes("additionalContext"), true);
+  run(msg("z1"));
+  const z2 = stopAs("z1");
+  check("Z2 读端在场的交互会话:收尾钩子不输出 additionalContext(不续轮)", z2.includes("additionalContext"), false);
+  const z3 = run(msg("z1"));
+  check("Z3 下一条用户消息拿到那条提示", [has(z3, HEAD), has(z3, "[DRIFT] 文档漂移(全程自测)")].join(":"), "true:true");
+  check("Z4 只送一次", run(msg("z1")).ctx, "");
+  const z5 = stopAs("z1", { entries: [{ entrypoint: "sdk-cli" }] });
+  check("Z5 无头会话:收尾钩子照旧当轮送,下一条消息没有重复件", [z5.includes("additionalContext"), run(msg("z1")).ctx].join(":"), "true:");
+  const z6 = stopAs("z1", { env: { STOP_CLOSURE_HINT_DEFER: "0" } });
+  check("Z6 开关关掉:收尾钩子照旧当轮送,下一条消息没有重复件", [z6.includes("additionalContext"), run(msg("z1")).ctx].join(":"), "true:");
+  // 批 305 回修:不是人发起的轮(后台任务回报 / 子代理回件)⇒ 收尾钩子当轮送,不寄存到下一条人的消息
+  const notHuman = (kind, text) => [humanTurn[0], humanTurn[1],
+    { type: "user", entrypoint: "cli", origin: { kind }, promptSource: "system", message: { role: "user", content: text } }, humanTurn[1]];
+  const z7 = stopAs("z1", { entries: notHuman("task-notification", "<task-notification>done</task-notification>") });
+  check("Z7 后台任务通知开始的轮:收尾钩子照旧当轮送,下一条消息没有重复件", [z7.includes("additionalContext"), run(msg("z1")).ctx].join(":"), "true:");
+  const z8 = stopAs("z1", { entries: notHuman("peer", "<agent-message>回件</agent-message>") });
+  check("Z8 子代理 / 跨会话消息开始的轮:同上", [z8.includes("additionalContext"), run(msg("z1")).ctx].join(":"), "true:");
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }

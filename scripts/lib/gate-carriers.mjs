@@ -131,12 +131,56 @@ const DELIVERABLE_EXCLUDE = new RegExp(
  *  它从上线首日就在判据里(批 285 D132 补这句,原注释只写三条内容管线,与判据实含不符)。
  *  天花板(D132,按接受风险结清):只认这四个脚本名——绕开 deploy-prod.ps1 直接 ssh 敲部署步不命中。 */
 //  0.10.0:部署脚本认 `deploy-<名>` 这一形(原来写死一个具体脚本名)——安装方的部署脚本各叫各的。
-//  这四个脚本名本该是安装方配置(闸规矩第五节),现在仍写在这里,见 docs/gate-debts.md。
-//  0.10.1:`deploy-<名>` 后面必须跟脚本扩展名——0.10.0 没带这个限制,名字里含 deploy- 的普通文件
-//  (`docs/deploy-windows.md`、记忆文件名 `…-deploy-is-law`)被当成部署脚本,W 误拦(装回源仓后回放实撞 2 处)。
-//  天花板(照实写):省略扩展名的调用(PowerShell 的 `.\scripts\deploy-x -Apply`、`npm run deploy-x`)不认;
-//  源头项目四个月的转录里这两种写法 0 次,带 `.ps1` 的 112 次。
-export const CONTENT_WRITE_RE = /write-node\.mjs|prod-lib\.mjs|bulk[-_]?create|deploy-[\w-]+\.(?:[Pp][Ss]1|sh|mjs|cjs|js|ts)\b/;
+//  0.10.1:`deploy-<名>` 后面必须跟脚本扩展名(0.10.0 连 `docs/deploy-windows.md` 这类普通文件也认,W 误拦)。
+//  批 305:**部署脚本那一支改读安装方配置里的确切文件名**(gate-install.json 的 `deployScripts`,经 ctx.installNames 注入;
+//    规则不自读磁盘)。按一族名字认(`deploy-<名>.<脚本扩展名>`)仍然太宽:对 `src/lib/deploy-utils.ts` 跑测试、
+//    对别的项目的 `deploy-staging.sh` 做语法检查都被当成生产写入;W 误拦的出路是真跑一轮外审,很贵,所以认窄。
+//    · 只认名单里的**整个文件名**,不分大小写(Windows 文件系统不分):左边不得紧贴 `[\w.-]`(`my-deploy-prod.ps1` 不认;
+//      路径分隔符、空白、引号、`=`、行首都算边界),右边同样不得紧贴 `[\w.-]`(`deploy-prod.ps1.bak` 不认)。
+//    · 名单为空(没配、没有配置文件、配置写错)⇒ 这一支不响。名字只当数据:拼进正则前逐字符转义。
+//    · 另外三类(write-node.mjs / prod-lib.mjs / bulk-create)这一轮仍写在下面这张表里,判法逐字不变
+//      (「提及」形与「引号整串路径」形各自保留原样——两形本来就不同宽,见表内注)。
+//  天花板(照实写,已登记、不为它加逻辑):**省略扩展名**的调用(PowerShell 的 `.\scripts\deploy-prod -Apply`、
+//    `npm run deploy-prod`)不认——名单里写的是带扩展名的文件名;源头项目四个月的转录里这两种写法 0 次,带 `.ps1` 的 112 次。
+//    右边界把 `.` 算进去 ⇒ 句末紧贴句号的散文提及(`…跑了 deploy-prod.ps1.`)也不认(漏认向,只影响文本提及)。
+/** 写在代码里的三类内容写脚本。`mention` = 命令串里**提到**它的形(W 的入口判据);
+ *  `quotedTail` = **引号整串路径**以它结尾的形(W 的 QUOTED_PATH,另带 `i`)。两形并列在一张表里,
+ *  由下面两个函数各自派生——原先 QUOTED_PATH 是手抄在 gate-rules.mjs 里的第二份。 */
+const CONTENT_WRITE_FIXED = [
+  { mention: "write-node\\.mjs", quotedTail: "write-node\\.(?:mjs|cjs|js|ts|ps1)" },
+  { mention: "prod-lib\\.mjs", quotedTail: "prod-lib\\.(?:mjs|cjs|js|ts|ps1)" },
+  { mention: "bulk[-_]?create", quotedTail: "bulk[-_]?create[\\w-]*\\.(?:mjs|cjs|js|ts|ps1)" },
+];
+const reEscape = (s) => String(s).replace(/[.*+?^${}()|[\]\\/-]/g, "\\$&");
+/** 一个名字 ⇒ 不分大小写的正则源串(逐字符 `[xX]`;整条正则不带 `i`,固定三类的大小写口径不受牵连)。 */
+const caseFold = (name) => [...String(name)].map((ch) => {
+  const lo = ch.toLowerCase(), up = ch.toUpperCase();
+  return lo !== up && lo.length === 1 && up.length === 1 ? `[${reEscape(lo)}${reEscape(up)}]` : reEscape(ch);
+}).join("");
+const NAME_L = "(?<![\\w.-])", NAME_R = "(?![\\w.-])";
+const cleanNames = (names) => [...new Set((Array.isArray(names) ? names : []).filter((s) => typeof s === "string" && s.trim()).map((s) => s.trim()))];
+const _cwMemo = new Map();
+const cwDerive = (names) => {
+  const list = cleanNames(names);
+  const key = JSON.stringify(list);
+  let v = _cwMemo.get(key);
+  if (!v) {
+    const dep = list.length ? `${NAME_L}(?:${list.map(caseFold).join("|")})${NAME_R}` : null;
+    v = {
+      mention: new RegExp([...CONTENT_WRITE_FIXED.map((x) => x.mention), ...(dep ? [dep] : [])].join("|")),
+      // 引号整串路径:固定三类照原样(结尾形,`i`);部署脚本 = 整串以名单里的整个文件名结尾
+      quoted: new RegExp(`^[^\\s"']*(?:${CONTENT_WRITE_FIXED.map((x) => x.quotedTail).join("|")})$` +
+        (list.length ? `|^[^\\s"']*${NAME_L}(?:${list.map(reEscape).join("|")})$` : ""), "i"),
+    };
+    if (_cwMemo.size > 64) _cwMemo.clear();
+    _cwMemo.set(key, v);
+  }
+  return v;
+};
+/** 命令串里提到「生产内容写入脚本」的判据(W 的入口)。`deployScripts` = 安装方配置里的部署脚本文件名名单。纯函数(按名单缓存)。 */
+export function contentWriteRe(deployScripts = []) { return cwDerive(deployScripts).mention; }
+/** 引号串**整串**是一条以内容写脚本结尾的路径(W 的 QUOTED_PATH)。与 contentWriteRe 同一张表、同一份名单。 */
+export function quotedContentWritePathRe(deployScripts = []) { return cwDerive(deployScripts).quoted; }
 
 /** 写它算「产出交付物」吗(W 项的判据面)。 */
 export function isDeliverable(p) {
@@ -352,6 +396,25 @@ export function selfTest() {
     ["clipboard/pending-after-limit.md", true, "同名非点文件仍算交付物(排除只认点文件)"],
   ]) chk(`D101 交付物面  ${p.slice(-44).padEnd(44)} ${why}`, isDeliverable(p), want);
 
+  // ── 批 305:内容写脚本名的两条派生正则(部署脚本读名单里的确切文件名)──
+  {
+    const none = contentWriteRe([]), cfg = contentWriteRe(["deploy-prod.ps1"]);
+    const hits = (re, xs) => xs.map((x) => (re.test(x) ? 1 : 0)).join("");
+    chk("305 提及形:固定三类与名单无关(无名单也认)", hits(none, ["node scripts/write-node.mjs --apply p", "import x from './prod-lib.mjs'", "node bulk-create-nodes.mjs", "bulk_create"]), "1111");
+    chk("305 提及形:无名单 ⇒ 任何 deploy-<名>.<扩展名> 都不认", hits(none, ["pwsh -File scripts/deploy-prod.ps1", "bash scripts/deploy-staging.sh", "vitest src/lib/deploy-utils.ts"]), "000");
+    chk("305 提及形:有名单 ⇒ 只认确切文件名(路径 / 反斜杠 / 引号 / 行首 / 扩展名大写 / 全大写)",
+      hits(cfg, ["pwsh -File scripts/deploy-prod.ps1", ".\\scripts\\deploy-prod.ps1 -Apply", "\"E:/x/scripts/deploy-prod.ps1\"", "deploy-prod.ps1", "scripts/deploy-prod.PS1", "SCRIPTS\\DEPLOY-PROD.PS1", "--file=deploy-prod.ps1;"]), "1111111");
+    chk("305 提及形:有名单 ⇒ 同族别名、带前缀 / 后缀的不认",
+      hits(cfg, ["bash scripts/deploy-staging.sh", "vitest src/lib/deploy-utils.ts", "node scripts/deploy-status.mjs --json", "cp deploy-prod.ps1.bak x", "pwsh my-deploy-prod.ps1", "x.deploy-prod.ps1", "deploy-prod.ps1x", "deploy-prod-ps1", "scripts/deploy-prod -Apply", "docs/deploy-windows.md"]), "0000000000");
+    chk("305 提及形:名字只当数据(正则元字符转义;`.` 不通配)", hits(contentWriteRe(["a+b(1).ps1"]), ["./a+b(1).ps1", "./aab(1)xps1", "./a+b(1)xps1"]), "100");
+    chk("305 提及形:固定三类的大小写口径不受名单牵连(仍分大小写)", hits(cfg, ["WRITE-NODE.MJS", "Prod-Lib.mjs"]), "00");
+    chk("305 提及形:名单脏项(非字符串 / 空串)丢掉、非数组按空", [hits(contentWriteRe([1, "", null, " deploy-prod.ps1 "]), ["scripts/deploy-prod.ps1"]), hits(contentWriteRe("deploy-prod.ps1"), ["scripts/deploy-prod.ps1"])].join(" "), "1 0");
+    const q0 = quotedContentWritePathRe([]), q1 = quotedContentWritePathRe(["deploy-prod.ps1"]);
+    chk("305 引号整串形:固定三类照原样(五种扩展名、结尾形、不分大小写)", hits(q0, ["scripts/write-node.mjs", "E:/x/prod-lib.ts", "scripts/bulk-create-nodes.cjs", "SCRIPTS/WRITE-NODE.PS1", "scripts/write-node.mjs.bak", "see write-node.mjs", "scripts/write-node.sh"]), "1111000");
+    chk("305 引号整串形:部署脚本只认名单里的整名(无名单全不认;与提及形同一份名单)",
+      [hits(q0, ["scripts/deploy-prod.ps1", "scripts/deploy-staging.sh"]), hits(q1, ["scripts/deploy-prod.ps1", "scripts\\Deploy-Prod.PS1", "deploy-prod.ps1", "scripts/deploy-staging.sh", "scripts/my-deploy-prod.ps1", "scripts/deploy-prod.ps1.bak", "run scripts/deploy-prod.ps1"])].join(" "), "00 1110000");
+    chk("305 同一份名单取到同一个正则对象(按名单缓存)", contentWriteRe(["deploy-prod.ps1"]) === contentWriteRe(["deploy-prod.ps1"]) && contentWriteRe() === contentWriteRe([]), true);
+  }
   let pass = 0;
   for (const [r, n, extra] of t) { if (r === "FAIL") console.log(`  FAIL  ${n}  ← ${extra}`); if (r === "PASS") pass++; }
   console.log(`载体分类自测 ${pass}/${t.length}`);

@@ -356,6 +356,10 @@ export function fpRightNotManual(ledger) {
 /** 误报率分母口径(fpTable 与 --fp-report 表头共用,红队 a30a87d8 BP-3):只数主 Stop 通道、不数 UNKNOWN。 */
 export const fpRowCounted = (a) => !!a && a.channel !== "SubagentStop";
 export const fpIdsOf = (a) => ((a && a.ids) || []).filter((id) => id !== "UNKNOWN");
+/** 批 305:误报表的口径句,`--fp-report`(含 `--hot`)首行印出;batch-goal 结清时整表转出、开批列待修行时单独转出这一行。
+ *  为什么要有:表里的「误报」只数自签申诉过的那些拦截,没人申诉的拦截(无论拦对拦错)不在分子里——
+ *  不写明,读表的人会把「误报率低」读成「拦得准」。自测钉着它在首行。 */
+export const FP_SCOPE_NOTE = "口径:只统计被申诉过的拦截,不是全部拦截的准确率;没人申诉的拦截不在这张表里。";
 // 批 285(D157③):`since` = {规则 id: 毫秒} —— 该规则**最后一次改判据**的时刻(取自规则对象的 `criteriaSince`)。
 //   给了 ⇒ 该规则的报警、自签与撤回只数此刻之后的(撤回 / 盲审行按其指向那笔自签的时刻归窗,指不到再看自己的 ts),
 //   「待修」按窗口内的数判,全量数挂在 `all` 上照列。没给 ⇒ 逐字是原表。
@@ -980,7 +984,12 @@ function perfLine() {
 //   于是**已经纠正过的旧句被反复重判**(2026-08-19 实撞:同一句完成断言被 F 项连判三轮)。
 //   hook feedback 天然是轮次边界——它之后的输出才是「对上次拦截的回应」。
 export function lastTurn(entries) {
-  let start = 0;
+  return entries.slice(turnBoundary(entries).start);
+}
+/** 「本轮」的切点(lastTurn 的唯一实现;批 305 回修抽出,切法逐字未改)。返回 { start, by }:
+ *  by = "message"(边界①:entries[start] 就是开启本轮的那条消息行)/ "hook"(边界②②′③:从闸的输出或被拦的 Stop 之后起算)/
+ *  "none"(找不到边界,取全文件)。`hintDeferWhy` 据 by 与 entries[start] 认本轮由谁开始。 */
+export function turnBoundary(entries) {
   const blockedIds = blockedStopIds(entries);
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
@@ -994,7 +1003,7 @@ export function lastTurn(entries) {
     //   a2155edb BP-6:「这次 Stop 被拦没有」改由 gate-ctx 的 `isBlockedStop` 判(唯一实现,被拦后续跑的补收回扫同用它):
     //   同 toolUseID 拦截附件、或汇总行前的 feedback 行(判官型 prompt hook 只留这一种)任一即算。倒着扫先遇到的是
     //   汇总行(它在附件与 feedback 行之后),起点取它之后;没有汇总行的那次(进行中)不在这里切,与原③一致。
-    if (e.type === "system" && e.hookCount !== undefined && isBlockedStop(entries, i, blockedIds)) { start = i + 1; break; }
+    if (e.type === "system" && e.hookCount !== undefined && isBlockedStop(entries, i, blockedIds)) return { start: i + 1, by: "hook" };
     if (e.type === "system" && e.hookCount !== undefined) {
       const s = JSON.stringify(e.hookErrors || []) + JSON.stringify(e.hookAdditionalContext || "");
       // ⚠️ `i + 1` 而不是 `i`:本闸自己的输出**不得进入自己的证据窗口**。
@@ -1004,7 +1013,7 @@ export function lastTurn(entries) {
       //   更坏的是它构成**洗白链**:注入进 .batch-goal.json 的文本 → 被 K 回显进阻断消息
       //   → 落进 system 条目 → 下一轮进入 P 的证据窗口,`"name":"WebSearch"` 之类字样
       //   即可满足三通道。断掉首项就断了这条链的中段。
-      if (/收尾闸阻断|收尾闭环闸命中/.test(s)) { start = i + 1; break; }   // 边界②
+      if (/收尾闸阻断|收尾闭环闸命中/.test(s)) return { start: i + 1, by: "hook" };   // 边界②
     }
     if (e.type !== "user") continue;
     // 工具结果也记作 type:user,不算真正的用户发言
@@ -1019,16 +1028,15 @@ export function lastTurn(entries) {
     //   正是 S7 立 `i+1` 要断的那条洗白链)。同理 `i+1` 排除,反馈之后才是「对拦截的回应」。
     //   真实用户发言也可能是字符串形态 ⇒ 判据锚定 harness 固定前缀,不看正文关键词。
     // v7(codex v6 接缝 1):用户亲口打的话恰以这个前缀开头(贴报错来问)⇒ 是用户发言,走边界①,不当 hook 反馈切掉
-    if (isStopFeedbackLine(e)) { start = i + 1; break; }
+    if (isStopFeedbackLine(e)) return { start: i + 1, by: "hook" };
     // 边界②″ 已撤(2026-10-09):lanes 转投 v1 的插件消息形态已退役;v2 以 isMeta 行附全文、引擎仍落 feedback 行与附件,由②′/③认。
     //   lanes 附给模型的闸全文(isMeta 且以 Stop hook feedback: 开头)由上一行②′按 `i+1` 当边界(窗口从它之后起),不当边界①。
     //   热修红队 BP-4/9(10-09):无 origin 的 isMeta 行(技能/命令展开的正文、系统提醒)与插件消息都不是新一轮的起点
     //   ——轮中调 Skill 曾把本轮先前的 Write/Edit 整段切出窗口(真语料 45 处)。peer/task-notification/human 照旧当边界①。
     if ((e.isMeta === true && !e.origin?.kind) || e.origin?.kind === "plugin") continue;
-    start = i;                                                         // 边界①
-    break;
+    return { start: i, by: "message" };                                // 边界①
   }
-  return entries.slice(start);
+  return { start: 0, by: "none" };
 }
 
 function assistantText(entries) {
@@ -2831,6 +2839,17 @@ import { ledgerAppend, verifyFile as ledgerVerify } from "./lib/ledger-chain.mjs
 import { readTouched, selfTest as touchSelfTest } from "./lib/gate-touch.mjs";   // 批 279「修闸 tag」
 // 批 299 / 299b:写入三态观测(287 设计 2.5;判法见 299b-design)。本文件只把观测落账(.claude/.write-state.jsonl),不改任何规则的判决
 import { observeWrites, collectInterval, ledgerRow as writeStateRow, selfTest as writeStateSelfTest } from "./lib/write-state.mjs";
+// 批 305:「只提示」延后到下一条用户消息送达(寄存端在 emit();取走端在 hook-start-gate.mjs)
+import { stashHint, takeHints, interactiveSession, receiverSeen, markReceiver as markHintReceiver, boxFile as hintBoxFile, dropSummary as hintDropSummary, selfTest as hintRelaySelfTest } from "./lib/gate-hint-relay.mjs";
+import { classifyEntry as classifyTurnEntry } from "./lib/batch-ruler.mjs";   // 批 305 回修:「本轮由谁开始」复用主尺的认人口径(唯一实现)
+// 批 305:安装方名单(gate-install.json 的 deployScripts / privateRepos)。hook 读一次、注入 ctx.installNames;规则不自读磁盘。
+import { readInstallConfig, installNames as installNamesOf, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
+/** 读**本脚本所在 checkout 根**的那份配置里的两份名单(不取进程 cwd:配置随仓走,会话可能停在别的目录)。
+ *  没有这份文件 / 读不了 / 解析坏 / 键写错 ⇒ 对应名单为空(闸不因配置坏而多拦;配置坏由 batch-goal 那边出声)。readFile 可注入(自测)。 */
+export function readInstallNames(root = fileURLToPath(new URL("..", import.meta.url)), readFile = (f) => fs.readFileSync(f, "utf8")) {
+  return installNamesOf(readInstallConfig((f) => readFile(path.join(root, f)), INSTALL_CONFIG_FILE));
+}
+let _installNamesMemo;
 
 /** 反推「闸机件」清单:凡**改了它就可能改变闸的行为**的文件。
  *
@@ -3120,6 +3139,13 @@ export function run(transcriptPath, ctx = {}) {
         //   自测进程不注入(否则新装闸、还没立过批的仓,自测里 K0 全部静音而红;公开树 gate:accept 实撞)
         //   红队 a363e144 BP-1:按 ctx.live 门控(离线 --audit / --dry-run 读的是现在的盘面,套到历史轮上是错配)
         batchEverArmed: ctx.batchGoal !== undefined || !ctx.live || process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : batchEverArmedHere(),
+        // 批 305:安装方名单(W 的部署脚本文件名、DP 的私仓仓名)。同一注入纪律——hook 读一次(进程内缓存)、规则纯函数。
+        //   调用方注入了就用注入的(夹具 / 回放器:回放器读一次、两版共用);自测进程(STOP_CLOSURE_SELFTEST=1,回放同此)不读盘
+        //   ⇒ undefined ⇒ 两个空名单(测出来的东西不得取决于仓根碰巧有没有那份配置)。
+        //   实时与离线(--audit / --dry-run)都读:名单是随仓提交的安装方事实,不是逐轮变化的状态;
+        //   离线读到的是今天的名单——历史轮里部署脚本若叫过别的名字,那几轮的 W 读数偏松(照实写的天花板)。
+        installNames: ctx.installNames !== undefined ? ctx.installNames
+          : (process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : (_installNamesMemo ??= readInstallNames())),
         // 批 258:实时路径给批状态补 `turnBatchStart`(本轮开始时正开着的那一批的起点;W 按它切交付物)
         batchGoal: ctx.batchGoal !== undefined ? ctx.batchGoal : (() => {
           const g0 = readBatchGoal();
@@ -3442,7 +3468,53 @@ export function splitLogOnly(findings, ids = logOnlyIds()) {
   return { shown, logged };
 }
 
-function emit(findings, streak = 0, opts = {}) {
+/** 批 305(设计稿第三节第 5 项):本轮的非阻断输出能不能**延后**到下一条用户消息再送。
+ *  返回 null = 可以延后;否则返回不延后的原因(走老通道:当轮经 additionalContext 送,会让模型再走一轮)。纯函数,自测直接调。
+ *
+ *  为什么要延后:Stop 的 `hookSpecificOutput.additionalContext` 会让模型续一轮(本机 changelog 原话「keep the turn going」;
+ *  本机转录里 1,057 次只提示有 1,040 次的下一条是 assistant)。「只提示」档按设计不该为它单独把模型叫回来。
+ *  只延后「只提示」档:档位取自命中的 `block` 字段(引擎按规则的 `blocking` 算出),不抄规则名单——
+ *    · 含阻断档的命中(连撞降级成提示的、被 STOP_CLOSURE_BLOCK_<X>=0 降成提示的)⇒ 不延后:那是「本该拦」的项,当轮就要让模型看到;
+ *    · 含没判成的项(unknown)⇒ 不延后:判据坏了要当轮出声。
+ *  其余条件见 lib/gate-hint-relay.mjs 头注的不变量①②④:读端在场、正面认出是交互会话、本轮由人亲口说的一条消息开始。
+ *  拿不准一律不延后——延后了没人取 = 提示悄悄丢了(等于把「只提示」降成「只记账」);不延后只是多走一轮。
+ *  开关:`STOP_CLOSURE_HINT_DEFER=0` 退回老行为(全部当轮送)。 */
+export function hintDeferWhy(findings, { yielding = false, root = ".", sid, entries, env = process.env } = {}) {
+  if (env && env.STOP_CLOSURE_HINT_DEFER === "0") return "开关关了";
+  if (yielding) return "降级轮";
+  if (!Array.isArray(findings) || !findings.length) return "没有提示";
+  if (findings.some((f) => f && f.block)) return "含阻断档";
+  if (findings.some((f) => f && f.unknown)) return "含没判成的项";
+  if (!sid) return "没有会话号";
+  if (!interactiveSession(entries, env)) return "认不出是交互会话";
+  if (!turnOpenedByHuman(entries)) return "本轮不是人发起的";
+  if (!receiverSeen(root, sid)) return "读端不在场";
+  return null;
+}
+
+/** 批 305 回修(用户裁定):「只提示」只在**人发起的那一轮**寄存。没有人发消息的自动续轮(后台任务回报、定时唤醒、
+ *  子代理 / 跨会话消息、自动续跑、闸自己的反馈让模型续的那一轮)里寄存,提示要等人的下一条消息才送到——全自动跑的批
+ *  可能从头到尾模型都看不到。所以:本轮起点(与 lastTurn 同一个切点 `turnBoundary`)必须是一条消息行(边界①),
+ *  且主尺的认人口径 `classifyEntry` 判它是人说的、类型在 HUMAN_OPENER_KINDS 里;其余一律 false(走老通道当轮送)。
+ *  不收的「人说的」类型:sdk(无头会话的提示词,无头本就不寄存)、legacy(没有来源标记——本机转录里这类几乎都是无头 /
+ *  SDK 会话的提示词,交互会话里极少,认不出是谁发的就当不是人)、interrupt(中断标记不是一条消息)。
+ *  CEILING:定时唤醒 / `/loop` 触发的轮在转录里是什么形态,本机转录未观测到;若它落成「没有来源标记的斜杠命令行」,
+ *  classifyEntry 会认作人说的斜杠命令 ⇒ 那一轮会寄存(漏看方向)。 */
+export const HUMAN_OPENER_KINDS = new Set(["typed", "queued", "slash", "bang"]);
+export function turnOpenedByHuman(entries) {
+  if (!Array.isArray(entries) || !entries.length) return false;
+  let b;
+  try { b = turnBoundary(entries); } catch { return false; }
+  if (!b || b.by !== "message") return false;            // 从闸的输出 / 被拦的 Stop 之后起算,或定位不到起点
+  const e = entries[b.start];
+  if (!e || e.type !== "user") return false;
+  let c;
+  try { c = classifyTurnEntry(e); } catch { return false; }
+  return !!(c && c.human === true && HUMAN_OPENER_KINDS.has(c.kind));
+}
+
+/** 导出只为跨钩子的全程自测(hook-start-gate.selftest.mjs 的 Z 组:真 emit 寄存 → 真开工钩子取走);生产只经下方主块调用。 */
+export function emit(findings, streak = 0, opts = {}) {
   // D40:与 run() 同一纪律——落盘台账(心跳/报警分母)只认显式 `opts.live`,不再嗅 argv。
   const live = opts.live === true;
   // 批 292(287 设计 2.8;用户 11-06「只是改成只提醒不阻断的话会不会依然继续污染上下文?」):
@@ -3689,6 +3761,20 @@ function emit(findings, streak = 0, opts = {}) {
           : ""),
     })));
     return 2;
+  }
+  // 批 305(设计稿第三节第 5 项):交互会话里的「只提示」不经下面那条会续轮的出口——寄存到盘上,
+  //   开工钩子在下一次 UserPromptSubmit 时取走、随用户那条消息注入一次(lib/gate-hint-relay.mjs)。
+  //   能不能延后只由 hintDeferWhy 判(档位、读端在场、交互会话、开关);寄存抛错 ⇒ 落到下面的老通道,不许既没寄存又没送。
+  //   生产路径(live)用真仓根与本会话转录;自测注入 `opts.hintRelay`;离线回放两者都没有 ⇒ 行为同改前。
+  //   给人看的 systemMessage(批次提醒等)不续轮,照常出。上面写到 stderr 的那份清单也照写(exit 0 的 stderr 只进调试日志与
+  //   hook 附件,不到模型;盲审取证 fp-audit 靠它在 Stop 那一刻认出本次提示)。
+  const relay = opts.hintRelay || (live ? { root: ".", sid: _ledgerSid, entries: _allEntriesCache, env: process.env } : null);
+  if (relay && hintDeferWhy(findings, { ...relay, yielding }) === null) {
+    try {
+      stashHint(relay.root, relay.sid, { text: notice, ids: findings.map((f) => f.id) });
+      if (sysParts.length) process.stdout.write(JSON.stringify({ systemMessage: sysParts.join("\n") }));
+      return 0;
+    } catch { /* 寄存不成 ⇒ 当轮照送(宁可多走一轮,不丢提示) */ }
   }
   // 非阻断项走官方的 additionalContext 出口,而不是 stderr:
   // 官方明写它「shown in the transcript as hook feedback **rather than a hook error**」
@@ -4861,6 +4947,32 @@ function selfTest() {
     sc("未迁的 A 在引擎接管下仍阻断", aBlock(aOn), true);
     sc("且与回退旧实现完全一致", aBlock(aOn) === aBlock(aOff), true);
 
+    // 批 305:安装方名单这条通道真的从 run() 接到了规则手里(造了通道不接线是本仓的老毛病,见上方 priorEntries 那段)
+    {
+      const turnD = [{ type: "assistant", message: { content: [
+        { type: "text", text: "部署完收工。" },
+        { type: "tool_use", name: "Bash", input: { command: "pwsh -File scripts/deploy-prod.ps1" } },
+        { type: "tool_use", name: "Bash", input: { command: "node --no-warnings scripts/batch-goal.mjs --clear" } },
+      ] } }];
+      const wHit = (extra) => run(null, { text: "部署完收工。", turn: turnD, ...extra }).some((f) => f.id === "W");
+      sc("305 名单通道:run() 把注入的 installNames 交到规则手里——配了部署脚本名 ⇒ W 响",
+        wHit({ installNames: { deployScripts: ["deploy-prod.ps1"], privateRepos: [] } }), true);
+      sc("305 名单通道:自测进程不读盘(没注入 ⇒ 空名单)/ 注入空名单 ⇒ 部署脚本那一支不响",
+        [wHit({}), wHit({ installNames: { deployScripts: [], privateRepos: [] } })].join(), "false,false");
+      // 读盘那一半(readInstallNames,假读文件):有配置 / 没有文件 / 解析坏 / 键写错
+      const rd = (text, code) => JSON.stringify(readInstallNames("/repo", () => { if (code) { const e = new Error(code); e.code = code; throw e; } return text; }));
+      const EMPTY = '{"deployScripts":[],"privateRepos":[]}';
+      sc("305 名单读盘:配置里两键都写了 ⇒ 原样取到",
+        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: ["deploy-prod.ps1"], privateRepos: ["app-private"] })), '{"deployScripts":["deploy-prod.ps1"],"privateRepos":["app-private"]}');
+      sc("305 名单读盘:没有配置文件 / 读不了 / 不是 JSON / 有未知键(整份判坏)⇒ 两个空名单,不抛",
+        [rd("", "ENOENT"), rd("", "EBUSY"), rd("{oops"), rd(JSON.stringify({ format: "gate-install/v1", deployScript: ["x.ps1"] }))].join(""), EMPTY.repeat(4));
+      sc("305 名单读盘:一个键形状不对 ⇒ 只那一个归空,另一个照取",
+        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: "deploy-prod.ps1", privateRepos: ["app-private"] })), '{"deployScripts":[],"privateRepos":["app-private"]}');
+      let asked = null;
+      readInstallNames("/repo/x", (f) => { asked = String(f).replace(/\\/g, "/"); return "{}"; });
+      sc("305 名单读盘:读的是给定根下的 gate-install.json(不是进程 cwd)", asked, "/repo/x/gate-install.json");
+    }
+
     // ⚠️ **干净通过时 stdout 必须是空的**(2026-08-20 实撞)。
     //   `hookSpecificOutput.additionalContext` 的官方语义是「**keep the turn going**」
     //   (本机 changelog L1391)——把心跳放在那儿,等于每次全过都主动续一轮:
@@ -4921,6 +5033,83 @@ function selfTest() {
     }
     sc("未降级时照常阻断", held.includes('"decision":"block"'), true);
     sc("未降级时不谎称降级", held.includes("自行降级"), false);
+    // 批 305(设计稿第三节第 5 项):交互会话里「只提示」不再经会续轮的 additionalContext 输出,寄存到盘上、
+    //   由开工钩子随下一条用户消息送达(lib/gate-hint-relay.mjs)。无头会话、读端不在场、拿不准、寄存不成 ⇒ 一律老通道。
+    //   这里注入 `opts.hintRelay`(临时目录当仓根),不走 live ⇒ 不写任何真台账。
+    {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "hint-defer-st-"));
+      try {
+        const SID = "s-305-defer";
+        const hint = [{ id: "DRIFT", block: false, msg: "文档漂移\n第二行说明" }];
+        // 批 305 回修:寄存还要「本轮由人亲口说的一条消息开始」⇒ 缺省夹具是一轮人打字开始的交互会话
+        const HU = (over = {}) => ({ type: "user", entrypoint: "cli", origin: { kind: "human" }, promptSource: "typed", message: { role: "user", content: "把这批收个尾" }, ...over });
+        const AS = { type: "assistant", entrypoint: "cli", message: { role: "assistant", content: [{ type: "text", text: "做完了" }] } };
+        const turnOf = (opener) => [HU({ message: { role: "user", content: "先前那句" } }), AS, opener, AS];
+        const relay = (over = {}) => ({ root: tmp, sid: SID, entries: turnOf(HU()), env: {}, ...over });
+        const kicks = (s) => s.includes("additionalContext");
+        const boxed = (sid = SID) => takeHints(tmp, sid).n;
+        // 读端还没在本会话跑过 ⇒ 不寄存
+        const noRx = capture(() => emit(hint, 0, { hintRelay: relay() }));
+        sc("305 读端不在场(开工钩子没接 / 没跑过)⇒ 老通道照送、不寄存", `${kicks(noRx)}:${boxed()}`, "true:0");
+        markHintReceiver(tmp, SID);
+        const deferred = capture(() => emit(hint, 0, { hintRelay: relay() }));
+        sc("305 交互会话 + 读端在场:只提示 ⇒ 对模型零输出(不续轮)", deferred.trim(), "");
+        const got = takeHints(tmp, SID);
+        sc("305 寄存的是原提示全文(标题行、命中行、CEILING 行都在)",
+          [got.n, got.text.includes("收尾闭环闸命中 1 项"), got.text.includes("[DRIFT] 文档漂移"), got.text.includes("CEILING")].join(":"), "1:true:true:true");
+        got.commit();
+        sc("305 取走并 commit 之后信箱空(同一条只送一次)", boxed(), 0);
+        // 无头 / 拿不准 ⇒ 老通道
+        sc("305 无头会话(sdk-cli)⇒ 老通道照送、不寄存", `${kicks(capture(() => emit(hint, 0, { hintRelay: relay({ entries: [{ entrypoint: "sdk-cli" }] }) })))}:${boxed()}`, "true:0");
+        sc("305 转录里认不出入口 ⇒ 老通道(拿不准宁可多送)", `${kicks(capture(() => emit(hint, 0, { hintRelay: relay({ entries: [{ type: "user" }] }) })))}:${boxed()}`, "true:0");
+        sc("305 没有会话号 ⇒ 老通道", kicks(capture(() => emit(hint, 0, { hintRelay: relay({ sid: undefined }) }))), true);
+        // 开关退回老行为
+        sc("305 开关 STOP_CLOSURE_HINT_DEFER=0 ⇒ 老通道照送、不寄存",
+          `${kicks(capture(() => emit(hint, 0, { hintRelay: relay({ env: { STOP_CLOSURE_HINT_DEFER: "0" } }) })))}:${boxed()}`, "true:0");
+        // 档位:只有「只提示」档才延后
+        sc("305 阻断档被连撞降级成提示 ⇒ 不延后(老通道,当轮送)", `${kicks(capture(() => emit(boom, 99, { hintRelay: relay() })))}:${boxed()}`, "true:0");
+        const both = capture(() => emit([...boom, ...hint], 0, { hintRelay: relay() }));
+        sc("305 与阻断同轮 ⇒ 照旧随阻断说明一起出(只出这一份)、不寄存", `${both.includes('"decision":"block"')}:${both.includes("同时提示")}:${boxed()}`, "true:true:0");
+        sc("305 提示里有没判成的项(unknown)⇒ 不延后", `${kicks(capture(() => emit([{ id: "A", block: false, unknown: true, msg: "账读不出" }], 0, { hintRelay: relay() })))}:${boxed()}`, "true:0");
+        sc("305 hintDeferWhy:阻断档(被开关降成提示的也算)不延后", hintDeferWhy([{ id: "K", block: true, msg: "x" }], { ...relay(), yielding: false }), "含阻断档");
+        sc("305 hintDeferWhy:全是只提示档 + 交互 + 读端在场 ⇒ 可延后", hintDeferWhy(hint, { ...relay(), yielding: false }), null);
+        sc("305 hintDeferWhy:档位取自命中的 block 字段,不按规则名单", hintDeferWhy([{ id: "随便什么新规则", block: false, msg: "x" }], { ...relay(), yielding: false }), null);
+        // 批 305 回修(用户裁定):只在人发起的那一轮寄存;没有人发消息的自动续轮 ⇒ 老通道当轮送。拿不准一律不寄存。
+        const why = (entries) => hintDeferWhy(hint, { ...relay({ entries }), yielding: false });
+        const NOT_HUMAN = "本轮不是人发起的";
+        sc("305 回修 人打字开始的轮 ⇒ 可寄存", why(turnOf(HU())), null);
+        sc("305 回修 人排队插话开始的轮 ⇒ 可寄存", why(turnOf(HU({ promptSource: "queued" }))), null);
+        sc("305 回修 人敲斜杠命令开始的轮(无来源标记的 <command-name> 行)⇒ 可寄存",
+          why(turnOf({ type: "user", entrypoint: "cli", message: { role: "user", content: "<command-message>kplan</command-message>\n<command-name>/kplan</command-name>" } })), null);
+        sc("305 回修【反向】后台任务通知开始的轮 ⇒ 不寄存", why(turnOf(HU({ origin: { kind: "task-notification" }, promptSource: "system", message: { role: "user", content: "<task-notification>done</task-notification>" } }))), NOT_HUMAN);
+        sc("305 回修【反向】后台任务通知(老形态,无来源标记)开始的轮 ⇒ 不寄存", why(turnOf({ type: "user", entrypoint: "cli", message: { role: "user", content: "<task-notification>\n<status>completed</status>" } })), NOT_HUMAN);
+        sc("305 回修【反向】子代理 / 跨会话消息开始的轮 ⇒ 不寄存", why(turnOf(HU({ origin: { kind: "peer" }, promptSource: "system", message: { role: "user", content: "<agent-message from=\"x\">回件</agent-message>" } }))), NOT_HUMAN);
+        sc("305 回修【反向】跨会话消息(老形态)开始的轮 ⇒ 不寄存", why(turnOf({ type: "user", entrypoint: "cli", message: { role: "user", content: "<cross-session-message from=\"y\">hi</cross-session-message>" } })), NOT_HUMAN);
+        sc("305 回修【反向】自动续跑开始的轮 ⇒ 不寄存", why(turnOf(HU({ origin: { kind: "auto-continuation" }, promptSource: "system", message: { role: "user", content: "continue" } }))), NOT_HUMAN);
+        sc("305 回修【反向】来源不认识的轮(例:定时唤醒落成新的来源)⇒ 不寄存", why(turnOf(HU({ origin: { kind: "scheduled-wakeup" }, promptSource: "system", message: { role: "user", content: "/loop tick" } }))), NOT_HUMAN);
+        sc("305 回修【反向】没有来源标记的纯文字(认不出是谁发的)⇒ 不寄存", why(turnOf({ type: "user", entrypoint: "cli", message: { role: "user", content: "定时提醒:看一眼部署" } })), NOT_HUMAN);
+        sc("305 回修【反向】闸的反馈让模型续的那一轮(本轮从 Stop hook feedback 之后起算)⇒ 不寄存",
+          why([HU(), AS, { type: "user", entrypoint: "cli", message: { role: "user", content: "Stop hook feedback:\n收尾闸阻断 1 项" } }, AS]), NOT_HUMAN);
+        sc("305 回修【反向】起点定位不到(转录里没有任何消息行)⇒ 不寄存", why([AS, AS]), NOT_HUMAN);
+        sc("305 回修【反向】人开的头、轮中来了后台任务通知(本轮起点 = 那条通知)⇒ 不寄存",
+          why([HU(), AS, HU({ origin: { kind: "task-notification" }, promptSource: "system", message: { role: "user", content: "<task-notification>x</task-notification>" } }), AS]), NOT_HUMAN);
+        sc("305 回修【反向】中断标记开头的轮 ⇒ 不寄存(不是一条消息)", why(turnOf({ type: "user", entrypoint: "cli", message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user]" }] } })), NOT_HUMAN);
+        sc("305 回修 turnOpenedByHuman:无头提示词(sdk)与空转录 ⇒ 假", [turnOpenedByHuman([HU({ promptSource: "sdk", turnOrigin: "sdk" })]), turnOpenedByHuman([]), turnOpenedByHuman(null)].join(":"), "false:false:false");
+        sc("305 回修 turnBoundary 与 lastTurn 同一切点:消息 / 闸反馈之后 / 定位不到",
+          [turnBoundary(turnOf(HU())).by, turnBoundary(turnOf(HU())).start, lastTurn(turnOf(HU())).length,
+            turnBoundary([HU(), AS, { type: "user", message: { role: "user", content: "Stop hook feedback:\nx" } }, AS]).by, turnBoundary([AS]).by].join(":"), "message:2:2:hook:none");
+        {
+          const notif = turnOf(HU({ origin: { kind: "task-notification" }, promptSource: "system", message: { role: "user", content: "<task-notification>x</task-notification>" } }));
+          sc("305 回修【反向】全程:后台任务通知开始的轮,读端在场也走老通道当轮送、不寄存",
+            `${kicks(capture(() => emit(hint, 0, { hintRelay: relay({ entries: notif }) })))}:${boxed()}`, "true:0");
+        }
+        // 寄存不成 ⇒ 退回老通道(不能既不寄存又不送)
+        fs.writeFileSync(hintBoxFile(tmp, SID), "{坏的");
+        sc("305 信箱坏了寄存不成 ⇒ 老通道照送", kicks(capture(() => emit(hint, 0, { hintRelay: relay() }))), true);
+        // 离线(回放 / --dry-run:不 live、不注入)⇒ 行为与改前逐字相同
+        sc("305 离线形态不寄存、照旧输出", kicks(capture(() => emit(hint, 0))), true);
+      } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 清不掉不影响 */ } }
+    }
 
     // ⚠️ **跨轮窗口必须真的接上**(2026-08-20 实撞:`priorEntries` 从落地起就没被
     //   生产路径喂过 ⇒ `ctx.window()` 恒为 null ⇒ I 项那条「窗口放宽到批」的修法是死代码)。
@@ -4968,6 +5157,37 @@ function selfTest() {
       sc("D45:外层 catch fail-open ⇒ 子进程真实退出码 0", code, 0);
       sc("D45:崩溃不隐身(additionalContext 求救行)", out.includes("收尾闸自身未完成"), true);
       sc("D45:崩溃到达用户(systemMessage)", out.includes("自身崩了"), true);
+    }
+    // ── 批 305:误报表首行的口径句(子进程真跑 `--fp-report`;空目录 ⇒ 不读真台账)──
+    //   这张表只数「被申诉过的拦截」,没有这句,读表的人会把它当成全部拦截的准确率。
+    //   `--hot` 形态(batch-goal 开批时读)首行同样带;batch-goal 在列待修行时把它转出。
+    {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "fp-scope-st-"));
+      const rep = (extra) => {
+        try {
+          return execFileSync(process.execPath, ["--no-warnings", process.argv[1], "--fp-report", ...extra], {
+            cwd: tmp, encoding: "utf8", timeout: 30_000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
+          });
+        } catch (e) { return "ERR:" + String(e.stdout || ""); }
+      };
+      const WANT = "口径:只统计被申诉过的拦截,不是全部拦截的准确率;没人申诉的拦截不在这张表里。";
+      const full = rep([]);
+      sc("305 误报表:--fp-report 首行是口径句", full.split("\n")[0], WANT);
+      sc("305 误报表:口径句只出一次", full.split(WANT).length - 1, 1);
+      sc("305 误报表:原有内容照旧在(报警分母行、RECALL 行、表头)",
+        [/^报警分母: /m, /^RECALL=UNKNOWN/m, /^规则  报警  误报  误报率/m].map((re) => (re.test(full) ? 1 : 0)).join(""), "111");
+      sc("305 误报表:--hot 形态首行同样是口径句", rep(["--hot"]).split("\n")[0], WANT);
+      sc("305 误报表:导出常量与印出的一致", FP_SCOPE_NOTE, WANT);
+      // 「只提示」延后送达的丢弃账要有必经读点:结清时整表转出 ⇒ 这一行跟着到模型眼前。没有丢弃 ⇒ 不出这一行。
+      sc("305 误报表:没有丢弃账 ⇒ 不出「没送到模型」行", full.includes("只提示延后送达"), false);
+      fs.mkdirSync(path.join(tmp, ".claude"), { recursive: true });
+      fs.writeFileSync(path.join(tmp, ".claude", ".gate-hints-dropped.jsonl"),
+        [{ ts: "2026-11-16T08:00:00.000Z", reason: "expired", n: 2, ids: ["B", "C"] }, { ts: "2026-11-17T09:00:00.000Z", reason: "corrupt", n: null }].map((r) => JSON.stringify(r)).join("\n") + "\n");
+      const withDrops = rep([]);
+      sc("305 误报表:有丢弃账 ⇒ 末尾汇总一行(次数、条数、最近一次)",
+        /^只提示延后送达:2 次共 3 条没送到模型就丢弃了.*2026-11-17T09:00/.test(withDrops.trim().split("\n").pop() || ""), true);
+      sc("305 误报表:--hot 形态不出这一行(开批只读待修行)", rep(["--hot"]).includes("只提示延后送达"), false);
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 清不掉不影响 */ }
     }
   }
 
@@ -5663,7 +5883,8 @@ function selfTest() {
           execFileSync("git", ["init", "-q", other], { windowsHide: true, stdio: "ignore" });
         } catch { other = null; }
         if (DP && other && fs.existsSync("scripts/verify-prod.mjs")) {
-          const hit = (cmd) => DP.detect({ bashCmds: [cmd], hookCheckout: here }).length > 0 ? 1 : 0;
+          // 批 305:私仓名改读安装方名单(ctx.installNames.privateRepos)——「按 URL 推私仓 ⇒ 照算」那条要带名单才成立
+          const hit = (cmd) => DP.detect({ bashCmds: [cmd], hookCheckout: here, installNames: { deployScripts: [], privateRepos: ["app-private"] } }).length > 0 ? 1 : 0;
           hp("285 D161① DP:别仓 cd 后推 / 别仓 cd 后裸推 / git -C 别仓 ⇒ 不计",
             [`cd ${other} && git push private main`, `cd "${other}" && git push`, `git -C ${other} push private main`].map(hit).join(""), "000");
           hp("285 D161① DP:再 cd 回本仓 / || / 管道 / 后台 & / GIT_DIR / 包装器里 cd / -C 回本仓 / 按 URL 推私仓 / 子 shell 首段 ⇒ 照算",
@@ -5674,6 +5895,103 @@ function selfTest() {
           hp("285 D161① DP:本仓目录 cd 后推照算", hit(`cd ${here} && git push private`), 1);
         } else hp("285 D161① DP 证人:临时仓起不来或缺 verify-prod(公开树)⇒ 跳过", true, true);
         try { if (other) fs.rmSync(other, { recursive: true, force: true }); } catch { /* 临时目录清不掉不影响判定 */ }
+      }
+      // 批 305:DP 的「这一段点了安装方自己的私仓 ⇒ 不算推去别仓」短路,改读安装方名单(privateRepos)里的确切仓名,且只在远端那一格上认。
+      //   ① 纯函数面(取格 / 取名 / 比名)不需要临时仓;② 去向面要真的别仓目录:起两个临时 git 仓——「本仓」里放一个探针桩
+      //   (DP 在没有 scripts/verify-prod.mjs 的树里按设计整条退场,公开树即如此),进程切进去跑,跑完切回。
+      //   ③ 变异经 `_dp.detect` 的 privHit 注入口换形态,断言同一组命令的读数**变了**(拧断就红);写不进静态夹具的理由同上一组。
+      {
+        const DP = RULES.find((r) => r.id === "DP");
+        const D = DP && DP._dp;
+        const NAMES = ["app-private"];
+        if (D) {
+          hp("305 DP 取名:地址末段去 .git / 去结尾斜杠 / scp 形 / 引号 / 反斜杠路径 / 远端名原样",
+            ["https://github.com/x/app-private.git", "https://github.com/x/app-private/", "git@github.com:x/app-private.git", "git@host:app-private.git",
+              "\"https://github.com/x/app-private.git\"", "'D:\\srv\\app-private.git'", "app-private", "../app-private/", "https://u:p@host/x/app-private.git/"]
+              .map((t) => D.repoNameOf(t)).join(" "), Array(9).fill("app-private").join(" "));
+          hp("305 DP 取名:地址后紧贴重定向符 / 逗号 / 续行符 / 分号 / 管道都算结束",
+            ["https://github.com/x/app-private.git>push.log", "https://github.com/x/app-private.git>logs/push.log", "https://github.com/x/app-private.git,",
+              "https://github.com/x/app-private.git\\", "https://github.com/x/app-private.git;", "https://github.com/x/app-private|tee", "https://github.com/x/app-private.git2>&1"]
+              .map((t) => D.repoNameOf(t)).join(" "), "app-private app-private app-private app-private app-private app-private app-private.git2");
+          hp("305 DP 取名:取不出 ⇒ null(null / 空串 / 只有符号)", [D.repoNameOf(null), D.repoNameOf(""), D.repoNameOf(">x.log")], [null, null, null]);
+          const sp = (cmd, names = NAMES) => (D.segPushesPrivate(cmd, names) ? 1 : 0);
+          hp("305 DP 远端格:按地址推名单里的仓(带 .git / 紧贴重定向 / 引号 / 大小写不同 / --repo= / --repo 空格 / -o 取值后 / 带路径的 git / git -C)⇒ 认",
+            ["git push https://github.com/x/app-private.git master", "git push https://github.com/x/app-private.git>push.log master", "git push \"https://github.com/x/app-private.git\" master",
+              "git push https://github.com/x/APP-Private master", "git push --repo=https://github.com/x/app-private.git", "git push --repo git@github.com:x/app-private.git",
+              "git push -o ci.skip https://github.com/x/app-private.git main", "/usr/bin/git push https://github.com/x/app-private.git", "git -C E:/x push https://github.com/x/app-private.git"]
+              .map((c) => sp(c)).join(""), "111111111");
+          hp("305 DP 远端格:远端名恰好等于名单里的名字 ⇒ 认;只是相像(前后多字)⇒ 不认",
+            ["git push app-private main", "git push app-private", "git push my-app-private main", "git push app-private-mirror main", "git push app-private2 main"].map((c) => sp(c)).join(""), "11000");
+          hp("305 DP 远端格:别人的 -private 仓 / 分支名 / refspec / -o 的值 / 提交信息 / 别的子命令里出现同样的字 ⇒ 不认",
+            ["git push https://github.com/acme/notes-private.git main", "git push origin feature/keep-notes-private", "git push origin feature/app-private", "git push origin app-private",
+              "git push upstream main:refs/heads/app-private", "git push -o note=app-private upstream main", "git commit -m \"push to app-private later\"",
+              "git remote add app-private https://github.com/x/app-private.git", "gh repo view x/app-private", "git push https://github.com/x/app-private-mirror.git main",
+              "git push https://github.com/app-private/tools.git main"].map((c) => sp(c)).join(""), "00000000000");
+          hp("305 DP 远端格:名单为空 / 不是数组 ⇒ 一律不认", [sp("git push https://github.com/x/app-private.git", []), sp("git push app-private", null), sp("git push app-private", "app-private")], [0, 0, 0]);
+          hp("305 DP 远端格:名单里多个名字都认,脏项(非字符串 / 空串)丢掉", [sp("git push git@host:x/second-repo.git", ["app-private", 1, "", "second-repo"]), sp("git push app-private", [null, "app-private"])], [1, 1]);
+        }
+        const cwd0 = process.cwd();
+        let home = null, other = null;
+        try {
+          home = fs.mkdtempSync(path.join(os.tmpdir(), "dp305-home-")).replace(/\\/g, "/");
+          other = fs.mkdtempSync(path.join(os.tmpdir(), "dp305-other-")).replace(/\\/g, "/");
+          execFileSync("git", ["init", "-q", home], { windowsHide: true, stdio: "ignore" });
+          execFileSync("git", ["init", "-q", other], { windowsHide: true, stdio: "ignore" });
+          fs.mkdirSync(`${home}/scripts`, { recursive: true });
+          fs.writeFileSync(`${home}/scripts/verify-prod.mjs`, "// 自测桩:只为让 DP 判「探针在场」\n");
+        } catch { home = null; }
+        if (D && home && other) {
+          try {
+            process.chdir(home);
+            const run = (names, opt) => (cmd) => (D.detect({ bashCmds: [cmd], hookCheckout: home, ...(names === undefined ? {} : { installNames: { deployScripts: [], privateRepos: names } }) }, opt).length > 0 ? 1 : 0);
+            const hit = run(NAMES);
+            // 不追探针:别仓里推的不是名单里的仓(哪怕名字以 -private 结尾、哪怕分支 / refspec / 选项值里出现名单里的字)
+            const AWAY = [
+              `cd ${other} && git push https://github.com/acme/notes-private.git main`,
+              // 远端名用 upstream:origin / custodiet 是「确知公开」的字面名,推它们本来就不算,当不了证人
+              `cd ${other} && git push upstream feature/keep-notes-private`,
+              `cd ${other} && git push upstream feature/app-private`,
+              `cd ${other} && git push upstream main:refs/heads/app-private`,
+              `cd ${other} && git push -o note=app-private upstream main`,
+              `cd ${other} && git push https://github.com/x/app-private-mirror.git main`,
+              `git -C ${other} push https://github.com/acme/notes-private.git`,
+            ];
+            // 仍然追:别仓里按地址 / 按远端名推的就是名单里的仓
+            const MINE = [
+              `cd ${other} && git push https://github.com/x/app-private.git master`,
+              `cd ${other} && git push https://github.com/x/app-private.git>push.log master`,
+              `cd ${other} && git push app-private main`,
+              `cd ${other} && git push git@github.com:x/app-private.git`,
+              `cd ${other} && git push "https://github.com/x/App-Private" master`,
+              `cd ${other} && git push --repo=https://github.com/x/app-private.git`,
+              `git -C ${other} push https://github.com/x/app-private/ master`,
+              `cd ${other} && git push https://github.com/x/app-private.git 2>&1 | tail -3`,
+            ];
+            const vec = (f, xs) => xs.map(f).join("");
+            hp("305 DP 别仓:推别人的 -private 仓 / 分支名 / refspec / 选项值里带名单里的字 / 近名仓 ⇒ 不追探针", vec(hit, AWAY), "0000000");
+            hp("305 DP 别仓:按地址推名单里的私仓(含紧贴 >push.log、scp 形、引号大小写、--repo=、结尾斜杠、后接管道)/ 远端名恰为名单里的名字 ⇒ 仍然追", vec(hit, MINE), "11111111");
+            hp("305 DP 别仓:名单为空 / 没接名单通道 ⇒ 短路不生效(按地址推那个仓也不追),别仓判定照旧",
+              [vec(run([]), MINE), vec(run(undefined), MINE)], ["00000000", "00000000"]);
+            hp("305 DP 本仓:不在别仓时名单不影响结论(推别人的 -private 仓照算;推公开远端照放)",
+              [hit("git push https://github.com/acme/notes-private.git main"), hit("git push app-private main"), hit("git push origin main"), run([])("git push https://github.com/acme/notes-private.git main")], [1, 1, 0, 1]);
+            // 变异:各拧断一处,上面两组读数必须变(拧断就红)
+            const FAMILY = (s) => /[\/:][\w.-]+-private(?:\.git)?(?=$|[\s"'])/i.test(s);
+            const mut = {
+              "退回:私仓名按一族认(整段里找 <名>-private,0.10.1 的写法)": { privHit: FAMILY },
+              "松:不读名单(短路恒不生效)": { privHit: () => false },
+              "松:名字在整段里找(不限远端那一格)": { privHit: (s, names) => names.some((n) => String(s).toLowerCase().includes(n.toLowerCase())) },
+              "严:取名不认地址后紧贴的符号(重定向符 / 逗号 / 续行符)": { privHit: (s, names) => D.pushRemoteToks(s, /git/i).some((t) => typeof t === "string" && names.includes(t.replace(/^["']|["']$/g, "").replace(/\/+$/, "").replace(/\.git$/i, "").split(/[/:]/).pop().toLowerCase())) },
+              "严:比名分大小写": { privHit: (s, names) => D.pushRemoteToks(s, /git/i).some((t) => names.includes(D.repoNameOf(t))) },
+            };
+            for (const [name, opt] of Object.entries(mut)) {
+              const got = [vec(run(NAMES, opt), AWAY), vec(run(NAMES, opt), MINE)].join(" ");
+              hp(`305 DP 变异「${name}」⇒ 读数变(实得 ${got})`, got !== "0000000 11111111", true);
+            }
+            hp("305 DP 变异读数逐条钉(防「变了但不是因为它」):一族认 ⇒ 别人的 -private 仓 / -private 结尾的分支被追、紧贴重定向的认不出",
+              [vec(run(NAMES, mut["退回:私仓名按一族认(整段里找 <名>-private,0.10.1 的写法)"]), AWAY.slice(0, 3)), run(NAMES, { privHit: FAMILY })(MINE[1])], ["111", 0]);
+          } finally { process.chdir(cwd0); }
+        } else hp("305 DP 别仓证人:临时仓起不来 ⇒ 跳过", true, true);
+        for (const d of [home, other]) { try { if (d) fs.rmSync(d, { recursive: true, force: true }); } catch { /* 临时目录清不掉不影响判定 */ } }
       }
       // 批 266:原样装入的闸引擎(安装清单核对)。假 git:按 `<sha>:<path>` 返回树里的内容
       {
@@ -6028,11 +6346,16 @@ function selfTest() {
   let wsPass = 0, wsTotal = 0;
   try { const r = writeStateSelfTest({ quiet: true }); wsPass = r.pass; wsTotal = r.total; }
   catch (e) { console.log(`FAIL  write-state 自测跑不起来:${e && e.message}`); wsTotal = 1; }
+  // 批 305:「只提示」延后送达的寄存 / 取走 / 过期记账自测(lib/gate-hint-relay.mjs;同上,经本文件自测进验收链)
+  let hrPass = 0, hrTotal = 0;
+  try { const r = hintRelaySelfTest({ quiet: true }); hrPass = r.pass; hrTotal = r.total; }
+  catch (e) { console.log(`FAIL  gate-hint-relay 自测跑不起来:${e && e.message}`); hrTotal = 1; }
 
   console.log(`\n自测 ${pass}/${cases.length}` +
     (carrTotal ? ` · 载体分类 ${carrPass}/${carrTotal}` : "") +
     (dfTotal ? ` · 欠账事实 ${dfPass}/${dfTotal}` : "") +
     (wsTotal ? ` · 写入三态 ${wsPass}/${wsTotal}` : "") +
+    (hrTotal ? ` · 只提示延后 ${hrPass}/${hrTotal}` : "") +
     (seamTotal ? ` · 接缝 ${seamPass}/${seamTotal}` : "") +
     (cxTotal ? ` · codex 账 ${cxPass}/${cxTotal}` : "") +
     (escTotal ? ` · 逃生口 ${escPass}/${escTotal}` : "") +
@@ -6044,7 +6367,7 @@ function selfTest() {
   return (pass === cases.length && driftPass === driftTotal && probePass === probeTotal
     && partPass === partTotal && hpPass === hpTotal && seamPass === seamTotal && escPass === escTotal
     && cxPass === cxTotal
-    && lawPass + (lawObserve ? lawSide : 0) === lawTotal && carrPass === carrTotal && dfPass === dfTotal && wsPass === wsTotal) ? 0 : 1;
+    && lawPass + (lawObserve ? lawSide : 0) === lawTotal && carrPass === carrTotal && dfPass === dfTotal && wsPass === wsTotal && hrPass === hrTotal) ? 0 : 1;
 }
 
 // ── main
@@ -6150,6 +6473,7 @@ if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
       }
       return { rows, bad };
     };
+    console.log(FP_SCOPE_NOTE);   // 批 305:首行口径句(`--hot` 同样带;原有内容从第二行起不变)
     // D1/批 102:报表前先验链——断链不瞒报,红行打在报表头(完整性告警的默认路径)
     for (const lf of [".claude/.gate-alerts.jsonl", LEDGER]) {
       try {
@@ -6206,6 +6530,12 @@ if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
     // 窗口注写在「← 下一批待修」之前:batch-goal 只剥行尾那个标记(batch-goal.mjs 读 --hot 的那段)
     const winNote = (r) => (r.since ? `  [判据窗口起 ${r.since.slice(0, 16)}Z;全量 报警 ${r.all.alerts} 误报 ${r.all.fp} ${(r.all.rate * 100).toFixed(1)}%]` : "");
     for (const r of tbl) if (!hotOnly || r.hot) console.log(`${hotOnly ? "待修 " : ""}${r.id.padEnd(4)}  ${String(r.alerts).padStart(4)}  ${String(r.fp).padStart(4)}  ${(r.rate * 100).toFixed(1).padStart(5)}%  ${String(r.confirmed).padStart(12)}${winNote(r)}  ${r.hot ? "← 下一批待修" : ""}`);
+    // 批 305:「只提示」延后送达时没送到模型就丢弃的(过期没人取 / 信箱损坏),在这里汇总一行——结清时整表转出,是它的必经读点。
+    //   没有丢弃 ⇒ 不出这一行。失效条件:连续 5 批这行一直是零 ⇒ 这行可撤,丢弃账照留。
+    if (!hotOnly) {
+      const d = hintDropSummary(".");
+      if (d.times) console.log(`\n只提示延后送达:${d.times} 次共 ${d.hints} 条没送到模型就丢弃了(寄存后过期没人取,或信箱损坏;最近一次 ${d.last.slice(0, 16)}Z;明细 .claude/.gate-hints-dropped.jsonl)`);
+    }
   }
   process.exit(0);
 }

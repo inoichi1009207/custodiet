@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.11.0 — 2026-11-21
+
+主题：**把已有的件往「一句话交出去、活自己跑到关账」那条线上接了四处；两处写成「一族名字」的判据改读安装方配置**。
+
+- **开批记指令与主尺**(`batch-goal`)：`--arm` 新增只记录、不阻断的旗标 `--instruction "<原话>"`(可另给 `--instruction-session` / `--instruction-at`)、`--finish-line`、`--cap-usd`、`--deadline`；`--status` 显示它们。`--clear` 成功时打印主尺——从那句指令到关账，人亲口说了几条话，按类型分项——并记进 clear 行；新增只读的 `--ruler`。口径是上界：不区分纠正、拍板、问进度；跨会话续跑只数读得到的转录；量不出时照实写「量不出(原因)」，不拒绝关账。新文件 `scripts/lib/batch-ruler.mjs`。
+- **工作树里开的批并进同一批**：在 git worktree 里 `--arm` / `--clear`，另记一份到主 checkout 的 `.claude/.batch-goal.worktrees.jsonl`(带 hash 链)，主树 `--history` 一并显示。
+- **`batch-goal --handoff [--out <路径>]`**：从事实生成交接文件——分支与 HEAD、未推送数、全部 worktree、批状态、在跑或未读的外部作业、到期欠账。每一段拿不到就写「取不到(原因)」，不含叙述。
+- **「只提示」不再单独把模型叫回来**：Stop 钩子的 `additionalContext` 会让模型再走一轮。现在交互会话里、由人亲口说的一条消息开始的那一轮，「只提示」档先寄存，随下一条用户消息送达，只送一次。后台任务回报、子代理或跨会话消息、自动续跑开始的轮，无头会话，没接开工钩子的仓，以及含阻断档或没判成的项时，照旧当轮送。`STOP_CLOSURE_HINT_DEFER=0` 退回老行为。已知代价：会话最后一轮寄存的提示，用户清屏或退出就没人看到；超期 7 天的记进 `.claude/.gate-hints-dropped.jsonl`，`--fp-report` 末尾汇总。新文件 `scripts/lib/gate-hint-relay.mjs`。任何规则的判决不变。
+- **误报表口径**：`--fp-report` 首行写明「只统计被申诉过的拦截，不是全部拦截的准确率」。
+- **`codex-run` 发车前看一眼任务书**(只提醒，不拦)：`--task` 发车时检查任务书的形——有没有以「用途」「完成标准」开头的段、结论选项里有没有「不用再审」、审设计类是否不超过 5 个编号问题且不超过 25 行。没过照常发车，stderr 打出缺哪条和怎么补；检查结果记进作业台账(`taskbookCheck` = pass / warn / skipped)。新旗标：`--skeleton [design|fact]` 出任务书骨架，`--check-taskbook <文件>` 只判不发(不过退出 4)，`--fact-check` 免长度那一条，`--no-taskbook-check` 连提醒也不要。只看形，不判内容。
+- **第二轮回件提示先派方向复核**：结果文件是 `<slug>-r<n>.md` 且 n ≥ 2 时，取回件的命令在 stderr 多打一行提示；stdout 的机器块与末行格式不变。
+- **W：部署脚本名读安装方配置**。`gate-install.json` 新键 `deployScripts`(部署脚本的文件名，带扩展名、不带目录)。W 判「生产内容写入」时，部署脚本那一支只认名单里的确切文件名(整名，不分大小写)；没配就不响。0.10.x 按 `deploy-<名>.<脚本扩展名>` 一族认，`src/lib/deploy-utils.ts`、名单外的 `deploy-staging.sh` 都会被当成生产写入，现在不会了。省略扩展名的调用仍不认(已登记的天花板)。
+- **DP：私仓名读安装方配置**。新键 `privateRepos`(私仓仓名，不带属主、不带 `.git`)。「点了私仓名就不算推去别仓」只认名单里的确切仓名，且只在远端那一格上认：别人的 `-private` 仓、`-private` 结尾的分支不再追欠账探针；地址后紧贴重定向符的写法现在认得出。没配这条短路就不生效。
+- **配置写错不判坏整份**：两个新键缺失、类型不对、带目录或带属主，都按空名单处理，`batch-goal --status` 出一行告警。
+- **回放器读名单**：`gate-replay` 读工作树根的两份名单、注入改前改后两版，摘要报名单个数。
+- **接口变动**：`gate-carriers` 删掉导出 `CONTENT_WRITE_RE`，新增 `contentWriteRe(names)` / `quotedContentWritePathRe(names)`；`hook-stop-closure` 新增导出 `readInstallNames()`、`emit`、`hintDeferWhy`、`turnBoundary`；ctx 多一个字段 `installNames`。
+- **升级时要做的**：在安装方的 `gate-install.json` 里加上 `deployScripts` 与 `privateRepos`，否则 W 的部署脚本那一支和 DP 的私仓短路会静默关掉。
+- **已知限制**：规则 W 判「外审到没到场」只看命令里有没有 `codex-run.mjs`，所以只出骨架(`--skeleton`)或只判不发(`--check-taskbook`)也会被算成外审到场——老问题，这一版新增了两种不发车的调用形，待改成按作业记录判。
+
 ## 0.10.1 — 2026-11-16
 
 主题：**收窄 0.10.0 里两处写宽了的通用形**。把 0.10.0 装回源头项目后，用回放器对比装前装后（1500 个随机回合加 1655 个定向回合），W 多拦了 2 个回合。
