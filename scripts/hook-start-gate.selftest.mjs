@@ -336,7 +336,10 @@ try {
     process.stdout.write = (s) => { buf += String(s); return true; }; process.stderr.write = () => true;
     try { fn(); } finally { process.stdout.write = w; process.stderr.write = e; } return buf; };
   const hintF = [{ id: "DRIFT", block: false, msg: "文档漂移(全程自测)" }];
-  const stopAs = (sid, over = {}) => capture(() => stopHook.emit(hintF, 0, { hintRelay: { root: dir, sid, entries: [{ entrypoint: "cli" }], env: {}, ...over } }));
+  // 批 305 回修:寄存还要「本轮由人亲口说的一条消息开始」⇒ 缺省转录是一轮人打字开始的交互会话
+  const humanTurn = [{ type: "user", entrypoint: "cli", origin: { kind: "human" }, promptSource: "typed", message: { role: "user", content: "收个尾" } },
+    { type: "assistant", entrypoint: "cli", message: { role: "assistant", content: [{ type: "text", text: "好" }] } }];
+  const stopAs = (sid, over = {}) => capture(() => stopHook.emit(hintF, 0, { hintRelay: { root: dir, sid, entries: humanTurn, env: {}, ...over } }));
   const firstStop = stopAs("z1");
   check("Z1 会话还没发过消息(读端没跑过)⇒ 收尾钩子走老通道", firstStop.includes("additionalContext"), true);
   run(msg("z1"));
@@ -349,6 +352,13 @@ try {
   check("Z5 无头会话:收尾钩子照旧当轮送,下一条消息没有重复件", [z5.includes("additionalContext"), run(msg("z1")).ctx].join(":"), "true:");
   const z6 = stopAs("z1", { env: { STOP_CLOSURE_HINT_DEFER: "0" } });
   check("Z6 开关关掉:收尾钩子照旧当轮送,下一条消息没有重复件", [z6.includes("additionalContext"), run(msg("z1")).ctx].join(":"), "true:");
+  // 批 305 回修:不是人发起的轮(后台任务回报 / 子代理回件)⇒ 收尾钩子当轮送,不寄存到下一条人的消息
+  const notHuman = (kind, text) => [humanTurn[0], humanTurn[1],
+    { type: "user", entrypoint: "cli", origin: { kind }, promptSource: "system", message: { role: "user", content: text } }, humanTurn[1]];
+  const z7 = stopAs("z1", { entries: notHuman("task-notification", "<task-notification>done</task-notification>") });
+  check("Z7 后台任务通知开始的轮:收尾钩子照旧当轮送,下一条消息没有重复件", [z7.includes("additionalContext"), run(msg("z1")).ctx].join(":"), "true:");
+  const z8 = stopAs("z1", { entries: notHuman("peer", "<agent-message>回件</agent-message>") });
+  check("Z8 子代理 / 跨会话消息开始的轮:同上", [z8.includes("additionalContext"), run(msg("z1")).ctx].join(":"), "true:");
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }

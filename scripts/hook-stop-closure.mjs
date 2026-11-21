@@ -984,7 +984,12 @@ function perfLine() {
 //   于是**已经纠正过的旧句被反复重判**(2026-08-19 实撞:同一句完成断言被 F 项连判三轮)。
 //   hook feedback 天然是轮次边界——它之后的输出才是「对上次拦截的回应」。
 export function lastTurn(entries) {
-  let start = 0;
+  return entries.slice(turnBoundary(entries).start);
+}
+/** 「本轮」的切点(lastTurn 的唯一实现;批 305 回修抽出,切法逐字未改)。返回 { start, by }:
+ *  by = "message"(边界①:entries[start] 就是开启本轮的那条消息行)/ "hook"(边界②②′③:从闸的输出或被拦的 Stop 之后起算)/
+ *  "none"(找不到边界,取全文件)。`hintDeferWhy` 据 by 与 entries[start] 认本轮由谁开始。 */
+export function turnBoundary(entries) {
   const blockedIds = blockedStopIds(entries);
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
@@ -998,7 +1003,7 @@ export function lastTurn(entries) {
     //   a2155edb BP-6:「这次 Stop 被拦没有」改由 gate-ctx 的 `isBlockedStop` 判(唯一实现,被拦后续跑的补收回扫同用它):
     //   同 toolUseID 拦截附件、或汇总行前的 feedback 行(判官型 prompt hook 只留这一种)任一即算。倒着扫先遇到的是
     //   汇总行(它在附件与 feedback 行之后),起点取它之后;没有汇总行的那次(进行中)不在这里切,与原③一致。
-    if (e.type === "system" && e.hookCount !== undefined && isBlockedStop(entries, i, blockedIds)) { start = i + 1; break; }
+    if (e.type === "system" && e.hookCount !== undefined && isBlockedStop(entries, i, blockedIds)) return { start: i + 1, by: "hook" };
     if (e.type === "system" && e.hookCount !== undefined) {
       const s = JSON.stringify(e.hookErrors || []) + JSON.stringify(e.hookAdditionalContext || "");
       // ⚠️ `i + 1` 而不是 `i`:本闸自己的输出**不得进入自己的证据窗口**。
@@ -1008,7 +1013,7 @@ export function lastTurn(entries) {
       //   更坏的是它构成**洗白链**:注入进 .batch-goal.json 的文本 → 被 K 回显进阻断消息
       //   → 落进 system 条目 → 下一轮进入 P 的证据窗口,`"name":"WebSearch"` 之类字样
       //   即可满足三通道。断掉首项就断了这条链的中段。
-      if (/收尾闸阻断|收尾闭环闸命中/.test(s)) { start = i + 1; break; }   // 边界②
+      if (/收尾闸阻断|收尾闭环闸命中/.test(s)) return { start: i + 1, by: "hook" };   // 边界②
     }
     if (e.type !== "user") continue;
     // 工具结果也记作 type:user,不算真正的用户发言
@@ -1023,16 +1028,15 @@ export function lastTurn(entries) {
     //   正是 S7 立 `i+1` 要断的那条洗白链)。同理 `i+1` 排除,反馈之后才是「对拦截的回应」。
     //   真实用户发言也可能是字符串形态 ⇒ 判据锚定 harness 固定前缀,不看正文关键词。
     // v7(codex v6 接缝 1):用户亲口打的话恰以这个前缀开头(贴报错来问)⇒ 是用户发言,走边界①,不当 hook 反馈切掉
-    if (isStopFeedbackLine(e)) { start = i + 1; break; }
+    if (isStopFeedbackLine(e)) return { start: i + 1, by: "hook" };
     // 边界②″ 已撤(2026-10-09):lanes 转投 v1 的插件消息形态已退役;v2 以 isMeta 行附全文、引擎仍落 feedback 行与附件,由②′/③认。
     //   lanes 附给模型的闸全文(isMeta 且以 Stop hook feedback: 开头)由上一行②′按 `i+1` 当边界(窗口从它之后起),不当边界①。
     //   热修红队 BP-4/9(10-09):无 origin 的 isMeta 行(技能/命令展开的正文、系统提醒)与插件消息都不是新一轮的起点
     //   ——轮中调 Skill 曾把本轮先前的 Write/Edit 整段切出窗口(真语料 45 处)。peer/task-notification/human 照旧当边界①。
     if ((e.isMeta === true && !e.origin?.kind) || e.origin?.kind === "plugin") continue;
-    start = i;                                                         // 边界①
-    break;
+    return { start: i, by: "message" };                                // 边界①
   }
-  return entries.slice(start);
+  return { start: 0, by: "none" };
 }
 
 function assistantText(entries) {
@@ -2837,6 +2841,7 @@ import { readTouched, selfTest as touchSelfTest } from "./lib/gate-touch.mjs";  
 import { observeWrites, collectInterval, ledgerRow as writeStateRow, selfTest as writeStateSelfTest } from "./lib/write-state.mjs";
 // 批 305:「只提示」延后到下一条用户消息送达(寄存端在 emit();取走端在 hook-start-gate.mjs)
 import { stashHint, takeHints, interactiveSession, receiverSeen, markReceiver as markHintReceiver, boxFile as hintBoxFile, dropSummary as hintDropSummary, selfTest as hintRelaySelfTest } from "./lib/gate-hint-relay.mjs";
+import { classifyEntry as classifyTurnEntry } from "./lib/batch-ruler.mjs";   // 批 305 回修:「本轮由谁开始」复用主尺的认人口径(唯一实现)
 // 批 305:安装方名单(gate-install.json 的 deployScripts / privateRepos)。hook 读一次、注入 ctx.installNames;规则不自读磁盘。
 import { readInstallConfig, installNames as installNamesOf, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
 /** 读**本脚本所在 checkout 根**的那份配置里的两份名单(不取进程 cwd:配置随仓走,会话可能停在别的目录)。
@@ -3471,8 +3476,8 @@ export function splitLogOnly(findings, ids = logOnlyIds()) {
  *  只延后「只提示」档:档位取自命中的 `block` 字段(引擎按规则的 `blocking` 算出),不抄规则名单——
  *    · 含阻断档的命中(连撞降级成提示的、被 STOP_CLOSURE_BLOCK_<X>=0 降成提示的)⇒ 不延后:那是「本该拦」的项,当轮就要让模型看到;
  *    · 含没判成的项(unknown)⇒ 不延后:判据坏了要当轮出声。
- *  其余条件见 lib/gate-hint-relay.mjs 头注的不变量①②:读端在场、正面认出是交互会话。拿不准一律不延后——
- *  延后了没人取 = 提示悄悄丢了(等于把「只提示」降成「只记账」);不延后只是多走一轮。
+ *  其余条件见 lib/gate-hint-relay.mjs 头注的不变量①②④:读端在场、正面认出是交互会话、本轮由人亲口说的一条消息开始。
+ *  拿不准一律不延后——延后了没人取 = 提示悄悄丢了(等于把「只提示」降成「只记账」);不延后只是多走一轮。
  *  开关:`STOP_CLOSURE_HINT_DEFER=0` 退回老行为(全部当轮送)。 */
 export function hintDeferWhy(findings, { yielding = false, root = ".", sid, entries, env = process.env } = {}) {
   if (env && env.STOP_CLOSURE_HINT_DEFER === "0") return "开关关了";
@@ -3482,8 +3487,30 @@ export function hintDeferWhy(findings, { yielding = false, root = ".", sid, entr
   if (findings.some((f) => f && f.unknown)) return "含没判成的项";
   if (!sid) return "没有会话号";
   if (!interactiveSession(entries, env)) return "认不出是交互会话";
+  if (!turnOpenedByHuman(entries)) return "本轮不是人发起的";
   if (!receiverSeen(root, sid)) return "读端不在场";
   return null;
+}
+
+/** 批 305 回修(用户裁定):「只提示」只在**人发起的那一轮**寄存。没有人发消息的自动续轮(后台任务回报、定时唤醒、
+ *  子代理 / 跨会话消息、自动续跑、闸自己的反馈让模型续的那一轮)里寄存,提示要等人的下一条消息才送到——全自动跑的批
+ *  可能从头到尾模型都看不到。所以:本轮起点(与 lastTurn 同一个切点 `turnBoundary`)必须是一条消息行(边界①),
+ *  且主尺的认人口径 `classifyEntry` 判它是人说的、类型在 HUMAN_OPENER_KINDS 里;其余一律 false(走老通道当轮送)。
+ *  不收的「人说的」类型:sdk(无头会话的提示词,无头本就不寄存)、legacy(没有来源标记——本机转录里这类几乎都是无头 /
+ *  SDK 会话的提示词,交互会话里极少,认不出是谁发的就当不是人)、interrupt(中断标记不是一条消息)。
+ *  CEILING:定时唤醒 / `/loop` 触发的轮在转录里是什么形态,本机转录未观测到;若它落成「没有来源标记的斜杠命令行」,
+ *  classifyEntry 会认作人说的斜杠命令 ⇒ 那一轮会寄存(漏看方向)。 */
+export const HUMAN_OPENER_KINDS = new Set(["typed", "queued", "slash", "bang"]);
+export function turnOpenedByHuman(entries) {
+  if (!Array.isArray(entries) || !entries.length) return false;
+  let b;
+  try { b = turnBoundary(entries); } catch { return false; }
+  if (!b || b.by !== "message") return false;            // 从闸的输出 / 被拦的 Stop 之后起算,或定位不到起点
+  const e = entries[b.start];
+  if (!e || e.type !== "user") return false;
+  let c;
+  try { c = classifyTurnEntry(e); } catch { return false; }
+  return !!(c && c.human === true && HUMAN_OPENER_KINDS.has(c.kind));
 }
 
 /** 导出只为跨钩子的全程自测(hook-start-gate.selftest.mjs 的 Z 组:真 emit 寄存 → 真开工钩子取走);生产只经下方主块调用。 */
@@ -5014,7 +5041,11 @@ function selfTest() {
       try {
         const SID = "s-305-defer";
         const hint = [{ id: "DRIFT", block: false, msg: "文档漂移\n第二行说明" }];
-        const relay = (over = {}) => ({ root: tmp, sid: SID, entries: [{ entrypoint: "cli" }], env: {}, ...over });
+        // 批 305 回修:寄存还要「本轮由人亲口说的一条消息开始」⇒ 缺省夹具是一轮人打字开始的交互会话
+        const HU = (over = {}) => ({ type: "user", entrypoint: "cli", origin: { kind: "human" }, promptSource: "typed", message: { role: "user", content: "把这批收个尾" }, ...over });
+        const AS = { type: "assistant", entrypoint: "cli", message: { role: "assistant", content: [{ type: "text", text: "做完了" }] } };
+        const turnOf = (opener) => [HU({ message: { role: "user", content: "先前那句" } }), AS, opener, AS];
+        const relay = (over = {}) => ({ root: tmp, sid: SID, entries: turnOf(HU()), env: {}, ...over });
         const kicks = (s) => s.includes("additionalContext");
         const boxed = (sid = SID) => takeHints(tmp, sid).n;
         // 读端还没在本会话跑过 ⇒ 不寄存
@@ -5043,6 +5074,35 @@ function selfTest() {
         sc("305 hintDeferWhy:阻断档(被开关降成提示的也算)不延后", hintDeferWhy([{ id: "K", block: true, msg: "x" }], { ...relay(), yielding: false }), "含阻断档");
         sc("305 hintDeferWhy:全是只提示档 + 交互 + 读端在场 ⇒ 可延后", hintDeferWhy(hint, { ...relay(), yielding: false }), null);
         sc("305 hintDeferWhy:档位取自命中的 block 字段,不按规则名单", hintDeferWhy([{ id: "随便什么新规则", block: false, msg: "x" }], { ...relay(), yielding: false }), null);
+        // 批 305 回修(用户裁定):只在人发起的那一轮寄存;没有人发消息的自动续轮 ⇒ 老通道当轮送。拿不准一律不寄存。
+        const why = (entries) => hintDeferWhy(hint, { ...relay({ entries }), yielding: false });
+        const NOT_HUMAN = "本轮不是人发起的";
+        sc("305 回修 人打字开始的轮 ⇒ 可寄存", why(turnOf(HU())), null);
+        sc("305 回修 人排队插话开始的轮 ⇒ 可寄存", why(turnOf(HU({ promptSource: "queued" }))), null);
+        sc("305 回修 人敲斜杠命令开始的轮(无来源标记的 <command-name> 行)⇒ 可寄存",
+          why(turnOf({ type: "user", entrypoint: "cli", message: { role: "user", content: "<command-message>kplan</command-message>\n<command-name>/kplan</command-name>" } })), null);
+        sc("305 回修【反向】后台任务通知开始的轮 ⇒ 不寄存", why(turnOf(HU({ origin: { kind: "task-notification" }, promptSource: "system", message: { role: "user", content: "<task-notification>done</task-notification>" } }))), NOT_HUMAN);
+        sc("305 回修【反向】后台任务通知(老形态,无来源标记)开始的轮 ⇒ 不寄存", why(turnOf({ type: "user", entrypoint: "cli", message: { role: "user", content: "<task-notification>\n<status>completed</status>" } })), NOT_HUMAN);
+        sc("305 回修【反向】子代理 / 跨会话消息开始的轮 ⇒ 不寄存", why(turnOf(HU({ origin: { kind: "peer" }, promptSource: "system", message: { role: "user", content: "<agent-message from=\"x\">回件</agent-message>" } }))), NOT_HUMAN);
+        sc("305 回修【反向】跨会话消息(老形态)开始的轮 ⇒ 不寄存", why(turnOf({ type: "user", entrypoint: "cli", message: { role: "user", content: "<cross-session-message from=\"y\">hi</cross-session-message>" } })), NOT_HUMAN);
+        sc("305 回修【反向】自动续跑开始的轮 ⇒ 不寄存", why(turnOf(HU({ origin: { kind: "auto-continuation" }, promptSource: "system", message: { role: "user", content: "continue" } }))), NOT_HUMAN);
+        sc("305 回修【反向】来源不认识的轮(例:定时唤醒落成新的来源)⇒ 不寄存", why(turnOf(HU({ origin: { kind: "scheduled-wakeup" }, promptSource: "system", message: { role: "user", content: "/loop tick" } }))), NOT_HUMAN);
+        sc("305 回修【反向】没有来源标记的纯文字(认不出是谁发的)⇒ 不寄存", why(turnOf({ type: "user", entrypoint: "cli", message: { role: "user", content: "定时提醒:看一眼部署" } })), NOT_HUMAN);
+        sc("305 回修【反向】闸的反馈让模型续的那一轮(本轮从 Stop hook feedback 之后起算)⇒ 不寄存",
+          why([HU(), AS, { type: "user", entrypoint: "cli", message: { role: "user", content: "Stop hook feedback:\n收尾闸阻断 1 项" } }, AS]), NOT_HUMAN);
+        sc("305 回修【反向】起点定位不到(转录里没有任何消息行)⇒ 不寄存", why([AS, AS]), NOT_HUMAN);
+        sc("305 回修【反向】人开的头、轮中来了后台任务通知(本轮起点 = 那条通知)⇒ 不寄存",
+          why([HU(), AS, HU({ origin: { kind: "task-notification" }, promptSource: "system", message: { role: "user", content: "<task-notification>x</task-notification>" } }), AS]), NOT_HUMAN);
+        sc("305 回修【反向】中断标记开头的轮 ⇒ 不寄存(不是一条消息)", why(turnOf({ type: "user", entrypoint: "cli", message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user]" }] } })), NOT_HUMAN);
+        sc("305 回修 turnOpenedByHuman:无头提示词(sdk)与空转录 ⇒ 假", [turnOpenedByHuman([HU({ promptSource: "sdk", turnOrigin: "sdk" })]), turnOpenedByHuman([]), turnOpenedByHuman(null)].join(":"), "false:false:false");
+        sc("305 回修 turnBoundary 与 lastTurn 同一切点:消息 / 闸反馈之后 / 定位不到",
+          [turnBoundary(turnOf(HU())).by, turnBoundary(turnOf(HU())).start, lastTurn(turnOf(HU())).length,
+            turnBoundary([HU(), AS, { type: "user", message: { role: "user", content: "Stop hook feedback:\nx" } }, AS]).by, turnBoundary([AS]).by].join(":"), "message:2:2:hook:none");
+        {
+          const notif = turnOf(HU({ origin: { kind: "task-notification" }, promptSource: "system", message: { role: "user", content: "<task-notification>x</task-notification>" } }));
+          sc("305 回修【反向】全程:后台任务通知开始的轮,读端在场也走老通道当轮送、不寄存",
+            `${kicks(capture(() => emit(hint, 0, { hintRelay: relay({ entries: notif }) })))}:${boxed()}`, "true:0");
+        }
         // 寄存不成 ⇒ 退回老通道(不能既不寄存又不送)
         fs.writeFileSync(hintBoxFile(tmp, SID), "{坏的");
         sc("305 信箱坏了寄存不成 ⇒ 老通道照送", kicks(capture(() => emit(hint, 0, { hintRelay: relay() }))), true);
