@@ -10,5 +10,6 @@
 .claude/.p-head/
 .claude/.gate-replay/
 .claude/.gate-pending-hints/
+.claude/.start-ctx-seen/
 .claude/.gate-hints-dropped.jsonl
 node_modules/

@@ -14,7 +14,7 @@ To install right away: jump to [Hand it to your agent](#hand-it-to-your-agent).
 
 ## Direction
 
-- **The main line is the workflow; the gate is two stops on it.** The measure is: from one instruction to close-out, how many messages the human sent, and how many of those were signatures. This reading is not recorded yet (planned).
+- **The main line is the workflow; the gate is two stops on it.** The measure is: from one instruction to close-out, how many messages the human sent, and how many of those were signatures. From 0.11.0, a batch can record that instruction when it opens, and close-out prints this reading (how many messages the human sent; it cannot yet tell which of them were signatures).
 - **Few mandatory rules.** A check that blocks must judge accurately; one that cannot is a hint, or is only logged. Of the 31 engine rules, 7 block today.
 - **Whether a rule is still needed for the current model gets re-asked with data, regularly.** Most rules were written to cover a weakness of the model at the time. With a new model, the ledgers and replays are used to ask again: "without this rule, would the model still get it wrong?" Rules that are no longer needed are downgraded or deleted.
 
@@ -24,12 +24,12 @@ The data behind this, and its scope, are in [False-block data](#false-block-data
 
 | Stage | In the repo today | Planned |
 |---|---|---|
-| Open a batch | `batch-goal --arm`: write completion conditions, optionally with executable checks | A finish line, turn and cost limits, a record of which instruction started it |
+| Open a batch | `batch-goal --arm`: write completion conditions, optionally with executable checks; can record the instruction that started the batch, a finish line, a cost cap and a deadline (recorded only, never blocking) | Passing the limits to the execution session at launch |
 | Execute | Nothing (your own session does the work) | A launcher for headless sessions with turn and cost limits |
 | Watch | Nothing | Stop and write down where it is stuck when turns, time or cost hit the limit, or the same error keeps repeating |
 | Accept | `batch-goal --clear` re-runs the checks registered at opening and refuses on failure; the 7 blocking engine rules, plus A and R, at the end of a turn | Acceptance triggered automatically after execution; on failure, a bounded number of repair rounds |
 | Close | `batch-goal --clear`, outcome and decision records, a debt table with expiry | A headless session that walks the whole close-out chain itself |
-| Record data | Alert ledger, false-block ledger with blind review, replay tool | One summary row per batch; sampling of blocks nobody appealed |
+| Record data | Alert ledger, false-block ledger with blind review, replay tool; at close-out it prints the ruler (how many times the human spoke between that instruction and close-out, by type) | One summary row per batch; sampling of blocks nobody appealed |
 | Maintain rules | False-block claims with blind review; the red-team and false-block-hunter agents | Deleting the 17 log-only rules after a replay confirms nothing is lost; re-testing each rule when the model changes |
 
 ## Flowcharts
