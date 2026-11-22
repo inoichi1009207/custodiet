@@ -159,7 +159,20 @@ function unlinkQuiet(p) {
  * @param {number} [opts.maxRetries] 递增重试上限(默认 1000);超限抛错(I4)
  * @returns {{id:string,num:number,path:string,attempts:number}}
  */
-export function allocatePromptId({ dir = DEFAULT_DIR, slug, ext = ".md", maxRetries = 1000 } = {}) {
+// Windows 上抢同一个号的 claim 时,`open(…, "wx")` 偶发报 EPERM 而不是 EEXIST。
+//   实撞(2026-11-22,2 进程 × 10 号的并发自测):未改动的代码连跑 40 次失败 2 次,两次都是这一步的 EPERM,
+//   那个进程抛错退出、整批少一个号。成因没有证实(同一个号的 claim 正被对方转正 / 删除的瞬间是最可疑的窗口;
+//   「对方握着句柄时 unlink」这条路在本机单独试过,复现不出 EPERM)。
+//   处理不依赖成因:**原地重试同一个号**——拿到 claim 就照常往下走,变成 EEXIST 就照常让号。
+//   这样零重号、零跳号两条不变量都不动(直接让号会在「其实没人占着」时留下空洞)。重试有限,用尽照抛原错。
+const CLAIM_EPERM_RETRIES = 8;
+const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+function sleepSync(ms) {
+  Atomics.wait(SLEEP_CELL, 0, 0, ms);
+}
+
+/** `_openClaim` 只给自测注入用(模拟 open 报 EPERM);生产调用不传。 */
+export function allocatePromptId({ dir = DEFAULT_DIR, slug, ext = ".md", maxRetries = 1000, _openClaim = (p) => fs.openSync(p, "wx") } = {}) {
   if (typeof slug !== "string" || !slug.trim()) {
     throw new Error("allocatePromptId: slug 必填且不得为空");
   }
@@ -175,12 +188,24 @@ export function allocatePromptId({ dir = DEFAULT_DIR, slug, ext = ".md", maxRetr
     }
     const claim = claimPath(dir, n);
     let fd;
-    try {
-      fd = fs.openSync(claim, "wx"); // O_CREAT|O_EXCL —— 每个号唯一的互斥体
-    } catch (err) {
-      if (err.code === "EEXIST") continue; // 号在被别人处理中(I4)
-      throw err;
+    let taken = false;
+    for (let k = 0; ; k++) {
+      try {
+        fd = _openClaim(claim); // O_CREAT|O_EXCL —— 每个号唯一的互斥体
+        break;
+      } catch (err) {
+        if (err.code === "EEXIST") {
+          taken = true; // 号在被别人处理中(I4)
+          break;
+        }
+        if (err.code === "EPERM" && process.platform === "win32" && k < CLAIM_EPERM_RETRIES) {
+          sleepSync(2 * (k + 1)); // 见 CLAIM_EPERM_RETRIES 头注:同一个号原地重试
+          continue;
+        }
+        throw err;
+      }
     }
+    if (taken) continue;
     try {
       fs.writeSync(fd, `pid=${process.pid} slug=${slug}\n`); // 便于诊断遗留 claim
     } finally {

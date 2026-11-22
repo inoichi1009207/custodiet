@@ -194,6 +194,30 @@ async function main() {
     failed = true;
   }
 
+  // ---- 注入:claim 的 open 报 EPERM(Windows 上并发时偶发,见生产模块 CLAIM_EPERM_RETRIES 头注)----
+  //   只在 win32 上有这条重试;别的平台 EPERM 照抛,所以这一轮按平台分两种期望。
+  console.log("\n=== ROUND eperm(注入:claim 的 open 报 EPERM)===");
+  {
+    const { allocatePromptId } = await import("./lib/alloc-prompt-id.mjs");
+    const eperm = () => Object.assign(new Error("EPERM: operation not permitted, open"), { code: "EPERM" });
+    const win = process.platform === "win32";
+    const dirA = path.join(root, "eperm-once");
+    seedDir(dirA);
+    let calls = 0;
+    let got = null, errA = null;
+    try { got = allocatePromptId({ dir: dirA, slug: "x", _openClaim: (p) => { if (++calls <= 2) throw eperm(); return fs.openSync(p, "wx"); } }); } catch (e) { errA = e; }
+    const a6 = win ? (!!got && got.num === EXPECTED_START && calls === 3) : (!!errA && errA.code === "EPERM");
+    console.log(`ASSERT-6 EPERM 两次后拿到同一个号 : ${a6 ? "PASS" : "FAIL"}  (${win ? `期望号 ${EXPECTED_START}、open 3 次;实测号 ${got ? got.num : "抛错"}、open ${calls} 次` : `非 Windows 期望照抛;实测 ${errA ? errA.code : "没抛"}`})`);
+    const dirB = path.join(root, "eperm-always");
+    seedDir(dirB);
+    let errB = null;
+    try { allocatePromptId({ dir: dirB, slug: "x", _openClaim: () => { throw eperm(); } }); } catch (e) { errB = e; }
+    const leftover = fs.readdirSync(dirB).filter((f) => f.endsWith(".alloc-claim"));
+    const a7 = !!errB && errB.code === "EPERM" && leftover.length === 0;
+    console.log(`ASSERT-7 EPERM 不散 ⇒ 照抛原错     : ${a7 ? "PASS" : "FAIL"}  (实测 ${errB ? errB.code : "没抛"};残留 claim ${leftover.length} 个)`);
+    if (!(a6 && a7)) failed = true;
+  }
+
   console.log(`\nSELFTEST=${failed ? "FAIL" : "PASS"}`);
   if (!keep) {
     fs.rmSync(root, { recursive: true, force: true });
