@@ -660,12 +660,33 @@ async function closeOut(C, acc) {
   return { stop: { code: "clear-unknown", why: `batch-goal --clear 退出码 ${cl.status}:${tail(cl.stdout + "\n" + cl.stderr, 300)}`, stage: "clear" } };
 }
 
+/** 工作树里只剩「运行时残留」时把它们删掉,好让不带 --force 的 `git worktree remove` 走得通。
+ *  实撞(2026-11-22,没装闸的空仓里真跑一次):批已并回、已结清,工作树里还有三个未跟踪文件——批状态与批台账
+ *  (`.claude/` 下;目标仓没忽略它们时算未跟踪)和结清时后台盲审写的日志——git 因此拒删,工作树与分支留了下来。
+ *  这些文件在忽略了它们的仓里本来就会随工作树一起删掉;批台账的 arm / clear 行已镜像到主树。
+ *  只在**全部**未提交项都是未跟踪、且都属于下面两类时才动;有一项不是 ⇒ 一个都不删,交给 git 去拒。 */
+const RUNTIME_LEFTOVER_RE = /^(?:\.claude\/|clipboard\/codex\/fp-audit-last\.log$)/;
+function dropRuntimeLeftovers(C) {
+  const st = git(C.wt, ["status", "--porcelain", "--untracked-files=all"]);
+  if (st.status !== 0) return;
+  const rows = st.stdout.split(/\r?\n/).filter((l) => l.trim());
+  if (!rows.length) return;
+  const paths = [];
+  for (const l of rows) {
+    const p = l.slice(3).replace(/^"(.*)"$/, "$1").replace(/\\/g, "/");
+    if (l.slice(0, 2) !== "??" || !RUNTIME_LEFTOVER_RE.test(p) || p.includes("..")) return;
+    paths.push(p);
+  }
+  for (const p of paths) { try { fs.rmSync(path.join(C.wt, p), { force: true }); } catch { /* 删不掉 ⇒ 下面的 git worktree remove 照旧会拒,只记一行 */ } }
+}
+
 async function cleanup(C) {
   if (!C.merged) { note(C, "--no-merge:工作树与分支都留着"); return; }
   C.R.stage = "cleanup";
   let ok = false, last = "";
   for (let i = 0; i < 3 && !ok; i++) {
     if (i) await sleep(1000);   // 关账时后台起的盲审进程可能还占着工作树里的文件,等一下再试
+    dropRuntimeLeftovers(C);
     const r = git(C.root, ["worktree", "remove", C.wt]);
     ok = r.status === 0; last = r.stderr;
     if (!ok && !fs.existsSync(C.wt)) { git(C.root, ["worktree", "prune"]); ok = true; }
@@ -966,6 +987,21 @@ async function selfTestE2E(t, tmp) {
   const argsFor = (b, extra = [], check = `test -f ${b}.txt`) => ["--batch", b, "--instruction", `自测指令 ${b}:照剧本做`, "--cond", `${b}.txt 在`, "--check", check, ...extra];
   const has = (arr, x) => arr.includes(x);
   const valAfter = (arr, f) => (arr.includes(f) ? arr[arr.indexOf(f) + 1] : null);
+
+  // 清理前删运行时残留(没忽略 .claude/ 与盲审日志的仓):全是残留 ⇒ 删;混着别的未跟踪文件 ⇒ 一个都不删
+  { const B = J(tmp, "bare-repo");
+    fs.mkdirSync(B); g(B, "init", "-q", "-b", "main");
+    fs.writeFileSync(J(B, "base.txt"), "base\n"); g(B, "add", "-A"); g(B, "commit", "-q", "-m", "init");
+    const left = [J(B, ".claude", ".batch-goal.json"), J(B, ".claude", ".batch-goal.jsonl"), J(B, "clipboard", "codex", "fp-audit-last.log")];
+    const seed = () => { for (const f of left) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, "x\n"); } };
+    seed(); dropRuntimeLeftovers({ wt: B });
+    const gone = left.map((f) => fs.existsSync(f));
+    seed(); fs.writeFileSync(J(B, "notes.txt"), "别人的东西\n"); dropRuntimeLeftovers({ wt: B });
+    const kept = [...left, J(B, "notes.txt")].map((f) => fs.existsSync(f));
+    fs.rmSync(J(B, "notes.txt")); fs.writeFileSync(J(B, "base.txt"), "改过\n"); dropRuntimeLeftovers({ wt: B });
+    const keptDirty = left.map((f) => fs.existsSync(f));
+    t("清理:工作树里只剩运行时残留 ⇒ 删掉;混着别的未跟踪文件或已跟踪改动 ⇒ 一个都不删", [gone, kept, keptDirty], [[false, false, false], [true, true, true, true], [true, true, true]]);
+  }
 
   // ① 一次过 ⇒ 关账(同一次运行兼测 ⑨ 的前一半:--push 的远端不在私仓名单 ⇒ 不推,照常关账)
   { const before = runsCount();
