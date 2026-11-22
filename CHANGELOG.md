@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.12.0 — 2026-11-22
+
+主题：**发车脚本：开批、无头执行、自动验收、同会话回修、关账串成一条线**。
+
+- **新脚本 `scripts/batch-run.mjs`**：给一句用户原话和完成条件（至少一条 `--check`），它在 `<主树>/.claude/worktrees/batch-<批号>` 建工作树、在里面 `batch-goal --arm`（武装者是执行会话），拉起 `claude -p --permission-mode auto`（带轮数与花费上限，提示词走 stdin），跑完后自动验收：工作树干净、`batch-goal --dry-check` 全过、最后一条消息里逐条写了「条件N:达成 / 不适用:理由」、本批发起过的外审作业结论行是「不用再审」。不过就用 `claude -p --resume <同一个会话号>` 回修，至多三轮；第二次验收不过时先拉一次 `_direction-judge` 方向复核。全过就 ff 并回基分支（基分支前进过就在工作树里 rebase 一次）、仓名在 `privateRepos` 名单里才推送并回读、`batch-goal --clear --verdict …` 关账、删工作树与分支。任何一步判不了就停：`batch-goal --handoff` 生成交接，追加一节「卡在哪」，工作树与分支留着。退出码 0 / 10 / 2 / 1 = 已关账 / 停下 / 拒绝发车 / 内部错误；stdout 末行恒为 `BATCH_RUN_RESULT=<JSON>`。
+- **分类按无头上限实测表**：`error_max_turns` / `error_max_budget_usd` / 到整批截止被杀算「到上限」；`is_error` 真而 `subtype` 是 `success` 时看结果文字分「撞额度」与「失败」——不只看 `subtype`。整批累计花费（含回修与方向复核）到 `--cap-usd` 就不再拉起。
+- **运行面**：`<主树>/.claude/.batch-run/` 下的运行状态（同时只跑一个，状态里记本进程与子进程的进程号）、每次拉起的日志、交接、`runs.jsonl`（每次运行一行）。`--status` 只读打印。
+- **自测**：`--self-test` 用临时 git 仓、真 `batch-goal` 和按剧本行事的假 claude 跑十一类场景，不碰真的 claude / codex / 网络；进了 `selftest:workflow`。
+- **安装器**：拷贝清单加 `scripts/batch-run.mjs`。
+- **`.gitignore`**：加 `.claude/.obligations/`（义务账的运行时目录，开批后会冒出来）、`.claude/.batch-run/`、`.claude/worktrees/`，以及只在本仓生效的 `clipboard/`。安装器照旧只把 `.claude/` 开头的行带到目标仓。
+- **文档**：`docs/batch-run.md`（用法、流程、什么时候停、落盘文件、已知限制）。
+- **已知限制**：整条线还没在真的 claude 上跑过；续接会话时 CLI 报的花费是不是累计值没核实（按每次读数相加，多算只会更早停）；`--clear` 在并回之后才跑，被拒且回修用完时基分支上已有这一批的提交而批没结清；外审作业的判活只看台账字段。详见 `docs/batch-run.md`。
+
 ## 0.11.0 — 2026-11-21
 
 主题：**把已有的件往「一句话交出去、活自己跑到关账」那条线上接了四处；两处写成「一族名字」的判据改读安装方配置**。

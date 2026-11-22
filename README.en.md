@@ -6,7 +6,7 @@
 
 **custodiet** is a set of workflow scripts and gates for Claude Code. The main line is **hand over one sentence and let the work run itself to close-out**: write down what counts as done when the batch opens, execute, accept, close. On that line the gate holds only two positions: **acceptance** (checking the actual state at each checkpoint) and **watch** (stopping a run that is spinning or has drifted). The predicates read the turn's actual tool-call record and git facts, not what the agent says.
 
-Only part of that line exists today. The repo has: batch opening and closing (`batch-goal`), the acceptance rules that run at the end of a turn (the Stop hook), a false-block ledger with blind review, and a replay tool plus two review agents for changing the gate. Wiring these into a line that runs by itself, and the watch position, are planned — see [Status and plans](#status-and-plans).
+Only part of that line exists today. The repo has: batch opening and closing (`batch-goal`), the acceptance rules that run at the end of a turn (the Stop hook), a false-block ledger with blind review, and a replay tool plus two review agents for changing the gate. From 0.12.0 a launcher, `batch-run`, wires them into one line (open → headless execution → automatic acceptance → repair in the same session → close, or stop and write a handoff when a step cannot be judged; usage in [docs/batch-run.md](docs/batch-run.md), Chinese). So far it has only been self-tested against a scripted fake `claude`, not run end to end on a real session. The watch position is planned — see [Status and plans](#status-and-plans).
 
 **lanes** is the companion UI: it moves gate messages, tool calls and edited files out of the output pane into lanes of their own.
 
@@ -25,9 +25,9 @@ The data behind this, and its scope, are in [False-block data](#false-block-data
 | Stage | In the repo today | Planned |
 |---|---|---|
 | Open a batch | `batch-goal --arm`: write completion conditions, optionally with executable checks; can record the instruction that started the batch, a finish line, a cost cap and a deadline (recorded only, never blocking) | Passing the limits to the execution session at launch |
-| Execute | Nothing (your own session does the work) | A launcher for headless sessions with turn and cost limits |
+| Execute | `batch-run` (0.12.0): launches a headless session in its own worktree with turn, per-launch cost, whole-batch cost and deadline limits; the whole line has not yet run on a real session | Running one real batch through it |
 | Watch | Nothing | Stop and write down where it is stuck when turns, time or cost hit the limit, or the same error keeps repeating |
-| Accept | `batch-goal --clear` re-runs the checks registered at opening and refuses on failure; the 7 blocking engine rules, plus A and R, at the end of a turn | Acceptance triggered automatically after execution; on failure, a bounded number of repair rounds |
+| Accept | `batch-goal --clear` re-runs the checks registered at opening and refuses on failure; the 7 blocking engine rules, plus A and R, at the end of a turn; `batch-run` accepts automatically after execution and, on failure, resumes the same session for at most three repair rounds | — |
 | Close | `batch-goal --clear`, outcome and decision records, a debt table with expiry | A headless session that walks the whole close-out chain itself |
 | Record data | Alert ledger, false-block ledger with blind review, replay tool; at close-out it prints the ruler (how many times the human spoke between that instruction and close-out, by type) | One summary row per batch; sampling of blocks nobody appealed |
 | Maintain rules | False-block claims with blind review; the red-team and false-block-hunter agents | Deleting the 17 log-only rules after a replay confirms nothing is lost; re-testing each rule when the model changes |
@@ -213,7 +213,7 @@ Recompute in your own repo: `node scripts/hook-stop-closure.mjs --fp-report`.
 
 - Recall is unknown.
 - The overall false-block rate cannot be measured either: only appealed blocks reach blind review (see [False-block data](#false-block-data)).
-- The watch position and the line that runs itself to close-out are not implemented yet (see [Status and plans](#status-and-plans)).
+- The watch position is not implemented yet. The line that runs itself to close-out now has a launcher, `batch-run`, but it has only been self-tested against a fake `claude` and has not run end to end on a real session (see [Status and plans](#status-and-plans)).
 - So far only the author's own repo uses it.
 - Text rules (causal claims, noun questions, pushing work out of a batch, etc.) match Chinese sentence patterns, and judge messages are in Chinese. In an English repo those rules neither fire nor block.
 - Usage numbers come from the author's own ledgers, with no third-party audit.
