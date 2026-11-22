@@ -138,7 +138,15 @@ export function launchCost(total, seen) {
   return Number.isFinite(seen) && seen >= 0 && total >= seen ? total - seen : total;
 }
 
-/** `git status --porcelain` ⇒ { tracked:[已跟踪文件的改动], untracked:[未跟踪未忽略] };`.claude/` 下的不算(运行时面)。纯函数。 */
+/** 运行时面:`.claude/` 下**名字以点开头的那一层**(批状态、批台账、义务账、各份台账、本脚本的运行目录)和 `.claude/worktrees/`。
+ *  `.claude/agents/`、`.claude/commands/`、`.claude/settings.json` 这类是版本化内容,**不算**——
+ *  原先整个 `.claude/` 都不看,执行会话在那里新建文件忘了 `git add` 时验收照过、关账后清理还会把它删掉(批 306 独立审查发现 1)。纯函数。 */
+export function isRuntimePath(p) {
+  return /^\.claude\/(?:\.[^/]+|worktrees)(?:\/|$)/.test(String(p || "").replace(/\\/g, "/"));
+}
+
+/** `git status --porcelain --untracked-files=all` ⇒ { tracked:[已跟踪文件的改动], untracked:[未跟踪未忽略] };运行时面(isRuntimePath)不算。
+ *  要带 `--untracked-files=all`:不带时整个未跟踪目录只报一行(如 `?? .claude/`),分不出里面是运行时件还是交付物——那种目录行按未跟踪算。纯函数。 */
 export function porcelainIssues(text) {
   const tracked = [], untracked = [];
   for (const line of String(text || "").split(/\r?\n/)) {
@@ -147,7 +155,7 @@ export function porcelainIssues(text) {
     let p = line.slice(3);
     if (p.includes(" -> ")) p = p.split(" -> ").pop();
     p = p.replace(/^"(.*)"$/, "$1").replace(/\\/g, "/");
-    if (p === ".claude" || p.startsWith(".claude/")) continue;
+    if (isRuntimePath(p)) continue;
     if (xy === "!!") continue;
     (xy === "??" ? untracked : tracked).push(p);
   }
@@ -487,14 +495,30 @@ async function launch(C, prompt, resume) {
 function readArmedAt(wt) {
   try { const g = JSON.parse(fs.readFileSync(path.join(wt, ".claude", ".batch-goal.json"), "utf8")); return typeof g.armedAt === "string" ? g.armedAt : null; } catch { return null; }
 }
-function readJobs(root, sinceMs, wt) {
+/** 读作业台账里属于本批的作业。台账件解析不了时:codex-run 的 worker 是先截断再写(不是原子写),读到半截是正常的瞬间
+ *  ⇒ 隔一下重读,至多 4 次;还解析不了 ⇒ 看文件的修改时刻:开批之后动过的,可能就是本批的作业 ⇒ 报错(调用方按判不了停);
+ *  开批之前就没再动过的坏件不可能是本批的 ⇒ 跳过(台账目录是全机共用的,别的仓留下的坏件不该拦住这一批)。
+ *  原先解析不了一律跳过:唯一的外审作业恰好在被重写时,会被当成「本批没发起过外审」(批 306 独立审查发现 2)。 */
+async function readJobs(root, sinceMs, wt) {
   let names;
   try { names = fs.readdirSync(root).filter((n) => /^[A-Za-z0-9_-]{1,64}\.json$/.test(n)); }
   catch (e) { if (e.code === "ENOENT") return { jobs: [] }; return { error: `读不了作业台账目录(${e.code})` }; }
   const w = normCheckout(wt), jobs = [];
   for (const n of names) {
-    let j;
-    try { j = JSON.parse(fs.readFileSync(path.join(root, n), "utf8")); } catch { continue; /* 半写 / 坏件:不是本批能认的作业 */ }
+    const file = path.join(root, n);
+    let j = null, gone = false;
+    for (let k = 0; k < 4 && !j && !gone; k++) {
+      if (k) await sleep(150);
+      try { j = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) { j = null; if (e.code === "ENOENT") gone = true; }
+      if (j === null || typeof j !== "object") j = null;
+    }
+    if (gone) continue;
+    if (!j) {
+      let m = NaN;
+      try { m = fs.statSync(file).mtimeMs; } catch { m = NaN; }
+      if (!Number.isFinite(m) || m >= sinceMs - 2000) return { error: `外审作业台账 ${n} 读不出(半截或坏件,开批之后动过),判不了它是不是本批的作业` };
+      continue;
+    }
     const t = Date.parse(j.startedAt || "");
     if (!Number.isFinite(t) || t < sinceMs) continue;
     const c = normCheckout(j.cwd || "");
@@ -507,13 +531,13 @@ async function codexReviews(C) {
   const root = process.env.BATCH_RUN_CODEX_JOB_ROOT || CODEX_JOB_ROOT;
   const pollMs = Math.max(50, Number(process.env.BATCH_RUN_POLL_MS) || 5000);
   const since = Date.parse(C.armedAt);
-  let got = readJobs(root, since, C.wt);
+  let got = await readJobs(root, since, C.wt);
   if (got.error) return { unknown: [got.error], items: [] };
   if (!got.jobs.length) return { unknown: [], items: [], none: true };
   while (got.jobs.some((j) => j.state === "running") && Date.now() < C.deadlineAt) {
     say(`等外审作业到终态:${got.jobs.filter((j) => j.state === "running").map((j) => j.id).join("、")}`);
     await sleep(Math.min(pollMs, Math.max(50, C.deadlineAt - Date.now())));
-    got = readJobs(root, since, C.wt);
+    got = await readJobs(root, since, C.wt);
     if (got.error) return { unknown: [got.error], items: [] };
   }
   const unknown = [], items = [];
@@ -537,7 +561,7 @@ async function accept(C, { onlyStatic = false } = {}) {
   R.stage = "accept";
   if (!onlyStatic) R.acceptRounds++;
   const items = [], unknown = [];
-  const st = git(C.wt, ["status", "--porcelain"]);
+  const st = git(C.wt, ["status", "--porcelain", "--untracked-files=all"]);
   if (st.status !== 0) unknown.push(`git status 跑不起来:${tail(st.stderr, 200)}`);
   else {
     const p = porcelainIssues(st.stdout);
@@ -665,7 +689,7 @@ async function closeOut(C, acc) {
  *  (`.claude/` 下;目标仓没忽略它们时算未跟踪)和结清时后台盲审写的日志——git 因此拒删,工作树与分支留了下来。
  *  这些文件在忽略了它们的仓里本来就会随工作树一起删掉;批台账的 arm / clear 行已镜像到主树。
  *  只在**全部**未提交项都是未跟踪、且都属于下面两类时才动;有一项不是 ⇒ 一个都不删,交给 git 去拒。 */
-const RUNTIME_LEFTOVER_RE = /^(?:\.claude\/|clipboard\/codex\/fp-audit-last\.log$)/;
+const isRuntimeLeftover = (p) => isRuntimePath(p) || p === "clipboard/codex/fp-audit-last.log";
 function dropRuntimeLeftovers(C) {
   const st = git(C.wt, ["status", "--porcelain", "--untracked-files=all"]);
   if (st.status !== 0) return;
@@ -674,7 +698,7 @@ function dropRuntimeLeftovers(C) {
   const paths = [];
   for (const l of rows) {
     const p = l.slice(3).replace(/^"(.*)"$/, "$1").replace(/\\/g, "/");
-    if (l.slice(0, 2) !== "??" || !RUNTIME_LEFTOVER_RE.test(p) || p.includes("..")) return;
+    if (l.slice(0, 2) !== "??" || !isRuntimeLeftover(p) || p.includes("..")) return;
     paths.push(p);
   }
   for (const p of paths) { try { fs.rmSync(path.join(C.wt, p), { force: true }); } catch { /* 删不掉 ⇒ 下面的 git worktree remove 照旧会拒,只记一行 */ } }
@@ -918,7 +942,9 @@ async function selfTest() {
     parseVerdicts("- **条件1**:达成 ✅\n- 条件 2: **不适用**:`本仓没有日记`\n**条件3:达成**", 3),
     { verdicts: [{ n: 1, verdict: "达成" }, { n: 2, verdict: "不适用", why: "本仓没有日记" }, { n: 3, verdict: "达成" }], problems: [] });
   t("工作树:已跟踪改动 / 未跟踪新文件各自认;.claude/ 下的不算;改名取新路径",
-    porcelainIssues(" M a.txt\n?? new.txt\n?? .claude/x.json\nR  old.txt -> moved.txt\n!! ignored.txt\n"), { tracked: ["a.txt", "moved.txt"], untracked: ["new.txt"] });
+    porcelainIssues(" M a.txt\n?? new.txt\n?? .claude/.batch-goal.json\n?? .claude/.obligations/state.json\n?? .claude/worktrees/batch-9/x\nR  old.txt -> moved.txt\n!! ignored.txt\n"), { tracked: ["a.txt", "moved.txt"], untracked: ["new.txt"] });
+  t("工作树:.claude/ 下的版本化内容照算(新 agent 定义忘了 git add、设置文件改了没提交、整个目录只报一行)",
+    porcelainIssues("?? .claude/agents/_x.md\n M .claude/settings.json\n?? .claude/\n?? .claude/commands/y.md\n"), { tracked: [".claude/settings.json"], untracked: [".claude/agents/_x.md", ".claude/", ".claude/commands/y.md"] });
   t("工作树:干净 ⇒ 两项都空", porcelainIssues(""), { tracked: [], untracked: [] });
   t("外审结论:只认最后一个非空行", ["可以用,不用再审", "要改的有三条\n\n有会翻转的,要改\n", "判不了", "", "要改?不用再审?"].map((b) => reviewVerdict(b).v), ["pass", "fail", "unknown", "unknown", "unknown"]);
   t("外审结论:占位行 ⇒ unknown", reviewVerdict("(codex-run 作业 abc 运行中,结果未产出——占位)\n").v, "unknown");
@@ -996,11 +1022,23 @@ async function selfTestE2E(t, tmp) {
     const seed = () => { for (const f of left) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, "x\n"); } };
     seed(); dropRuntimeLeftovers({ wt: B });
     const gone = left.map((f) => fs.existsSync(f));
-    seed(); fs.writeFileSync(J(B, "notes.txt"), "别人的东西\n"); dropRuntimeLeftovers({ wt: B });
-    const kept = [...left, J(B, "notes.txt")].map((f) => fs.existsSync(f));
-    fs.rmSync(J(B, "notes.txt")); fs.writeFileSync(J(B, "base.txt"), "改过\n"); dropRuntimeLeftovers({ wt: B });
+    const agent = J(B, ".claude", "agents", "_x.md");
+    seed(); fs.mkdirSync(path.dirname(agent), { recursive: true }); fs.writeFileSync(agent, "忘了 git add 的交付物\n"); dropRuntimeLeftovers({ wt: B });
+    const kept = [...left, agent].map((f) => fs.existsSync(f));
+    fs.rmSync(agent); fs.writeFileSync(J(B, "base.txt"), "改过\n"); dropRuntimeLeftovers({ wt: B });
     const keptDirty = left.map((f) => fs.existsSync(f));
-    t("清理:工作树里只剩运行时残留 ⇒ 删掉;混着别的未跟踪文件或已跟踪改动 ⇒ 一个都不删", [gone, kept, keptDirty], [[false, false, false], [true, true, true, true], [true, true, true]]);
+    t("清理:工作树里只剩运行时残留 ⇒ 删掉;混着 .claude/ 下的版本化新文件或已跟踪改动 ⇒ 一个都不删", [gone, kept, keptDirty], [[false, false, false], [true, true, true, true], [true, true, true]]);
+  }
+  // 外审作业台账:半截 / 坏件。开批之后动过的 ⇒ 判不了(不当成「没发起过外审」);开批之前就没再动过的 ⇒ 跳过
+  { const JR = J(tmp, "jobs-broken");
+    fs.mkdirSync(JR);
+    const f = J(JR, "jhalf.json");
+    fs.writeFileSync(f, "");
+    const fresh = await readJobs(JR, Date.now() - 60_000, A);
+    const old = new Date(Date.now() - 3600_000);
+    fs.utimesSync(f, old, old);
+    const stale = await readJobs(JR, Date.now() - 60_000, A);
+    t("外审台账:0 字节的台账件,开批后动过 ⇒ 报判不了;开批前的旧坏件 ⇒ 跳过", [/读不出/.test(fresh.error || ""), stale.error ?? null, (stale.jobs || []).length], [true, null, 0]);
   }
 
   // ① 一次过 ⇒ 关账(同一次运行兼测 ⑨ 的前一半:--push 的远端不在私仓名单 ⇒ 不推,照常关账)

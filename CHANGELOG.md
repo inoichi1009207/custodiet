@@ -10,7 +10,7 @@
 - **自测**：`--self-test` 用临时 git 仓、真 `batch-goal` 和按剧本行事的假 claude 跑十一类场景，不碰真的 claude / codex / 网络；进了 `selftest:workflow`。
 - **安装器**：拷贝清单加 `scripts/batch-run.mjs`。
 - **花费按差额记**：续接会话（`--resume`）时 CLI 报的 `total_cost_usd` 是这个会话的累计值，`--max-budget-usd` 则按本次拉起单独比（在 claude 2.1.327 上实测）。回修轮按「本次读数减上一次读数」记进整批累计。
-- **关账后的清理**：删工作树之前先删掉里面的运行时残留（`.claude/` 下的未跟踪文件、结清时后台盲审写的日志），只在工作树里全部未提交项都属于这两类时才删。没忽略这些文件的仓里，原先 `git worktree remove` 会被它们挡住。
+- **关账后的清理**：删工作树之前先删掉里面的运行时残留（`.claude/` 下名字以点开头的那一层里的未跟踪文件、结清时后台盲审写的日志），只在工作树里全部未提交项都属于这两类时才删。验收看「工作树干净」时不算的也只有这一层和 `.claude/worktrees/`；`.claude/agents/`、`.claude/settings.json` 这类版本化内容照算。没忽略这些文件的仓里，原先 `git worktree remove` 会被它们挡住。
 - **`.gitignore`**：加 `.claude/.obligations/`（义务账的运行时目录，开批后会冒出来）、三份钩子的运行时台账（`.gate-candidates.jsonl`、`.gate-notice-seen.json`、`.write-state.jsonl`）、`.claude/.batch-run/`、`.claude/worktrees/`，以及只在本仓生效的 `clipboard/`。安装器照旧只把 `.claude/` 开头的行带到目标仓。
 - **`alloc-prompt-id`：Windows 上并发取号偶发丢号**。抢同一个号的占位文件时 `open` 偶发报 EPERM 而不是 EEXIST，那个进程抛错退出，`npm run gate:accept` 链尾的并发自测因此偶发变红（未改动的代码连跑 40 次失败 2 次；成因没有证实）。现在 EPERM（仅 Windows）时同一个号原地重试至多 8 次，用尽照抛；改后连跑 80 次 0 失败。自测加两条注入用例。
 - **文档**：`docs/batch-run.md`（用法、流程、什么时候停、落盘文件、已知限制）。
