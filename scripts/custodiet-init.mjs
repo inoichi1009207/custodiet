@@ -120,6 +120,8 @@ const FILES = [
   "scripts/tool-usage-census.mjs",
   // 0.12.0:发车脚本(开批 → 无头执行 → 验收 → 回修 → 关账 / 停下交接);静态 import batch-goal、codex-run、lib/install-config
   "scripts/batch-run.mjs",
+  // 0.13.0:看守(纯判定 + 回放量具);batch-run 静态 import 它
+  "scripts/batch-watch.mjs",
   "scripts/lib/alloc-prompt-id.mjs",
   "scripts/alloc-prompt-id-selftest.mjs",
   "scripts/lib/exit-watchdog.mjs",
