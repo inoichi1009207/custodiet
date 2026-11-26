@@ -177,13 +177,12 @@ async function configAt(root) {
   return readInstallConfig((f) => fs.readFileSync(path.join(root, f), "utf8"), INSTALL_CONFIG_FILE);
 }
 
-// ── MF 判据(同一份实现:gate-rules 的 RULE_MF)─────────────────────────────────────
+// ── MF 判据(同一份实现:gate-rules 的 MF_JUDGE;批 308 起收尾规则 MF 已删,判据件留给本层)──────────────
 let MF_CACHE = null;
 export async function loadMF() {
   if (MF_CACHE) return MF_CACHE;
-  const { RULES } = await import("./gate-rules.mjs");
-  const R = RULES.find((r) => r && r.id === "MF");
-  if (!R || typeof R.faceOk !== "function" || typeof R.fmType !== "function" || typeof R._smallEdit !== "function") throw new Error("RULE_MF 判据件缺(faceOk / fmType / _smallEdit)");
+  const { MF_JUDGE: R } = await import("./gate-rules.mjs");
+  if (!R || typeof R.faceOk !== "function" || typeof R.fmType !== "function" || typeof R._smallEdit !== "function" || !(R._USER_CUE instanceof RegExp)) throw new Error("MF 判据件缺(gate-rules 的 MF_JUDGE:faceOk / fmType / _smallEdit / _USER_CUE)");
   return (MF_CACHE = R);
 }
 /** 这份 memory 正文是不是「以后都这样做」类却没有执行面(原 MF 的触发口径 + faceOk)。 */

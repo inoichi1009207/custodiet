@@ -15,7 +15,7 @@ To install right away: jump to [Hand it to your agent](#hand-it-to-your-agent).
 ## Direction
 
 - **The main line is the workflow; the gate is two stops on it.** The measure is: from one instruction to close-out, how many messages the human sent, and how many of those were signatures. From 0.11.0, a batch can record that instruction when it opens, and close-out prints this reading (how many messages the human sent; it cannot yet tell which of them were signatures).
-- **Few mandatory rules.** A check that blocks must judge accurately; one that cannot is a hint, or is only logged. Of the 31 engine rules, 7 block today.
+- **Few mandatory rules.** A check that blocks must judge accurately; one that cannot is a hint, or is deleted. Since 0.14.0 the engine has 12 rules (down from 31), 6 of which block.
 - **Whether a rule is still needed for the current model gets re-asked with data, regularly.** Most rules were written to cover a weakness of the model at the time. With a new model, the ledgers and replays are used to ask again: "without this rule, would the model still get it wrong?" Rules that are no longer needed are downgraded or deleted.
 
 The data behind this, and its scope, are in [False-block data](#false-block-data).
@@ -27,10 +27,10 @@ The data behind this, and its scope, are in [False-block data](#false-block-data
 | Open a batch | `batch-goal --arm`: write completion conditions, optionally with executable checks; can record the instruction that started the batch, a finish line, a cost cap and a deadline (recorded only, never blocking) | Passing the limits to the execution session at launch |
 | Execute | `batch-run` (0.12.0): launches a headless session in its own worktree with turn, per-launch cost, whole-batch cost and deadline limits; so far run for real only in an empty throwaway repo | Running one batch through it in a real project with the gate installed |
 | Watch | `batch-run` (0.13.0): the four limits (turns, per-launch cost, whole-batch cost, deadline) plus one watch predicate (`scripts/batch-watch.mjs`): the same tool call failing with the same error 3 times in a row ⇒ kill the execution session and stop, with the handoff naming the tool and the error. Verified only by self-tests and log replay; it has not yet fired in a real run | Trying a fix before stopping (version 2) |
-| Accept | `batch-goal --clear` re-runs the checks registered at opening and refuses on failure; the 7 blocking engine rules, plus A and R, at the end of a turn; `batch-run` accepts automatically after execution and, on failure, resumes the same session for at most three repair rounds | — |
+| Accept | `batch-goal --clear` re-runs the checks registered at opening and refuses on failure; the 6 blocking engine rules, plus A and R, at the end of a turn; `batch-run` accepts automatically after execution and, on failure, resumes the same session for at most three repair rounds | — |
 | Close | `batch-goal --clear`, outcome and decision records, a debt table with expiry | A headless session that walks the whole close-out chain itself |
 | Record data | Alert ledger, false-block ledger with blind review, replay tool; at close-out it prints the ruler (how many times the human spoke between that instruction and close-out, by type) | One summary row per batch; sampling of blocks nobody appealed |
-| Maintain rules | False-block claims with blind review; the red-team and false-block-hunter agents | Deleting the 17 log-only rules after a replay confirms nothing is lost; re-testing each rule when the model changes |
+| Maintain rules | False-block claims with blind review; the red-team and false-block-hunter agents; 0.14.0 deleted the 17 log-only rules and two hint rules that blind review found mostly wrong (L, O) | Re-testing each rule when the model changes |
 
 ## Flowcharts
 
@@ -134,34 +134,28 @@ The Stop gate itself runs only deterministic predicates and calls no model. A mo
 
 Rules read assistant text and the **inputs** of `tool_use` blocks, never tool **outputs** — so "read a file that mentions `git commit`" cannot count as "committed". Two built-in rules, A (delegation closure) and R (completion statements), are the exception and scan the full text.
 
-## Rules: 31, of which 7 block
+## Rules: 12, of which 6 block
 
-There are 31 engine rules in three tiers (`npm run gate:accept` prints the count).
+There are 12 engine rules in two tiers (`npm run gate:accept` prints the count).
 
-**Blocking (7)** — a hit keeps the turn from ending.
+**Blocking (6)** — a hit keeps the turn from ending.
 - **K0 / K**: touching the working tree (writing files, committing) with no completion conditions set blocks on the turn that commits or clears; running `batch-goal --clear` when the batch did not clear blocks. Conditions are written at the start with `batch-goal --arm`, optionally with a check command.
 - **DP**: a push with no debt probe run after it blocks. Active only when the repo has the probe script `scripts/verify-prod.mjs`.
 - **W**: documents that will be published, or that later work will rely on, need one external review before the batch is closed.
 - **X**: saying "generated" or "written to disk" needs a probe action.
-- **U**: a Skill was called and never wrapped up.
 - **P**: load-bearing changes need three independent reviews — cross-model, read-only sub-agent, external precedent. Only tool actions count; saying you ran one does not. For gate-engine files, the independent-view slot needs both bundled agents: the red team `_gate-bypass-hunter` (misses) and the false-block hunter `_gate-false-block-hunter` (false blocks, by replaying real transcripts through the old and new rules with `scripts/gate-replay.mjs`). Planned: one review before merging to the main branch instead; see section 3 of `docs/gate/AGENTS.md`.
 
-**Hint only (7)** — one line to the model, no block.
+**Hint only (6)** — one line to the model, no block.
 - **I**: search for existing tools before building a new tool or script.
 - **ND**: when the user asks "what is X", the term goes into the noun diary.
 - **AD**: a commit message in this batch looks like a signed decision, and the decision list is empty.
 - **PF**: the commit range contains gate changes brought in by another session.
 - **G**: self-review before committing.
-- **L**: counting the tool surface by hand.
-- **O**: a URL used as evidence must actually have been fetched.
+- **U**: a Skill was called and never wrapped up. Downgraded from blocking to hint-only in 0.14.0; the check itself is unchanged.
 
-**Log only (17)** — a hit goes into a candidate ledger and nothing is shown to the model.
-- The 13 wording rules (S, E0, E1, E2, V, C, Q, F, SE, N, B, D, H): reasons for stopping, causal claims, completion statements, deferrals and the like.
-- Four more: J (changes to rule files), T (expiry dates on debts), MF (memory notes must name where they are enforced), M (read-back after Bash writes).
+0.14.0 deleted 19 rules: the 17 that were log-only (the wording rules S, E0, E1, E2, V, C, Q, F, SE, N, B, D, H, plus J, T, MF, M) and the hint rules L (counting the tool surface by hand) and O (a URL used as evidence must actually have been fetched). Hits on the 17 had long stopped reaching the model and only added a line to the candidate ledger; blind review of L and O came out 8 wrong / 0 right and 6 wrong / 0 right. The reasoning is in [False-block data](#false-block-data): rules that infer meaning from wording were judged wrong more often than right. The write-layer checks for J, T, MF and M (`scripts/lib/write-checks.mjs`: hook-guard before a write, and `batch-goal --clear`) stay; only their Stop-gate rule is gone. The log-only plumbing (the candidate ledger and the summary line at the end of `--clear`) stays as well; no rule writes to it now.
 
-These 17 are planned for deletion once a replay confirms that the cases they used to block correctly are still caught. The reason for the downgrade is in [False-block data](#false-block-data): rules that infer meaning from wording were judged wrong more often than right in blind review.
-
-Three more checks sit outside the 31 and also run at Stop: A (a delegated job was never collected and read), R (saying something was run needs an action), and DRIFT (references in docs that have drifted). A and R block on a hit; DRIFT only hints.
+Three more checks sit outside the 12 and also run at Stop: A (a delegated job was never collected and read), R (saying something was run needs an action), and DRIFT (references in docs that have drifted). A and R block on a hit; DRIFT only hints.
 
 CW (re-checking concurrent writer sessions at Stop) was removed in 0.4.2; concurrent writes now use git worktrees and branches. See the [CHANGELOG](CHANGELOG.md).
 
@@ -183,7 +177,7 @@ Recompute in your own repo: `node scripts/hook-stop-closure.mjs --fp-report`.
 - Every rule carries a `law:` field pointing to a section of a rule file (e.g. K → `AGENTS.md#真正动手的批`). The engine checks at load time and in self-tests that the pointers resolve.
 - There are two sample rule files: `AGENTS.md` (repo rules: this repo's red lines, batches and verification, deployment) and `docs/gate/AGENTS.md` (gate rules: how the gate is designed, how a rule gets in, how to change it, who may approve).
 - The gate rules require every rule to point to a mistake that actually happened and to ship a fixture that goes red first and is then restored. The "error list" they refer to does not exist in this repo yet (planned).
-- The old sample constitution and the three sample codes are archived in `docs/archive/laws-2026-11/`; they are not current rules. Some rules (most of them log-only) still point there, so the files stay.
+- The old sample constitution and the three sample codes are archived in `docs/archive/laws-2026-11/`; they are not current rules. The `law:` pointers of four rules (G, I, U, X) still land there, so the files stay.
 - `AGENTS.md` is a sample. Replace it with clauses you have signed and update the pointers; the top of `AGENTS.md` lists which clauses are pointer targets.
 
 ## The gate is gated too
@@ -215,7 +209,7 @@ Recompute in your own repo: `node scripts/hook-stop-closure.mjs --fp-report`.
 - The overall false-block rate cannot be measured either: only appealed blocks reach blind review (see [False-block data](#false-block-data)).
 - The watch has one predicate (the same tool call failing with the same error 3 times in a row) plus the four limits; it only stops and never tries a fix. Spinning it cannot recognise — error text that changes every time, two calls failing in turn — is left to the limits. The line that runs itself to close-out now has a launcher, `batch-run`, but it has only run end to end in an empty throwaway repo with no gate installed, not in a real project (see [Status and plans](#status-and-plans)).
 - So far only the author's own repo uses it.
-- Text rules (causal claims, noun questions, pushing work out of a batch, etc.) match Chinese sentence patterns, and judge messages are in Chinese. In an English repo those rules neither fire nor block.
+- Text rules (noun questions, wording of signed decisions, the stop-and-confirm marker, etc.) match Chinese sentence patterns, and judge messages are in Chinese. In an English repo those rules neither fire nor block.
 - Usage numbers come from the author's own ledgers, with no third-party audit.
 
 ## FAQ
@@ -304,7 +298,7 @@ Or in two steps: `/plugin marketplace add inoichi1009207/custodiet`, then `/plug
 
 | Capability | In one line | Command |
 |---|---|---|
-| Stop gate | At Stop, runs 31 engine rules (7 blocking) and three more checks (A, R, DRIFT; A and R also block) over the turn's tool-call record; a blocking hit keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
+| Stop gate | At Stop, runs 12 engine rules (6 blocking) and three more checks (A, R, DRIFT; A and R also block) over the turn's tool-call record; a blocking hit keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
 | Batch completion conditions | Set checkable acceptance conditions up front, optionally with a check command; `--clear` runs the checks and refuses on failure | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "render done" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
 | Rule acceptance | Positive/negative cases + mutation acceptance per rule; cases that do not kill their mutations cannot ship (run in this repo; first `npm --prefix scripts/gate-deps install`, which needs node `^22.18.0` or `>=24.11.0` — the windowsHide check in it needs the parser) | `npm run gate:accept` |
 | Ledger integrity chain | Three ledgers with per-line hash chains; rewrite / insert / delete-middle turns red | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |

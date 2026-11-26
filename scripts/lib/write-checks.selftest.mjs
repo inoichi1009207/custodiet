@@ -318,17 +318,11 @@ export async function selfTest() {
       W("docs/gate-debts.md", HD + ROW + "\n"); commit("修好");
     }
 
-    // ── ⑥ Stop 上只记账化 ─────────────────────────────────────────────────────────────
+    // ── ⑥ Stop 上:T / J / MF / M 四条收尾规则批 308 已删(原先只记账),本层照旧;MF 判据件改从 MF_JUDGE 取 ─────────
     {
-      const { RULES } = await import("./gate-rules.mjs");
-      const { splitLogOnly } = await import("../hook-stop-closure.mjs");
-      t("T / J / MF / M 在 Stop 上 blocking:false 且 logOnly(只记账)", ["T", "J", "MF", "M"].map((id) => { const x = RULES.find((y) => y.id === id); return `${id}:${x.blocking}:${!!x.logOnly}`; }),
-        ["T:false:true", "J:false:true", "MF:false:true", "M:false:true"]);
-      const T = RULES.find((x) => x.id === "T");
-      const d195 = ["这不是缺陷,是误报,已用 --fp 登记了。", "红队报的漏放那条 T 拦错了,已用 --fp 登记了。"];
-      const finds = d195.map((text) => ({ id: "T", block: false, msg: T.detect({ text }).join(" ") }));
-      const sp = splitLogOnly(finds);
-      t("D195 两形(否认句、缺陷词作话题)在 Stop 不再阻断:进只记账一侧,不进对模型的输出", [sp.shown.length, sp.logged.length], [0, 2]);
+      const { RULES, MF_JUDGE } = await import("./gate-rules.mjs");
+      t("308:T / J / MF / M 不再是收尾规则(本层的写前 / 关账取证不受影响)", ["T", "J", "MF", "M"].filter((id) => RULES.some((y) => y.id === id)), []);
+      t("308:loadMF 取到的是 gate-rules 的 MF_JUDGE", (await WC.loadMF()) === MF_JUDGE, true);
     }
   } catch (e) {
     fail++; console.log(`FAIL  自测抛错:${e && e.stack || e}`);

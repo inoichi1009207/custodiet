@@ -700,8 +700,10 @@ function priorClosedFromJournal(rows, g) {
  *  会**连 K0 一起永久关掉**——另一条规则、另一份义务,fail-open 且不可见。
  *  ⇒ 派生而非并列。**共用一个环境变量这件事本身仍在**(K/K0 同开关),
  *    但现在它至少是**印出来那个**,不再骗人;要拆成独立开关是另一批。 */
-const BLOCK_ENV = { A: "A", E0: "E", E1: "E", E2: "E", I: "I", J: "J", W: "W",
-  K: "K", K0: "K", M: "M", R: "R", Q: "Q", S: "S", T: "T", U: "U", ND: "ND", DP: "DP", X: "X", MF: "MF" };   // MF:批 276 D179
+// 批 308:删规则 Q / S / T / M / MF / E0 / E1 / E2 / J 的键随规则删去;U 降为只提示,键一并撤(只提示项不进本表,同 E1 原注)。
+//   I / ND 本来就是只提示,键留着(命中从不带 block,不影响判决)。
+const BLOCK_ENV = { A: "A", I: "I", W: "W",
+  K: "K", K0: "K", R: "R", ND: "ND", DP: "DP", X: "X" };
 
 // ⚠️ **由 BLOCK_ENV 计算得出,不再是第二张手写表**(D21 结案,codex 072 裁决原话:
 //   「对账只能发现漂移,不能阻止漂移」——一份表按构造不漂)。
@@ -3871,31 +3873,8 @@ function selfTest() {
       { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_a1", content: "CODEX_JOB=abc123\nCODEX_STATE=done\nCODEX_RESULT=\\repo\\clipboard\\codex\\t-r1.md\n" }] } },
       A("发出去了")], want: ["A"] },
     { name: "A 不命中:正文只提到 CODEX_JOB(不是发起事件)", lines: [U("go"), A("CODEX_JOB=abc123 已发出")], want: [] },
-    { name: "B 命中:承诺句零工具", lines: [U("go"), A("我这就去改,不问,你喊停就停")], want: ["B"] },
-    { name: "B 命中:干了别的那件(今日实撞形态)",
-      lines: [U("go"), A("我这就去改 `foo.mjs`", [{ name: "Edit", input: { file_path: "/repo/bar.md" } }])], want: ["B", "K0"] },
-    { name: "B 命中:无具体对象的空头承诺",
-      lines: [U("go"), A("我这就去处理一下", [{ name: "Edit", input: { file_path: "/repo/bar.md" } }])], want: ["B", "K0"] },
-    { name: "B 不命中:承诺对象与动作对得上",
-      lines: [U("go"), A("工具面已扫:无命中。我这就去改 `foo.mjs`", [{ name: "Grep", input: { pattern: "x", path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Edit", input: { file_path: "/repo/scripts/foo.mjs" } }])], want: ["K0"] },
-    { name: "C 命中:缺陷陈述无处置", lines: [U("go"), A("这条还没落盘,也没入仓")], want: ["C"] },
-    // ⚠️ 2026-08-20 引擎接管后,这几条夹具从简写 `["Write"]` 改成**带真入参**。
-    //   原写法造出的是**没有 file_path 的 Write**:旧实现只看「出现了 Write 这个工具名」就算写过,
-    //   引擎要求真有路径。**「出现了 Write 工具」≠「写了文件」正是这次重写要消灭的东西**,
-    //   所以是夹具跟上契约,不是放宽规则。
-    { name: "C 不命中:缺陷陈述后有写",
-      lines: [U("go"), A("这条还没落盘", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
-    { name: "D 命中:强制面降级", lines: [U("go"), A("这条要交叉验证。要不要我去跑一下?")], want: ["D"] },
-    { name: "D 不命中:非强制面", lines: [U("go"), A("配色你要是想换我可以帮你调")], want: [] },
-    { name: "E0+E2 阻断:裸因果断言两半都没走", lines: [U("go"), A("根因是缓存没刷新")], want: ["E0","E2"] },
-    { name: "自标豁免 E0 但**不豁免 E2**(承认不确定≠找过判据)", lines: [U("go"), A("根因是缓存没刷新——这是我的推断,证据不足")], want: ["E2"] },
-    { name: "E2 单命中:发了 codex 但没走 xros(今日实撞形态)", lines: [U("go"), A("根因是缓存没刷新", [{ name: "Bash", input: { command: "node ~/.claude/scripts/codex-run.mjs --task t.md" } }]), A("--poll x1")], want: ["E2"] },
-    { name: "E1 单命中:跑了探针但没跨模型", lines: [U("go"), A("根因是缓存没刷新", [{ name: "Bash", input: { command: "node scripts/verify-laws.mjs" } }])], want: ["E1"] },
-    { name: "E0+E2 覆盖最常见句式「X 是因为 Y」", lines: [U("go"), A("它失败是因为路径写错了")], want: ["E0","E2"] },
-    // F:今日实撞原句形态——同段既说全部执行完毕、又登记还欠一件
-    { name: "F 命中:完成断言与欠件并存", lines: [U("go"), A("9 项全部执行完毕。欠件一条:取页适配器还没造", ["Write"])], want: ["F"] },
-    { name: "F 不命中:只报完成无欠件", lines: [U("go"), A("9 项全部执行完毕,两个闸 PASS", ["Write"])], want: [] },
-    { name: "F 不命中:只报欠件无完成断言", lines: [U("go"), A("取页适配器还没造,登记为欠件", ["Write"])], want: [] },
+    // 批 308:B / C / D / E0 / E1 / E2 / F / H / J / M / N / Q 这几条规则已删,它们在这里的端到端用例一并删去(共 30 条);
+    //   以 I 命名、期望里顺带写了 M 的两条只删期望里的 M,I / K0 的期望不动。
     // ⚠️ 原写法把 `git commit -m x` 放在**助理的文本块**里 —— 旧实现在裸文本里 grep 到
     //   就算「提交过」。引擎从 Bash **入参**解析。这条夹具本身就是那个 bug 的化石。
     // ── G v2(2026-08-25,批 101/D48):仪式文本判据已裁撤,判据面=①入册②失效条件④关账自测。
@@ -3912,10 +3891,6 @@ function selfTest() {
         // 2026-09-07 起 P 也响:闸引擎提交无绑定红队 ⇒ 不计宽限(D11 独立于宽限)
         { name: "Bash", input: { command: "git commit -m x" } }])], want: ["G", "K0", "P"] },
     { name: "G 不命中:没提交", lines: [U("go"), A("改完了", ["Edit"])], want: [] },
-    // H:今日实撞原形——自己写下「我能做、不需要你签」然后停手等发话
-    { name: "H 命中:自陈能做却没做", lines: [U("go"), A("这两件我能做,不需要你签,属工装面")], want: ["H"] },
-    { name: "H 不命中:自陈能做且做了",
-      lines: [U("go"), A("这件我能做,不需要你签", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
     // I:纪律 32 闸化——新建载体必须留工具面扫描痕迹
     { name: "I 阻断:新建 agent 未留扫描痕迹",
       lines: [U("go"), A("造好了", [{ name: "Write", input: { file_path: "/repo/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
@@ -3927,18 +3902,11 @@ function selfTest() {
       lines: [U("go"), A("工具面已扫:四层无命中,造", [{ name: "Read", input: { file_path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Write", input: { file_path: "/repo/.claude/skills/y/SKILL.md" } }])], want: ["K0"] },
     { name: "I 不命中:写的不是载体面",
       lines: [U("go"), A("更新文档", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
-    // J:立法必答触发层——递归的最后一层
-    { name: "J 命中:改法典未交代触发层",
-      lines: [U("go"), A("新增一条纪律", [{ name: "Edit", input: { file_path: "/repo/docs/laws/collab.md" } }])], want: ["J", "K0"] },
-    { name: "J 不命中:触发层写在对话里",
-      lines: [U("go"), A("新增一条,触发层:Stop hook 的 I 项,必然执行", [{ name: "Edit", input: { file_path: "/repo/AGENTS.md" } }])], want: ["K0"] },
-    { name: "J 不命中:没碰法典",
-      lines: [U("go"), A("工具面已扫:无命中。改工装", [{ name: "Grep", input: { pattern: "x", path: "docs/tool-register.md" } }, { name: "WebSearch", input: { query: "existing impl" } }, { name: "Edit", input: { file_path: "/repo/scripts/x.mjs" } }])], want: ["K0"] },
     // I 的两个新覆盖面(2026-08-19 实测漏掉整类动作后补)
     { name: "I 命中:Edit 已有载体也算造物",
       lines: [U("go"), A("改一下", [{ name: "Edit", input: { file_path: "/repo/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
     { name: "I 命中:经 Bash 写载体绕不过去",
-      lines: [U("go"), A("改一下", [{ name: "Bash", input: { command: "node -e \"fs.writeFileSync('scripts/foo.mjs',s)\"" } }])], want: ["I","M"] },
+      lines: [U("go"), A("改一下", [{ name: "Bash", input: { command: "node -e \"fs.writeFileSync('scripts/foo.mjs',s)\"" } }])], want: ["I"] },   // 批 308:M 已删
     // 两条反向用例:2026-08-19 实撞的误报形态
     { name: "I 不命中:git add/commit 载体不算写它(G v2 下亦不触造物入册)",
       lines: [U("go"), A("提交", [{ name: "Bash", input: { command: "git add scripts/foo.mjs && git commit -m 'x'" } }])], want: ["K0"] },
@@ -3990,10 +3958,8 @@ function selfTest() {
       lines: [U("go"), A("造完改", [
         { name: "Bash", input: { command: "printf x > scripts/zz-f1.mjs" } },
         { name: "Edit", input: { file_path: "scripts/zz-f1.mjs", old_string: "x", new_string: "y" } },
-      ])], want: ["I", "K0", "M"] },
-    //   期望里的 `M`(写了没回读)是这条夹具的**真实属性**,不是放水:Bash `>` 写盘 + Edit 收尾、
-    //   全程没有一次读回 ⇒ M 按其定义响。(下面那条同形态的 memory 夹具实测不带 M;
-    //   成因未查,不在本批范围——此处只记读数,不代它下结论。)
+      ])], want: ["I", "K0"] },
+    //   批 308:期望里原有的 `M`(写了没回读)随 M 规则删去;I / K0 的期望不动。
     // 下一条:同形态落在 memory 笔记上 ⇒ 批 253 用户签后不算载体,不命中。
     { name: "I 不命中:Bash 造 memory 笔记 + Edit 收尾(批 253 用户签:memory 笔记不算工具载体)",
       lines: [U("go"), A("造完改", [
@@ -4010,46 +3976,10 @@ function selfTest() {
         { name: "Edit", input: { file_path: "C:/Users/x/.claude/projects/example-project/memory/zzz-new2.md", old_string: "x", new_string: "y" } },
       ])], want: [] },
     // `2>/dev/null` 的 `>` 曾被当成「写载体」,于是纯读命令被判成新建载体。
-    // E2 出路②必须认**全角冒号**——中文正文里「机械判据：」天然是全角,
-    // 原判据的字符类两个都是半角,该出路对中文形同虚设。
-    // 带引号路径的探针必须被认作出路①(Windows 长路径几乎总要加引号)。
-    { name: "E0 不命中:跑了带引号路径的探针",
-      lines: [U("go"), A("根因是索引失效导致的。", [
-        { name: "Bash", input: { command: 'node --no-warnings "/c/tmp/scratchpad/verify-idx.mjs"' } },
-      ])], want: ["E1"] },   // E1 属正确:过了「形」,未过「独立性」
-    // 「无判据」档必须附一条带实参的 /xros:sharpen,否则出路②不成立。
-    { name: "E2 命中:只说「无机械判据」而未递出 sharpen",
-      lines: [U("go"), A("根因是缓存未失效。机械判据:无,因该命题不可机械核定。", [])], want: ["E0", "E2"] },
-    { name: "E2 不命中:说「无判据」且递出带实参的 sharpen",
-      lines: [U("go"), A("根因是缓存未失效。机械判据:无,不可机械核定 ⇒ 请敲 `/xros:sharpen 缓存失效判据怎么定`", [])], want: ["E0"] },
-    // 本例同时跑了探针(满足 E0 要求的「真动作」),故只考核冒号那一处。
-    // ⚠️ E0 与 E2 出路**故意不同**:E2 认一句声明,E0 要真动作(见 E0 注释「出路刻意留便宜」)。
-    //   所以纯文本回合里写「机械判据:已跑」豁免 E2 但不豁免 E0——那是设计,不是 bug。
-    // 批 285 第二轮复核:期望由 ["E1"] 改 []——批 285 D117(057c5cf)起,探针已跑 + 就地声明肯定的机械判据 ⇒ E1 也不再提示
-    //   (全局规范 3.1「纯机器判据不必走」);本条考核的全角冒号那一处不变,E2 仍不命中。
-    { name: "E2 不命中:全角冒号写的就地声明(伴随真探针;285 D117 后 E1 也不提示)",
-      lines: [U("go"), A("根因是缓存未失效导致的。**机械判据：已跑** grep 对账。", [
-        { name: "Bash", input: { command: "node scratchpad/cache-probe.mjs" } },
-      ])], want: [] },
-    // N:正文报出计数即满足法条的「指出第二个 agent 在哪」,不必本轮再读一次文件。
-    { name: "N 不命中:递给用户但正文已报出 agent 计数",
-      lines: [U("go"), A("`/xros:sharpen` 只能你亲手下(`parallel(` 2 处,多 agent 管线)。", [])], want: [] },
-    { name: "N 命中:递给用户且说不出计数",
-      lines: [U("go"), A("这个 `/xros:sharpen` 只能你亲手下。", [])], want: ["N"] },
     { name: "I 不命中:ls/grep 读载体目录且带 2>/dev/null(读不是写)",
       lines: [U("go"), A("看看", [
         { name: "Bash", input: { command: "ls .claude/agents/*.md 2>/dev/null | wc -l" } },
         { name: "Bash", input: { command: "grep -Rl x .claude/skills/ 2>/dev/null | head -2" } },
-      ])], want: [] },
-    // Q:推面出批。正例=只说推迟;反例=推迟并指出三类合法阻断之一。
-    { name: "Q 命中:说留给下次但没指出阻断",
-      lines: [U("go"), A("这三件留给下次做,今天先到这儿。", [])], want: ["Q"] },
-    { name: "Q 不命中:推迟且指出需亲签",
-      lines: [U("go"), A("这件留给下次——它改的是授权边界,需亲签,归你签。", [])], want: [] },
-    { name: "M 路径不被回溯切碎:带引号的 cp 目标整词取出且回读被认",
-      lines: [U("go"), A("备份", [
-        { name: "Bash", input: { command: 'cp docs/a.md "docs/settings.json"' } },
-        { name: "Bash", input: { command: "grep -c x docs/settings.json" } },
       ])], want: [] },
   ];
   let pass = 0;
@@ -4843,18 +4773,7 @@ function selfTest() {
     // 而闸会退回「拦得住但说不清拦的是什么」——实况原样:
     //   「是因为 会让你在 和 之间反复权衡」(引文里的名词全没了)。
     {
-      const raw = "不是因为技术——是因为「装 QQNT」会让你在「本地」和「服务器」之间反复权衡。";
-      const e0 = RULES.find((r) => r.id === "E0");
-      const shown = e0.detect({
-        text: raw, actions: [], toolNames: [], skills: [], ranBash: () => false,
-      }).join(" ");
-      sc("E0 回显保留引文(不拿掩码文本当回显)", shown.includes("「装 QQNT」"), true);
-      // 反向钉:判据本身仍跑在掩码上——引文内的因果词不得单独把整句咬出来。
-      const quotedOnly = e0.detect({
-        text: "问题一句话:「根因是缓存没刷新」。拿它当搜索键扫了三层。",
-        actions: [], toolNames: [], skills: [], ranBash: () => false,
-      });
-      sc("引文内的因果仍不命中(掩码没白做)", quotedOnly.length, 0);
+      // 批 308:E0 已删,原先钉在 E0.detect 上的两条(回显保留引文 / 引文内因果不命中)随之删去;掩码本身的两条性质照钉。
       // 掩码的两条硬性质:等长 + 保行。行号对不上则回显会串行(比抹掉更坏)。
       const ml = "前「跨\n行引文」后";
       sc("maskQuoted 等长", maskQuoted(ml).length, ml.length);
@@ -4971,16 +4890,17 @@ function selfTest() {
     //   原来验「引擎与旧实现一致」;现在旧实现不存在,改验引擎自身的两条硬性质——
     //   官方字段可见性(立法动机原样保留)与 engine:false 的**退役语义**。
     // 批 292:E0 / Q 改「只记账」(不阻断),这几条验的是**官方字段可见性**,不是阻断等级 ⇒ 认命中本身(有无 `!` 都算)
+    // 批 308:E0 / Q 已删,探针换成只看正文就会响的留下规则 X(媒体文件「已落盘」而无探针);验的仍是官方字段可见性。
     const hasId = (s, id) => String(s).split(",").some((x) => x.replace(/!$/, "") === id);
-    const t1 = "根因是缓存没刷新。这三件留给下次做。";
+    const t1 = "成片 out.mp4 已落盘。";
     const on1 = ids(run(null, { text: t1, turn: [] }));
-    sc("transcript 读不到时,引擎看得见官方文本(E0/Q 照命中)", hasId(on1, "E0") && hasId(on1, "Q"), true);
+    sc("transcript 读不到时,引擎看得见官方文本(X 照命中)", hasId(on1, "X"), true);
     sc("且确实命中了(不是两边都空)", on1.length > 0, true);
 
     // 末句只在 last_assistant_message 里(transcript 在但落后)⇒ 引擎必须看得见
-    const t2 = "开始干活\n根因是缓存没刷新";
+    const t2 = "开始干活\n成片 out.mp4 已落盘";
     sc("末句只在官方字段里也看得见",
-      hasId(ids(run(null, { text: t2, turn: [{ type: "assistant", message: { content: [{ type: "text", text: "开始干活" }] } }] })), "E0"), true);
+      hasId(ids(run(null, { text: t2, turn: [{ type: "assistant", message: { content: [{ type: "text", text: "开始干活" }] } }] })), "X"), true);
 
     // 切换后 engine:false 的语义 = **只剩未迁原生规则**(A/R 族),引擎 21 条一律不产出。
     //   它若还能产出引擎 id,说明内联尸体没删干净。
@@ -5085,13 +5005,18 @@ function selfTest() {
     sc("观察档关掉后同一批项照常阻断", capture(() => emit(boom, 0)).includes('"decision":"block"'), true);
     // 批 292(287 设计 2.8):「只记账」档的命中对模型零输出;与别的命中同轮时,只有别的那条出现
     {
-      const lo = [...logOnlyIds()][0];
-      sc("292 只记账档:规则表里至少有 E0 / E2 / S / Q", ["E0", "E2", "S", "Q"].every((id) => logOnlyIds().has(id)), true);
-      sc("292 循环依赖:先加载 gate-rules 再读只记账档不抛错", (() => { try { return logOnlyIds().size > 0; } catch { return false; } })(), true);
+      // 批 308:只记账档的 17 条规则全删了,档位与管道(splitLogOnly / 候选台账 / --clear 末尾汇总)留着不动。
+      //   规则表里那一档现在是空的;下面管道的用例改用夹具 id(LO1 / LO2)注入档位,不再借真实规则 id。
+      sc("308 只记账档:规则表里已没有只记账档规则(管道留着)", logOnlyIds().size, 0);
+      sc("292 循环依赖:先加载 gate-rules 再读只记账档不抛错", (() => { try { logOnlyIds(); return true; } catch { return false; } })(), true);
+      const savedLo = _logOnlyIds;
+      _logOnlyIds = new Set(["LO1", "LO2"]);
+      try {
+      const lo = "LO1";
       sc("292 只记账档:只有只记账命中 ⇒ 对模型零输出(心跳走 stderr)", capture(() => emit([{ id: lo, block: false, msg: "x 因果断言" }], 0)).trim(), "");
       const mixed = capture(() => emit([{ id: lo, block: false, msg: "只记账那条" }, { id: "DRIFT", block: false, msg: "文档漂移" }], 0));
       sc("292 只记账档:与提示项同轮 ⇒ 只出提示项", `${mixed.includes("文档漂移")}:${mixed.includes("只记账那条")}`, "true:false");
-      sc("292 splitLogOnly:按 id 拆分", JSON.stringify(splitLogOnly([{ id: "E2" }, { id: "P" }, { id: "S" }]).logged.map((f) => f.id)), JSON.stringify(["E2", "S"]));
+      sc("292 splitLogOnly:按 id 拆分", JSON.stringify(splitLogOnly([{ id: "LO2" }, { id: "P" }, { id: "LO1" }]).logged.map((f) => f.id)), JSON.stringify(["LO2", "LO1"]));
       // codex fix-r1 §3:写端按 git 公共目录定主树(与读端同口径)
       { const saved = _candPath; _candPath = null;
         sc("292 codex fix-r1 §3:候选台账写端按 git 公共目录定主树",
@@ -5099,8 +5024,9 @@ function selfTest() {
         _candPath = null;
         sc("292 codex fix-r1 §3:git 取不到 ⇒ 退回 cwd 相对", candidateLedgerFile(() => { throw new Error("no git"); }), ".claude/.gate-candidates.jsonl");
         _candPath = saved; }
-      sc("292 红队 BP-3:只记账档 id 的阻断级命中不被吞(留在 shown)", JSON.stringify(splitLogOnly([{ id: "S", block: true }]).shown.map((f) => f.id)), JSON.stringify(["S"]));
-      sc("292 红队 BP-4:只记账档 id 的 UNKNOWN 不进账(留在 shown,让人看见判据坏了)", JSON.stringify(splitLogOnly([{ id: "E0", unknown: true }]).shown.map((f) => f.id)), JSON.stringify(["E0"]));
+      sc("292 红队 BP-3:只记账档 id 的阻断级命中不被吞(留在 shown)", JSON.stringify(splitLogOnly([{ id: "LO1", block: true }]).shown.map((f) => f.id)), JSON.stringify(["LO1"]));
+      sc("292 红队 BP-4:只记账档 id 的 UNKNOWN 不进账(留在 shown,让人看见判据坏了)", JSON.stringify(splitLogOnly([{ id: "LO2", unknown: true }]).shown.map((f) => f.id)), JSON.stringify(["LO2"]));
+      } finally { _logOnlyIds = savedLo; }
       sc("292 只记账档:I / ND 是提醒(不阻断、不在只记账档)", RULES.filter((r) => ["I", "ND"].includes(r.id)).map((r) => `${r.id}:${r.blocking}:${!!r.logOnly}`).join(","), "I:false:false,ND:false:false");
     }
     sc("未降级时照常阻断", held.includes('"decision":"block"'), true);
@@ -5907,28 +5833,6 @@ function selfTest() {
           const r = touchSelfTest({ segments, gitArgs: gitArgsT, walk: (cmd, d) => Pt.walk(cmd, d), writeTargets: (cmd, d) => Pt.writeTargets(cmd, () => true, d), engineRel: Pt.ENGINE_REL, resolve: Pt.resolve }, os,
             (l) => { if (/^FAIL/.test(l)) console.log("  gate-touch " + l); });
           hp(`279 gate-touch 记账判据 ${r.pass + r.fail} 条全过`, r.fail, 0);
-        }
-        // 批 279(交接单 20261027 第一节):MF 碰即补 ⇒ 小改的 Edit 不查(smallEdit;首版按指令词个数判,被红队 279 BP-6/7 打穿后收窄)
-        {
-          const MF = RULES.find((r) => r.id === "MF");
-          const mp = "C:/Users/u/.claude/projects/example-project/memory/no-such-279.md";
-          const ed = (o, n) => buildCtx([{ type: "assistant", message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: mp, old_string: o, new_string: n } }] } }], {});
-          const fm = "---\nname: n\nmetadata:\n  type: feedback\n---\n";
-          hp("279 MF:改旧 feedback memory 的日期 ⇒ 不拦", MF.detect(ed(fm + "2026-09-04 用户要求", fm + "2026-09-05 用户要求")).length, 0);
-          hp("279 MF:改错别字 ⇒ 不拦", MF.detect(ed(fm + "回复先给结伦。", fm + "回复先给结论。")).length, 0);
-          hp("279 MF:Edit 新增「以后一律」⇒ 照拦", MF.detect(ed(fm + "回复先给结论。", fm + "回复先给结论。以后一律先跑自测。")).length, 1);
-          hp("279 MF:Edit 新增「禁止」类规则句 ⇒ 照拦", MF.detect(ed(fm + "回复先给结论。", fm + "回复先给结论。\n禁止在正文写出处。")).length, 1);
-          hp("279 红队 BP-6:同数替换换掉规则 ⇒ 照拦", MF.detect(ed(fm + "以后回复先给结论。", fm + "以后改闸提交都不跑红队。")).length, 1);
-          hp("279 红队 BP-7:无指令词的规则句(长)⇒ 照拦", MF.detect(ed(fm + "回复先给结论。", fm + "回复先给结论。\n提交后回读远端,推完部署。")).length, 1);
-          hp("279 红队 BP-6:小改里换指令词「必须」→「不必」⇒ 照拦", MF.detect(ed(fm + "提交前必须跑自测。", fm + "提交前不必跑自测。")).length, 1);
-          hp("279 误拦猎手 FB-3:补一个漏字 ⇒ 不拦", MF.detect(ed(fm + "回复先给论。", fm + "回复先给结论。")).length, 0);
-          hp("279 误拦猎手 FB-3:英文 commonly 不算 only ⇒ 不拦", MF.detect(ed(fm + "it is comonly seen.", fm + "it is commonly seen.")).length, 0);
-          hp("279 误拦猎手 FB-3:纯插入一句(>2 字)⇒ 照拦", MF.detect(ed(fm + "回复先给结论。", fm + "回复先给结论。提交后回读")).length, 1);
-          // 误拦猎手 279 FB-5:同轮另一笔小改补了执行面行 ⇒ 判执行面时取全部写入
-          const ed2 = buildCtx([{ type: "assistant", message: { content: [
-            { type: "tool_use", name: "Edit", input: { file_path: mp, old_string: fm + "回复先给结论。", new_string: fm + "回复先给结论。以后一律先跑自测。" } },
-            { type: "tool_use", name: "Edit", input: { file_path: mp, old_string: "执行面:暂无", new_string: "执行面:M 项" } }] } }], {});
-          hp("279 误拦猎手 FB-5:同轮两笔 Edit,另一笔补了执行面行 ⇒ 不拦", MF.detect(ed2).length, 0);
         }
       }
       // ENGINE_PATHSPECS 与 ENGINE_REL 同一口径(改一处必改另一处)
@@ -6862,7 +6766,8 @@ if (hookInput.hook_event_name === "SubagentStop") {
       //   · `MF`(批 276 红队 r6 BP-6):触发与出路只吃本轮写入与那份 memory 的盘上全文,在子代理边界上语义完整
       //     ⇒ **接入**。注意本通道整体是**提示**不阻断(见下「升阻断的判据」):接入只让「派子代理写 memory」不再静默,
       //     并没有把它堵成阻断(误拦猎手 r7 附二①纠正);SE 吃的是认错措辞,子代理的自述不是执行方本人,不接。
-      const only = new Set(["I", "M", "L", "B", "MF"]);
+      // 批 308:M / L / B / MF 已删,子代理面只剩 I(消息里列的是 `only`,不改它就会列出已不跑的项)。
+      const only = new Set(["I"]);
       // 批 292:曾在此接 splitLogOnly 让子代理面也只记账(误拦猎手第二份 附二④),codex 292-wording-fix2-review-r1 判
       //   正常档下 `hitIds` 只在观察档落账 ⇒ 被拆出的 B 命中两本台账都不进、也不输出,整条丢失(新形态)⇒ **撤回**,
       //   子代理面照旧输出提示(与「只记账」不一致,但不丢记录);接上子代理面的候选落账后再改(债表 D200 ④)。

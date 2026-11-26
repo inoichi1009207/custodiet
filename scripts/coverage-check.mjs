@@ -190,6 +190,11 @@ export function ctxConsumers(opts = {}) {
   const ALIAS_CONSUMERS = {
     // (agents 条目批 258 删:T 的 reviewed() 删去后字段本身已从 ctx 撤掉)
     commits: /\bwin\.commits\b/,           // gate-rules batchDrifting():窗口式消费
+    // 批 308(删 17 条只记账规则与 L、O 后人工复核入册):三个字段原来由被删规则以 `ctx.<字段>` 直接消费,
+    //   现在只剩别名形态的消费者(本扫描的 `[cC]tx.` 口径够不着),字段本身仍在用:
+    toolNames: /\bc\.toolNames\b/,         // gate-rules RULE_I 的 webIn(本轮 / 窗口里有没有联网动作)
+    wroteAny: /\bc\.wroteAny\(/,           // gate-rules G_CHECK.wroteRegister(本轮 / 窗口里写没写 tool-register)
+    reads: /\bctx\.readAny\(/,             // gate-ctx 的 readAny 闭包读 reads;消费者是 RULE_I 的 `ctx.readAny(…)`
   };
   const dead = [];
   for (const f of [...fields].sort()) {
