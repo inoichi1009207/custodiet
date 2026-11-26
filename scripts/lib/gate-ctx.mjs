@@ -197,7 +197,8 @@ export function buildCtx(entries, extra = {}) {
    *  只收**无正文的结构化事实**:`isError`(tool_result.is_error)、`exitCode`(只取 toolUseResult 里的**数字**字段
    *  exitCode / exit_code / returnCode,取不到 ⇒ null;**不从输出文本解析**「Exit code N」——codex 299-review-r1 地基③:
    *  成功的 `echo Exit code 17` 会被当成退出码 17。本机转录的 Bash 结果里没有数字退出码字段 ⇒ 实际上恒为 null,如实)、
-   *  `truncated`(正文以 <persisted-output> 开头,或 toolUseResult 带 persistedOutputPath;只会多报截断)、`interrupted`、`background`(转去后台 / 异步子代理)。
+   *  `truncated`(正文以 <persisted-output> 开头,或 toolUseResult 带 persistedOutputPath;只会多报截断)、`interrupted`、`background`(转去后台 / 异步子代理)、
+   *  `bgId`(后台任务号:toolUseResult.backgroundTaskId,缺则取 harness 转后台措辞里的 ID;批 308 K1)。
    *  工具输出正文一律不进(本模块契约:那是别人说的话)。 */
   const results = new Map();
   const resultFacts = (b, tur) => {
@@ -206,12 +207,17 @@ export function buildCtx(entries, extra = {}) {
     const head = text.slice(0, 200);
     const o = tur && typeof tur === "object" && !Array.isArray(tur) ? tur : null;
     const code = o ? [o.exitCode, o.exit_code, o.returnCode].find((v) => Number.isInteger(v)) : undefined;
+    // 批 308 K1:转后台的三种 harness 措辞(显式后台 / 超时被转后台 / 用户手动转后台;与 A 的 CODEX_BG_ID 同一组)也算后台,
+    //   并取出后台任务号 `bgId`——真实语料里有 toolUseResult 缺 backgroundTaskId、只有措辞的行。只看正文开头 200 字(harness 前缀),同 truncated。
+    const bgm = /^\s*Command (?:running in background with ID:|did not complete within its \d+s timeout and was moved to the background \(ID:|was moved to the background \(ID:|was manually backgrounded by user with ID:)\s*([A-Za-z0-9_-]+)/.exec(head);
+    const bgId = o && typeof o.backgroundTaskId === "string" && o.backgroundTaskId ? o.backgroundTaskId : bgm ? bgm[1] : null;
     return Object.freeze({
       isError: b.is_error === true,
       exitCode: code === undefined ? null : code,
       truncated: /^\s*<persisted-output>/.test(head) || !!(o && o.persistedOutputPath),
       interrupted: !!(o && o.interrupted === true),
-      background: !!(o && (o.backgroundTaskId || o.isAsync === true)),
+      background: !!(o && (o.backgroundTaskId || o.isAsync === true)) || !!bgm,
+      bgId,
     });
   };
 
@@ -670,6 +676,11 @@ export function buildCtx(entries, extra = {}) {
      *  三态:undefined=通道没接(夹具 / 回放 ⇒ P 保持旧判法);true / false=账里有 / 没有本会话;null=账读不了(P 按碰过算)。 */
     gateTouched: extra.gateTouched === undefined ? undefined : (extra.gateTouched === true || extra.gateTouched === false ? extra.gateTouched : null),
     bgTasks: Array.isArray(extra.bgTasks) ? extra.bgTasks : null,
+    /** 批 308 K0-1:本仓的全部 checkout 根(主树 + 各 worktree;hook 由 `git worktree list` 取,经 isNewEvidence 注入)。
+     *  正斜杠、去尾斜杠。没注入 / 空 ⇒ null(K0 退回原判据:写到哪都算动工作面)。 */
+    repoCheckouts: Array.isArray(extra.repoCheckouts) && extra.repoCheckouts.some((r) => typeof r === "string" && r)
+      ? Object.freeze(extra.repoCheckouts.filter((r) => typeof r === "string" && r).map((r) => r.replace(/\\/g, "/").replace(/\/+$/, "")))
+      : null,
     /** 部署欠账事实(DP 项,2026-09-12 批 202):`{lastPushTs, pushRef, lastProbeTs}`,由 hook 经
      *  `lib/debt-facts.mjs` 读一次注入(reflog 最后一次 `update by push` vs 欠账探针标记)。三态同 pLedger:
      *  undefined=通道没接(夹具/离线回放 ⇒ DP 退回命令解析判法)/ null=接了但读取故障(同样退回)/ 对象=事实。 */
@@ -1213,6 +1224,15 @@ export function selfTest() {
       const cc = buildCtx([A([U("g1", "Bash", { command: "sleep 9", run_in_background: true })]), R("g1", "Command running in background with ID: x", false, { backgroundTaskId: "x", interrupted: false })]);
       return [cc.actions[0].result.background, cc.actions[0].result.interrupted].join(",");
     })(), "true,false");
+    chk("308 K1 超时被转后台、toolUseResult 缺任务号 ⇒ 按措辞认后台并取出 bgId", (() => {
+      const cc = buildCtx([A([U("g2", "Bash", { command: "node x.mjs" })]),
+        R("g2", "Command did not complete within its 10s timeout and was moved to the background (ID: bq7). Output is being written to: E:/x/bq7.output.", false, { stdout: "", interrupted: false })]);
+      return [cc.actions[0].result.background, cc.actions[0].result.bgId].join(",");
+    })(), "true,bq7");
+    chk("308 K1 变异对照:正文里**中途**提到那句措辞不算后台", (() => {
+      const cc = buildCtx([A([U("g3", "Bash", { command: "cat log" })]), R("g3", "log: Command running in background with ID: bz9.", false, { stdout: "" })]);
+      return [cc.actions[0].result.background, cc.actions[0].result.bgId].join(",");
+    })(), "false,");
     // turnLog 截断显式标 cut(287 设计 2.5:截断时显式产出「看不清」)
     const long = "echo " + "x".repeat(8100);
     const lc = buildCtx([A([use("Bash", { command: long }), use("Bash", { command: "ls" })])]);

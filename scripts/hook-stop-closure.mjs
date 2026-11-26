@@ -1709,6 +1709,10 @@ export function codexLedger(entries, env = {}) {
         ledger = f && typeof f === "object" ? f : null;
         if (!ledger && !job.anon && typeof env.jobState === "function") { try { ledger = env.jobState(job.foundId || job.id, [...jobDirs]); } catch { ledger = null; } }
         if (ledger && typeof ledger !== "object") ledger = null;
+        // 批 308 A1(实撞):转录里已观测到 done(上面的 jobState 补路径只在非终态时跑)而返回里从没出现 CODEX_RESULT
+        //   (发起输出被重定向、只 grep 出 JOB/STATE)⇒ R 是空集,Read 台账 result 那个文件永远不算读回。终态时也从台账补结果路径;
+        //   只在 R 还是空集时补、只补路径(不改上面已取的 rBody),读回的其余条件(终态之后、读到正文、不是占位)不变。
+        if (ledger && ledger.result && !job.R.size) note(job, { RESULT: ledger.result }, job.cwd);
         const te = Date.parse(ledger && (ledger.resultAt || ledger.endedAt) || "");
         if (Number.isFinite(te)) doneTs = te;
       }
@@ -2555,6 +2559,36 @@ export function isForeignBatch(g, sid, entries) {
 export function noticeKeyOf(brief) {
   return (f) => (f && typeof f.key === "string" && f.key ? `  [${f.id}] #${f.key}` : brief(f));
 }
+/** `--fp-report` 报表头的验链红行(批 308 L1 抽出):有违例 ⇒ 返回那一行,否则 null。verify = ledger-chain 的 verifyFile,exists = 文件在不在。 */
+//   实撞:新克隆的仓里误报台账从没被创建过,开批 / 结清都打「L0 UNREADABLE」红字。不存在 = 空台账(没有可断的链);
+//   文件在而读不了、链断了照报。只在报表这一处分清;ledger-chain verify 命令对一个不存在的路径照旧 FAIL(那是给错了参数)。
+export function ledgerChainRedLine(lf, verify, exists) {
+  if (!exists(lf)) return null;
+  const vr = verify(lf);
+  if (vr.ok) return null;
+  return `🔴 台账链违例:${lf} ${vr.violations.length} 处(首处 L${vr.violations[0].line} ${vr.violations[0].kind})——下面的数字不可信,先 ledger-chain verify 查`;
+}
+/** DRIFT 绊线的提示消息(批 308 DRIFT1 抽出)。out = `tool-usage-census.mjs --doc-drift` 的输出(或错误文字)。 */
+//   实撞:提示只露首行,原首行「文档引用漂移(写触发绊线;--doc-drift 非零退出):」冒号后是空的,模型看不到指的是哪处;
+//   手工复跑又用了别的命令(`hook-stop-closure.mjs --doc-drift`,不是这条绊线)⇒ 退出码 0 无输出,对不上。
+//   现首行自带处数、头一处、复跑命令(与钩子跑的是同一条);输出不是漂移清单(超时 / 报错)时照实写没跑成。全文仍在第二行起。
+const DRIFT_CMD = "node --no-warnings scripts/tool-usage-census.mjs --doc-drift";
+export function driftNoticeMsg(out) {
+  const s = String(out || "");
+  const n = /文档引用漂移\s*(\d+)\s*处/.exec(s);
+  const first = s.split(/\r?\n/).map((l) => l.trim()).find((l) => / → /.test(l));
+  const head = n
+    ? `文档引用漂移 ${n[1]} 处${first ? `,头一处 ${first}` : ""}(写触发绊线;复跑 \`${DRIFT_CMD}\` 看全部)`
+    : `文档引用漂移核没跑成(写触发绊线 \`${DRIFT_CMD}\` 非零退出,输出不是漂移清单:${s.split(/\r?\n/)[0].slice(0, 80) || "无输出"})`;
+  return `${head}\n${s}`;
+}
+/** 非阻断轮的提示去重(批 308 I1 抽出):mine = 本会话见过的键集。本轮每一行都见过 ⇒ `{ shown: null }`(整轮静音);
+ *  否则 `shown` = 这一轮要给模型看的行。 */
+export function noticeFresh(mine, findings, keyOf) {
+  const cur = findings.map(keyOf);
+  if (cur.every((l) => mine.has(l))) return { shown: null };
+  return { shown: findings.filter((f, i) => f.unknown || !mine.has(cur[i])) };
+}
 export function dedupNotices(file, sid, notices, keyOf) {
   if (!notices.length) return notices;
   let seen = {};
@@ -2776,6 +2810,21 @@ export function isNewEvidence(sid) {
     trackedIn: trackedInFs,
     ...(hookCheckout ? { hookCheckout } : {}),
   };
+}
+/** 批 308 K0-1:本仓全部 checkout 根(`git worktree list --porcelain` 的 worktree 行:主树 + 各 worktree,不论放在哪)。
+ *  K0 拿它分「仓内写 / 仓外写」。git 失败 / 列不出 ⇒ null(K0 不筛,判法同旧)。进程内缓存一次。 */
+let _repoCheckoutsCache;
+export function repoCheckoutsFs(git = null) {
+  if (!git && _repoCheckoutsCache !== undefined) return _repoCheckoutsCache;
+  const run = git || ((args) => execFileSync("git", args, { encoding: "utf8", cwd: process.cwd(), timeout: 5000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true }));
+  let out = null;
+  try {
+    const roots = String(run(["worktree", "list", "--porcelain"]) || "").split(/\r?\n/)
+      .filter((l) => l.startsWith("worktree ")).map((l) => l.slice(9).trim().replace(/\\/g, "/").replace(/\/+$/, "")).filter(Boolean);
+    out = roots.length ? roots : null;
+  } catch { out = null; }
+  if (!git) _repoCheckoutsCache = out;
+  return out;
 }
 
 /** P 项的承重面。模块级导出,因为**自测要拿它跑漂移检查**(见 selfTest 的「承重面漂移」一节)。
@@ -3146,6 +3195,10 @@ export function run(transcriptPath, ctx = {}) {
         //   离线读到的是今天的名单——历史轮里部署脚本若叫过别的名字,那几轮的 W 读数偏松(照实写的天花板)。
         installNames: ctx.installNames !== undefined ? ctx.installNames
           : (process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : (_installNamesMemo ??= readInstallNames())),
+        // 批 308 K0-1:本仓全部 checkout 根(K0 分仓内 / 仓外写)。同 installNames 的注入纪律:调用方注入了就用注入的;
+        //   自测与回放进程(STOP_CLOSURE_SELFTEST=1)不读盘 ⇒ undefined ⇒ K0 不筛(测出来的东西不取决于宿主仓有几个 worktree)。
+        repoCheckouts: ctx.repoCheckouts !== undefined ? ctx.repoCheckouts
+          : (process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : repoCheckoutsFs()),
         // 批 258:实时路径给批状态补 `turnBatchStart`(本轮开始时正开着的那一批的起点;W 按它切交付物)
         batchGoal: ctx.batchGoal !== undefined ? ctx.batchGoal : (() => {
           const g0 = readBatchGoal();
@@ -3310,8 +3363,7 @@ export function run(transcriptPath, ctx = {}) {
               { encoding: "utf8", timeout: 15000, windowsHide: true });
           } catch (de) {
             const out = String((de && de.stdout) || safeErrMsg(de)).slice(0, 600);
-            eFindings.push({ id: "DRIFT", block: false,
-              msg: `文档引用漂移(写触发绊线;--doc-drift 非零退出):\n${out}` });
+            eFindings.push({ id: "DRIFT", block: false, msg: driftNoticeMsg(out) });
           }
         }
       } catch { /* 绊线失败不影响闸 */ }
@@ -3673,9 +3725,13 @@ export function emit(findings, streak = 0, opts = {}) {
   // D184(批 276,用户 2026-10-24:「这玩意成死循环了啊,就算不阻断也依然会一直撞」):
   //   非阻断提示每输出一次,模型就续一轮;同一条提示每轮重报 ⇒ 等后台任务时成了停不下来的空转(本会话 AD 连撞十余轮)。
   //   ⇒ **本轮无阻断项**时,本会话已经提示过的同一行(规则 id + 首行原文)不再输出;只要出现新的一行就整批照报。
+  //   批 308 I1(实撞):「整批照报」让见过的行跟着新行一起重出——新建 scripts/batch-run.mjs 的那条 I 第一次单独出,
+  //   下一轮因为 G、DRIFT 是新行又整批出了一遍。现只列没见过的行(带 unknown 的照列),首行注明另有几项已提示过;
+  //   续不续轮(有没有新行)与改前相同,只是消息里不再重列旧行。阻断轮的随附提示早就是这样(dedupNotices)。
   //   阻断项不去重(它们本来就要求处理);systemMessage(批次提醒等)不续轮,照常投递。
   //   台账在 gitignore 面 `.claude/.gate-notice-seen.json`,按会话号分桶,只留最近 20 个会话;写不了 ⇒ 下轮照报(宁吵)。
   //   失效条件:Claude Code 不再因 Stop 的非阻断反馈续轮 ⇒ 撤掉去重。
+  let shownF = findings;
   if (live && !blocking.length && _ledgerSid && process.env.STOP_CLOSURE_NOTICE_DEDUP !== "0") {
     const SEEN = ".claude/.gate-notice-seen.json";
     let seen = {};
@@ -3696,7 +3752,8 @@ export function emit(findings, streak = 0, opts = {}) {
     //   被 STOP_CLOSURE_BLOCK_<X>=0 降级的阻断项会进这里,带 unknown 的由下面这条 systemMessage 兜住。
     const key = noticeKey;
     const cur = findings.map(key);
-    if (cur.every((l) => mine.has(l))) {
+    const { shown } = noticeFresh(mine, findings, key);
+    if (!shown) {
       const unk = findings.filter((f) => f.unknown).map(brief);
       if (unk.length) sysParts.push(`收尾闸本轮有 ${unk.length} 项未能判定(提示本会话已给过模型,不再续轮):\n${unk.join("\n")}`);
       if (sysParts.length) process.stdout.write(JSON.stringify({ systemMessage: sysParts.join("\n") }));
@@ -3708,10 +3765,13 @@ export function emit(findings, streak = 0, opts = {}) {
     const keys = Object.keys(seen);
     for (const k of keys.slice(0, Math.max(0, keys.length - 20))) delete seen[k];
     try { fs.writeFileSync(SEEN, JSON.stringify(seen)); } catch { /* 写不了 ⇒ 下轮照报 */ }
+    shownF = shown;
   }
   const lines = findings.map(brief).join("\n");
+  // 批 308 I1:给模型的那份只列本会话没提示过的行(去重分支外 shownF 即 findings);stderr 那份照列全部(盲审取证认的是本次全部命中)
+  const omitted = findings.length - shownF.length;
   const notice =
-    `收尾闭环闸命中 ${findings.length} 项:\n${lines}\n` +
+    `收尾闭环闸命中 ${shownF.length} 项${omitted > 0 ? `(另 ${omitted} 项本会话已提示过,不再重列)` : ""}:\n${shownF.map(brief).join("\n")}\n` +
     `CEILING: 除 A 外系关键词匹配,判不出语义;详见脚本头注的误报/漏报形态表。CALIBRATED=false;拦错了→ --fp 记账。`;
   // 离线模式(--audit/--dry-run)仍走 stderr 便于人读;生产路径下面改走 additionalContext
   if (process.env.STOP_CLOSURE_STDERR === "1") process.stderr.write(notice + "\n");
@@ -4164,6 +4224,18 @@ function selfTest() {
       const outOf = (J) => (p) => (/bv1\.output$/.test(p) ? `CODEX_JOB=${J}\nCODEX_STATE=background\nCODEX_RESULT=${R}\nCODEX_END=${J}\n` : null);
       cx("v7 codex-1:后台输出文件直连身份,超出时间窗也认 ⇒ 待读", lbl([...bgL(T0, 1)], mkEnv(tb7, { now: T0 + 9_000_000, readOutput: outOf("J7") })), "J7:pending-read");
       cx("v7 codex-1 对照:读不到输出文件 ⇒ 窗口外认不上(只剩提示)", lbl([...bgL(T0, 1)], mkEnv(tb7, { now: T0 + 9_000_000 })).includes("unknown"), true);
+      // 批 308 A1(实撞):后台发起时把 runner 输出重定向进文件、只 grep 出 JOB/STATE 两行 ⇒ 转录里从没出现 CODEX_RESULT;
+      //   随后一次 shell 读输出看到 STATE=done(转录里已观测到终态)⇒ 原先只在「非终态」时才从台账补结果路径,R 永远是空集,
+      //   之后 Read 台账 result 那个文件(仓外临时目录,盘符大小写、斜杠方向与台账写法不同)也不算读回,只剩「不接管道的 --poll」一条出路。
+      const A1R = "E:\\x\\Tmp\\scratch\\smoke-result.md";
+      const tbA1 = { J7: { state: "done", task: TT, result: A1R, startedAt: iso(T0 + 100), resultAt: iso(T0 + 50_000), endedAt: iso(T0 + 50_100) } };
+      const outA1 = (p) => (/bv1\.output$/.test(p) ? "exit=0\nCODEX_JOB=J7\nCODEX_STATE=background\n" : null);
+      const catA1 = at(T0 + 60_000, "Bash", { command: "cat C:/x/bv1.output" }, "exit=0\nCODEX_JOB=J7\nCODEX_STATE=done\n0.13.0\n\n[exited with code 0]");
+      const readA1 = (p) => at(T0 + 70_000, "Read", { file_path: p }, numbered([...HEAD, ...BODY]));
+      cx("308 A1:转录里已见 done、结果路径只在台账 ⇒ Read 台账 result(大小写 / 斜杠 / .. 不同)算读回",
+        lbl([...bgL(T0, 1), ...catA1, ...readA1("e:/X/tmp/other/../scratch/./smoke-result.md")], mkEnv(tbA1, { readOutput: outA1 })), "J7:read");
+      cx("308 A1 变异:Read 的是别的文件 ⇒ 仍待读", lbl([...bgL(T0, 1), ...catA1, ...readA1("e:/x/tmp/scratch/other.md")], mkEnv(tbA1, { readOutput: outA1 })), "J7:pending-read");
+      cx("308 A1 变异:没有 Read ⇒ 仍待读", lbl([...bgL(T0, 1), ...catA1], mkEnv(tbA1, { readOutput: outA1 })), "J7:pending-read");
       // codex v6 第 2 条:早 5 秒的同任务旧作业 / 缺 startedAt 的台账,读它的输出都不得认领新占位
       const tbOld = (sa) => ({ J0: { state: "done", task: TT, result: "/repo/clipboard/codex/t-r0.md", ...(sa ? { startedAt: sa } : {}) },
         J1: { state: "done", task: TT, result: RF, startedAt: iso(T0 + 100), endedAt: iso(T0 + 60_000) } });
@@ -5204,6 +5276,56 @@ function selfTest() {
       console.log(`${ok ? "PASS" : "FAIL"}  零件用例:${name}` + (ok ? "" : `  ← 期待 ${JSON.stringify(want)} 实得 ${JSON.stringify(got)}`));
       if (ok) hpPass++;
     };
+    // ── driftNoticeMsg(批 308 DRIFT1):提示只露首行,首行要自带「几处、头一处是什么、怎么复跑」──
+    {
+      const out = "✗ 文档引用漂移 2 处(扫 10 文件)——\n  docs/a.md → 文件不存在:scripts/x.mjs\n  docs/b.md → 文件不存在:scripts/y.mjs\n";
+      const first = driftNoticeMsg(out).split("\n")[0];
+      hp("308 DRIFT1 首行不以冒号收尾、带处数与头一处", /[::]\s*$/.test(first) ? "半句" : /2 处/.test(first) && first.includes("docs/a.md → 文件不存在:scripts/x.mjs") ? "整句" : first, "整句");
+      hp("308 DRIFT1 首行带复跑命令(与钩子同一条)", first.includes("node --no-warnings scripts/tool-usage-census.mjs --doc-drift"), true);
+      const err = driftNoticeMsg("spawnSync node ETIMEDOUT").split("\n")[0];
+      hp("308 DRIFT1 输出不是漂移清单(超时 / 报错)⇒ 首行照实写没跑成", /没跑成/.test(err) && !/[::]\s*$/.test(err), true);
+    }
+    // ── ledgerChainRedLine(批 308 L1):台账文件不存在 = 空台账,不报违例;在而读不了 / 断链照报 ──
+    {
+      const unread = () => ({ ok: false, violations: [{ line: 0, kind: "UNREADABLE", detail: "ENOENT" }] });
+      hp("308 L1 台账从没建过(文件不存在)⇒ 不报违例", ledgerChainRedLine(".claude/.x.jsonl", unread, () => false), null);
+      hp("308 L1 对照:文件在但读不了 ⇒ 照报", /UNREADABLE/.test(String(ledgerChainRedLine(".claude/.x.jsonl", unread, () => true))), true);
+      hp("308 L1 对照:文件在、链断 ⇒ 照报", /TORN-TAIL/.test(String(ledgerChainRedLine(".claude/.x.jsonl",
+        () => ({ ok: false, violations: [{ line: 3, kind: "TORN-TAIL", detail: "x" }] }), () => true))), true);
+      hp("308 L1 对照:链完好 ⇒ 不报", ledgerChainRedLine(".claude/.x.jsonl", () => ({ ok: true, violations: [] }), () => true), null);
+    }
+    // ── G 的提示首行(批 308 G1):只露首行时要看得出是哪一项 ──
+    {
+      const gFirst = (hits) => String(RULES.find((r) => r.id === "G").message(hits, {})).split("\n")[0];
+      const one = gFirst(["① 入册:新建并提交了造物面载体(scripts/x.mjs),而本轮∪批窗口没有对 docs/tool-register.md 的写动作"]);
+      hp("308 G1 首行不以冒号收尾、带头一项", !/[::]\s*$/.test(one) && one.includes("① 入册"), true);
+      hp("308 G1 多项时首行注明另有几项", /另 1 项/.test(gFirst(["① a", "④ b"])), true);
+    }
+    // ── noticeFresh(批 308 I1):非阻断轮去重,只列没见过的行 ──
+    {
+      const kf = (f) => `  [${f.id}] ${f.msg}`;
+      const I1 = { id: "I", msg: "新建载体前未扫工具面(本轮新建:scripts/x.mjs)。" };
+      const G1 = { id: "G", msg: "关账自审的可核项未过" };
+      const ids = (r) => (r.shown ? r.shown.map((f) => f.id).join(",") : "静音");
+      hp("308 I1 noticeFresh:见过 I、新来 G ⇒ 只列 G(不重列 I)", ids(noticeFresh(new Set([kf(I1)]), [G1, I1], kf)), "G");
+      hp("308 I1 noticeFresh:全见过 ⇒ 静音", ids(noticeFresh(new Set([kf(I1), kf(G1)]), [G1, I1], kf)), "静音");
+      hp("308 I1 noticeFresh:见过但带 unknown 的行随新行照列", ids(noticeFresh(new Set([kf(I1)]), [G1, { ...I1, unknown: true }], kf)), "G,I");
+      hp("308 I1 noticeFresh:都没见过 ⇒ 全列", ids(noticeFresh(new Set(), [G1, I1], kf)), "G,I");
+    }
+    // ── repoCheckoutsFs(批 308 K0-1):本仓全部 checkout 根 ──
+    hp("308 K0-1 repoCheckoutsFs:worktree 行逐条取出(反斜杠归一、去尾斜杠)",
+      repoCheckoutsFs(() => "worktree D:/repo\nHEAD abc\nbranch refs/heads/m\n\nworktree D:\\repo\\.claude\\worktrees\\w1\\\nHEAD def\ndetached\n"),
+      ["D:/repo", "D:/repo/.claude/worktrees/w1"]);
+    hp("308 K0-1 repoCheckoutsFs:git 失败 ⇒ null(K0 不筛)", repoCheckoutsFs(() => { throw new Error("no git"); }), null);
+    hp("308 K0-1 repoCheckoutsFs:一行都没有 ⇒ null", repoCheckoutsFs(() => ""), null);
+    {
+      // 接线:run() 把 ctx.repoCheckouts 交给引擎——只写了仓外文件 ⇒ K0 不响;不注入(自测进程缺省)⇒ 照旧响
+      const es = [{ type: "user", message: { role: "user", content: [{ type: "text", text: "go" }] } },
+        { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "改好了配置。" }, { type: "tool_use", name: "Edit", input: { file_path: "C:/Users/x/.toolrc/config.toml" } }] } }];
+      const k0 = (extra) => run(null, { entries: es, turn: lastTurn(es), text: "改好了配置。", ...extra }).some((f) => f.id === "K0");
+      hp("308 K0-1 接线:注入本仓 checkout、只写仓外 ⇒ K0 不响", k0({ repoCheckouts: ["/repo"] }), false);
+      hp("308 K0-1 接线对照:不注入 ⇒ K0 照响", k0({}), true);
+    }
     // ── attachBatchLog(批 256):AD 项的提交全文注入 ──
     {
       const g = { batch: "256", conditions: ["甲"], baseCommit: "abc1234" };
@@ -6477,8 +6599,8 @@ if (["--fp", "--fp-retract", "--fp-miss", "--fp-report"].includes(argv[0])) {
     // D1/批 102:报表前先验链——断链不瞒报,红行打在报表头(完整性告警的默认路径)
     for (const lf of [".claude/.gate-alerts.jsonl", LEDGER]) {
       try {
-        const vr = ledgerVerify(lf);
-        if (!vr.ok) console.log(`🔴 台账链违例:${lf} ${vr.violations.length} 处(首处 L${vr.violations[0].line} ${vr.violations[0].kind})——下面的数字不可信,先 ledger-chain verify 查`);
+        const red = ledgerChainRedLine(lf, ledgerVerify, (f) => fs.existsSync(f));
+        if (red) console.log(red);
       } catch { /* 验不了照出报表,数字按未担保读 */ }
     }
     const A = rd(".claude/.gate-alerts.jsonl"), L = rd(LEDGER);

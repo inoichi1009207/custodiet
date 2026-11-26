@@ -300,7 +300,7 @@ console.log("正反例:");
 //   第十八次:`justAdded`(批 285,D136②)——「同轮造件分两次提交」这一漏放形态原先在夹具层无机器证人(只能拿 tracked 近似);
 //     注入面与 tracked / preExisted 同形,值为仓根相对路径数组。只补夹具通道,不改任何判据。
 //   第十七次:`batchEverArmed`(批 265,K0 在「从没立过批的仓」不判;实时 hook 才注入,夹具不加写不出这一形)。
-const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "justAdded", "preExisted", "batchGoal", "batchEverArmed", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "resolveRev", "hookCheckout", "gateTouched", "at", "then", "expectBlock", "priorFar", "codexJobs", "installNames"]);
+const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bash", "ps", "read", "grep", "web", "agent", "mcp", "skill", "tracked", "justAdded", "preExisted", "batchGoal", "batchEverArmed", "pLedger", "prior", "user", "bgTasks", "debtFacts", "diffFacts", "headFacts", "resolveRev", "hookCheckout", "gateTouched", "at", "then", "expectBlock", "priorFar", "codexJobs", "installNames", "bashBg", "repoCheckouts"]);
 //   第二十次:`installNames`(批 305)——安装方配置里的两份确切名字名单(部署脚本文件名 / 私仓仓名),注入通道,不进 entries。
 //     W 的部署脚本那一支、DP 的私仓短路改读它之后,「配了这个名字 / 没配」两半在夹具里要分得开;不写 ⇒ 不传(两个空名单)。
 //     值 `{ deployScripts?: string[], privateRepos?: string[] }`;子键与值形状都校验(写成字符串会被 buildCtx 静默归空)。
@@ -408,7 +408,22 @@ const mkEntries = (c) => {
   // `then`:主 assistant 条目之后、同一窗口内再接的条目(写法同 prior 项;a2155edb BP-1)。
   if ("then" in c && !Array.isArray(c.then)) throw new Error(`夹具 then 须为数组:${JSON.stringify(c.then)}`);
   const tail = Array.isArray(c.then) ? c.then.flatMap(mkPriorEntries) : [];
-  return [...pre, { type: "assistant", ...(c.at ? { timestamp: c.at } : {}), message: { content: blocks } }, ...tail];
+  // `bashBg`(批 308 K1):带**工具结果**的 Bash 调用,写「这条命令被放到后台 / 还没跑完」那一形。
+  //   值 = [{ command, result: "<工具结果原文>", tur?: {toolUseResult 结构字段} }];每项发一个带编号的 tool_use,
+  //   主 assistant 条目之后各接一条 tool_result(与真实转录同形:结果挂在 user 型条目下,toolUseResult 是整条一份)。
+  const bgRes = [];
+  if ("bashBg" in c) {
+    if (!Array.isArray(c.bashBg)) throw new Error(`夹具 bashBg 须为数组 [{ command, result, tur? }]:${JSON.stringify(c.bashBg)}`);
+    c.bashBg.forEach((x, k) => {
+      for (const kk of Object.keys(x || {})) if (!["command", "result", "tur"].includes(kk)) throw new Error(`bashBg 子键不认识:「${kk}」—— 合法键:command, result, tur`);
+      if (typeof x.command !== "string" || typeof x.result !== "string") throw new Error(`bashBg 项须有字符串 command 与 result:${JSON.stringify(x)}`);
+      const id = `fx-bg-${k}`;
+      blocks.push({ type: "tool_use", id, name: "Bash", input: { command: x.command } });
+      bgRes.push({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: x.result, is_error: false }] },
+        ...(x.tur ? { toolUseResult: x.tur } : {}) });
+    });
+  }
+  return [...pre, { type: "assistant", ...(c.at ? { timestamp: c.at } : {}), message: { content: blocks } }, ...bgRes, ...tail];
 };
 // ⚠️ `tracked` 必须**从夹具注入**,不能让规则自己去 execFileSync git。
 //   注不进来 ⇒ ctx 侧 fail-closed 当「新建」——于是 I 的「改既有载体」这一支
@@ -497,6 +512,8 @@ const mkCtx = (c) => buildCtx(mkEntries(c), {
   ...("batchGoal" in c ? { batchGoal: c.batchGoal } : {}),
   ...("batchEverArmed" in c ? { batchEverArmed: c.batchEverArmed } : {}),
   ...("bgTasks" in c ? { bgTasks: c.bgTasks } : {}),
+  // `repoCheckouts`(批 308 K0-1):本仓全部 checkout 根,注入通道;不写 ⇒ 不传 ⇒ K0 不筛仓外写(与旧夹具逐字同)
+  ...("repoCheckouts" in c ? { repoCheckouts: c.repoCheckouts } : {}),
   ...("debtFacts" in c ? { debtFacts: c.debtFacts } : {}),
   ...("diffFacts" in c ? { diffTier: () => c.diffFacts } : {}),
   ...("headFacts" in c ? { headFacts: () => c.headFacts } : {}),

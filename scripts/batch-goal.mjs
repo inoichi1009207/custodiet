@@ -1644,6 +1644,15 @@ function selfTest() {
     const shiftRow = "| D905 | 描述 `a|b` | 已结过一轮的 270 | **≤281** | 来源 | x |";
     t("285 D133:对照——旧切法第 4 列读到错位格", shiftRow.split("|").slice(1, -1)[3].trim(), "已结过一轮的 270");
     t("285 D133:掩码后不再被错位格的「已结」当成已结", debtDue([shiftRow], 285).mine, ["D905(≤281)"]);
+    // 批 308 D1(实撞):随仓发的示例欠账表里有一行「D1 示例行 … ≤5」,任何批号大于 5 的开批都把它当到期未结的债列出来。
+    //   钉住:随仓那份表在任何批号下都没有到期项(取行口径同 debtTableRows)。仓里没有这份文件(安装方换了位置)⇒ 不比。
+    t("308 D1:随仓的示例欠账表在任何批号下都没有到期项", (() => {
+      const f = fileURLToPath(new URL("../docs/gate-debts.md", import.meta.url));
+      if (!fs.existsSync(f)) return [[], []];
+      const rows = fs.readFileSync(f, "utf8").split(/\r?\n/).filter((l) => /^\| D\d+ \|/.test(l) && !debtRowParked(l));
+      const d = debtDue(rows, 9999);
+      return [d.mine, d.yours];
+    })(), [[], []]);
   }
   // ⚠️ **「结清后再武装」这条序列此前零覆盖**(2026-08-20 实撞后补)。
   //   为修 grill E6 我让 `--clear` 把批号写进状态文件 ⇒ 结清后是 `{cleared:true, batch:"073"}`;

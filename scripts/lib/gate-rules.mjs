@@ -157,8 +157,11 @@ export const RULE_D = {
 const G_CHECK = {
   wroteRegister: (c) => !!c && c.wroteAny(/tool-register\.md/),
   // ① 入册(取证窗=本轮∪批窗口,同 I 项的理由:造与入册可以不同轮)
-  reg(ctx, win) {
-    const created = touched(ctx, CARRIER_RE, true);
+  reg(ctx, win, { memoryExempt = true } = {}) {
+    // 批 308 G1(实撞):memory 笔记(用户主目录下的项目记忆)不在仓里、进不了提交,用户已签「不是载体」——与 I / L / K0 同一谓词豁免。
+    //   memoryExempt 只给变异用(退回改前)。
+    const view = memoryExempt ? { ...ctx, isNew: (p) => !RULE_I._i.isMemoryNote(p) && ctx.isNew(p) } : ctx;
+    const created = touched(view, CARRIER_RE, true);
     if (!created.length || this.wroteRegister(ctx) || this.wroteRegister(win)) return null;
     return `① 入册:新建并提交了造物面载体(${created.slice(0, 2).join("、")}),而本轮∪批窗口没有对 docs/tool-register.md 的写动作`;
   },
@@ -210,8 +213,10 @@ export const RULE_G = {
     return [G_CHECK.reg(ctx, win), G_CHECK.expiry(ctx), G_CHECK.accept(ctx, win)].filter(Boolean);
   },
   exempts: [],
+  // 批 308 G1:提示只露首行,原首行以冒号收尾、冒号后是空的——模型看不到是哪一项。首行改成自带头一项。
   message: (hits) =>
-    `关账自审的可核项未过(动作面判据,v2;③接线无机器判据仍归人审):\n    · ${hits.join("\n    · ")}`,
+    `关账自审的可核项未过 ${hits.length} 项:${hits[0]}${hits.length > 1 ? `(另 ${hits.length - 1} 项见下)` : ""}\n` +
+    `    (动作面判据,v2;③接线无机器判据仍归人审)\n    · ${hits.join("\n    · ")}`,
   mutations: [
     // 拧断①:不查入册联动 ⇒ 造完不入册无人拦(v1 的实况:coverage-check 漏册 5 天没人发现)
     { name: "① 不查造物入册", apply: (r) => ({ ...r, detect: (ctx) => {
@@ -230,6 +235,12 @@ export const RULE_G = {
       if (!ctx.didCommit()) return [];
       const win = gWin(ctx);
       return [G_CHECK.reg(ctx, win), G_CHECK.expiry(ctx)].filter(Boolean);
+    } }) },
+    // 批 308 G1 退回:① 把新建的 memory 笔记也算成待入册载体。证人 = neg「308 G1:新建 memory 笔记 + 同轮提交别的」。
+    { name: "308 G1 退回:memory 笔记算待入册载体", apply: (r) => ({ ...r, detect: (ctx) => {
+      if (!ctx.didCommit()) return [];
+      const win = gWin(ctx);
+      return [G_CHECK.reg(ctx, win, { memoryExempt: false }), G_CHECK.expiry(ctx), G_CHECK.accept(ctx, win)].filter(Boolean);
     } }) },
     // 拧断⑤:去掉 didCommit 前置闸 ⇒ 没提交的工作轮也被追讨(v1 已修对的那半,钉住)
     { name: "去掉 didCommit 前置闸", apply: (r) => ({ ...r, detect: (ctx) => {
@@ -270,6 +281,10 @@ export const RULE_G = {
         tracked: ["scripts/hook-remote-check.mjs"], bash: "echo timeout 300 node scripts/hook-remote-check.selftest.mjs" },
     ],
     neg: [
+      // 批 308 G1(实撞两次):本轮新写了 memory 笔记(用户主目录下的项目记忆,不在仓里、不会进提交,用户已签「memory 笔记不是载体」),
+      //   同轮提交了别的文件 ⇒ ① 原把 memory 笔记算成「新建并提交的造物面载体」,要求写 tool-register。与 I / L / K0 同一个豁免谓词。
+      { name: "308 G1:新建 memory 笔记 + 同轮提交别的 ⇒ ① 不响", text: "记下了,提交。", commit: true,
+        write: "C:/Users/x/.claude/projects/p/memory/note-a.md", then: [{ write: "C:/Users/x/.claude/projects/p/memory/MEMORY.md" }] },
       // 批 276 误拦 r6 FB-14:续行写法真跑了推送防线自测 ⇒ 放行;cd 之后跑也放
       { name: "276 误拦 r6 FB-14:续行跑推送防线自测", text: "改完提交。", commit: true, write: "scripts/hook-remote-check.mjs",
         tracked: ["scripts/hook-remote-check.mjs"], bash: "node --no-warnings \\\n  scripts/hook-remote-check.selftest.mjs" },
@@ -2922,6 +2937,22 @@ function properClose(ctx) {
 //   现在能忍是因为它只在本轮有提交时才升阻断(武装与提交同轮的情况少),
 //   但这是**运气不是设计**:哪天有人 arm 完顺手提交,就会被自己刚立的条件拦住。
 //   不当场改的理由:同一文件当日已改多轮,攒批处理;条件已写进批 069。
+/** 批 308 K1(实撞):本轮**最后一次**执行 `batch-goal --clear` 的那条命令,工具结果说它被放到后台(显式后台 / 超时被转后台 /
+ *  手动转后台)且没有证据说它已经跑完 ⇒ true。「跑完了」只认 Stop 载荷 background_tasks[] 里同一任务号的非在飞状态;
+ *  载荷缺席 / 没列这个任务 / 说还在跑 ⇒ 按还没跑完算(误拦比漏放贵)。拿不到工具结果(老转录、夹具)⇒ false,判法不变。 */
+export function clearStillInBackground(ctx) {
+  let last = null;
+  for (const a of ctx.actions || []) {
+    if (!/^(Bash|PowerShell)$/.test(String(a?.name || ""))) continue;
+    if (batchGoalOps({ actions: [a] }).some((o) => o.op === "clear")) last = a;
+  }
+  const r = last && last.result;
+  if (!r || !r.background) return false;
+  const tasks = Array.isArray(ctx.bgTasks) ? ctx.bgTasks : [];
+  const t = r.bgId ? tasks.find((x) => String(x?.id || "") === r.bgId) : null;
+  return !(t && !BG_RUNNING_STATUS.test(String(t.status || "").toLowerCase().trim()));
+}
+
 const RULE_K = {
   id: "K",
   // ═══ 批 250 瘦身(用户 2026-09-17 签:「K 我们做的有点过头了——没人主观上会这样,但是不少好人被拦了」)═══
@@ -2987,6 +3018,9 @@ const RULE_K = {
     }
     const sTxtK = text.replace(/「[^」]*」|«[^»]*»|“[^”]*”|"[^"]*"/g, " ");
     if (matchAny(sTxtK, PAT.waitMark).length && matchAny(text, PAT.stopReason).length) return [];   // 与 S 的 marked 同口径(批 253e)
+    // 批 308 K1(实撞):这次 --clear 被放到后台、还没跑完 ⇒ 盘上未结清无痕是正常的中间态,不响(只管无痕那一支;带拒清痕迹的照旧)。
+    //   代价(漏放,接受):后台结清在下一轮跑完却失败无痕时,那一轮没有 --clear 动作,K 不再追——盘上批仍武装,S / K0 照常盯着。
+    if (!g.clearRefusedAt && clearStillInBackground(ctx)) return [];
     return [g.clearRefusedAt
       ? `本轮跑了 --clear,但结清被拒(拒清痕迹 ${g.clearRefusedAt})`
       : "本轮跑了 --clear,但盘上仍是未结清状态,也没有拒清痕迹(结清可能半路出错)"];
@@ -3059,6 +3093,10 @@ const RULE_K = {
     } }) },
     // ⏸ 不算合法停工 ⇒ 拒清后停下问用户被拦。证人 = 批 253 的 ⏸ neg。
     { name: "⏸ 不算合法停工", apply: (r) => ({ ...r, detect: (ctx) => r.detect({ ...ctx, text: String(ctx.text || "").replace(/⏸/g, "") }) }) },
+    // 批 308 K1 退回:不看结清是不是还在后台跑 ⇒ 后台结清的那一轮被判「结清半路出错」。证人 = neg「308 K1:结清被显式放到后台」。
+    { name: "后台结清当成已跑完", apply: (r) => ({ ...r, detect: (ctx) => r.detect({ ...ctx, bgTasks: (ctx.actions || []).map((a) => a.result && a.result.bgId).filter(Boolean).map((id) => ({ id, status: "completed" })) }) }) },
+    // 批 308 K1 退回(另一侧):后台任务跑完了也当在跑 ⇒ 跑完却没结清的那一轮放走。证人 = pos「308 K1:后台结清已跑完」。
+    { name: "后台结清跑完了也当在跑", apply: (r) => ({ ...r, detect: (ctx) => r.detect({ ...ctx, bgTasks: null }) }) },
     // 降成提示 ⇒ 结清没成那一轮不再逼模型处理(codex 250 实现复核第 5 条)。证人 = 两条 pos 的阻断标志。
     { name: "降成提示(blocking=false)", apply: (r) => ({ ...r, blocking: false }) },
     // 改看正文里的 --clear ⇒ 说一句「接下来 --clear」就报、真跑了反而不报。证人 = pos「拒清」与 neg「正文提到 --clear」。
@@ -3093,8 +3131,26 @@ const RULE_K = {
       // 结清无痕:跑了 --clear,盘上仍武装且无拒清痕迹。
       { text: "提交并结清。", commit: true, bash: "node --no-warnings scripts/batch-goal.mjs --clear",
         batchGoal: { batch: "250", conditions: ["甲", "乙"] } },
+      // 批 308 K1 的边界:结清放到后台,但 Stop 载荷说那个后台任务已经跑完 ⇒ 跑完了却没结清、没痕迹,照旧阻断。
+      { name: "308 K1:后台结清已跑完(载荷 completed)仍未结清无痕 ⇒ 阻断", text: "结清跑完了。",
+        bashBg: [{ command: "node --no-warnings scripts/batch-goal.mjs --clear > out.txt 2>&1", result: "Command running in background with ID: bx1. Output is being written to: E:/x/tasks/bx1.output.", tur: { backgroundTaskId: "bx1" } }],
+        bgTasks: [{ id: "bx1", status: "completed" }],
+        batchGoal: { batch: "250", conditions: ["甲", "乙"] } },
     ],
     neg: [
+      // 批 308 K1(实撞):--clear 以后台方式起(工具结果是「running in background with ID」),回合结束时结清还在重跑登记的检查,
+      //   盘上自然还是未结清、也没有拒清痕迹 ⇒ 不是「结清半路出错」,不响。工具结果措辞取自真实转录(路径、任务号已换中性写法)。
+      { name: "308 K1:结清被显式放到后台、还没跑完 ⇒ 不响", text: "关账命令在后台跑,完成会叫我回来。",
+        bashBg: [{ command: "node --no-warnings scripts/batch-goal.mjs --clear --verdict \"1=达成\" > out.txt 2>&1; echo \"clear exit=$?\"",
+          result: "Command running in background with ID: bx1. Output is being written to: E:/x/tasks/bx1.output. You will be notified when it completes — do not poll that file or sleep while waiting.",
+          tur: { stdout: "", stderr: "", interrupted: false, backgroundTaskId: "bx1" } }],
+        batchGoal: { batch: "250", conditions: ["甲", "乙"] } },
+      // 同上,本机钩子把超过 10 秒的前台命令自动转后台的形态;结构字段缺席(真实语料里有这种行),只认措辞。载荷说还在跑。
+      { name: "308 K1:结清超时被转后台(只有措辞)、载荷说在跑 ⇒ 不响", text: "结清还在跑。",
+        bashBg: [{ command: "node --no-warnings scripts/batch-goal.mjs --clear",
+          result: "Command did not complete within its 10s timeout and was moved to the background (ID: bx2). Output is being written to: E:/x/tasks/bx2.output. You will be notified when it completes." }],
+        bgTasks: [{ id: "bx2", status: "running" }],
+        batchGoal: { batch: "250", conditions: ["甲", "乙"] } },
       // 批 284(281 实撞):在 worktree 里结清了自己的批,盘上读到的是别的会话武装的批 ⇒ 不响
       { name: "K 284:外来批不追结清", text: "批 281 结清。", bash: "cd .claude/worktrees/batch281 && node --no-warnings scripts/batch-goal.mjs --clear",
         batchGoal: { batch: "280", conditions: ["甲", "乙"], foreign: true } },
@@ -3401,7 +3457,8 @@ const k0Bookkeeping = (ctx) => {
   const norm = (w) => String(w).replace(/\\/g, "/");
   // 批 253b(第二轮红队 BP-5):memory 笔记(`.claude/projects/*/memory/**.md`,与 I 同口径)不是工作面,
   //   自然也不占簿记豁免的名额——否则「补 memory + 记债表」会因为混入 memory 而落回拦截侧。
-  const fromTools = (ctx.writes || []).map(norm).filter((w) => !RULE_I._i.isMemoryNote(w));
+  // 批 308 K0-1:确知在本仓所有 checkout 之外的写同样不是工作面,不占簿记名额(与 workWrites 同口径;repoCheckouts 缺席不筛)
+  const fromTools = (ctx.writes || []).map(norm).filter((w) => !RULE_I._i.isMemoryNote(w) && inRepoCheckout(w, ctx.repoCheckouts));
   // ⚠️ 头两版都写错,记在这:①第一版传了 `JSON.stringify(ctx.actions)`,而本函数要的是
   //   **单条命令串**;②同时漏了第二参 `pathRe` ⇒ 函数内 `pathRe.test` 抛 TypeError
   //   ⇒ **被我自己的 catch 吞成空数组**,豁免安静地不工作、还看不出来。
@@ -3409,7 +3466,7 @@ const k0Bookkeeping = (ctx) => {
   //   故此处 catch 只兜**单条命令**的解析失败,不整体吞;且失败 ⇒ 不豁免(fail-closed)。
   const fromBash = [];
   for (const [ci, cmd] of (ctx.bashCmds || []).entries()) {
-    try { for (const t of bashWriteTargets(cmd, ANY_PATH_RE, { dialect: ctx.bashDialects?.[ci] })) { const p = norm(t); if (!RULE_I._i.isMemoryNote(p)) fromBash.push(p); } }
+    try { for (const t of bashWriteTargets(cmd, ANY_PATH_RE, { dialect: ctx.bashDialects?.[ci] })) { const p = norm(t); if (!RULE_I._i.isMemoryNote(p) && inRepoCheckout(p, ctx.repoCheckouts)) fromBash.push(p); } }
     catch { return false; }   // 解析不了就不豁免,而不是当成「没写」
   }
   const all = [...fromTools, ...fromBash];
@@ -3417,12 +3474,34 @@ const k0Bookkeeping = (ctx) => {
   return all.length > 0 && all.every((w) => /docs\/(gate-debts|product-diary|noun-diary)\.md$/.test(w));
 };
 
+/** 批 308 K0-1:一个写目标是否落在本仓的某个 checkout 里(`roots` = ctx.repoCheckouts)。
+ *  只对**确知的绝对路径**下「仓外」结论:盘符路径、`/c/…`、`/mnt/c/…` 形归一成 `c:/…`、消 `.` / `..`、不分大小写比前缀;
+ *  相对路径、`~` / `$VAR` 开头、解不出的 ⇒ 按仓内算(原判据)。roots 缺席 ⇒ 一律仓内。 */
+export function inRepoCheckout(p, roots) {
+  if (!Array.isArray(roots) || !roots.length) return true;
+  const norm = (x) => {
+    let s = String(x || "").trim().replace(/\\/g, "/");
+    const m = /^\/mnt\/([A-Za-z])(\/|$)/.exec(s) || /^\/([A-Za-z])(\/|$)/.exec(s);
+    if (m) s = `${m[1]}:/${s.slice(m[0].length)}`;
+    const drive = /^[A-Za-z]:\//.test(s) ? s.slice(0, 2) : s.startsWith("/") ? "" : null;
+    if (drive === null) return null;                          // 相对 / ~ / $VAR / D:foo ⇒ 判不了
+    const parts = [];
+    for (const seg of s.slice(drive.length).split("/")) { if (!seg || seg === ".") continue; if (seg === "..") parts.pop(); else parts.push(seg); }
+    return `${drive}/${parts.join("/")}`.toLowerCase();
+  };
+  const t = norm(p);
+  if (t === null) return true;
+  return roots.some((r) => { const n = norm(r); return n !== null && (t === n || t.startsWith(n.replace(/\/$/, "") + "/")); });
+}
+
 const RULE_K0 = {
   id: "K0",
   _k0: {
-    /** 工作面写入 = `ctx.writes` 去掉 memory 笔记(批 253b;口径与 I 项 `isMemoryNote` 同一实现)。 */
+    /** 工作面写入 = `ctx.writes` 去掉 memory 笔记(批 253b;口径与 I 项 `isMemoryNote` 同一实现),
+     *  再去掉确知落在本仓所有 checkout 之外的写(批 308 K0-1 实撞:结清后只改了用户主目录下的工具配置与临时目录里的任务书,
+     *  K0 报「已结清后又动工作面」。仓外的文件不是本仓的工作面;`repoCheckouts` 没注入时不筛,判法同旧)。 */
     workWrites(ctx, { memoryExempt = true } = {}) {
-      const ws = (ctx.writes || []).map((w) => String(w).replace(/\\/g, "/"));
+      const ws = (ctx.writes || []).map((w) => String(w).replace(/\\/g, "/")).filter((w) => inRepoCheckout(w, ctx.repoCheckouts));
       return memoryExempt ? ws.filter((w) => !RULE_I._i.isMemoryNote(w)) : ws;
     },
   },
@@ -3635,6 +3714,15 @@ const RULE_K0 = {
         }
         return r.detect(ctx);
       } }) },
+    // 批 308 K0-1 退回:仓外的写也算工作面(不看 repoCheckouts)。证人 = neg「308 K0-1:结清后只写仓外」「只改债表 + 仓外一处」。
+    { name: "308 K0-1 退回:仓外的写也算工作面", apply: (r) => ({ ...r, detect: (ctx) => r.detect({ ...ctx, repoCheckouts: null }) }) },
+    // 批 308 K0-1 退回(另一侧):只比字面前缀(不归一大小写 / 斜杠 / git-bash 形)⇒ 仓内的写被当成仓外。证人 = pos 两条「308 K0-1 反向钉」。
+    { name: "308 K0-1 退回:只比字面前缀", apply: (r) => ({ ...r, detect: (ctx) => {
+      const roots = ctx.repoCheckouts;
+      if (!roots) return r.detect(ctx);
+      const ws = (ctx.writes || []).filter((w) => !/^([A-Za-z]:|\/)/.test(w) || roots.some((x) => String(w).startsWith(x + "/")));
+      return r.detect({ ...ctx, writes: ws, repoCheckouts: null });
+    } }) },
     // 批 253d(第三轮红队 BP-4):排除式 pathspec 退回按普通路径计数 ⇒ `git add -A ':!clipboard'` 算定向、簿记豁免放行。
     //   **真退回**:整条 detect(含 K0 分区外的 k0Bookkeeping)都在旧口径下跑,两个方向同时作证——
     //   证人 = pos「253d BP-4 ①②③」(旧口径放行)与 neg「253d BP-4 反向钉:正向 pathspec + 排除式」(新旧都放行,守住不外溢)。
@@ -3756,6 +3844,12 @@ const RULE_K0 = {
       // `batchGoal: null` 是**必须显式写**的:null = 读了、文件不在(真没武装),
       // 而省略 = undefined = 通道没接(不判)。夹具里省略它会让本条静默不响。
       { text: "改完了。", write: "scripts/x.mjs", batchGoal: null },
+      // 批 308 K0-1 反向钉:仓内照算——worktree 里的写(反斜杠、盘符大小写不同)、git-bash 形 /d/… 的写,混着仓外写也照响
+      { name: "308 K0-1 反向钉:worktree 里的写(大小写 / 反斜杠不同)照算", text: "改完了。",
+        write: "d:\\Repo\\.claude\\worktrees\\w1\\scripts\\x.mjs", then: [{ write: "C:/Users/x/.toolrc/config.toml" }],
+        repoCheckouts: ["D:/repo", "D:/repo/.claude/worktrees/w1"], batchGoal: { cleared: true, batch: "307", closedConditions: ["甲"] } },
+      { name: "308 K0-1 反向钉:git-bash 形 /d/repo/… 照算", text: "改完了。", write: "/d/repo/docs/a.md",
+        repoCheckouts: ["D:/repo"], batchGoal: { cleared: true, batch: "307", closedConditions: ["甲"] } },
       // D90 反向钉:台账与判据**同批**改 ⇒ 混入即照拦。
       //   簿记豁免的边界原话是「任何其他路径混入写面即照拦(『顺手把修法也做了』不属簿记)」,
       //   本条钉住它在 **Bash 写面**上同样成立——否则新豁免会顺手把「顺手」也放过去。
@@ -3886,6 +3980,15 @@ const RULE_K0 = {
         batchGoal: { cleared: true, batch: "285", closedConditions: ["甲", "乙", "丙"] } },
     ],
     neg: [
+      // 批 308 K0-1(实撞):结清之后只改了仓外两处(用户主目录下的工具配置、临时目录里的任务书),本仓一个文件没碰 ⇒ 不响
+      { name: "308 K0-1:结清后只写仓外(主目录工具配置、临时目录)⇒ 不响", text: "配置改好了,冒烟任务也写好了。",
+        write: "C:\\Users\\x\\.toolrc\\config.toml", then: [{ write: "E:/x/Tmp/scratch/../scratch/smoke.md" }],
+        repoCheckouts: ["D:/repo", "D:/repo/.claude/worktrees/w1"],
+        batchGoal: { cleared: true, batch: "307", closedConditions: ["甲"] } },
+      // 同口径在簿记豁免上:只改债表 + 仓外一处 ⇒ 仓外那处不占名额,仍是纯簿记
+      { name: "308 K0-1:只改债表 + 仓外一处 ⇒ 仍是簿记", text: "登记欠账。", write: "docs/gate-debts.md",
+        then: [{ write: "C:/Users/x/.toolrc/config.toml" }], repoCheckouts: ["D:/repo"],
+        batchGoal: { cleared: true, batch: "307", closedConditions: ["甲"] } },
       // 批 285 第二轮复核(误拦猎手第 2 份 FB-1,阻断级老误拦):Markdown 写法的逐条对照同样算数
       ...["条件 1:**达成**", "条件 1(欠账清零):达成", "- 条件 1 —— 达成", "| 条件 1 | 达成 |", "条件 1:✅ 达成", "**条件 1**:达成", "条件（一）:达成"]
         .map((w) => ({ name: `285 二轮 FB-1:${w}`, text: `${w}\n关账。`, bash: "node scripts/batch-goal.mjs --clear\ngit commit -m x",
