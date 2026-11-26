@@ -3201,6 +3201,9 @@ export function run(transcriptPath, ctx = {}) {
         //   自测与回放进程(STOP_CLOSURE_SELFTEST=1)不读盘 ⇒ undefined ⇒ K0 不筛(测出来的东西不取决于宿主仓有几个 worktree)。
         repoCheckouts: ctx.repoCheckouts !== undefined ? ctx.repoCheckouts
           : (process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : repoCheckoutsFs()),
+        // 批 308 S1b G-2:本仓有没有工具登记表(G ① 没有就不要求入册)。同一注入纪律;进程已锚在仓根,相对路径即仓根下。
+        toolRegisterPresent: ctx.toolRegisterPresent !== undefined ? ctx.toolRegisterPresent
+          : (process.env.STOP_CLOSURE_SELFTEST === "1" ? undefined : fs.existsSync("docs/tool-register.md")),
         // 批 258:实时路径给批状态补 `turnBatchStart`(本轮开始时正开着的那一批的起点;W 按它切交付物)
         batchGoal: ctx.batchGoal !== undefined ? ctx.batchGoal : (() => {
           const g0 = readBatchGoal();
@@ -5251,6 +5254,14 @@ function selfTest() {
       const k0 = (extra) => run(null, { entries: es, turn: lastTurn(es), text: "改好了配置。", ...extra }).some((f) => f.id === "K0");
       hp("308 K0-1 接线:注入本仓 checkout、只写仓外 ⇒ K0 不响", k0({ repoCheckouts: ["/repo"] }), false);
       hp("308 K0-1 接线对照:不注入 ⇒ K0 照响", k0({}), true);
+      // 批 308 S1b G-2 接线:run() 把 ctx.toolRegisterPresent 交给引擎
+      const eg = [{ type: "user", message: { role: "user", content: [{ type: "text", text: "go" }] } },
+        { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "写好了,提交。" },
+          { type: "tool_use", name: "Write", input: { file_path: "/repo/scripts/zzz-new-widget.mjs" } },
+          { type: "tool_use", name: "Bash", input: { command: "git commit -m x" } }] } }];
+      const gHit = (extra) => run(null, { entries: eg, turn: lastTurn(eg), text: "写好了,提交。", ...extra }).some((f) => f.id === "G");
+      hp("308 S1b G-2 接线:注入「没有登记表」⇒ G 不响", gHit({ toolRegisterPresent: false }), false);
+      hp("308 S1b G-2 接线对照:不注入 ⇒ G 照响", gHit({}), true);
     }
     // ── attachBatchLog(批 256):AD 项的提交全文注入 ──
     {

@@ -676,6 +676,9 @@ export function buildCtx(entries, extra = {}) {
      *  三态:undefined=通道没接(夹具 / 回放 ⇒ P 保持旧判法);true / false=账里有 / 没有本会话;null=账读不了(P 按碰过算)。 */
     gateTouched: extra.gateTouched === undefined ? undefined : (extra.gateTouched === true || extra.gateTouched === false ? extra.gateTouched : null),
     bgTasks: Array.isArray(extra.bgTasks) ? extra.bgTasks : null,
+    /** 批 308 S1b G-2:本仓有没有工具登记表(`docs/tool-register.md`)。hook 实时路径注入 true / false;
+     *  没注入(夹具、自测、回放)⇒ undefined ⇒ G ① 原判。 */
+    toolRegisterPresent: extra.toolRegisterPresent === true || extra.toolRegisterPresent === false ? extra.toolRegisterPresent : undefined,
     /** 批 308 K0-1:本仓的全部 checkout 根(主树 + 各 worktree;hook 由 `git worktree list` 取,经 isNewEvidence 注入)。
      *  正斜杠、去尾斜杠。没注入 / 空 ⇒ null(K0 退回原判据:写到哪都算动工作面)。 */
     repoCheckouts: Array.isArray(extra.repoCheckouts) && extra.repoCheckouts.some((r) => typeof r === "string" && r)

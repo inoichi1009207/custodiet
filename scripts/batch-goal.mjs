@@ -57,7 +57,7 @@ import { quoteUntrusted, buildCtx } from "./lib/gate-ctx.mjs";   // buildCtx:批
 import { isCarrierPath, CARRIER_SURFACE } from "./lib/gate-carriers.mjs";
 import { readInstallConfig, parseInstallConfig, mergeInstallConfig, absentInstallConfig, snapshotConfig, configFromSnapshot, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
 import * as OB from "./lib/obligations.mjs";
-import { debtRowCells, debtRowParked } from "./lib/debt-schema.mjs";   // 批 301:切列一份实现
+import { debtRowCells, debtRowParked, liveDebtRows } from "./lib/debt-schema.mjs";   // 批 301:切列一份实现
 import { planWriteChecks, applyWriteChecks, isWriteCheckType, withdrawnClears, transcriptDirs, projectDirName } from "./lib/write-checks.mjs";   // 批 301:写入类义务产生器(T / MF / J / M);批 305:转录目录的定位沿用它
 import * as RULER from "./lib/batch-ruler.mjs";   // 批 305:指令定位与主尺(从指令到关账人亲口说了几条话)
 export { debtRowCells, debtRowParked };
@@ -1260,8 +1260,9 @@ export function debtDue(rows, cur) {
 }
 
 /** 批 305:债表里参与到期判定的行(`| Dnn |` 起头、未停放)。读不到 ⇒ 抛(调用方各自处理:--arm 只提示,--handoff 写取不到)。 */
+//   批 308 S1b D-2:取行改走 debt-schema 的 liveDebtRows(同一份区段口径:「已销账」「已结清」二级标题下的行不取)。
 function debtTableRows() {
-  return fs.readFileSync(cfgDebtTable(), "utf8").split(/\r?\n/).filter((l) => /^\| D\d+ \|/.test(l) && !debtRowParked(l));
+  return liveDebtRows(fs.readFileSync(cfgDebtTable(), "utf8"));
 }
 
 function debtTableWarn() {
@@ -1649,10 +1650,15 @@ function selfTest() {
     t("308 D1:随仓的示例欠账表在任何批号下都没有到期项", (() => {
       const f = fileURLToPath(new URL("../docs/gate-debts.md", import.meta.url));
       if (!fs.existsSync(f)) return [[], []];
-      const rows = fs.readFileSync(f, "utf8").split(/\r?\n/).filter((l) => /^\| D\d+ \|/.test(l) && !debtRowParked(l));
-      const d = debtDue(rows, 9999);
+      const d = debtDue(liveDebtRows(fs.readFileSync(f, "utf8")), 9999);
       return [d.mine, d.yours];
     })(), [[], []]);
+    // 批 308 S1b D-2:同一份随仓表,「已结清」表里 4 列的行不再被点名「列数异常、看不见到期」
+    t("308 S1b D-2:随仓的示例欠账表没有列数异常的行(已结清区段不取)", (() => {
+      const f = fileURLToPath(new URL("../docs/gate-debts.md", import.meta.url));
+      if (!fs.existsSync(f)) return [];
+      return debtDue(liveDebtRows(fs.readFileSync(f, "utf8")), 9999).colBad;
+    })(), []);
   }
   // ⚠️ **「结清后再武装」这条序列此前零覆盖**(2026-08-20 实撞后补)。
   //   为修 grill E6 我让 `--clear` 把批号写进状态文件 ⇒ 结清后是 `{cleared:true, batch:"073"}`;
