@@ -7,7 +7,7 @@
 //
 // 判据(只有这一条;轮数、单次花费、整批花费、总时长四条「到线」由发车脚本自己管,这里不重做):
 //   - 「同一个调用」= 工具名相同 + 入参(JSON 序列化)逐字相同;入参顶层的 `description`(给人看的说明)不参与比较;
-//   - 「同样的错」= 结果 is_error 为真,且错误文字归一后(空白折成一个空格、取前 500 字)相同;
+//   - 「同样的错」= 结果 is_error 为真,且错误文字归一后(空白折成一个空格)全文相同;展示时只取前 500 字;
 //   - 「连着」= 严格连着:同一条线上先后到达的工具结果,连续 N 个都是它;中间夹了任何别的结果(成功的,或别的错)就从头数。
 //     一条线 = 主会话,或某一个子代理(事件带 parent_tool_use_id 的按它分线,互不打断、互不合并)。
 //   - 找不到对应 tool_use 的结果:忽略,不打断也不计数。
@@ -41,12 +41,17 @@ export const MAIN_LANE = "main";
 
 /** 工具结果的错误文字归一:字符串原样;数组取各块的 text 拼起来;空白折成一个空格、去首尾、取前 500 字。纯函数。 */
 export function normError(content) {
+  return normErrorFull(content).slice(0, ERROR_MAX);
+}
+/** 同上但不截断:判「同样的错」比的是这份全文。只比前 500 字的话,前面是一样的样板、后面才不同的几个错
+ *  会被当成同一个错而误停(批 307 codex 第 1 条);截断只用于展示。纯函数。 */
+export function normErrorFull(content) {
   let s;
   if (typeof content === "string") s = content;
   else if (Array.isArray(content)) s = content.map((c) => (typeof c === "string" ? c : c && typeof c.text === "string" ? c.text : "")).join(" ");
   else if (content == null) s = "";
   else { try { s = JSON.stringify(content); } catch { s = String(content); } }
-  return s.replace(/\s+/g, " ").trim().slice(0, ERROR_MAX);
+  return s.replace(/\s+/g, " ").trim();
 }
 function inputJson(x) {
   try { const s = JSON.stringify(x === undefined ? null : x); return s === undefined ? "null" : s; } catch { return String(x); }
@@ -81,8 +86,9 @@ export function createWatch({ sameErrorLimit = SAME_ERROR_LIMIT } = {}) {
     if (!st) { st = { key: null, count: 0 }; lanes.set(lane, st); }
     if (b.is_error !== true) { st.key = null; st.count = 0; return null; }
     errors++;
-    const error = normError(b.content);
-    const key = JSON.stringify([u.name, u.ident, error]);
+    const full = normErrorFull(b.content);
+    const error = full.slice(0, ERROR_MAX);
+    const key = JSON.stringify([u.name, u.ident, full]);
     if (st.key === key) st.count++;
     else { st.key = key; st.count = 1; }
     if (st.count > longestRun) { longestRun = st.count; longestTool = u.name; }
@@ -204,6 +210,10 @@ function selfTest() {
     [play(createWatch(), [["Bash", { command: "false", description: "a" }, true, "Exit code 1"], ["Bash", { command: "false ", description: "a" }, true, "Exit code 1"], ["Bash", { command: "false", description: "b" }, true, "Exit code 1"]]),
       play(createWatch(), [1, 2, 3].map((i) => ["Agent", { prompt: "p", opts: { description: `d${i}` } }, true, "boom"]))],
     [[null, null, null], [null, null, null]]);
+  t("错误文字前 500 字相同、后面才不同 ⇒ 不算同样的错,不命中;全文相同的长错误照样命中",
+    [play(createWatch(), ["A", "B", "C"].map((x) => ["Bash", { command: "false" }, true, "x".repeat(500) + x])),
+      play(createWatch(), [1, 2, 3].map(() => ["Bash", { command: "false" }, true, "x".repeat(900)]))],
+    [[null, null, null], [null, null, "same-error:3:main"]]);
   t("换了错误文字 ⇒ 不算同样的错,不命中", play(createWatch(), [E, E, ["Bash", { command: "false" }, true, "Exit code 2"], E]), [null, null, null, null]);
   t("换了工具名、入参同 ⇒ 不命中", play(createWatch(), [E, E, ["Grep", { command: "false" }, true, "Exit code 1"]]), [null, null, null]);
   t("甲乙甲乙轮流失败 ⇒ 不算连着(已登记的漏放)", play(createWatch(), [E, ["Read", { file_path: "a" }, true, "nope"], E, ["Read", { file_path: "a" }, true, "nope"], E, ["Read", { file_path: "a" }, true, "nope"]]), [null, null, null, null, null, null]);

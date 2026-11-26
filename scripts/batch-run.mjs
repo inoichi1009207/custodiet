@@ -363,11 +363,21 @@ export function resolveClaudeBin(env = process.env) {
   }
   return null;
 }
+/** 杀子进程树。Windows 上先 `taskkill /T /F`;它起不来或没成功(退出码非 0)⇒ 退一步只杀直接子进程。
+ *  返回「杀的动作发出去了没有」;进程退没退由 close 事件说,发出去了也可能不退——所以调用方另设宽限(见 runClaude 的 askKill)。
+ *  BATCH_RUN_TEST_NO_KILL=1 只给自测用:什么都不杀,用来走「杀不掉」那条路。 */
 function killTree(child) {
-  if (!child || !child.pid) return;
-  if (process.platform === "win32") spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 30_000 });
-  else { try { child.kill("SIGKILL"); } catch { /* 已退 */ } }
+  if (!child || !child.pid) return false;
+  if (process.env.BATCH_RUN_TEST_NO_KILL === "1") return false;
+  let ok = false;
+  if (process.platform === "win32") {
+    const r = spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 30_000 });
+    ok = !r.error && r.status === 0;
+  }
+  if (!ok) { try { ok = child.kill("SIGKILL"); } catch { ok = false; } }
+  return ok;
 }
+const KILL_GRACE_MS = 20_000;
 /** 拉起一次 claude:提示词走 stdin;stdout / stderr 追加进日志;逐行扫最后一条 type:"result";到 deadlineAt 杀进程树。
  *  watch(看守实例,可缺):逐行把事件喂给它,命中 ⇒ 记下命中内容、日志里写一行、杀进程树(事件驱动,不另起定时器)。 */
 function runClaude({ bin, args, cwd, input, log, deadlineAt, env, onPid, keepStdout = false, watch = null }) {
@@ -375,12 +385,29 @@ function runClaude({ bin, args, cwd, input, log, deadlineAt, env, onPid, keepStd
     const t0 = Date.now();
     const out = fs.createWriteStream(log, { flags: "a" });
     out.write(`# batch-run ${new Date().toISOString()} bin=${bin.how} args=${args.join(" ")}\n`);
-    let settled = false, killed = false, result = null, buf = "", all = "", spawnError = null, timer = null, hit = null, child = null;
+    let settled = false, killed = false, result = null, buf = "", all = "", spawnError = null, timer = null, hit = null, child = null, graceTimer = null, killStuck = null;
     const done = (code) => {
       if (settled) return; settled = true;
       if (timer) clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       if (buf) onLine(buf);
-      out.end(() => resolve({ code, killed, result, spawnError, watch: hit, ms: Date.now() - t0, stdout: all }));
+      out.end(() => resolve({ code, killed, result, spawnError, watch: hit, killStuck, ms: Date.now() - t0, stdout: all }));
+    };
+    // 看守命中或到截止时间 ⇒ 杀进程树;杀的动作发出去后进程迟迟不退(或根本杀不了)⇒ 宽限到了就不再等:
+    //   松开它的管道与引用(否则本进程退不出去),按已经定下的原因停,并把「这个进程可能还活着」交给上层写进交接。
+    //   原先杀的命令失败时没人知道,而本函数只等 close 事件 ⇒ 会一直等下去(批 307 codex 第 2 条)。
+    const askKill = (why) => {
+      const sent = killTree(child);
+      out.write(`# ${why}:杀子进程树 pid ${child?.pid}${sent ? "" : "(杀的动作没发出去)"}\n`);
+      if (graceTimer || settled) return;
+      const grace = Math.max(50, Number(process.env.BATCH_RUN_KILL_GRACE_MS) || KILL_GRACE_MS);
+      graceTimer = setTimeout(() => {
+        if (settled) return;
+        killStuck = child?.pid ?? null;
+        out.write(`# 宽限 ${grace} 毫秒到了,pid ${killStuck} 还没退:不再等它\n`);
+        try { child.stdout.destroy(); child.stderr.destroy(); child.stdin.destroy(); child.unref(); } catch { /* 松不开也照常往下走 */ }
+        done(-1);
+      }, sent ? grace : Math.min(grace, 2000));
     };
     const onLine = (line) => {
       const s = line.trim();
@@ -392,26 +419,27 @@ function runClaude({ bin, args, cwd, input, log, deadlineAt, env, onPid, keepStd
       const h = watch.feed(o);
       if (!h) return;
       hit = h;
-      out.write(`\n# 看守:同一个工具调用(${h.tool})连着 ${h.count} 次报同样的错,杀子进程树 pid ${child?.pid}\n`);
-      killTree(child);
+      out.write("\n");
+      askKill(`看守:同一个工具调用(${h.tool})连着 ${h.count} 次报同样的错`);
     };
     try { child = spawn(bin.cmd, [...bin.pre, ...args], { cwd, env, shell: bin.shell, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }); }
     catch (e) { spawnError = e.message; out.write(`# 起不来:${e.message}\n`); return done(-1); }
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (s) => {
+      if (settled) return;
       out.write(s);
       if (keepStdout) all += s;
       buf += s;
       let k;
       while ((k = buf.indexOf("\n")) >= 0) { onLine(buf.slice(0, k)); buf = buf.slice(k + 1); }
     });
-    child.stderr.on("data", (s) => out.write(s));
+    child.stderr.on("data", (s) => { if (!settled) out.write(s); });
     child.stdin.on("error", () => { /* 子进程先退,写 stdin 撞 EPIPE:不影响判定 */ });
     child.on("error", (e) => { spawnError = e.message; out.write(`# 子进程错误:${e.message}\n`); setTimeout(() => done(-1), 200); });
     child.on("close", (code) => done(code ?? -1));
     if (child.pid && onPid) onPid(child.pid);
-    timer = setTimeout(() => { killed = true; out.write(`# 到整批截止时间,杀子进程树 pid ${child.pid}\n`); killTree(child); }, Math.max(0, deadlineAt - Date.now()));
+    timer = setTimeout(() => { if (settled) return; killed = true; askKill("到整批截止时间"); }, Math.max(0, deadlineAt - Date.now()));
     child.stdin.end(input);
   });
 }
@@ -521,6 +549,7 @@ async function launch(C, prompt, resume) {
   const cost = costKnown ? launchCost(total, resume ? C.sessionCostSeen : null) : NaN;
   if (costKnown) { C.spent += cost; C.sessionCostSeen = total; }
   else note(C, `第 ${k} 次拉起没有花费读数(按 0 计)`);
+  if (r.killStuck) note(C, `第 ${k} 次拉起的执行会话杀不掉或迟迟不退(pid ${r.killStuck}),发车脚本没有再等它:请手工确认这个进程已经不在,再接着干`);
   C.launches.push({ k, kind: resume ? "repair" : "exec", cls: c.cls, exitCode: r.code, subtype: r.result?.subtype ?? null, isError: r.result?.is_error ?? null,
     turns: r.result?.num_turns ?? null, costUsd: costKnown ? round4(cost) : null, ms: r.ms, log: fwd(log), watch: r.watch || null, ...(r.spawnError ? { spawnError: r.spawnError } : {}) });
   C.lastResultText = String(r.result?.result ?? "");
@@ -1215,6 +1244,15 @@ async function selfTestE2E(t, tmp) {
       [true, true, true, true, true, true, true]);
     t("⑬ runs.jsonl 那一行与运行状态的拉起记录都带 watch(工具、次数、线);没有花费读数 ⇒ 记一行按 0 计",
       [row?.watch?.tool, row?.watch?.count, row?.watch?.lane, st.rounds?.[0]?.watch?.count, st.rounds?.[0]?.cls, r.res.notes.some((n) => /没有花费读数/.test(n))], ["Bash", 3, "main", 3, "stalled", true]); }
+
+  // ⑭ 杀不掉(自测接缝:什么都不杀):看守命中后宽限一到就不再等,照样停下、写交接,并写明那个进程可能还在
+  { const t0 = Date.now();
+    const r = run("t14", argsFor("t14"), { steps: [{ stream: sameErr(3, "t14"), sleepMs: 4000, result: ok() }] }, { extraEnv: { BATCH_RUN_TEST_NO_KILL: "1", BATCH_RUN_KILL_GRACE_MS: "300" } });
+    const ms = Date.now() - t0;
+    const log = (() => { try { return fs.readFileSync(J(RUN, "t14-r1.log"), "utf8"); } catch { return ""; } })();
+    t("⑭ 杀的动作没发出去、进程不退 ⇒ 宽限到了不再等:退出 10、watch-same-error、早于那段 4 秒长睡、备注写明杀不掉、日志里有不再等那一行",
+      [r.code, r.res.reasonCode, r.exec.length, ms < 3500, r.res.notes.some((n) => /杀不掉或迟迟不退/.test(n)), /还没退:不再等它/.test(log), !!r.res.handoff],
+      [10, "watch-same-error", 1, true, true, true, true]); }
 
   // ⑩ 发车前检查:没有 --check / 锁被活进程占着 / 在 linked worktree 里 ⇒ 退出 2,不留工作树
   { const r = run("t10a", ["--batch", "t10a", "--instruction", "x", "--cond", "甲"], null);
