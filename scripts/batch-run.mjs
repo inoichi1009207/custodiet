@@ -10,7 +10,7 @@
 //   node --no-warnings scripts/batch-run.mjs --batch <批号> --instruction "<用户原话>"
 //        --cond "<条件>" [--check "<命令>" [--expect "<子串>" | --expect-re "<正则>"]] [--cond …]   (原样透传给 batch-goal --arm)
 //        [--finish-line "<终点线>"] [--max-turns 80] [--max-budget-usd 8] [--cap-usd 20] [--deadline-min 90]
-//        [--model <名>] [--judge-model opus] [--no-merge] [--push <远端名>] [--handoff-out <路径>]
+//        [--model <名>] [--judge-model opus] [--no-merge] [--push <远端名>] [--handoff-out <路径>] [--same-error-limit 3]
 //   node --no-warnings scripts/batch-run.mjs --status [<批号>]      只读:运行状态与 runs.jsonl
 //   node --no-warnings scripts/batch-run.mjs --self-test           临时 git 仓 + 真 batch-goal + 按剧本行事的假 claude
 // 退出码:0 = 已关账;10 = 停下了(交接已写);2 = 拒绝发车(什么都没起);1 = 内部错误(尽量也写交接)。
@@ -25,6 +25,7 @@
 //   发车前检查(不过 ⇒ 退出 2、不留痕迹)→ 建工作树 `<主树>/.claude/worktrees/batch-<批号>`(分支 `batch-run/<批号>`,
 //   收尾闸只认这个位置的 worktree 批状态)→ 在工作树里 `batch-goal --arm`(环境变量 CLAUDE_CODE_SESSION_ID = 执行会话号,
 //   批状态的 armedBy 因此是执行会话)→ `claude -p --session-id <号>`(提示词走 stdin)→ 分类(classifyRun,照无头上限实测表)
+//   (执行与回修的拉起挂看守 batch-watch.mjs:同一个工具调用连着 3 次报同样的错 ⇒ 杀执行会话、停,不回修;`--same-error-limit 0` 关掉)
 //   → 验收(工作树干净 / `batch-goal --dry-check` / 逐条裁决 / 本批发起过的外审作业)→ 回修 `claude -p --resume <号>`
 //   (至多 3 轮;第二次验收不过时先拉一次方向复核 `_direction-judge`)→ 关账(ff 并回 / 基分支前进过则 rebase 一次 /
 //   推私仓并回读 / 欠账探针 / `--clear --verdict`)→ 清理(辅助件)。
@@ -50,6 +51,7 @@ import { fileURLToPath } from "node:url";
 import { findBash, normCheckout, parseArm } from "./batch-goal.mjs";
 import { JOB_ROOT as CODEX_JOB_ROOT, isPlaceholder } from "./codex-run.mjs";
 import { readInstallConfig, installNames, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
+import { createWatch, SAME_ERROR_LIMIT } from "./batch-watch.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const HERE = path.dirname(SELF);
@@ -58,7 +60,7 @@ const fwd = (p) => (p == null ? p : String(p).replace(/\\/g, "/"));
 const BG_FWD = fwd(BG);
 export const RESULT_KEY = "BATCH_RUN_RESULT=";
 export const REPAIR_MAX = 3;
-export const DEFAULTS = Object.freeze({ maxTurns: 80, maxBudgetUsd: 8, capUsd: 20, deadlineMin: 90, judgeModel: "opus" });
+export const DEFAULTS = Object.freeze({ maxTurns: 80, maxBudgetUsd: 8, capUsd: 20, deadlineMin: 90, judgeModel: "opus", sameErrorLimit: SAME_ERROR_LIMIT });
 const JUDGE_MAX_TURNS = 15, JUDGE_MAX_USD = 2;
 const say = (s) => process.stderr.write(`[batch-run] ${s}\n`);
 const tail = (s, n = 600) => { const t = String(s || "").trim(); return t.length > n ? "…" + t.slice(-n) : t; };
@@ -75,6 +77,7 @@ export function parseCli(argv) {
   }
   const STR = { "--batch": "batch", "--instruction": "instruction", "--finish-line": "finishLine", "--model": "model", "--judge-model": "judgeModel", "--push": "push", "--handoff-out": "handoffOut" };
   const NUM = { "--max-turns": "maxTurns", "--max-budget-usd": "maxBudgetUsd", "--cap-usd": "capUsd", "--deadline-min": "deadlineMin" };
+  const INT0 = { "--same-error-limit": "sameErrorLimit" };   // 非负整数;0 = 关掉看守
   const PASS = new Set(["--cond", "--check", "--expect", "--expect-re"]);
   const o = { arm: [], noMerge: false };
   const seen = new Set();
@@ -88,6 +91,14 @@ export function parseCli(argv) {
     };
     if (PASS.has(a)) { o.arm.push(a, val()); continue; }
     if (a === "--no-merge") { o.noMerge = true; continue; }
+    if (INT0[a]) {
+      if (seen.has(a)) throw new Error(`${a} 给了两次`);
+      seen.add(a);
+      const v = val();
+      if (!/^\d+$/.test(v)) throw new Error(`${a}「${v}」要是非负整数(0 = 关掉)`);
+      o[INT0[a]] = Number(v);
+      continue;
+    }
     if (STR[a] || NUM[a]) {
       if (seen.has(a)) throw new Error(`${a} 给了两次`);
       seen.add(a);
@@ -115,9 +126,12 @@ export function parseCli(argv) {
 // ── 纯判定(自测逐条钉住)────────────────────────────────────────────────────────────
 // 撞账户额度时 CLI 的结果文字(只在 is_error 真而 subtype 为 success 时才看):宽一点只会把「失败」认成「等额度」,两者都停。
 export const QUOTA_RE = /usage limit|limit (?:reached|exceeded)|hit your (?:usage )?limit|out of (?:extra )?usage|quota|rate.?limit|too many requests|resets? (?:at|in|on)\b|额度|用量/i;
-/** 一次拉起的分类(照无头上限实测表)。入参 { code, result(最后一条 type:"result" 事件或 null), killed(被截止时间杀掉) }。
- *  返回 { cls: done|cap|quota|failed|unknown, code(reasonCode), why }。不能只看 subtype:撞账户额度时它写的是 success。 */
-export function classifyRun({ code, result, killed } = {}) {
+/** 一次拉起的分类(照无头上限实测表)。入参 { code, result(最后一条 type:"result" 事件或 null), killed(被截止时间杀掉),
+ *  watch(看守的命中或 null) }。返回 { cls: done|cap|stalled|quota|failed|unknown, code(reasonCode), why }。
+ *  不能只看 subtype:撞账户额度时它写的是 success。优先级:看守命中 > 截止时间被杀 > 其余——进程是被看守杀的,
+ *  退出码与 result 事件都不可信;stalled 和 cap 一样停、不回修。 */
+export function classifyRun({ code, result, killed, watch } = {}) {
+  if (watch) return { cls: "stalled", code: "watch-same-error", why: `同一个工具调用(${watch.tool})连着 ${watch.count} 次报同样的错,看守把执行会话停了` };
   if (killed) return { cls: "cap", code: "cap-deadline", why: "到整批截止时间,执行会话被杀掉" };
   if (!result || typeof result !== "object") return { cls: "unknown", code: "unknown", why: `没有 result 事件(退出码 ${code})` };
   const st = result.subtype, text = String(result.result ?? "");
@@ -192,6 +206,19 @@ export function reviewVerdict(body) {
   if (!lastLine || isPlaceholder(lastLine)) return { v: "unknown", line: lastLine };
   const ok = /不用再审/.test(lastLine), bad = /要改/.test(lastLine);
   return { v: ok && !bad ? "pass" : bad && !ok ? "fail" : "unknown", line: lastLine };
+}
+
+/** `batch-goal --clear` 的拒清行 ⇒ { reason, repairable };没有拒清行 ⇒ null。
+ *  只有执行会话自己补得上的拒因才回修:检查没过、有没提交的改动、登记的决定缺记录、登记的成果缺日记行、缺「没有决定」的声明、
+ *  名下还有开着的义务、转欠账的那一行还没提交。拒因由 `+` 连起来时要**每一段**都在这张单子里。
+ *  其余(判不了工作树 / 判不了义务、检查被改过、批身份或义务账对不上、配置在批内改坏、裁决参数不对、没有可关的批……)
+ *  一律不回修——那不是再干一轮能解决的,按「判不了就停」处理(批 306 补审 codex 第 3 条)。纯函数。 */
+const CLEAR_REPAIRABLE = new Set(["checks-failed", "uncommitted", "adr-missing", "diary-missing", "no-decision", "obligation-open", "settle-uncommitted"]);
+export function clearRefusal(stderr) {
+  const m = /BATCH-GOAL-CLEAR-REFUSED\b[^\n]*?\breason=([^\s]+)/.exec(String(stderr || ""));
+  if (!m) return null;
+  const parts = m[1].split("+").filter(Boolean);
+  return { reason: m[1], repairable: parts.length > 0 && parts.every((p) => CLEAR_REPAIRABLE.has(p)) };
 }
 
 /** 远端地址 ⇒ 仓名(末段,去 `.git` 与尾斜杠)。认不出 ⇒ null。纯函数。 */
@@ -336,47 +363,83 @@ export function resolveClaudeBin(env = process.env) {
   }
   return null;
 }
+/** 杀子进程树。Windows 上先 `taskkill /T /F`;它起不来或没成功(退出码非 0)⇒ 退一步只杀直接子进程。
+ *  返回「杀的动作发出去了没有」;进程退没退由 close 事件说,发出去了也可能不退——所以调用方另设宽限(见 runClaude 的 askKill)。
+ *  BATCH_RUN_TEST_NO_KILL=1 只给自测用:什么都不杀,用来走「杀不掉」那条路。 */
 function killTree(child) {
-  if (!child || !child.pid) return;
-  if (process.platform === "win32") spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 30_000 });
-  else { try { child.kill("SIGKILL"); } catch { /* 已退 */ } }
+  if (!child || !child.pid) return false;
+  if (process.env.BATCH_RUN_TEST_NO_KILL === "1") return false;
+  let ok = false;
+  if (process.platform === "win32") {
+    const r = spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 30_000 });
+    ok = !r.error && r.status === 0;
+  }
+  if (!ok) { try { ok = child.kill("SIGKILL"); } catch { ok = false; } }
+  return ok;
 }
-/** 拉起一次 claude:提示词走 stdin;stdout / stderr 追加进日志;逐行扫最后一条 type:"result";到 deadlineAt 杀进程树。 */
-function runClaude({ bin, args, cwd, input, log, deadlineAt, env, onPid, keepStdout = false }) {
+const KILL_GRACE_MS = 20_000;
+/** 拉起一次 claude:提示词走 stdin;stdout / stderr 追加进日志;逐行扫最后一条 type:"result";到 deadlineAt 杀进程树。
+ *  watch(看守实例,可缺):逐行把事件喂给它,命中 ⇒ 记下命中内容、日志里写一行、杀进程树(事件驱动,不另起定时器)。 */
+function runClaude({ bin, args, cwd, input, log, deadlineAt, env, onPid, keepStdout = false, watch = null }) {
   return new Promise((resolve) => {
     const t0 = Date.now();
     const out = fs.createWriteStream(log, { flags: "a" });
     out.write(`# batch-run ${new Date().toISOString()} bin=${bin.how} args=${args.join(" ")}\n`);
-    let settled = false, killed = false, result = null, buf = "", all = "", spawnError = null, timer = null;
+    let settled = false, killed = false, result = null, buf = "", all = "", spawnError = null, timer = null, hit = null, child = null, graceTimer = null, killStuck = null;
     const done = (code) => {
       if (settled) return; settled = true;
       if (timer) clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       if (buf) onLine(buf);
-      out.end(() => resolve({ code, killed, result, spawnError, ms: Date.now() - t0, stdout: all }));
+      out.end(() => resolve({ code, killed, result, spawnError, watch: hit, killStuck, ms: Date.now() - t0, stdout: all }));
+    };
+    // 看守命中或到截止时间 ⇒ 杀进程树;杀的动作发出去后进程迟迟不退(或根本杀不了)⇒ 宽限到了就不再等:
+    //   松开它的管道与引用(否则本进程退不出去),按已经定下的原因停,并把「这个进程可能还活着」交给上层写进交接。
+    //   原先杀的命令失败时没人知道,而本函数只等 close 事件 ⇒ 会一直等下去(批 307 codex 第 2 条)。
+    const askKill = (why) => {
+      const sent = killTree(child);
+      out.write(`# ${why}:杀子进程树 pid ${child?.pid}${sent ? "" : "(杀的动作没发出去)"}\n`);
+      if (graceTimer || settled) return;
+      const grace = Math.max(50, Number(process.env.BATCH_RUN_KILL_GRACE_MS) || KILL_GRACE_MS);
+      graceTimer = setTimeout(() => {
+        if (settled) return;
+        killStuck = child?.pid ?? null;
+        out.write(`# 宽限 ${grace} 毫秒到了,pid ${killStuck} 还没退:不再等它\n`);
+        try { child.stdout.destroy(); child.stderr.destroy(); child.stdin.destroy(); child.unref(); } catch { /* 松不开也照常往下走 */ }
+        done(-1);
+      }, sent ? grace : Math.min(grace, 2000));
     };
     const onLine = (line) => {
       const s = line.trim();
       if (!s.startsWith("{")) return;
-      try { const o = JSON.parse(s); if (o && o.type === "result") result = o; } catch { /* 不是整行 JSON */ }
+      let o;
+      try { o = JSON.parse(s); } catch { return; /* 不是整行 JSON */ }
+      if (o && o.type === "result") result = o;
+      if (!watch || hit || settled) return;
+      const h = watch.feed(o);
+      if (!h) return;
+      hit = h;
+      out.write("\n");
+      askKill(`看守:同一个工具调用(${h.tool})连着 ${h.count} 次报同样的错`);
     };
-    let child;
     try { child = spawn(bin.cmd, [...bin.pre, ...args], { cwd, env, shell: bin.shell, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }); }
     catch (e) { spawnError = e.message; out.write(`# 起不来:${e.message}\n`); return done(-1); }
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (s) => {
+      if (settled) return;
       out.write(s);
       if (keepStdout) all += s;
       buf += s;
       let k;
       while ((k = buf.indexOf("\n")) >= 0) { onLine(buf.slice(0, k)); buf = buf.slice(k + 1); }
     });
-    child.stderr.on("data", (s) => out.write(s));
+    child.stderr.on("data", (s) => { if (!settled) out.write(s); });
     child.stdin.on("error", () => { /* 子进程先退,写 stdin 撞 EPIPE:不影响判定 */ });
     child.on("error", (e) => { spawnError = e.message; out.write(`# 子进程错误:${e.message}\n`); setTimeout(() => done(-1), 200); });
     child.on("close", (code) => done(code ?? -1));
     if (child.pid && onPid) onPid(child.pid);
-    timer = setTimeout(() => { killed = true; out.write(`# 到整批截止时间,杀子进程树 pid ${child.pid}\n`); killTree(child); }, Math.max(0, deadlineAt - Date.now()));
+    timer = setTimeout(() => { if (settled) return; killed = true; askKill("到整批截止时间"); }, Math.max(0, deadlineAt - Date.now()));
     child.stdin.end(input);
   });
 }
@@ -398,7 +461,7 @@ function stateOf(C) {
     batch: o.batch, status: R.status === null ? "running" : R.status, stage: R.stage, reason: R.reason, reasonCode: R.reasonCode,
     pid: process.pid, childPid: C.childPid ?? null, sessionId: C.sid, launcherSession: C.launcherSid,
     worktree: fwd(C.wt), branch: C.branch, base: C.base, baseCommit: C.baseCommit,
-    caps: { maxTurns: o.maxTurns, maxBudgetUsd: o.maxBudgetUsd, capUsd: o.capUsd, deadline: new Date(C.deadlineAt).toISOString() },
+    caps: { maxTurns: o.maxTurns, maxBudgetUsd: o.maxBudgetUsd, capUsd: o.capUsd, deadline: new Date(C.deadlineAt).toISOString(), sameErrorLimit: o.sameErrorLimit ?? null },
     model: o.model ?? null, judgeModel: o.judgeModel, instruction: o.instruction,
     rounds: C.launches, acceptRounds: R.acceptRounds, failHistory: C.failHistory.map((f) => f.map((i) => i.kind)),
     judge: C.judge, costUsd: round4(C.spent), merged: C.merged, pushed: R.pushed, handoff: R.handoff, ruler: R.ruler, notes: R.notes,
@@ -469,10 +532,13 @@ async function launch(C, prompt, resume) {
     ...(o.model ? ["--model", o.model] : []), ...(resume ? ["--resume", C.sid] : ["--session-id", C.sid])];
   const log = path.join(C.runDir, `${o.batch}-r${k}.log`);
   say(`第 ${k} 次拉起(${resume ? `回修第 ${C.repairs} 轮` : "执行"}),日志 ${fwd(log)}`);
-  const r = await runClaude({ bin: C.claude, args, cwd: C.wt, input: prompt, log, deadlineAt: C.deadlineAt,
+  // 看守只挂执行与回修的拉起(方向复核那次不挂);sameErrorLimit 0 ⇒ 不挂
+  const watch = o.sameErrorLimit > 0 ? createWatch({ sameErrorLimit: o.sameErrorLimit }) : null;
+  const r = await runClaude({ bin: C.claude, args, cwd: C.wt, input: prompt, log, deadlineAt: C.deadlineAt, watch,
     env: { ...process.env, CLAUDE_CODE_SESSION_ID: C.sid }, onPid: (pid) => { C.childPid = pid; saveState(C); } });
   C.childPid = null;
-  const c = classifyRun({ code: r.code, result: r.result, killed: r.killed });
+  if (r.watch) C.watchHit = { ...r.watch, k };
+  const c = classifyRun({ code: r.code, result: r.result, killed: r.killed, watch: r.watch });
   // 续接(--resume)时 CLI 报的 total_cost_usd 是**这个会话的累计值**,而 --max-budget-usd 是按本次拉起比的
   //   (实测 2026-11-22,claude 2.1.327:同一会话续接四次,读数 0.0112 → 0.0118 → 0.0136 → 0.0142 → 0.0147 单调增,
   //   只回两个字的一轮只多 0.0005;累计 0.0142 时带 --max-budget-usd 0.005 续接,照常 success)。
@@ -483,8 +549,9 @@ async function launch(C, prompt, resume) {
   const cost = costKnown ? launchCost(total, resume ? C.sessionCostSeen : null) : NaN;
   if (costKnown) { C.spent += cost; C.sessionCostSeen = total; }
   else note(C, `第 ${k} 次拉起没有花费读数(按 0 计)`);
+  if (r.killStuck) note(C, `第 ${k} 次拉起的执行会话杀不掉或迟迟不退(pid ${r.killStuck}),发车脚本没有再等它:请手工确认这个进程已经不在,再接着干`);
   C.launches.push({ k, kind: resume ? "repair" : "exec", cls: c.cls, exitCode: r.code, subtype: r.result?.subtype ?? null, isError: r.result?.is_error ?? null,
-    turns: r.result?.num_turns ?? null, costUsd: costKnown ? round4(cost) : null, ms: r.ms, log: fwd(log), ...(r.spawnError ? { spawnError: r.spawnError } : {}) });
+    turns: r.result?.num_turns ?? null, costUsd: costKnown ? round4(cost) : null, ms: r.ms, log: fwd(log), watch: r.watch || null, ...(r.spawnError ? { spawnError: r.spawnError } : {}) });
   C.lastResultText = String(r.result?.result ?? "");
   R.rounds = C.launches.length; R.costUsd = round4(C.spent);
   saveState(C);
@@ -680,7 +747,9 @@ async function closeOut(C, acc) {
     R.ruler = cl.stdout.split(/\r?\n/).map((l) => l.trim()).find((l) => l.startsWith("主尺")) || null;
     return { closed: true };
   }
-  if (cl.status === 2 && /BATCH-GOAL-CLEAR-REFUSED/.test(cl.stderr)) return { fail: [{ kind: "clear-refused", text: `batch-goal --clear 拒绝结清(原文):\n${tail(cl.stderr, 3000)}` }] };
+  const ref = cl.status === 2 ? clearRefusal(cl.stderr) : null;
+  if (ref && ref.repairable) return { fail: [{ kind: "clear-refused", text: `batch-goal --clear 拒绝结清(原文):\n${tail(cl.stderr, 3000)}` }] };
+  if (ref) return { stop: { code: "clear-unknown", why: `batch-goal --clear 拒绝结清,拒因 ${ref.reason} 不是执行会话回修得了的(判不了 / 状态对不上一类):${tail(cl.stderr, 400)}`, stage: "clear" } };
   return { stop: { code: "clear-unknown", why: `batch-goal --clear 退出码 ${cl.status}:${tail(cl.stdout + "\n" + cl.stderr, 300)}`, stage: "clear" } };
 }
 
@@ -729,6 +798,13 @@ function stuckSection(C) {
   L.push(`- 验收:${R.acceptRounds} 次;最后一次验收的不过项:${C.lastItems && C.lastItems.length ? "" : "无"}`);
   for (const it of C.lastItems || []) L.push(`  - (${it.kind})${String(it.text).replace(/\n/g, "\n    ")}`);
   if (C.lastUnknown && C.lastUnknown.length) { L.push("- 判不了的项:"); for (const u of C.lastUnknown) L.push(`  - ${u}`); }
+  if (C.watchHit) {
+    const w = C.watchHit;
+    L.push(`- 看守:第 ${w.k} 次拉起里,同一个工具调用连着 ${w.count} 次报同样的错,执行会话被杀掉(线:${w.lane === "main" ? "主会话" : `子代理 ${w.lane}`})`);
+    L.push(`  - 工具:${w.tool}`);
+    L.push(`  - 入参(JSON,前 300 字):${w.input}`);
+    L.push(`  - 错误(空白已折叠,前 500 字):${w.error || "(空)"}`);
+  }
   L.push(`- 方向复核:${C.judge ? (C.judge.verdict ? `判「${C.judge.verdict}」` : `判不了(${C.judge.why})`) : "没拉"}`);
   L.push(`- 花费:累计 ${round4(C.spent)} 美元 / 整批上限 ${o.capUsd} 美元(单次拉起上限 ${o.maxBudgetUsd} 美元,轮数上限 ${o.maxTurns});整批截止 ${new Date(C.deadlineAt).toISOString()}`);
   L.push(`- 执行会话号:${C.sid}`);
@@ -753,7 +829,7 @@ function appendRun(C) {
   const { o, R } = C;
   const row = { at: new Date().toISOString(), batch: o.batch, status: R.status, reason: R.reason, reasonCode: R.reasonCode, stage: R.stage,
     rounds: C.launches.map((r) => ({ k: r.k, kind: r.kind, cls: r.cls, turns: r.turns, costUsd: r.costUsd, ms: r.ms })),
-    acceptRounds: R.acceptRounds, judge: C.judge ? (C.judge.verdict || "判不了") : null, costUsd: round4(C.spent),
+    acceptRounds: R.acceptRounds, judge: C.judge ? (C.judge.verdict || "判不了") : null, watch: C.watchHit || null, costUsd: round4(C.spent),
     model: o.model ?? null, judgeModel: o.judgeModel, sessionId: C.sid, ruler: R.ruler, pushed: R.pushed, totalMs: Date.now() - C.startMs };
   try { fs.mkdirSync(C.runDir, { recursive: true }); fs.appendFileSync(path.join(C.runDir, "runs.jsonl"), JSON.stringify(row) + "\n", "utf8"); }
   catch (e) { say(`runs.jsonl 写不进去(${e.code || e.message})`); }
@@ -833,7 +909,7 @@ async function runBatch(o) {
   const sidEnv = process.env.CLAUDE_CODE_SESSION_ID;
   const C = { o, R, ...pf, sid: crypto.randomUUID(), launcherSid: typeof sidEnv === "string" && /^[\w-]{8,80}$/.test(sidEnv) ? sidEnv : null,
     startMs, deadlineAt: startMs + o.deadlineMin * 60_000, spent: 0, launches: [], failHistory: [], lastItems: [], lastUnknown: [],
-    judge: null, repairs: 0, merged: false, pushedNow: false, childPid: null, armedAt: null, lastResultText: "", lastCheck: null, sessionCostSeen: null };
+    judge: null, repairs: 0, merged: false, pushedNow: false, childPid: null, armedAt: null, lastResultText: "", lastCheck: null, sessionCostSeen: null, watchHit: null };
   R.sessionId = C.sid;
   try { return await drive(C); }
   catch (e) {
@@ -869,7 +945,7 @@ function statusCmd(batch) {
 }
 
 // ── 自测 ──────────────────────────────────────────────────────────────────────────────
-// 假 claude:每次被拉起按序号执行剧本里的一步(写文件 / 提交 / 动基分支 / 造外审作业 / 睡),再打印一条 result 事件并以指定退出码退出。
+// 假 claude:每次被拉起按序号执行剧本里的一步(写文件 / 提交 / 动基分支 / 造外审作业 / 逐行吐流式事件 / 睡),再打印一条 result 事件并以指定退出码退出。
 const FAKE_CLAUDE_SRC = String.raw`
 import fs from "node:fs";
 import path from "node:path";
@@ -899,8 +975,10 @@ for (const a of step.actions || []) {
     await new Promise((r) => setTimeout(r, 5));
   }
 }
+// 剧本里的流式事件(assistant 的 tool_use、user 的 tool_result …)逐行吐出,先于长睡,好让看守在睡着时就能命中
+for (const ev of step.stream || []) process.stdout.write(JSON.stringify(ev) + "\n");
 if (step.sleepMs) await new Promise((r) => setTimeout(r, step.sleepMs));
-const sid = argv.includes("--session-id") ? argv[argv.indexOf("--session-id") + 1] : argv.includes("--resume") ? argv[argv.indexOf("--resume") + 1] : "judge";
+const sid =argv.includes("--session-id") ? argv[argv.indexOf("--session-id") + 1] : argv.includes("--resume") ? argv[argv.indexOf("--resume") + 1] : "judge";
 const lines = kind === "judge" ? [] : [JSON.stringify({ type: "system", subtype: "init", session_id: sid })];
 if (step.result !== null) {
   const r = step.result || {};
@@ -932,10 +1010,23 @@ async function selfTest() {
   t("分类:没有 result 事件 / 被截止时间杀掉 / 退出 0 却 is_error 真且非 success ⇒ unknown / cap / unknown",
     [classifyRun({ code: 0, result: null }).cls, classifyRun({ code: null, result: null, killed: true }).code, cr(0, "error_during_execution", true)], ["unknown", "cap-deadline", "unknown"]);
   t("分类:退出码非 0 但 result 说 success 且 is_error 假 ⇒ unknown(不猜成跑完)", cr(1, "success", false), "unknown");
+  { const wh = { code: "same-error", tool: "Bash", input: "{}", error: "Exit code 1", count: 3, lane: "main" };
+    const a = classifyRun({ code: 0, result: { type: "result", subtype: "success", is_error: false, result: "" }, killed: true, watch: wh });
+    t("分类:看守命中 ⇒ stalled / watch-same-error,压过截止时间被杀与 result 事件;why 点名工具与次数",
+      [a.cls, a.code, a.why.includes("(Bash)"), a.why.includes("连着 3 次")], ["stalled", "watch-same-error", true, true]);
+    t("分类:watch 为 null ⇒ 照旧(被杀 ⇒ cap-deadline;跑完 ⇒ done)",
+      [classifyRun({ code: null, result: null, killed: true, watch: null }).code, classifyRun({ code: 0, result: { type: "result", subtype: "success", is_error: false }, watch: null }).code], ["cap-deadline", "done"]); }
   t("裁决:全角冒号与全角数字都认,同一条取最后一次", parseVerdicts("条件1:未达成:先写着\n…\n条件１：达成\n条件2:不适用:本仓没有日记。", 2),
     { verdicts: [{ n: 1, verdict: "达成" }, { n: 2, verdict: "不适用", why: "本仓没有日记" }], problems: [] });
   { const p = parseVerdicts("条件1:达成", 2); t("裁决:缺一条 ⇒ 不过项点名缺哪条,verdicts 不给", [p.verdicts, p.problems.length, /缺条件2/.test(p.problems[0])], [[], 1, true]); }
   { const p = parseVerdicts("条件1:未达成:接口不够\n条件2:不适用", 2); t("裁决:未达成 ⇒ 不过项;不适用不带理由 ⇒ 不过项", [p.problems.length, /未达成:接口不够/.test(p.problems[0]), /没写理由/.test(p.problems[1])], [2, true, true]); }
+  t("结清被拒:补得上的拒因才回修(单个与 + 连起来的);判不了 / 对不上一类不回修;没有拒清行 ⇒ null",
+    [clearRefusal("BATCH-GOAL-CLEAR-REFUSED batch=9 reason=checks-failed n=1\n拒绝结清:…"), clearRefusal("BATCH-GOAL-CLEAR-REFUSED batch=9 reason=adr-missing+diary-missing"),
+      clearRefusal("BATCH-GOAL-CLEAR-REFUSED batch=9 reason=worktree-unknown"), clearRefusal("BATCH-GOAL-CLEAR-REFUSED batch=9 reason=uncommitted+obligation-unknown"),
+      clearRefusal("BATCH-GOAL-CLEAR-REFUSED batch=9 reason=checks-tampered"), clearRefusal("结清失败: 别的错")],
+    [{ reason: "checks-failed", repairable: true }, { reason: "adr-missing+diary-missing", repairable: true },
+      { reason: "worktree-unknown", repairable: false }, { reason: "uncommitted+obligation-unknown", repairable: false },
+      { reason: "checks-tampered", repairable: false }, null]);
   t("花费:首次拉起整笔记;续接按会话累计读数的差额记;读数不增反降 ⇒ 整笔记",
     [launchCost(0.05, null), round4(launchCost(0.0136, 0.0118)), launchCost(0.02, 0.05), launchCost(0.05, 0.05)], [0.05, 0.0018, 0.02, 0]);
   t("裁决:Markdown 强调符夹在号、冒号、裁决之间照认,理由里的强调符剥掉",
@@ -954,6 +1045,11 @@ async function selfTest() {
   t("命令行:没有 --check ⇒ 抛(点名 --check)", pe(["--batch", "x", "--instruction", "做", "--cond", "甲"]), "throw:check");
   t("命令行:缺省值 / 透传", (() => { const p = parseCli(["--batch", "x", "--instruction", "做", "--cond", "甲", "--check", "true", "--expect-re", "^ok"]); return [p.maxTurns, p.maxBudgetUsd, p.capUsd, p.deadlineMin, p.judgeModel, p.model, p.arm]; })(),
     [80, 8, 20, 90, "opus", undefined, ["--cond", "甲", "--check", "true", "--expect-re", "^ok"]]);
+  { const base = ["--batch", "x", "--instruction", "做", "--cond", "甲", "--check", "true"];
+    const sel = (extra) => { try { return parseCli([...base, ...extra]).sameErrorLimit; } catch { return "throw"; } };
+    t("命令行:--same-error-limit 缺省 3;0 / 5 照收;负数、小数、非数、给两次 ⇒ 抛",
+      [sel([]), sel(["--same-error-limit", "0"]), sel(["--same-error-limit", "5"]), sel(["--same-error-limit", "-1"]), sel(["--same-error-limit", "1.5"]), sel(["--same-error-limit", "x"]), sel(["--same-error-limit", "2", "--same-error-limit", "3"])],
+      [3, 0, 5, "throw", "throw", "throw", "throw"]); }
   t("命令行:值以 -- 开头 / 未知旗标 / 坏批号 ⇒ 抛", [pe(["--batch", "--x"]), pe(["--batch", "x", "--bogus"]), pe(["--batch", "a b", "--instruction", "i", "--cond", "c", "--check", "true"])].map((x) => String(x).startsWith("throw")), [true, true, true]);
   { const C = { o: { batch: "x", instruction: "原话一字不差", conds: ["甲"], checks: [{ i: 0, cmd: "test -f a" }], finishLine: "到 a 为止" }, branch: "batch-run/x" };
     const p = execPrompt(C), r = repairPrompt(C, 2, [{ kind: "check", text: "没过" }]);
@@ -994,6 +1090,11 @@ async function selfTestE2E(t, tmp) {
   const ok = (cost = 0.05, text = okText()) => ({ subtype: "success", is_error: false, text, cost });
   const W = (f, content) => ({ write: f, content });
   const CM = { commit: "work" };
+  // 看守剧本:n 组「同一个 tool_use + 同样的报错 tool_result」(主会话线)
+  const sameErr = (n, tag) => Array.from({ length: n }, (_, i) => [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: `toolu_${tag}_${i}`, name: "Bash", input: { command: "false", timeout: 5000 } }] }, parent_tool_use_id: null },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: `toolu_${tag}_${i}`, is_error: true, content: "Exit code 1" }] }, parent_tool_use_id: null },
+  ]).flat();
   const run = (name, args, plan, { cwd = A, extraEnv = {} } = {}) => {
     const T1 = Date.now();
     const pf = J(tmp, "plans", `${name}.json`), calls = J(tmp, "plans", `${name}.calls.jsonl`);
@@ -1041,13 +1142,17 @@ async function selfTestE2E(t, tmp) {
     t("外审台账:0 字节的台账件,开批后动过 ⇒ 报判不了;开批前的旧坏件 ⇒ 跳过", [/读不出/.test(fresh.error || ""), stale.error ?? null, (stale.jobs || []).length], [true, null, 0]);
   }
 
-  // ① 一次过 ⇒ 关账(同一次运行兼测 ⑨ 的前一半:--push 的远端不在私仓名单 ⇒ 不推,照常关账)
+  // ① 一次过 ⇒ 关账(同一次运行兼测 ⑨ 的前一半:--push 的远端不在私仓名单 ⇒ 不推,照常关账;
+  //   也兼测 ⑬ 的后一半:--same-error-limit 0 时,和 ⑬ 同一段「连着 3 次同样的错」不被看守停下)
   { const before = runsCount();
     const bare = J(tmp, "pub-remote.git");
     g(tmp, "init", "-q", "--bare", bare); g(A, "remote", "add", "pubr", bare);
-    const r = run("t1", argsFor("t1", ["--push", "pubr"]), { steps: [{ actions: [W("t1.txt"), CM], result: ok() }] });
+    const r = run("t1", argsFor("t1", ["--push", "pubr", "--same-error-limit", "0"]), { steps: [{ actions: [W("t1.txt"), CM], stream: sameErr(3, "t1"), result: ok() }] });
     const a = r.exec[0]?.argv || [];
     t("① 一次过 ⇒ 关账:退出 0、closed、拉起 1 次、验收 1 次、末行可解析", [r.code, r.res.status, r.res.rounds, r.res.acceptRounds, typeof r.res.sessionId], [0, "closed", 1, 1, "string"]);
+    let st0 = {}; try { st0 = JSON.parse(fs.readFileSync(J(RUN, "t1.json"), "utf8")); } catch { st0 = {}; }
+    t("⑬ --same-error-limit 0 ⇒ 同一段连着 3 次的同样错误不被停(没有 watch-same-error、拉起记录的 watch 为 null)",
+      [r.res.reasonCode !== "watch-same-error", st0.rounds?.[0]?.watch, st0.caps?.sameErrorLimit], [true, null, 0]);
     t("⑨ 远端不在私仓名单 ⇒ 不推、照常关账、结果里记「未推送」", [r.res.pushed, r.res.notes.some((n) => n.startsWith("未推送:远端不在私仓名单")), g(A, "ls-remote", "pubr", "refs/heads/main").out], [false, true, ""]);
     t("① 基分支快进了、工作树与分支已删", [fs.existsSync(J(A, "t1.txt")), g(A, "symbolic-ref", "--short", "HEAD").out, fs.existsSync(wtOf("t1")), branchExists("t1")], [true, "main", false, false]);
     let st = {}; try { st = JSON.parse(fs.readFileSync(J(RUN, "t1.json"), "utf8")); } catch { st = {}; }
@@ -1123,6 +1228,31 @@ async function selfTestE2E(t, tmp) {
   { const t0 = Date.now();
     const r = run("t12", argsFor("t12", ["--deadline-min", "0.04"]), { steps: [{ sleepMs: 30_000, result: ok() }] });
     t("④ 到整批截止时间 ⇒ 杀掉执行会话、停(cap-deadline)、不回修", [r.code, r.res.reasonCode, r.exec.length <= 1, Date.now() - t0 < 25_000], [10, "cap-deadline", true, true]); }
+
+  // ⑬ 看守:执行会话吐出三组同一个 tool_use + 同样的报错后长睡 ⇒ 被看守杀掉、停(watch-same-error)、不回修
+  { const t0 = Date.now();
+    const r = run("t13", argsFor("t13"), { steps: [{ actions: [W("t13.txt"), CM], stream: sameErr(3, "t13"), sleepMs: 30_000, result: ok() }] });
+    const ms = Date.now() - t0;
+    const h = (() => { try { return fs.readFileSync(r.res.handoff, "utf8"); } catch { return ""; } })();
+    let row = null; try { row = fs.readFileSync(J(RUN, "runs.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((x) => x.batch === "t13").pop() || null; } catch { row = null; }
+    let st = {}; try { st = JSON.parse(fs.readFileSync(J(RUN, "t13.json"), "utf8")); } catch { st = {}; }
+    const log = (() => { try { return fs.readFileSync(J(RUN, "t13-r1.log"), "utf8"); } catch { return ""; } })();
+    t("⑬ 看守命中 ⇒ 退出 10、watch-same-error、只拉起 1 次、没回修、没拉方向复核、远早于那段 30 秒长睡(是被杀的)",
+      [r.code, r.res.reasonCode, r.exec.length, r.judge.length, ms < 20_000], [10, "watch-same-error", 1, 0, true]);
+    t("⑬ 交接「卡在哪」写明工具名、连着 3 次、入参与错误;日志里有看守那一行",
+      [h.includes("卡在哪(发车脚本写)"), /看守:第 1 次拉起里,同一个工具调用连着 3 次/.test(h), h.includes("工具:Bash"), h.includes("\"command\":\"false\""), h.includes("Exit code 1"), h.includes("线:主会话"), log.includes("# 看守:")],
+      [true, true, true, true, true, true, true]);
+    t("⑬ runs.jsonl 那一行与运行状态的拉起记录都带 watch(工具、次数、线);没有花费读数 ⇒ 记一行按 0 计",
+      [row?.watch?.tool, row?.watch?.count, row?.watch?.lane, st.rounds?.[0]?.watch?.count, st.rounds?.[0]?.cls, r.res.notes.some((n) => /没有花费读数/.test(n))], ["Bash", 3, "main", 3, "stalled", true]); }
+
+  // ⑭ 杀不掉(自测接缝:什么都不杀):看守命中后宽限一到就不再等,照样停下、写交接,并写明那个进程可能还在
+  { const t0 = Date.now();
+    const r = run("t14", argsFor("t14"), { steps: [{ stream: sameErr(3, "t14"), sleepMs: 4000, result: ok() }] }, { extraEnv: { BATCH_RUN_TEST_NO_KILL: "1", BATCH_RUN_KILL_GRACE_MS: "300" } });
+    const ms = Date.now() - t0;
+    const log = (() => { try { return fs.readFileSync(J(RUN, "t14-r1.log"), "utf8"); } catch { return ""; } })();
+    t("⑭ 杀的动作没发出去、进程不退 ⇒ 宽限到了不再等:退出 10、watch-same-error、早于那段 4 秒长睡、备注写明杀不掉、日志里有不再等那一行",
+      [r.code, r.res.reasonCode, r.exec.length, ms < 3500, r.res.notes.some((n) => /杀不掉或迟迟不退/.test(n)), /还没退:不再等它/.test(log), !!r.res.handoff],
+      [10, "watch-same-error", 1, true, true, true, true]); }
 
   // ⑩ 发车前检查:没有 --check / 锁被活进程占着 / 在 linked worktree 里 ⇒ 退出 2,不留工作树
   { const r = run("t10a", ["--batch", "t10a", "--instruction", "x", "--cond", "甲"], null);

@@ -6,7 +6,7 @@
 
 **custodiet** is a set of workflow scripts and gates for Claude Code. The main line is **hand over one sentence and let the work run itself to close-out**: write down what counts as done when the batch opens, execute, accept, close. On that line the gate holds only two positions: **acceptance** (checking the actual state at each checkpoint) and **watch** (stopping a run that is spinning or has drifted). The predicates read the turn's actual tool-call record and git facts, not what the agent says.
 
-Only part of that line exists today. The repo has: batch opening and closing (`batch-goal`), the acceptance rules that run at the end of a turn (the Stop hook), a false-block ledger with blind review, and a replay tool plus two review agents for changing the gate. From 0.12.0 a launcher, `batch-run`, wires them into one line (open → headless execution → automatic acceptance → repair in the same session → close, or stop and write a handoff when a step cannot be judged; usage in [docs/batch-run.md](docs/batch-run.md), Chinese). So far it has run end to end with a cheap model in an empty throwaway repo with no gate installed (one batch passed and closed; one with a check that cannot pass went through a repair round, a direction review that said stop, and a handoff), but not yet in a real project with the gate installed. The watch position is planned — see [Status and plans](#status-and-plans).
+Only part of that line exists today. The repo has: batch opening and closing (`batch-goal`), the acceptance rules that run at the end of a turn (the Stop hook), a false-block ledger with blind review, and a replay tool plus two review agents for changing the gate. From 0.12.0 a launcher, `batch-run`, wires them into one line (open → headless execution → automatic acceptance → repair in the same session → close, or stop and write a handoff when a step cannot be judged; usage in [docs/batch-run.md](docs/batch-run.md), Chinese). So far it has run end to end with a cheap model in an empty throwaway repo with no gate installed (one batch passed and closed; one with a check that cannot pass went through a repair round, a direction review that said stop, and a handoff), but not yet in a real project with the gate installed. From 0.13.0 the launcher has a watch: besides the four limits (turns, per-launch cost, whole-batch cost, deadline) it adds exactly one predicate — when the same tool call fails with the same error 3 times in a row, it kills the execution session, stops and writes a handoff. The "try a fix first" half is not built — see [Status and plans](#status-and-plans).
 
 **lanes** is the companion UI: it moves gate messages, tool calls and edited files out of the output pane into lanes of their own.
 
@@ -26,7 +26,7 @@ The data behind this, and its scope, are in [False-block data](#false-block-data
 |---|---|---|
 | Open a batch | `batch-goal --arm`: write completion conditions, optionally with executable checks; can record the instruction that started the batch, a finish line, a cost cap and a deadline (recorded only, never blocking) | Passing the limits to the execution session at launch |
 | Execute | `batch-run` (0.12.0): launches a headless session in its own worktree with turn, per-launch cost, whole-batch cost and deadline limits; so far run for real only in an empty throwaway repo | Running one batch through it in a real project with the gate installed |
-| Watch | Nothing | Stop and write down where it is stuck when turns, time or cost hit the limit, or the same error keeps repeating |
+| Watch | `batch-run` (0.13.0): the four limits (turns, per-launch cost, whole-batch cost, deadline) plus one watch predicate (`scripts/batch-watch.mjs`): the same tool call failing with the same error 3 times in a row ⇒ kill the execution session and stop, with the handoff naming the tool and the error. Verified only by self-tests and log replay; it has not yet fired in a real run | Trying a fix before stopping (version 2) |
 | Accept | `batch-goal --clear` re-runs the checks registered at opening and refuses on failure; the 7 blocking engine rules, plus A and R, at the end of a turn; `batch-run` accepts automatically after execution and, on failure, resumes the same session for at most three repair rounds | — |
 | Close | `batch-goal --clear`, outcome and decision records, a debt table with expiry | A headless session that walks the whole close-out chain itself |
 | Record data | Alert ledger, false-block ledger with blind review, replay tool; at close-out it prints the ruler (how many times the human spoke between that instruction and close-out, by type) | One summary row per batch; sampling of blocks nobody appealed |
@@ -63,7 +63,7 @@ flowchart TD
     J -.->|"off course, or should stop"| S
 
     classDef planned stroke-dasharray: 6 4
-    class T,P1,P2,P3,L,D,R,W,J planned
+    class T,P1,P2,P3,D,R planned
 ```
 
 One number is measured: from that instruction to close-out, how many times the human spoke, and how many of those were sign-offs.
@@ -213,7 +213,7 @@ Recompute in your own repo: `node scripts/hook-stop-closure.mjs --fp-report`.
 
 - Recall is unknown.
 - The overall false-block rate cannot be measured either: only appealed blocks reach blind review (see [False-block data](#false-block-data)).
-- The watch position is not implemented yet. The line that runs itself to close-out now has a launcher, `batch-run`, but it has only run end to end in an empty throwaway repo with no gate installed, not in a real project (see [Status and plans](#status-and-plans)).
+- The watch has one predicate (the same tool call failing with the same error 3 times in a row) plus the four limits; it only stops and never tries a fix. Spinning it cannot recognise — error text that changes every time, two calls failing in turn — is left to the limits. The line that runs itself to close-out now has a launcher, `batch-run`, but it has only run end to end in an empty throwaway repo with no gate installed, not in a real project (see [Status and plans](#status-and-plans)).
 - So far only the author's own repo uses it.
 - Text rules (causal claims, noun questions, pushing work out of a batch, etc.) match Chinese sentence patterns, and judge messages are in Chinese. In an English repo those rules neither fire nor block.
 - Usage numbers come from the author's own ledgers, with no third-party audit.
