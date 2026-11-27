@@ -8,6 +8,7 @@
 // 干什么:① 两份规矩文件必须在场且非空;AGENTS.md 必须有指向 docs/gate/AGENTS.md 的指针;
 //           两份规矩文件里反引号包着、以 docs/ scripts/ .claude/ 开头的路径(文件或目录)必须在场,
 //           .md 文件还须非空(指针能解析);闸规矩明写尚未落地的 docs/error-list.md、docs/receipt.md 豁免;
+//           闸的源头仓里(安装器脚本在场),仓规矩引用的五处安装方自备路径**不在场**时不报(SOURCE_REPO_MISSING_OK);
 //           带锚的指针还核锚:`file:行(-行)` / `:L行` 不得越界(D196 ⑭ BP-13);`#节名` 只剥掉用于定位文件,不核标题。
 //        ② 退役目录 docs/laws/ 下不得再出现 .md(没有任何规矩文件索引它 ⇒ 孤儿法)。
 //        ④ 触发层对照:规矩文件里声明的「hook-stop-closure 的 X 项」必须在闸实现里有 `id: "X"`;
@@ -24,6 +25,7 @@
 // CEILING: 本闸只证「文件在场、指针能解析、触发层项名存在」,不证规矩内容正确或彼此一致;
 //   路径指针只认反引号里带 docs/ scripts/ .claude/ 前缀的写法(见 extractPathRefs 天花板);
 //   docs/gate/AGENTS.md 明写尚未落地的 `docs/error-list.md`、`docs/receipt.md` 豁免(PATH_EXEMPT);
+//   源头仓里仓规矩的五处安装方自备路径只豁免「缺失」(SOURCE_REPO_MISSING_OK;认源头仓靠安装器脚本在场,安装方的仓不豁免);
 //   `#节名` 不核(批 292 两轮复核手写解析不收敛,停止;两份规矩文件当前零处节名锚)——只剥掉后缀定位文件,
 //   不读目标文件,只拦「锚指进目录」(如 `docs/gate/#todo.md` 剥成目录);
 //   `:行:列` 的列、通配路径上的锚都不核;
@@ -51,12 +53,21 @@ export const RULE_FILES = ["AGENTS.md", "docs/gate/AGENTS.md"];
  */
 const PATH_EXEMPT = {
   "docs/gate/AGENTS.md": new Set(["docs/error-list.md", "docs/receipt.md"]),
-  // 批 308(实撞):随仓的示例仓规矩里有五处路径是**明写要安装方自己提供**的——决策记录目录(「要你自己建」)、
-  //   产品日记(「这个文件要你自己建;不在场时 --clear 只提示、不拒」)、闸用语手册(「安装器生成」)、
-  //   欠账探针脚本(「是你自己的脚本」「仓里没有……时 DP 不响」)。本仓故意不带它们,原先本核对在本仓恒 FAIL:
-  //   凡是改过规矩文件的批,关账时写入层的 J 项就留下一条清不掉的义务,`batch-goal --clear` 被拒。
-  //   安装方的仓里这些路径在场时豁免不起作用;不在场时各自的功能本来就按「不在场」退让。
-  "AGENTS.md": new Set(["docs/adr", "docs/adr/", "docs/adr/README.md", "docs/product-diary.md", "docs/gate-phrasebook.md", "scripts/verify-prod.mjs"]),
+};
+
+/**
+ * 只在**闸的源头仓**里、且只对**缺失**生效的豁免(批 308 实撞)。
+ * 随仓的示例仓规矩引用了五处要安装方自己提供的路径——决策记录目录与它的索引(「要你自己建」)、产品日记
+ * (「这个文件要你自己建」)、闸用语手册(「安装器生成」)、欠账探针脚本(「是你自己的脚本」)。源头仓故意不带它们,
+ * 原先本核对在源头仓恒 FAIL:凡是改过规矩文件的批,关账时写入层的 J 项留下一条清不掉的义务,`batch-goal --clear` 被拒。
+ * 两条限定(第一版豁免写宽了,红队逐条复现后收窄):
+ *   · 认源头仓的标志是安装器脚本在场——它是唯一不随包拷给安装方的闸脚本。安装方的仓里没有它 ⇒ 一条都不豁免:
+ *     安装方把决策记录写成必经流程、文件却丢了,照报;
+ *   · 只豁免「路径不在场」。文件在场就照常核近空与行号锚。
+ */
+const SOURCE_REPO_MARK = "scripts/custodiet-init.mjs";
+const SOURCE_REPO_MISSING_OK = {
+  "AGENTS.md": new Set(["docs/adr/", "docs/adr/README.md", "docs/product-diary.md", "docs/gate-phrasebook.md", "scripts/verify-prod.mjs"]),
 };
 
 /**
@@ -129,6 +140,8 @@ export function checkLaws(root, overrides = {}) {
   if (!text.includes("docs/gate/AGENTS.md")) {
     problems.push("AGENTS.md 里未检出指向 docs/gate/AGENTS.md 的指针 —— 索引缺失或格式漂移,UNKNOWN 阻断");
   }
+  let isSourceRepo = false;
+  try { isSourceRepo = typeof ov[SOURCE_REPO_MARK] === "string" || fs.statSync(path.join(root, SOURCE_REPO_MARK)).isFile(); } catch { isSourceRepo = false; }
   for (const f of RULE_FILES) {
     if (texts[f] === undefined) continue;
     for (const { ref, probe, raw, anchor } of extractPathRefs(texts[f])) {
@@ -139,7 +152,10 @@ export function checkLaws(root, overrides = {}) {
       if (raw !== ref) { st = ovSt(raw); if (st) used = raw; else { try { st = fs.statSync(path.join(root, raw)); used = raw; } catch { /* 再试剥后缀的 */ } } }
       if (!st) { st = ovSt(probe); if (st) used = probe; else { try { st = fs.statSync(path.join(root, probe)); used = probe; } catch { /* 缺失走下面统一报 */ } } }
       // D196 ⑮ BP-17:原样路径 stat 成功时它就是目标文件,近空判据按原样路径判(不再拿剥过的 probe 判 `.md` 结尾)
-      if (!st) problems.push(`${f} 引用的路径缺失: ${ref}`);
+      if (!st) {
+        if (isSourceRepo && (SOURCE_REPO_MISSING_OK[f] || new Set()).has(ref)) continue;   // 源头仓、且确实不在场 ⇒ 不报(见头注)
+        problems.push(`${f} 引用的路径缺失: ${ref}`);
+      }
       else if (st.isFile() && used.endsWith(".md") && st.size < 200) problems.push(`${f} 引用的文件近空(${st.size}B): ${used}`);
       else if (anchor && used !== raw && probe === ref) {
         const why = checkAnchor(path.join(root, ref), st, anchor, typeof ov[ref] === "string" ? () => ov[ref] : undefined);
@@ -239,11 +255,18 @@ function selfTest() {
   fs.rmSync(path.join(tmp, ".claude/skills"), { recursive: true }); fs.rmSync(path.join(tmp, "scripts"), { recursive: true }); fresh();
   w("docs/gate/AGENTS.md", G + "\n判据工装:`scripts/no-such-gate.mjs`。\n"); t("闸规矩里不在豁免表的缺失路径 ⇒ 拒", false); fresh();
   w("AGENTS.md", K + "\n出错清单:`docs/error-list.md`。\n"); t("豁免只对闸规矩生效,宪法引未落地的 docs/error-list.md ⇒ 拒", false); fresh();
-  // 批 308:仓规矩里明写要安装方自己提供的五处路径不在场 ⇒ 过;同一份仓规矩里别的缺失路径照拒;这张豁免不对闸规矩生效
-  w("AGENTS.md", K + "\n决策记录:`docs/adr/`,先翻 `docs/adr/README.md`;产品日记:`docs/product-diary.md`;闸认的说法:`docs/gate-phrasebook.md`;欠账探针:`scripts/verify-prod.mjs`。\n");
-  t("308:仓规矩引用安装方自备的五处路径(都不在场)⇒ 过", true); fresh();
-  w("AGENTS.md", K + "\n决策记录:`docs/adr/`;另见 `docs/no-such-file.md`。\n"); t("308:仓规矩里不在豁免表的缺失路径 ⇒ 照拒", false); fresh();
-  w("docs/gate/AGENTS.md", G + "\n欠账探针:`scripts/verify-prod.mjs`。\n"); t("308:仓规矩的豁免不对闸规矩生效 ⇒ 拒", false); fresh();
+  // 批 308:源头仓(安装器脚本在场)里,仓规矩引用的五处安装方自备路径不在场 ⇒ 过;只豁免缺失、只在源头仓、只对仓规矩
+  { const FIVE = K + "\n决策记录:`docs/adr/`,先翻 `docs/adr/README.md`;产品日记:`docs/product-diary.md`;闸认的说法:`docs/gate-phrasebook.md`;欠账探针:`scripts/verify-prod.mjs`。\n";
+    const mark = () => w("scripts/custodiet-init.mjs", "// 安装器(源头仓才有)\n");
+    const unmark = () => fs.rmSync(path.join(tmp, "scripts"), { recursive: true, force: true });
+    w("AGENTS.md", FIVE); t("308:安装方的仓(没有安装器脚本)里这五处缺失 ⇒ 照拒(不豁免)", false);
+    mark(); t("308:源头仓里这五处都不在场 ⇒ 过", true);
+    w("docs/adr/README.md", "#\n"); t("308:源头仓里被豁免的文件在场但近空 ⇒ 照拒(只豁免缺失)", false); fs.rmSync(path.join(tmp, "docs/adr"), { recursive: true, force: true });
+    w("docs/adr/README.md", "# 决策记录\n" + "一页记一个决定。".repeat(40) + "\n"); w("AGENTS.md", FIVE + "见 `docs/adr/README.md:90-95`。\n"); t("308:源头仓里被豁免的文件在场、行号锚越界 ⇒ 照拒", false); fs.rmSync(path.join(tmp, "docs/adr"), { recursive: true, force: true });
+    w("AGENTS.md", K + "\n决策记录:`docs/adr/`;另见 `docs/no-such-file.md`。\n"); t("308:源头仓里不在名单上的缺失路径 ⇒ 照拒", false);
+    w("AGENTS.md", K + "\n决策记录住 `docs/adr`,必须在场。\n"); t("308:不带斜杠的写法不在名单上 ⇒ 照拒", false);
+    w("AGENTS.md", K); w("docs/gate/AGENTS.md", G + "\n欠账探针:`scripts/verify-prod.mjs`。\n"); t("308:这张名单不对闸规矩生效 ⇒ 拒", false);
+    unmark(); fresh(); }
   // 批 290 合并后误拦猎手 FB-18
   w("docs/gate/AGENTS.md", G + "\n锚点:`docs/prod-facts.md#一节`、`docs/prod-facts.md:12-14`。\n"); t("290 FB-18:在场文件带 #节名 / :行号 ⇒ 过", true); fresh();
   w("docs/gate/AGENTS.md", G + "\n锚点:`docs/no-such.md#一节`。\n"); t("290 FB-18 对照:缺失文件带 #节名 照样拒", false); fresh();
