@@ -1247,11 +1247,13 @@ async function selfTestE2E(t, tmp) {
 
   // ⑭ 杀不掉(自测接缝:什么都不杀):看守命中后宽限一到就不再等,照样停下、写交接,并写明那个进程可能还在
   { const t0 = Date.now();
-    const r = run("t14", argsFor("t14"), { steps: [{ stream: sameErr(3, "t14"), sleepMs: 4000, result: ok() }] }, { extraEnv: { BATCH_RUN_TEST_NO_KILL: "1", BATCH_RUN_KILL_GRACE_MS: "300" } });
+    //   那段长睡给到 20 秒、断言放到 15 秒:原先是 4 秒对 3.5 秒,量的是整次发车的墙钟(建工作树、开批就要两三秒),
+    //   机器一忙就超(批 308 实撞:同机另有重活时这条红了,与被测逻辑无关)。假 claude 没人杀,会在自测结束后自己睡完退出。
+    const r = run("t14", argsFor("t14"), { steps: [{ stream: sameErr(3, "t14"), sleepMs: 20_000, result: ok() }] }, { extraEnv: { BATCH_RUN_TEST_NO_KILL: "1", BATCH_RUN_KILL_GRACE_MS: "300" } });
     const ms = Date.now() - t0;
     const log = (() => { try { return fs.readFileSync(J(RUN, "t14-r1.log"), "utf8"); } catch { return ""; } })();
-    t("⑭ 杀的动作没发出去、进程不退 ⇒ 宽限到了不再等:退出 10、watch-same-error、早于那段 4 秒长睡、备注写明杀不掉、日志里有不再等那一行",
-      [r.code, r.res.reasonCode, r.exec.length, ms < 3500, r.res.notes.some((n) => /杀不掉或迟迟不退/.test(n)), /还没退:不再等它/.test(log), !!r.res.handoff],
+    t("⑭ 杀的动作没发出去、进程不退 ⇒ 宽限到了不再等:退出 10、watch-same-error、远早于那段 20 秒长睡、备注写明杀不掉、日志里有不再等那一行",
+      [r.code, r.res.reasonCode, r.exec.length, ms < 15_000, r.res.notes.some((n) => /杀不掉或迟迟不退/.test(n)), /还没退:不再等它/.test(log), !!r.res.handoff],
       [10, "watch-same-error", 1, true, true, true, true]); }
 
   // ⑩ 发车前检查:没有 --check / 锁被活进程占着 / 在 linked worktree 里 ⇒ 退出 2,不留工作树

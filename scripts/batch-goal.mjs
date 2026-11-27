@@ -57,7 +57,7 @@ import { quoteUntrusted, buildCtx } from "./lib/gate-ctx.mjs";   // buildCtx:批
 import { isCarrierPath, CARRIER_SURFACE } from "./lib/gate-carriers.mjs";
 import { readInstallConfig, parseInstallConfig, mergeInstallConfig, absentInstallConfig, snapshotConfig, configFromSnapshot, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
 import * as OB from "./lib/obligations.mjs";
-import { debtRowCells, debtRowParked } from "./lib/debt-schema.mjs";   // 批 301:切列一份实现
+import { debtRowCells, debtRowParked, liveDebtRows } from "./lib/debt-schema.mjs";   // 批 301:切列一份实现
 import { planWriteChecks, applyWriteChecks, isWriteCheckType, withdrawnClears, transcriptDirs, projectDirName } from "./lib/write-checks.mjs";   // 批 301:写入类义务产生器(T / MF / J / M);批 305:转录目录的定位沿用它
 import * as RULER from "./lib/batch-ruler.mjs";   // 批 305:指令定位与主尺(从指令到关账人亲口说了几条话)
 export { debtRowCells, debtRowParked };
@@ -1260,8 +1260,9 @@ export function debtDue(rows, cur) {
 }
 
 /** 批 305:债表里参与到期判定的行(`| Dnn |` 起头、未停放)。读不到 ⇒ 抛(调用方各自处理:--arm 只提示,--handoff 写取不到)。 */
+//   批 308 S1b D-2:取行改走 debt-schema 的 liveDebtRows(同一份区段口径:「已销账」「已结清」二级标题下的行不取)。
 function debtTableRows() {
-  return fs.readFileSync(cfgDebtTable(), "utf8").split(/\r?\n/).filter((l) => /^\| D\d+ \|/.test(l) && !debtRowParked(l));
+  return liveDebtRows(fs.readFileSync(cfgDebtTable(), "utf8"));
 }
 
 function debtTableWarn() {
@@ -1644,6 +1645,20 @@ function selfTest() {
     const shiftRow = "| D905 | 描述 `a|b` | 已结过一轮的 270 | **≤281** | 来源 | x |";
     t("285 D133:对照——旧切法第 4 列读到错位格", shiftRow.split("|").slice(1, -1)[3].trim(), "已结过一轮的 270");
     t("285 D133:掩码后不再被错位格的「已结」当成已结", debtDue([shiftRow], 285).mine, ["D905(≤281)"]);
+    // 批 308 D1(实撞):随仓发的示例欠账表里有一行「D1 示例行 … ≤5」,任何批号大于 5 的开批都把它当到期未结的债列出来。
+    //   钉住:随仓那份表在任何批号下都没有到期项(取行口径同 debtTableRows)。仓里没有这份文件(安装方换了位置)⇒ 不比。
+    t("308 D1:随仓的示例欠账表在任何批号下都没有到期项", (() => {
+      const f = fileURLToPath(new URL("../docs/gate-debts.md", import.meta.url));
+      if (!fs.existsSync(f)) return [[], []];
+      const d = debtDue(liveDebtRows(fs.readFileSync(f, "utf8")), 9999);
+      return [d.mine, d.yours];
+    })(), [[], []]);
+    // 批 308 S1b D-2:同一份随仓表,「已结清」表里 4 列的行不再被点名「列数异常、看不见到期」
+    t("308 S1b D-2:随仓的示例欠账表没有列数异常的行(已结清区段不取)", (() => {
+      const f = fileURLToPath(new URL("../docs/gate-debts.md", import.meta.url));
+      if (!fs.existsSync(f)) return [];
+      return debtDue(liveDebtRows(fs.readFileSync(f, "utf8")), 9999).colBad;
+    })(), []);
   }
   // ⚠️ **「结清后再武装」这条序列此前零覆盖**(2026-08-20 实撞后补)。
   //   为修 grill E6 我让 `--clear` 把批号写进状态文件 ⇒ 结清后是 `{cleared:true, batch:"073"}`;

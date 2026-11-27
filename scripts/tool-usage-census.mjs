@@ -281,6 +281,15 @@ export function windowTruncated(sinceTs, oldestMtimeMs) {
   return sinceTs < oldestMtimeMs;
 }
 
+/** `--doc-drift` 判「文档里反引号引用的脚本找不到」(批 308 DRIFT1 抽出)。`exists(p)` = 按 resolve 的三种候选找得到。
+ *  安装方自备、本仓故意不带的脚本不算漂移:现只有欠账探针 `scripts/verify-prod.mjs`(仓规矩「部署」一节与 DP 规则认的落点,
+ *  文档里写的是「有它时才生效」)。实撞:这两处引用让每个写过 docs 的回合收尾都报一次 DRIFT,而复跑看不出是什么。
+ *  名单只收「规矩点名由安装方提供」的路径;别的找不到的照报。 */
+export function docRefDangling(p, exists) {
+  if (["scripts/verify-prod.mjs"].includes(String(p))) return false;
+  return !exists(p);
+}
+
 // ---------- --self-test ----------
 // 反向用例的立法依据(施工单四·纪律):A1 那三条反向用例全是「第一句就是裸打印」的形态,
 // 测的是**想到的那个绕法**而不是绕法本身,反序一换就漏(F1)。故本组用例逐条写明
@@ -293,6 +302,12 @@ if (process.argv.includes("--self-test")) {
     process.stdout.write(`${ok ? "PASS" : "FAIL"} ${name}${detail ? " — " + detail : ""}\n`);
     ok ? pass++ : fail++;
   };
+
+  // 用例 0(批 308 DRIFT1 实撞):文档里写「装了欠账探针 `scripts/verify-prod.mjs` 时才生效」,那份脚本是安装方自备、
+  //   本仓故意不带的(规矩「部署」一节点名的落点)——不是漂移;别的找不到的脚本照报。
+  t("doc-drift:安装方自备的欠账探针不在场不算漂移", docRefDangling("scripts/verify-prod.mjs", () => false) === false);
+  t("doc-drift 对照:别的脚本找不到照报漂移", docRefDangling("scripts/nope.mjs", () => false) === true);
+  t("doc-drift 对照:找得到的不报", docRefDangling("scripts/batch-goal.mjs", () => true) === false);
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "census-selftest-"));
   const mkdir = (n) => {
@@ -553,7 +568,7 @@ if (args.includes("--playbook-drift") || args.includes("--doc-drift")) {
     const real = new Map();
     for (const p of seen) {
       const r = resolve(p);
-      if (!r) bad.push(`${rel} → 文件不存在:${p}`);
+      if (!r) { if (docRefDangling(p, () => false)) bad.push(`${rel} → 文件不存在:${p}`); }
       else real.set(p, r);
     }
     for (const line of md.split("\n")) {

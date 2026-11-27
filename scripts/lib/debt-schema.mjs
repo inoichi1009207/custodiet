@@ -5,7 +5,7 @@
 //   ②列数切错(代码段里的竖线)导致读错列,把合格行判成空、或把空行判成合格;③判不了(列数异常)被当成合格。
 //
 // 判据(只证「失效期列非空」,不判期限合不合理——那是模型的事):
-//   行 = 第一列是 D 号的表格行(半角 `D<数字>[字母]`,全角 NFKC 归一);二级标题「已销账」起到下一个二级标题止不查(窄版,批 301 主会话裁定,
+//   行 = 第一列是 D 号的表格行(半角 `D<数字>[字母]`,全角 NFKC 归一);二级标题「已销账」或「已结清」(批 308 S1b D-2)起到下一个二级标题止不查(窄版,批 301 主会话裁定,
 //         codex 合并审 r2 后冻结;非 D 行不查是已知漏放,见设计稿拟登债)。
 //   切列:debtRowCells(批 285 D133,原住 batch-goal.mjs,批 301 挪来这里,batch-goal 原名再导出——一份实现);
 //         切不出 6 列再按裸竖线试一次(与 batch-goal debtDue 同口径);仍不是 6 列 ⇒ 判不了(unknown)。
@@ -55,7 +55,7 @@ export const expiryFilled = (cell) => {
 };
 
 /** 债表里要查失效期的行:[{ line, n, id, label }]。**窄版(批 301 主会话裁定退回并冻结,codex 合并审 r2 后)**:
- *  只认第一列是 D 号的行(半角 `D<数字>[字母]`,全角先 NFKC 归一);一个**二级**标题含「已销账」开始、到下一个**二级**标题为止都不判
+ *  只认第一列是 D 号的行(半角 `D<数字>[字母]`,全角先 NFKC 归一);一个**二级**标题含「已销账」或「已结清」开始、到下一个**二级**标题为止都不判
  *  (子标题不重置,codex 合并审 r2 F2)。第一列不是 D 号的行(「(待编号)」等)不查——已知漏放,登债(主会话合并登债时一律给 D 号)。 */
 export function dataRows(text) {
   const out = [];
@@ -63,11 +63,27 @@ export function dataRows(text) {
   let parked = false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (/^##\s/.test(line)) { parked = /已销账/.test(line); continue; }   // 只有二级标题切换豁免区;### 等子标题不重置
+    if (/^##\s/.test(line)) { parked = SETTLED_HEADING.test(line); continue; }   // 只有二级标题切换豁免区;### 等子标题不重置(批 308 S1b D-2:「已结清」也认)
     if (parked) continue;
     const did = debtRowId(line);
     if (!did) continue;
     out.push({ line, n: i + 1, id: did, label: did });
+  }
+  return out;
+}
+
+/** 结清区的二级标题:「已销账」与「已结清」都认(批 308 S1b D-2:随仓示例表、安装器带到目标仓的那份用的是「已结清」)。 */
+export const SETTLED_HEADING = /已销账|已结清/;
+
+/** 到期腿(batch-goal --arm / --handoff)取的行:`| Dnn |` 起头、未停放(debtRowParked)、且不在结清区段里的行。
+ *  区段口径与 dataRows 相同:二级标题命中 SETTLED_HEADING 开始、到下一个二级标题为止;子标题不重置。
+ *  批 308 S1b D-2 从 batch-goal 抽来并补上区段判断——原先不看区段,结清区里 4 列的行被点名「列数异常、看不见到期」。 */
+export function liveDebtRows(text) {
+  const out = [];
+  let parked = false;
+  for (const l of String(text ?? "").split(/\r?\n/)) {
+    if (/^##\s/.test(l)) { parked = SETTLED_HEADING.test(l); continue; }
+    if (!parked && /^\| D\d+ \|/.test(l) && !debtRowParked(l)) out.push(l);
   }
   return out;
 }
@@ -138,6 +154,12 @@ function selfTest() {
   t("FB-8:新引入的列数异常行 ⇒ introducedUnknown 点名;既有的不算", [introducedUnknown(H + ok, H + ok + "\n| D957 | a|b | 1 | ≤3 | c | d |").map((u) => u.id), introducedUnknown(H + "| D958 | a|b | 1 | ≤3 | c | d |", H + "| D958 | a|b | 1 | ≤3 | c | d |\n" + ok).length], [["D957"], 0]);
   t("合并审④:占位词去首尾标点(待定? / TBD? / （待定） / 无。)⇒ 判空", ["待定?", "TBD?", "（待定）", "无。"].map((x) => expiryFilled(x)), [false, false, false, false]);
   t("合并审④:合法写法不误伤(≤304(⑩ ≤302) / 到期未办 ⇒ 展期)", ["≤304(⑩ ≤302)", "到期未办 ⇒ 展期"].map((x) => expiryFilled(x)), [true, true]);
+  // 批 308 S1b D-2:随仓示例表(安装器原样带到目标仓)的结清区标题是「已结清」,表头 4 列;只认「已销账」时它被算成判不了、到期腿点名列数异常
+  const H4 = "| # | 欠账 | 结清批 | 怎么结的 |\n|---|---|---|---|\n";
+  t("308 S1b D-2:二级标题「已结清」下的 D 行同样不查", (() => { const r = checkDebtTable("## 已结清\n\n" + H4 + "| D2 | 某事 | 307 | 补审了 |"); return [r.rows, r.unknown.length]; })(), [0, 0]);
+  t("308 S1b D-2:到期腿取行同口径——已结清 / 已销账区段的行不取,在账区照取", liveDebtRows(
+    "## 在账欠账\n" + H + "| D7 | x | 1 | **≤2** | c | d |\n\n## 已结清\n" + H4 + "| D2 | y | 307 | z |\n## 已销账\n| D9 | w | 1 | v |\n"), ["| D7 | x | 1 | **≤2** | c | d |"]);
+  t("308 S1b D-2 对照:已结清区段之后回到别的二级标题照取", liveDebtRows("## 已结清\n| D2 | y | 307 | z |\n## 在账欠账\n| D8 | x | 1 | **≤2** | c | d |\n"), ["| D8 | x | 1 | **≤2** | c | d |"]);
   t("debtRowParked 只看失效期列与出路列(D193④ 原用例)", [debtRowParked("| D901 | 原判据已撤销,但新问题仍在 | 285 | **≤280** | 来源 | 出路 |"), debtRowParked("| D902 | 某事 | 285 | **已撤销** | 来源 | 出路 |")], [false, true]);
   console.log(`\n自测 ${pass}/${pass + fail}`);
   return fail ? 1 : 0;
