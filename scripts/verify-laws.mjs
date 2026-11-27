@@ -51,6 +51,12 @@ export const RULE_FILES = ["AGENTS.md", "docs/gate/AGENTS.md"];
  */
 const PATH_EXEMPT = {
   "docs/gate/AGENTS.md": new Set(["docs/error-list.md", "docs/receipt.md"]),
+  // 批 308(实撞):随仓的示例仓规矩里有五处路径是**明写要安装方自己提供**的——决策记录目录(「要你自己建」)、
+  //   产品日记(「这个文件要你自己建;不在场时 --clear 只提示、不拒」)、闸用语手册(「安装器生成」)、
+  //   欠账探针脚本(「是你自己的脚本」「仓里没有……时 DP 不响」)。本仓故意不带它们,原先本核对在本仓恒 FAIL:
+  //   凡是改过规矩文件的批,关账时写入层的 J 项就留下一条清不掉的义务,`batch-goal --clear` 被拒。
+  //   安装方的仓里这些路径在场时豁免不起作用;不在场时各自的功能本来就按「不在场」退让。
+  "AGENTS.md": new Set(["docs/adr", "docs/adr/", "docs/adr/README.md", "docs/product-diary.md", "docs/gate-phrasebook.md", "scripts/verify-prod.mjs"]),
 };
 
 /**
@@ -233,6 +239,11 @@ function selfTest() {
   fs.rmSync(path.join(tmp, ".claude/skills"), { recursive: true }); fs.rmSync(path.join(tmp, "scripts"), { recursive: true }); fresh();
   w("docs/gate/AGENTS.md", G + "\n判据工装:`scripts/no-such-gate.mjs`。\n"); t("闸规矩里不在豁免表的缺失路径 ⇒ 拒", false); fresh();
   w("AGENTS.md", K + "\n出错清单:`docs/error-list.md`。\n"); t("豁免只对闸规矩生效,宪法引未落地的 docs/error-list.md ⇒ 拒", false); fresh();
+  // 批 308:仓规矩里明写要安装方自己提供的五处路径不在场 ⇒ 过;同一份仓规矩里别的缺失路径照拒;这张豁免不对闸规矩生效
+  w("AGENTS.md", K + "\n决策记录:`docs/adr/`,先翻 `docs/adr/README.md`;产品日记:`docs/product-diary.md`;闸认的说法:`docs/gate-phrasebook.md`;欠账探针:`scripts/verify-prod.mjs`。\n");
+  t("308:仓规矩引用安装方自备的五处路径(都不在场)⇒ 过", true); fresh();
+  w("AGENTS.md", K + "\n决策记录:`docs/adr/`;另见 `docs/no-such-file.md`。\n"); t("308:仓规矩里不在豁免表的缺失路径 ⇒ 照拒", false); fresh();
+  w("docs/gate/AGENTS.md", G + "\n欠账探针:`scripts/verify-prod.mjs`。\n"); t("308:仓规矩的豁免不对闸规矩生效 ⇒ 拒", false); fresh();
   // 批 290 合并后误拦猎手 FB-18
   w("docs/gate/AGENTS.md", G + "\n锚点:`docs/prod-facts.md#一节`、`docs/prod-facts.md:12-14`。\n"); t("290 FB-18:在场文件带 #节名 / :行号 ⇒ 过", true); fresh();
   w("docs/gate/AGENTS.md", G + "\n锚点:`docs/no-such.md#一节`。\n"); t("290 FB-18 对照:缺失文件带 #节名 照样拒", false); fresh();
