@@ -551,12 +551,16 @@ export function resolveCodexBin() {
 // 分类(外部工具报错串的分类,不是模型措辞;沿用 ADR 0039 的 UNAVAIL 口径,唯一实现在这里):
 //   rate-limit = 429 / rate limit / too many requests;quota = usage limit / quota;network = 网络终态 errno。
 //   配置告警(unrecognized configuration / configuration setting)不算;超时不算(任务太大也会超时)。
-//   BP-5(Rust 版 codex 的断网报错串对不上 Node errno 名)是词表覆盖问题,不在本层结构里解决。
+//   BP-5(Rust 版 codex 的断网报错串对不上 Node errno 名)是词表覆盖问题,不在本层结构里解决;批 310 只补了实撞的「workspace routing discovery failed」一种。
 // 只有作业最终 failed 或退出码非 0 时才写 `unavailable`(中途 429 重试成功的作业不算不可用);否则 null。
 export const UNAVAIL_RULES = [
   ["rate-limit", /rate.?limit|too many requests|\b429\b/i],
   ["quota", /usage limit|quota/i],
-  ["network", /ENOTFOUND|ECONNREFUSED|ECONNRESET|EAI_AGAIN|getaddrinfo/i],
+  // 批 310:Rust 版 codex 连不上后端时顶层 error / turn.failed 事件报「workspace routing discovery failed」(可带「Reconnecting... n/m (…)」前缀);
+  //   11-22 与 11-28 两天 8 次真实失败只打这个串(到后端域名的连接被对端重置)。只加这一种见过的串,不扩词表;
+  //   stderr 同时出现的「error sending request for url」不认——这 8 次的事件本身已能分类,而它也会出现在只是某个 MCP 连接断了、
+  //   作业因别的原因失败的场合(事件优先的结构下,只有没有事件时才会看 stderr,那时认它容易把任务出错判成不可用)。
+  ["network", /ENOTFOUND|ECONNREFUSED|ECONNRESET|EAI_AGAIN|getaddrinfo|workspace routing discovery failed/i],
 ];
 const UNAVAIL_SKIP = /unrecognized configuration|configuration setting/i;
 /** 不带原因的传输层失败事件(真因在 stderr)。 */
@@ -643,7 +647,12 @@ export function makeStreamScanner() {
       //   stderr 里 codex 内部 exec 子命令留下的 ENOTFOUND / 429(与本次失败无关)不再冒充通道不可用;没有事件才看 stderr
       // 2026-11-16(红队 b302 增量 BP-1,误拦):「有个配置项不认识」这类告警事件不算「事件明说了别的原因」——
       //   本机 28 份作业日志里 25 份带它,不剔掉的话下面两条看 stderr 的路都走不到,真断网 / 限流时判不出通道不可用。
-      const events = cands.filter((c) => c.source === "event" && !UNAVAIL_SKIP.test(c.text));
+      const all = cands.filter((c) => c.source === "event" && !UNAVAIL_SKIP.test(c.text));
+      // 批 310:「Reconnecting... n/m (…)」是重试通知,不是失败本身——另有事件说明这次失败(如任务本身出错的 turn.failed)时不拿它分类,
+      //   否则「中途重连过一次、后来因任务出错失败」会被判成通道不可用;别的事件都只是泛化传输层失败(或没有别的事件)时照常用它。
+      const RETRY = /^\s*Reconnecting\.\.\./i;
+      const nonRetry = all.filter((c) => !RETRY.test(c.text));
+      const events = nonRetry.some((c) => c.text.trim() && !GENERIC_TRANSPORT.test(c.text)) ? nonRetry : all;
       const pick = (list) => { for (const c of list) { const reason = classifyUnavailable(c.text); if (reason) return { reason, source: c.source, text: c.text.slice(0, 200) }; } return null; };
       if (!events.length) return pick(cands);
       const ev = pick(events);

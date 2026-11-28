@@ -909,6 +909,77 @@ export async function runSelfTest({ self }) {
     });
   }
 
+  // ── 批 310:codex(Rust 版)连不上后端时报的「workspace routing discovery failed」归 network ──────────────
+  //   防的失败:11-22 与 11-28 两天共 8 次真实失败(到 chatgpt.com 的连接被对端重置)只打这个串,UNAVAIL 词表只认 Node errno 名 ⇒
+  //   作业记录没有 unavailable、P 的「通道不可用」出路走不到。反方向:item 事件里的同一串不参与分类;任务本身出错的失败不算不可用。
+  {
+    const S = selfMod;
+    const RMCP = 'ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when Client(HttpRequest(HttpRequest("http/request failed: error sending request for url (https://backend.example/backend-api/ps/mcp)")))';
+    t("310:真实形状——Reconnecting 前缀的 error 事件、裸 error 事件、turn.failed、stderr 的 rmcp 行 ⇒ network(取自事件)", () => {
+      const sc = S.makeStreamScanner();
+      sc.err(RMCP + "\n");
+      sc.out('{"type":"error","message":"Reconnecting... 2/5 (workspace routing discovery failed)"}\n');
+      sc.out('{"type":"error","message":"workspace routing discovery failed"}\n');
+      sc.out('{"type":"turn.failed","error":{"message":"workspace routing discovery failed"}}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network"); eq(u.source, "event");
+    });
+    t("310:只有 turn.failed「workspace routing discovery failed」⇒ network", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"turn.failed","error":{"message":"workspace routing discovery failed"}}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network");
+    });
+    t("310:classifyUnavailable 认带 Reconnecting 前缀与不带的两形", () => {
+      eq(S.classifyUnavailable("Reconnecting... 2/5 (workspace routing discovery failed)"), "network");
+      eq(S.classifyUnavailable("workspace routing discovery failed"), "network");
+    });
+    t("310【反向】item 事件里的同一串不参与分类;任务本身出错的 turn.failed ⇒ 不算不可用", () => {
+      const sc = S.makeStreamScanner();
+      sc.out(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Falling back from WebSockets to HTTPS transport. workspace routing discovery failed" } }) + "\n");
+      sc.out('{"type":"turn.failed","error":{"message":"tool call failed: file not found: docs/x.md"}}\n');
+      sc.end();
+      eq(sc.unavailable(true), null);
+    });
+    t("310【反向】任务本身出错(明说原因的 turn.failed)+ stderr 的 rmcp 传输行 ⇒ 不看 stderr,不算不可用", () => {
+      const sc = S.makeStreamScanner();
+      sc.err(RMCP + "\n");
+      sc.out('{"type":"turn.failed","error":{"message":"tool call failed: file not found: docs/x.md"}}\n');
+      sc.end();
+      eq(sc.unavailable(true), null);
+    });
+    t("310【反向】中途 Reconnecting 过(重连成功)、后来因任务本身出错失败 ⇒ 不算不可用(Reconnecting 只是重试通知,有别的事件说明失败时不拿它分类)", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"error","message":"Reconnecting... 2/5 (workspace routing discovery failed)"}\n');
+      sc.out('{"type":"turn.failed","error":{"message":"tool call failed: file not found: docs/x.md"}}\n');
+      sc.end();
+      eq(sc.unavailable(true), null);
+    });
+    t("310:Reconnecting 事件 + 只是泛化传输层失败的 turn.failed(不带原因)⇒ 仍认 network", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"error","message":"Reconnecting... 5/5 (workspace routing discovery failed)"}\n');
+      sc.out('{"type":"turn.failed","error":{"message":"stream error: stream disconnected before completion"}}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network"); eq(u.source, "event");
+    });
+    t("310:只有 Reconnecting 事件、没有别的事件说明失败 ⇒ 照认 network", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"error","message":"Reconnecting... 5/5 (workspace routing discovery failed)"}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network");
+    });
+    t("310【反向】作业没失败(中途 Reconnecting 重试成功)⇒ 不写不可用", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"error","message":"Reconnecting... 2/5 (workspace routing discovery failed)"}\n');
+      sc.end();
+      eq(sc.unavailable(false), null);
+    });
+  }
+
   // ── 批 309 C-6:模型不可用 ⇒ 备用模型原样重发一次 ───────────────────────────────
   //   防的失败:后端报 model_not_found 时作业直接失败、人得改配置再发一次;以及反方向——codex 读到的文件里写着 model_not_found
   //   (item 事件)、或别的失败,被当成模型不可用而白重发。端到端用例的 codex 替身是 node 跑临时仓里一个叫 `exec` 的脚本,零 codex 调用。
