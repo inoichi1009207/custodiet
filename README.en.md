@@ -6,7 +6,7 @@
 
 **custodiet** is a set of workflow scripts and gates for Claude Code. The main line is **hand over one sentence and let the work run itself to close-out**: write down what counts as done when the batch opens, execute, accept, close. On that line the gate holds only two positions: **acceptance** (checking the actual state at each checkpoint) and **watch** (stopping a run that is spinning or has drifted). The predicates read the turn's actual tool-call record and git facts, not what the agent says.
 
-Only part of that line exists today. The repo has: batch opening and closing (`batch-goal`), the acceptance rules that run at the end of a turn (the Stop hook), a false-block ledger with blind review, and a replay tool plus two review agents for changing the gate. From 0.12.0 a launcher, `batch-run`, wires them into one line (open → headless execution → automatic acceptance → repair in the same session → close, or stop and write a handoff when a step cannot be judged; usage in [docs/batch-run.md](docs/batch-run.md), Chinese). So far it has run end to end with a cheap model in an empty throwaway repo with no gate installed (one batch passed and closed; one with a check that cannot pass went through a repair round, a direction review that said stop, and a handoff), but not yet in a real project with the gate installed. From 0.13.0 the launcher has a watch: besides the four limits (turns, per-launch cost, whole-batch cost, deadline) it adds exactly one predicate — when the same tool call fails with the same error 3 times in a row, it kills the execution session, stops and writes a handoff. The "try a fix first" half is not built — see [Status and plans](#status-and-plans).
+Only part of that line exists today. The repo has: batch opening and closing (`batch-goal`), the acceptance rules that run at the end of a turn (the Stop hook), a false-block ledger with blind review, and a replay tool plus two review agents for changing the gate. From 0.12.0 a launcher, `batch-run`, wires them into one line (open → headless execution → automatic acceptance → repair in the same session → close, or stop and write a handoff when a step cannot be judged; usage in [docs/batch-run.md](docs/batch-run.md), Chinese). So far it has run end to end with a cheap model in an empty throwaway repo with no gate installed (one batch passed and closed; one with a check that cannot pass went through a repair round, a direction review that said stop, and a handoff), but not yet in a real project with the gate installed. From 0.13.0 the launcher has a watch: besides the four limits (turns, per-launch cost, whole-batch cost, deadline) it adds exactly one predicate — when the same tool call fails with the same error 3 times in a row, it kills the execution session, stops and writes a handoff. The "try a fix first" half is not built — see [Status and plans](#status-and-plans). From 0.15.0 a sentence is triaged before launch: rules screen for red-line words first, and only when none match does a cheap model pick one of "full plan / completion criteria only / just do it"; a sentence triaged as "just do it" can be launched on its own. Triage, too, has run for real only in an empty throwaway repo.
 
 **lanes** is the companion UI: it moves gate messages, tool calls and edited files out of the output pane into lanes of their own.
 
@@ -15,7 +15,7 @@ To install right away: jump to [Hand it to your agent](#hand-it-to-your-agent).
 ## Direction
 
 - **The main line is the workflow; the gate is two stops on it.** The measure is: from one instruction to close-out, how many messages the human sent, and how many of those were signatures. From 0.11.0, a batch can record that instruction when it opens, and close-out prints this reading (how many messages the human sent; it cannot yet tell which of them were signatures).
-- **Few mandatory rules.** A check that blocks must judge accurately; one that cannot is a hint, or is deleted. Since 0.14.0 the engine has 12 rules (down from 31), 6 of which block.
+- **Few mandatory rules.** A check that blocks must judge accurately; one that cannot is a hint, or is deleted. Since 0.14.0 the engine has 12 rules (down from 31); since 0.15.0, 5 of them block (P moved from blocking at the end of a turn to refusing inside the close-out command).
 - **Whether a rule is still needed for the current model gets re-asked with data, regularly.** Most rules were written to cover a weakness of the model at the time. With a new model, the ledgers and replays are used to ask again: "without this rule, would the model still get it wrong?" Rules that are no longer needed are downgraded or deleted.
 
 The data behind this, and its scope, are in [False-block data](#false-block-data).
@@ -24,10 +24,11 @@ The data behind this, and its scope, are in [False-block data](#false-block-data
 
 | Stage | In the repo today | Planned |
 |---|---|---|
+| Triage | `batch-triage.mjs` (0.15.0): rules screen first for 11 red-line words (servers, live, production, deploy, publish, public, irreversible, force-push, dropping data, credentials, payment); a match ⇒ full plan, no model call. Otherwise a cheap model picks one of three routes (full plan / completion criteria only / just do it). `batch-run` can launch from a single sentence, and refuses to launch one triaged as a full plan. Run for real only in an empty throwaway repo with no gate installed; accuracy rests on four samples | Measuring accuracy on real instructions |
 | Open a batch | `batch-goal --arm`: write completion conditions, optionally with executable checks; can record the instruction that started the batch, a finish line, a cost cap and a deadline (recorded only, never blocking) | Passing the limits to the execution session at launch |
 | Execute | `batch-run` (0.12.0): launches a headless session in its own worktree with turn, per-launch cost, whole-batch cost and deadline limits; so far run for real only in an empty throwaway repo | Running one batch through it in a real project with the gate installed |
 | Watch | `batch-run` (0.13.0): the four limits (turns, per-launch cost, whole-batch cost, deadline) plus one watch predicate (`scripts/batch-watch.mjs`): the same tool call failing with the same error 3 times in a row ⇒ kill the execution session and stop, with the handoff naming the tool and the error. Verified only by self-tests and log replay; it has not yet fired in a real run | Trying a fix before stopping (version 2) |
-| Accept | `batch-goal --clear` re-runs the checks registered at opening and refuses on failure; the 6 blocking engine rules, plus A and R, at the end of a turn; `batch-run` accepts automatically after execution and, on failure, resumes the same session for at most three repair rounds | — |
+| Accept | `batch-goal --clear` re-runs the checks registered at opening and refuses on failure, and also refuses when the batch changed gate-engine or rule files without the required reviews (rule P, since 0.15.0); the 5 blocking engine rules, plus A and R, at the end of a turn; `batch-run` accepts automatically after execution and, on failure, resumes the same session for at most three repair rounds | — |
 | Close | `batch-goal --clear`, outcome and decision records, a debt table with expiry | A headless session that walks the whole close-out chain itself |
 | Record data | Alert ledger, false-block ledger with blind review, replay tool; at close-out it prints the ruler (how many times the human spoke between that instruction and close-out, by type) | One summary row per batch; sampling of blocks nobody appealed |
 | Maintain rules | False-block claims with blind review; the red-team and false-block-hunter agents; 0.14.0 deleted the 17 log-only rules and two hint rules that blind review found mostly wrong (L, O) | Re-testing each rule when the model changes |
@@ -63,7 +64,7 @@ flowchart TD
     J -.->|"off course, or should stop"| S
 
     classDef planned stroke-dasharray: 6 4
-    class T,P1,P2,P3,D,R planned
+    class P1,P2,P3,D,R planned
 ```
 
 One number is measured: from that instruction to close-out, how many times the human spoke, and how many of those were sign-offs.
@@ -134,24 +135,24 @@ The Stop gate itself runs only deterministic predicates and calls no model. A mo
 
 Rules read assistant text and the **inputs** of `tool_use` blocks, never tool **outputs** — so "read a file that mentions `git commit`" cannot count as "committed". Two built-in rules, A (delegation closure) and R (completion statements), are the exception and scan the full text.
 
-## Rules: 12, of which 6 block
+## Rules: 12, of which 5 block
 
 There are 12 engine rules in two tiers (`npm run gate:accept` prints the count).
 
-**Blocking (6)** — a hit keeps the turn from ending.
+**Blocking (5)** — a hit keeps the turn from ending.
 - **K0 / K**: touching the working tree (writing files, committing) with no completion conditions set blocks on the turn that commits or clears; running `batch-goal --clear` when the batch did not clear blocks. Conditions are written at the start with `batch-goal --arm`, optionally with a check command.
 - **DP**: a push with no debt probe run after it blocks. Active only when the repo has the probe script `scripts/verify-prod.mjs`.
 - **W**: documents that will be published, or that later work will rely on, need one external review before the batch is closed.
 - **X**: saying "generated" or "written to disk" needs a probe action.
-- **P**: load-bearing changes need three independent reviews — cross-model, read-only sub-agent, external precedent. Only tool actions count; saying you ran one does not. For gate-engine files, the independent-view slot needs both bundled agents: the red team `_gate-bypass-hunter` (misses) and the false-block hunter `_gate-false-block-hunter` (false blocks, by replaying real transcripts through the old and new rules with `scripts/gate-replay.mjs`). The missing reviews are still computed every turn, but P only blocks on a turn that closes the batch (`batch-goal --clear`), runs `git push`, `git merge` or `gh pr merge`; other turns get a single hint (since 0.14.0; before that it blocked at the end of every turn).
 
-**Hint only (6)** — one line to the model, no block.
+**Hint only (7)** — one line to the model, no block.
 - **I**: search for existing tools before building a new tool or script.
 - **ND**: when the user asks "what is X", the term goes into the noun diary.
 - **AD**: a commit message in this batch looks like a signed decision, and the decision list is empty.
 - **PF**: the commit range contains gate changes brought in by another session.
 - **G**: self-review before committing.
 - **U**: a Skill was called and never wrapped up. Downgraded from blocking to hint-only in 0.14.0; the check itself is unchanged.
+- **P**: load-bearing changes need three independent reviews — cross-model, read-only sub-agent, external precedent. Only tool actions count; saying you ran one does not. For gate-engine files, the independent-view slot needs both bundled agents: the red team `_gate-bypass-hunter` (misses) and the false-block hunter `_gate-false-block-hunter` (false blocks, by replaying real transcripts through the old and new rules with `scripts/gate-replay.mjs`). Since 0.15.0 P only hints at the end of a turn, and the refusal lives in the close-out command instead: if the batch (from its base at opening to HEAD) has commits that change gate-engine files or load-bearing rule files and the required reviews have not all run, `batch-goal --clear` refuses (reason `review-missing`), and `batch-goal --dry-check` reports the same item; if there are such commits but the session transcripts cannot be read to decide, it refuses too (reason `review-unknown`). The predicate is unchanged; the evidence comes from the transcripts of the batch's sessions. A batch that touches neither costs one extra git call and no transcript reads. If the refusal is wrong: record it with `node --no-warnings scripts/hook-stop-closure.mjs --fp P "<reason>"`, then close. The 0.14.0 approach — blocking at the end of a turn when the shell command looked like a close, push or merge — was inaccurate in both directions and is gone.
 
 0.14.0 deleted 19 rules: the 17 that were log-only (the wording rules S, E0, E1, E2, V, C, Q, F, SE, N, B, D, H, plus J, T, MF, M) and the hint rules L (counting the tool surface by hand) and O (a URL used as evidence must actually have been fetched). Hits on the 17 had long stopped reaching the model and only added a line to the candidate ledger; blind review of L and O came out 8 wrong / 0 right and 6 wrong / 0 right. The reasoning is in [False-block data](#false-block-data): rules that infer meaning from wording were judged wrong more often than right. The write-layer checks for J, T, MF and M (`scripts/lib/write-checks.mjs`: hook-guard before a write, and `batch-goal --clear`) stay; only their Stop-gate rule is gone. The log-only plumbing (the candidate ledger and the summary line at the end of `--clear`) stays as well; no rule writes to it now.
 
@@ -189,7 +190,7 @@ Recompute in your own repo: `node scripts/hook-stop-closure.mjs --fp-report`.
 - **Ledger integrity chain**: the alert, false-positive and batch-goal ledgers carry a per-line hash chain; rewriting, inserting or deleting a middle line turns it red.
 - **External anchor** (`ledger-anchor.mjs`): snapshots ledger prefix fingerprints into `~/.custodiet/`; rewriting or truncating before the anchor turns it red. The anchor lives in the same user's home directory on the same machine, so it does not stop a process running as you; `install-task` is implemented for Windows only.
 - **Fail-closed**: a rule missing a required input reports UNKNOWN and blocks.
-- **Escape hatches are reconciled**: a self-test ties escape hatches to the blocking table. P deliberately has none.
+- **Escape hatches are reconciled**: a self-test ties escape hatches to the blocking table. P only hints at the end of a turn and is not in that table; its refusal inside the close-out command has no environment-variable switch — a wrong refusal is let through by recording a false block with `--fp P`.
 
 <p>
 <img src="assets/same-shape-errors.jpg" alt="Every mistake today is the Nth instance of the same shape" width="640">
@@ -208,6 +209,8 @@ Recompute in your own repo: `node scripts/hook-stop-closure.mjs --fp-report`.
 - Recall is unknown.
 - The overall false-block rate cannot be measured either: only appealed blocks reach blind review (see [False-block data](#false-block-data)).
 - The watch has one predicate (the same tool call failing with the same error 3 times in a row) plus the four limits; it only stops and never tries a fix. Spinning it cannot recognise — error text that changes every time, two calls failing in turn — is left to the limits. The line that runs itself to close-out now has a launcher, `batch-run`, but it has only run end to end in an empty throwaway repo with no gate installed, not in a real project (see [Status and plans](#status-and-plans)).
+- Triage rules match literal words only: a sentence that mentions a red-line word but only touches local files (for example, fixing a typo in the deployment doc matches "deploy") is still sent down the full-plan route; the way out is `--route` on `batch-run`, to choose the route yourself.
+- The default check for the "just do it" route, `directCheck`, is one check shared by the whole repo. It cannot prove the sentence was actually carried out, only things like "the repo is not broken"; for a stronger check, write your own `--check`.
 - So far only the author's own repo uses it.
 - Text rules (noun questions, wording of signed decisions, the stop-and-confirm marker, etc.) match Chinese sentence patterns, and judge messages are in Chinese. In an English repo those rules neither fire nor block.
 - Usage numbers come from the author's own ledgers, with no third-party audit.
@@ -298,12 +301,12 @@ Or in two steps: `/plugin marketplace add inoichi1009207/custodiet`, then `/plug
 
 | Capability | In one line | Command |
 |---|---|---|
-| Stop gate | At Stop, runs 12 engine rules (6 blocking) and three more checks (A, R, DRIFT; A and R also block) over the turn's tool-call record; a blocking hit keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
+| Stop gate | At Stop, runs 12 engine rules (5 blocking) and three more checks (A, R, DRIFT; A and R also block) over the turn's tool-call record; a blocking hit keeps the turn from ending | `node --no-warnings scripts/hook-stop-closure.mjs --self-test` |
 | Batch completion conditions | Set checkable acceptance conditions up front, optionally with a check command; `--clear` runs the checks and refuses on failure | `node --no-warnings scripts/batch-goal.mjs --arm 001 --cond "render done" --check "ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4" --expect-re "^218\."` |
 | Rule acceptance | Positive/negative cases + mutation acceptance per rule; cases that do not kill their mutations cannot ship (run in this repo; first `npm --prefix scripts/gate-deps install`, which needs node `^22.18.0` or `>=24.11.0` — the windowsHide check in it needs the parser) | `npm run gate:accept` |
 | Ledger integrity chain | Three ledgers with per-line hash chains; rewrite / insert / delete-middle turns red | `node --no-warnings scripts/lib/ledger-chain.mjs verify <file.jsonl>` |
 | External anchor (in this repo) | Snapshots ledger prefix fingerprints into `~/.custodiet/`; rewriting or truncating before the anchor turns red | `node scripts/lib/ledger-anchor.mjs snapshot` |
-| Escape hatches | Each blocking rule can be switched off on its own (P has none) | `STOP_CLOSURE_BLOCK_<id>=0` |
+| Escape hatches | Each rule that blocks at the end of a turn can be switched off on its own; P only hints there, and its refusal in the close-out command does not use this switch — record a wrong refusal with `--fp P` instead | `STOP_CLOSURE_BLOCK_<id>=0` |
 | Red-team agent | After changing gate-engine files, finds "how to get past this rule", each bypass with a minimal fixture | Call the sub-agent `_gate-bypass-hunter` in a session |
 
 Batch condition order: arm → work → write "Condition N: met / not met / n/a" for each → **commit** → finally `node --no-warnings scripts/batch-goal.mjs --clear`. Clearing before committing is blocked by K0.
