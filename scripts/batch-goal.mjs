@@ -55,7 +55,7 @@ import { fileURLToPath } from "node:url";
 import { ledgerAppend, verifyFile as verifyFileChain } from "./lib/ledger-chain.mjs";
 import { quoteUntrusted, buildCtx } from "./lib/gate-ctx.mjs";   // buildCtx:批 305 自测拿它和主尺的认人口径逐条对账
 import { isCarrierPath, CARRIER_SURFACE } from "./lib/gate-carriers.mjs";
-import { readInstallConfig, parseInstallConfig, mergeInstallConfig, absentInstallConfig, snapshotConfig, configFromSnapshot, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
+import { readInstallConfig, parseInstallConfig, mergeInstallConfig, absentInstallConfig, snapshotConfig, configFromSnapshot, installNames, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
 import * as OB from "./lib/obligations.mjs";
 import { debtRowCells, debtRowParked, liveDebtRows } from "./lib/debt-schema.mjs";   // 批 301:切列一份实现
 import { planWriteChecks, applyWriteChecks, isWriteCheckType, withdrawnClears, transcriptDirs, projectDirName } from "./lib/write-checks.mjs";   // 批 301:写入类义务产生器(T / MF / J / M);批 305:转录目录的定位沿用它
@@ -1363,17 +1363,106 @@ function computeRuler(g) {
   try {
     const ins = g && g.instruction;
     if (!ins || !ins.at) return RULER.measureRuler({ instruction: ins || null });
-    const sids = [g.armedBy, sidEnv()];
-    try {
-      for (const l of fs.readFileSync(JOURNAL, "utf8").split("\n")) {
-        if (!l.includes('"arm"')) continue;
-        let o; try { o = JSON.parse(l); } catch { continue; }
-        if (o && o.action === "arm" && String(o.batch) === String(g.batch) && (o.armedAt || null) === (g.armedAt || null) && typeof o.armedBy === "string") sids.push(o.armedBy);
-      }
-    } catch { /* 台账读不到 ⇒ 只按批状态里的会话号 */ }
-    return RULER.measureRuler({ instruction: ins, sids, dirs: transcriptDirsHere(), nowMs: Date.now() });
+    return RULER.measureRuler({ instruction: ins, sids: batchSessionIds(g), dirs: transcriptDirsHere(), nowMs: Date.now() });
   } catch (e) { return { ok: false, why: `算的时候出错:${String(e && e.message || e).slice(0, 160)}` }; }
 }
+/** 这一批干过活的会话号:开批的会话(批状态 armedBy)、现在跑这条命令的会话、本批各 arm 行(同批号同 armedAt)的 armedBy。
+ *  主尺(批 305)与关账侧的 P 取证(批 309)共用。去重、去掉不像会话号的。 */
+function batchSessionIds(g) {
+  const sids = [g && g.armedBy, sidEnv()];
+  try {
+    for (const l of fs.readFileSync(JOURNAL, "utf8").split("\n")) {
+      if (!l.includes('"arm"')) continue;
+      let o; try { o = JSON.parse(l); } catch { continue; }
+      if (o && o.action === "arm" && String(o.batch) === String(g.batch) && (o.armedAt || null) === (g.armedAt || null) && typeof o.armedBy === "string") sids.push(o.armedBy);
+    }
+  } catch { /* 台账读不到 ⇒ 只按批状态里的会话号 */ }
+  return [...new Set(sids.filter((s) => typeof s === "string" && /^[\w-]{8,80}$/.test(s)))];
+}
+
+/// ── 批 309:规则 P 的拒绝挪进关账(--clear 拒、--dry-check 报;判定在 hook-stop-closure reviewVerdict,判据唯一实现 = RULE_P)──
+//   收尾钩子里的 P 只提示、永不阻断;这里问同一份判据,只改「什么时候拦」:本批(开批基点..HEAD)P 的 detect 有硬欠项 ⇒ 拒清
+//   `review-missing`(不分是改闸引擎文件的提交还是规矩文件类的承重提交,消息里分开写);有这两类提交但一份转录都读不到
+//   (或 git 事实取不到)⇒ `review-unknown`;只欠软项 ⇒ 不拒,提示登记。
+//   零成本路径:范围里没有一个提交碰过 scripts/(闸引擎文件全在它下面,是 P 的 ENGINE_PATHSPECS 的超集,自测钉着)或承重面
+//   (CARRIER_SURFACE,与 P 同一份判据)⇒ 只跑这一次 git,不载入收尾闸、不读转录。碰过才载入收尾闸;那边再先不读转录预判一次
+//   (规矩文件类提交在宽限内就到此为止),预判有命中才读转录。
+//   出路(复用现成的误报记账,不新造台账):`hook-stop-closure.mjs --fp P "<为什么拦错了>"`——本批武装之后记的、没撤回的一笔 P 误报
+//   ⇒ 这道拒绝放行,结清行记下那一笔的 h(留痕;误报记账照旧在批次结清时交盲审)。
+export const ENGINE_SUPERSET_PREFIX = "scripts/";
+const FP_LEDGER = path.join(".claude", ".gate-fp-ledger.jsonl");
+/** 本批武装之后记的、没被撤回的最后一笔 P 误报(纯函数,自测直接喂行)。没有 ⇒ null。 */
+export function reviewWaiver(g, rows) {
+  const since = Date.parse(String((g && g.armedAt) || ""));
+  if (!Number.isFinite(since)) return null;
+  const list = (rows || []).filter((r) => r && typeof r === "object");
+  const retracted = new Set(list.filter((r) => r.kind === "retraction" && r.id === "P" && typeof r.ref === "string").map((r) => r.ref));
+  const hit = list.filter((r) => r.kind === "claimed_fp" && r.id === "P" && typeof r.h === "string" && !retracted.has(r.h) && Date.parse(String(r.ts || "")) >= since);
+  return hit.length ? hit[hit.length - 1] : null;
+}
+/** 这个仓相对路径会不会让 P 触发:闸引擎面的超集(scripts/ 下)或承重面(与 P 的 isCarrierPath(CARRIER_SURFACE) 同一份)。 */
+export const reviewRelevantPath = (p) => { const s = String(p || "").replace(/\\/g, "/"); return s.startsWith(ENGINE_SUPERSET_PREFIX) || isCarrierPath(CARRIER_SURFACE, s); };
+/** 零成本路径的那一次 git:开批基点..HEAD 里各提交改过的文件名(`--no-renames`:改名的新旧两头都列;合并进来的旁支提交也在范围里)。
+ *  false = 一个都不会让 P 触发(直接过);true = 有;null = git 没跑成(交给精确判定,那边取不到事实就判不了)。 */
+export function reviewRangeTouched(base, git = gitRun) {
+  let r; try { r = git(["log", "--no-renames", "--name-only", "--format=", `${base}..HEAD`]); } catch { return null; }
+  if (!r || r.status !== 0) return null;
+  return String(r.stdout || "").split(/\r?\n/).some((l) => l.trim() && reviewRelevantPath(l.trim()));
+}
+function readFpRows() {
+  try { return fs.readFileSync(FP_LEDGER, "utf8").split("\n").map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { return []; }
+}
+/** 关账侧的 P 判定。返回 reviewVerdict 的结论,另加 status `none`(零成本路径)/ `skip`(没有开批基点 / 本仓没有收尾闸脚本,不查)。
+ *  `io` 可注入(自测):git、loadHook(载入收尾闸)、dirs(转录目录)。 */
+export async function loadBearingReview(g, io = {}) {
+  const base = g && g.baseCommit;
+  if (typeof base !== "string" || !/^[0-9a-f]{7,64}$/i.test(base)) return { status: "skip", why: "批状态里没有开批基点(baseCommit),判不了本批有没有承重面 / 改闸提交" };
+  if (reviewRangeTouched(base, io.git || gitRun) === false) return { status: "none" };
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "hook-stop-closure.mjs");
+  if (!io.loadHook && !fs.existsSync(script)) return { status: "skip", why: "本仓没有收尾闸脚本(hook-stop-closure.mjs),不查" };
+  let m;
+  try { m = io.loadHook ? await io.loadHook() : await import(new URL("./hook-stop-closure.mjs", import.meta.url).href); }
+  catch (e) { return { status: "unknown", step: "载入收尾闸", why: String(e && e.message || e).slice(0, 160) }; }
+  try {
+    let dirs = io.dirs;
+    if (dirs === undefined) { try { dirs = transcriptDirsHere(); } catch { dirs = []; } }
+    return m.reviewVerdict({ base, sids: batchSessionIds(g), ledgerSid: sidEnv() || g.armedBy, batchGoal: g,
+      findTranscript: (sid) => RULER.findTranscript(sid, dirs || []), ...(io.verdict || {}) });
+  } catch (e) { return { status: "unknown", step: "判定", why: `判定自己出错:${String(e && e.message || e).slice(0, 160)}` }; }
+}
+/** 每一欠格怎么补(拒绝那段话里列)。 */
+function reviewFix(h, g) {
+  const ch = String((h && h.ch) || "");
+  if (/独立视角/.test(ch) && (Array.isArray(h.missing) || /闸引擎面/.test(ch))) {
+    const miss = Array.isArray(h.missing) && h.missing.length ? h.missing : ["_gate-bypass-hunter", "_gate-false-block-hunter"];
+    return `起 ${miss.map((x) => `\`${x}\``).join(" 与 ")}(只读子代理),prompt 里带本批闸文件名 / 规则 id / diff 文件;误拦猎手派单里只写一个 \`--base ${String(g.baseCommit || "<开批基点>").slice(0, 12)}\`(开批基点,早于本批第一笔改闸提交)`;
+  }
+  if (/独立视角/.test(ch)) return "起一个只读子代理复核(grill: 系列或 `_` 开头的只读 agent),prompt 里带本批改的规矩文件名";
+  if (/跨模型/.test(ch)) return "跑一次跨模型复核:`node ~/.claude/scripts/codex-run.mjs --task <任务文件>`,等作业结束(作业记录 state=done、有 resultAt)";
+  if (/外部先例/.test(ch)) return "用 WebSearch / WebFetch 查一次同类做法(只认工具调用,不认正文里写的字)";
+  return "照收尾钩子 P 的提示补";
+}
+const commitList = (cs) => `${cs.slice(0, 8).map((c) => `${c.aggregated ? "(聚合)" : ""}${String(c.sha || "?").slice(0, 7)}${c.files && c.files.length ? `[${c.files.slice(0, 3).join(", ")}${c.files.length > 3 ? " …" : ""}]` : ""}`).join(";")}${cs.length > 8 ? " …" : ""}`;
+/** 拒绝 / 报告那段话(--clear 与 --dry-check 共用)。 */
+function printReview(er, g, head) {
+  console.error(head);
+  const ec = Array.isArray(er.engineCommits) ? er.engineCommits : [], cc = Array.isArray(er.carrierCommits) ? er.carrierCommits : [];
+  if (ec.length) console.error(`  改了闸引擎文件的提交(${ec.length} 个):${commitList(ec)}`);
+  if (cc.length) console.error(`  改了规矩文件类承重面的提交(${cc.length} 个):${commitList(cc)}`);
+  if (er.status === "unknown") {
+    console.error(`  判不了:${er.step || "?"} 这一步——${er.why || "原因未记"}。判不了按欠着算(这是这类提交唯一剩下的一道关)。`);
+  } else {
+    for (const h of er.hard || []) console.error(`  · 欠 ${String(h.ch).replace(/(.)——.*$/, "$1")}${Array.isArray(h.missing) && h.missing.length ? `(缺 ${h.missing.join("、")})` : ""}${Number.isFinite(h.commits) ? `(本会话 P 账 ${h.commits} 次承重提交,每 ${h.every} 次要跑一遍)` : ""}——怎么补:${reviewFix(h, g)}`);
+    if ((er.soft || []).length) console.error(`  (另:${er.soft.map((h) => String(h.ch).replace(/(.)——.*$/, "$1")).join(" / ")} 通道不可用,只算软项,收尾报告须登记欠账)`);
+  }
+  if (Array.isArray(er.unread) && er.unread.length) console.error(`  这几个本批会话的转录没读到(那里跑过的复核不算):${er.unread.join("、")}`);
+  console.error("  补完重跑 --clear(或先 --dry-check 看)。");
+  console.error("  认为这次拦错了(复核确实跑过,只是不在读到的转录里;或判据本身错了):`node --no-warnings scripts/hook-stop-closure.mjs --fp P \"<为什么拦错了>\"`,再重跑 --clear——" +
+    "本批武装之后记的那笔 P 误报会让这一项放行,结清行记下它;误报记账照旧在批次结清时交盲审。");
+}
+/** 拒绝 / 报告那段话的首句:说清是改了闸引擎文件还是规矩文件类承重面。 */
+const reviewWhat = (er) => (er.engine || (Array.isArray(er.engineCommits) && er.engineCommits.length && !(er.carrierCommits || []).length)
+  ? "改闸引擎文件的提交" : (Array.isArray(er.engineCommits) && er.engineCommits.length ? "改闸引擎文件与规矩文件类承重面的提交" : "规矩文件类承重提交"));
 // ── 批 305:`--handoff`——交接文件从事实生成 ─────────────────────────────────────────────
 //   每一段只写查得到的事实(git、批状态、作业目录、转录、债表);任何一段拿不到 ⇒「取不到(原因)」,不留空、不编。
 //   不写任何叙述(「下一步做什么」之类),那是读它的会话自己的事。只读:除 `--out` 指定的那一个文件外不写任何东西。
@@ -2023,6 +2112,7 @@ console.log(JSON.stringify(cmd === "create" ? { id: r.result.id } : r.result));
   }), [2, 0, 0, true, "309-D3", ["登记错了,不是决定", "纯调查无成果"], 0]);
   oblSelfTest(t, sandbox);
   selfTest305(t);
+  selfTest309(t);
   // 批 305:开批列「误报率待修」时带上误报表的口径句(整表不印,口径句单独转出);没有待修行 ⇒ 不印口径句
   {
     const NOTE = "口径:只统计被申诉过的拦截,不是全部拦截的准确率;没人申诉的拦截不在这张表里。";
@@ -2048,7 +2138,23 @@ function oblSelfTest(t, sandbox) {
   // ── 安装方配置 ──
   const K = parseInstallConfig(TEST_INSTALL_JSON);
   t("298 配置:HostApp 那份解析成功、取值照旧", [K.found, K.diary, K.adrDir, K.debtTable, K.loadBearingExtra.length], [true, "docs/product-diary.md", "docs/adr", "docs/gate-debts.md", 5]);
-  t("298 配置:仓里那份 gate-install.json 与自测字面量逐项相等(仓里没有这份文件 ⇒ 不比)", (() => { const f = fileURLToPath(new URL("../gate-install.json", import.meta.url)); if (!fs.existsSync(f)) return [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]; const r = parseInstallConfig(fs.readFileSync(f, "utf8")); return [r.diary, r.adrDir, r.debtTable, r.loadBearingSrc]; })(), [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]);
+  // 批 309 C-4:闸的源头仓(安装器脚本在场)自带一份 gate-install.json,只把欠账表指到不随包的 docs/own-debts.md ⇒ 源头仓里不比 HostApp 字面量,
+  //   改钉源头仓那份的取值;安装方的仓(没有安装器脚本)照旧与字面量比。
+  const isSourceRepo = fs.existsSync(fileURLToPath(new URL("./custodiet-init.mjs", import.meta.url)));
+  t("298 配置:仓里那份 gate-install.json 与自测字面量逐项相等(仓里没有这份文件 / 闸的源头仓 ⇒ 不比)", (() => { const f = fileURLToPath(new URL("../gate-install.json", import.meta.url)); if (isSourceRepo || !fs.existsSync(f)) return [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]; const r = parseInstallConfig(fs.readFileSync(f, "utf8")); return [r.diary, r.adrDir, r.debtTable, r.loadBearingSrc]; })(), [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]);
+  t("309 C-4:源头仓的 gate-install.json 只把欠账表指到 docs/own-debts.md(日记 / ADR / 承重 / 名单都不配),那份表在场(安装方的仓 ⇒ 不比)", (() => {
+    if (!isSourceRepo) return [null, null, "docs/own-debts.md", true, [], true];
+    const f = fileURLToPath(new URL("../gate-install.json", import.meta.url));
+    const r = fs.existsSync(f) ? parseInstallConfig(fs.readFileSync(f, "utf8")) : {};
+    return [r.diary, r.adrDir, r.debtTable, r.debtTableExplicit, r.loadBearingSrc, fs.existsSync(fileURLToPath(new URL("../docs/own-debts.md", import.meta.url)))];
+  })(), [null, null, "docs/own-debts.md", true, [], true]);
+  t("309 C-4:installNames 把显式配置的欠账表交给收尾闸;缺省的不交", [installNames(parseInstallConfig(JSON.stringify({ format: "gate-install/v1", debtTable: "docs/own-debts.md" }))).debtTables,
+    installNames(parseInstallConfig(JSON.stringify({ format: "gate-install/v1" }))).debtTables, installNames({ error: "x" }).debtTables], [["docs/own-debts.md"], [], []]);
+  t("309 C-6:codexFallbackModel 是登记过的键(不判坏整份);形状不对按没配 + 告警", (() => {
+    const a = parseInstallConfig(JSON.stringify({ format: "gate-install/v1", codexFallbackModel: "gpt-x" }));
+    const b = parseInstallConfig(JSON.stringify({ format: "gate-install/v1", codexFallbackModel: "a b", diary: "docs/d.md" }));
+    return [!!a.error, a.codexFallbackModel, !!b.error, b.codexFallbackModel, b.diary, b.warnings.length];
+  })(), [false, "gpt-x", false, null, "docs/d.md", 1]);
   // ── 批 305:两份名单键(部署脚本文件名 / 私仓仓名)──
   t("305 配置:字面量里的两份名单解析得出、没有告警", [K.deployScripts, K.privateRepos, K.warnings], [["deploy-prod.ps1"], ["app-private"], []]);
   t("305 配置:仓里那份 gate-install.json 的两份名单形状对(解析不坏、没有告警;名字是安装方的事,不与字面量比;仓里没有这份文件 ⇒ 不核)", (() => {
@@ -2733,6 +2839,111 @@ function fx305(baseMs = Date.now() - 6 * 3600_000) {
     TR: (id, text, min, x = {}) => U([{ type: "tool_result", tool_use_id: id, content: text }], min, { toolUseResult: { stdout: text }, ...x }),
   };
 }
+/// ── 批 309 自测:规则 P 的拒绝挪进关账(review-missing / review-unknown;判定本体的零件用例在 hook-stop-closure 自测)──
+//   沙盒仓里真跑 --arm / 提交 / --dry-check / --clear;转录是造的(假用户目录)。每条拒绝都主动造一次,看拒因行、退出码与出路走不走得通。
+export function selfTest309(t) {
+  const SID = "selftest-sess-0309-aaaa", SIDE = { CLAUDE_CODE_SESSION_ID: SID };
+  // 纯函数:误报记账放行只认本批武装之后、没撤回的 P 那一笔
+  {
+    const g = { armedAt: "2026-11-20T08:00:00.000Z" };
+    const row = (o) => ({ kind: "claimed_fp", id: "P", h: "h-after-0001", ts: "2026-11-20T08:30:00.000Z", why: "复核在别的会话", ...o });
+    t("309 出路:本批武装之后记的 P 误报 ⇒ 放行(取那一笔)", reviewWaiver(g, [row()])?.h, "h-after-0001");
+    t("309 出路反例:武装之前记的 / 别的规则 / 已撤回 ⇒ 不放行", [
+      reviewWaiver(g, [row({ ts: "2026-11-20T07:59:00.000Z" })]),
+      reviewWaiver(g, [row({ id: "K" })]),
+      reviewWaiver(g, [row(), { kind: "retraction", id: "P", ref: "h-after-0001" }]),
+      reviewWaiver({}, [row()])], [null, null, null, null]);
+    const out = (s) => () => ({ status: 0, stdout: s });
+    t("309 零成本路径:范围里的文件都不是闸引擎面超集 / 承重面 ⇒ false;有 scripts/ 下的 ⇒ true;有规矩文件 ⇒ true;git 没跑成 ⇒ null",
+      [reviewRangeTouched("1234567", out("src/a.ts\n\nREADME.txt\n")), reviewRangeTouched("1234567", out("src/a.ts\nscripts/lib/gate-rules.mjs\n")),
+        reviewRangeTouched("1234567", out("AGENTS.md\n")), reviewRangeTouched("1234567", out("docs/laws/collab.md\n")),
+        reviewRangeTouched("1234567", () => ({ status: 128, stdout: "" })), reviewRangeTouched("1234567", () => { throw new Error("x"); })], [false, true, true, true, null, null]);
+    t("309 零成本路径只跑一次 git(改名的新旧两头都列,不按 TREESAME 剪枝)",
+      (() => { let got = null; reviewRangeTouched("1234567", (a) => { got = a; return { status: 0, stdout: "" }; }); return got; })(),
+      ["log", "--no-renames", "--name-only", "--format=", "1234567..HEAD"]);
+    t("309 承重面判法与 P 同一份(isCarrierPath(CARRIER_SURFACE));clipboard / node_modules 下的同名件不算",
+      [reviewRelevantPath(".claude/agents/_x.md"), reviewRelevantPath("clipboard/x/AGENTS.md"), reviewRelevantPath("src/x.ts")], [true, false, false]);
+  }
+  const hookScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "hook-stop-closure.mjs");
+  const ENGINE = "scripts/lib/gate-rules.mjs";
+  const agentAt = (f, min, type, prompt) => f.A([{ type: "tool_use", id: `toolu_${type}_${min}`, name: "Agent", input: { subagent_type: type, prompt } }], min);
+  const toolAt = (f, min, name, input) => f.A([{ type: "tool_use", id: `toolu_${name}_${min}`, name, input }], min);
+  t("309 零成本:只改业务文件 ⇒ 过,结清行 review.status=none(没载入收尾闸、没读转录)", box305(({ repo, cli, w, commit, jrows }) => {
+    const a = cli(SIDE, "--arm", "309", "--cond", "甲");
+    w(repo, "src/app.txt", "x\n"); commit(repo, "biz");
+    const d = cli(SIDE, "--dry-check"), c = cli(SIDE, "--clear", "--verdict", "1=达成");
+    return [a.status, d.status, c.status, jrows().at(-1)?.review?.status];
+  }), [0, 0, 0, "none"]);
+  t("309 关账侧:改了闸引擎文件、本会话转录找不到 ⇒ --clear 拒 review-unknown(写明读转录这一步),拒清痕迹在;--dry-check 报判不了、不带「条未过」", box305(({ repo, cli, w, commit, st }) => {
+    cli(SIDE, "--arm", "309", "--cond", "甲");
+    w(repo, ENGINE, "// 改闸\n"); commit(repo, "gate");
+    const d = cli(SIDE, "--dry-check"), c = cli(SIDE, "--clear", "--verdict", "1=达成");
+    return [d.status, /reason=review-unknown/.test(d.stderr), /条未过/.test(d.stderr), c.status, /BATCH-GOAL-CLEAR-REFUSED batch=309 reason=review-unknown/.test(c.stderr),
+      /读转录/.test(c.stderr), /改了闸引擎文件的提交.*gate-rules\.mjs/.test(c.stderr), st().clearRefusedReason, st().cleared === true];
+  }), [2, true, false, 2, true, true, true, "review-unknown", false]);
+  t("309 关账侧:改了闸引擎、转录里只有红队 ⇒ --dry-check 报 1 条未过(发车脚本当验收不过)、--clear 拒 review-missing 并点名缺误拦猎手与怎么补;两猎手补齐 ⇒ 都过", box305(({ repo, cli, w, commit, st, jrows, transcript }) => {
+    cli(SIDE, "--arm", "309", "--cond", "甲");
+    const base = st().baseCommit;
+    w(repo, ENGINE, "// 改闸\n"); commit(repo, "gate");
+    const f = fx305(Date.now());
+    transcript(SID, [f.H("改闸", 1), agentAt(f, 2, "_gate-bypass-hunter", `红队本批 ${ENGINE} 的改动`)]);
+    const d1 = cli(SIDE, "--dry-check"), c1 = cli(SIDE, "--clear", "--verdict", "1=达成");
+    const r1 = [d1.status, /条未过/.test(d1.stderr), /reason=review-missing/.test(d1.stderr), c1.status, /reason=review-missing/.test(c1.stderr),
+      /缺 _gate-false-block-hunter/.test(c1.stderr), c1.stderr.includes(`--base ${base.slice(0, 12)}`), /补完重跑 --clear/.test(c1.stderr), /--fp P/.test(c1.stderr)];
+    transcript(SID, [f.H("改闸", 1), agentAt(f, 2, "_gate-bypass-hunter", `红队本批 ${ENGINE} 的改动`), agentAt(f, 3, "_gate-false-block-hunter", `回放本批 ${ENGINE} 的改动 --base ${base}`)]);
+    const d2 = cli(SIDE, "--dry-check"), c2 = cli(SIDE, "--clear", "--verdict", "1=达成");
+    return [...r1, d2.status, c2.status, jrows().at(-1)?.review];
+  }), [2, true, true, 2, true, true, true, true, true, 0, 0, { status: "ok", engineCommits: 1, carrierCommits: 0 }]);
+  // 规矩文件类承重提交(不改闸):把三通道的重新武装阈值调成 1(STOP_CLOSURE_P_REARM,P 现成的旋钮)⇒ 这一笔就要三通道各一遍;
+  //   跨模型格认 codex-run 的作业记录 ⇒ 系统临时目录指到沙盒里,合格记录手写一份(不碰本机真作业目录)
+  t("309 关账侧:只改规矩文件、三通道都没跑 ⇒ --dry-check 报 1 条未过、--clear 拒 review-missing(写明规矩文件类、列三格);三格补齐 ⇒ 都过", box305(({ tmp, repo, g, cli, w, commit, st, jrows, transcript }) => {
+    const TMPD = path.join(tmp, "t"); fs.mkdirSync(path.join(TMPD, "codex-run-jobs"), { recursive: true });
+    const E = { ...SIDE, STOP_CLOSURE_P_REARM: "1", TEMP: TMPD, TMP: TMPD };
+    cli(E, "--arm", "309", "--cond", "甲");
+    cli(E, "--no-decision", "自测:只改一句规矩,没有决定");
+    const f = fx305(Date.now());
+    w(repo, "docs/tool-register.md", "# 工具登记\n改一句。\n"); commit(repo, "law");
+    const commitAct = toolAt(f, 0.5, "Bash", { command: "git add -A && git commit -m law" });
+    transcript(SID, [f.H("改规矩", 0.2), commitAct]);
+    const d1 = cli(E, "--dry-check"), c1 = cli(E, "--clear", "--verdict", "1=达成");
+    const r1 = [d1.status, /条未过/.test(d1.stderr), c1.status, /reason=review-missing/.test(c1.stderr), /规矩文件类承重/.test(c1.stderr),
+      /欠 跨模型/.test(c1.stderr), /欠 独立视角/.test(c1.stderr), /欠 外部先例/.test(c1.stderr), /改闸引擎文件的提交/.test(c1.stderr)];
+    const top = String(g(repo, "rev-parse", "--show-toplevel").stdout || "").trim();
+    const t0 = Date.now();
+    fs.writeFileSync(path.join(TMPD, "codex-run-jobs", "J309.json"), JSON.stringify({ state: "done", exitCode: 0, threadId: "t-309", cwd: top,
+      startedAt: new Date(t0 - 1000).toISOString(), endedAt: t0 - 500, resultAt: t0 - 600 }));
+    transcript(SID, [f.H("改规矩", 0.2), commitAct, agentAt(f, 1, "grill:testing", "审本批 docs/tool-register.md 的改动"), toolAt(f, 1.5, "WebSearch", { query: "同类规矩" })]);
+    const d2 = cli(E, "--dry-check"), c2 = cli(E, "--clear", "--verdict", "1=达成");
+    return [...r1, d2.status, c2.status, jrows().at(-1)?.review];
+  }), [2, true, 2, true, true, true, true, true, false, 0, 0, { status: "ok", engineCommits: 0, carrierCommits: 1 }]);
+  t("309 关账侧:只改规矩文件、在宽限内(缺省阈值)⇒ 不读转录直接过(转录根本不存在也过)", box305(({ repo, cli, w, commit, jrows }) => {
+    cli(SIDE, "--arm", "309", "--cond", "甲");
+    cli(SIDE, "--no-decision", "自测:只改一句规矩,没有决定");
+    w(repo, "docs/tool-register.md", "# 工具登记\n改一句。\n"); commit(repo, "law");
+    const c = cli(SIDE, "--clear", "--verdict", "1=达成");
+    return [c.status, jrows().at(-1)?.review];
+  }), [0, { status: "ok", engineCommits: 0, carrierCommits: 1 }]);
+  t("309 关账侧:猎手跑在别的会话(开批的会话),关账在另一个会话 ⇒ 两份转录都读,过", box305(({ repo, cli, w, commit, jrows, transcript, st }) => {
+    cli(SIDE, "--arm", "309", "--cond", "甲");
+    const base = st().baseCommit;
+    w(repo, ENGINE, "// 改闸\n"); commit(repo, "gate");
+    const f = fx305(Date.now());
+    transcript(SID, [f.H("改闸", 1), agentAt(f, 2, "_gate-bypass-hunter", `红队本批 ${ENGINE} 的改动`), agentAt(f, 3, "_gate-false-block-hunter", `回放本批 ${ENGINE} --base ${base}`)]);
+    const SB = "selftest-sess-0309-bbbb";
+    transcript(SB, [f.H("接着关账", 10)]);
+    const c = cli({ CLAUDE_CODE_SESSION_ID: SB }, "--clear", "--verdict", "1=达成");
+    return [c.status, jrows().at(-1)?.review?.status];
+  }), [0, "ok"]);
+  t("309 出路走得通:欠审被拒后照提示记一笔 P 误报 ⇒ 重跑 --clear 放行,结清行记下那一笔的 h", box305(({ repo, cli, w, commit, jrows, env }) => {
+    cli(SIDE, "--arm", "309", "--cond", "甲");
+    w(repo, ENGINE, "// 改闸\n"); commit(repo, "gate");
+    const c1 = cli(SIDE, "--clear", "--verdict", "1=达成");
+    const fp = spawnSync(process.execPath, ["--no-warnings", hookScript, "--fp", "P", "复核在没登记的会话里跑过"], { cwd: repo, encoding: "utf8", env: { ...env, ...SIDE }, windowsHide: true, timeout: 60_000 });
+    const c2 = cli(SIDE, "--clear", "--verdict", "1=达成");
+    const er = jrows().at(-1)?.review;
+    return [c1.status, fp.status, c2.status, /按本批记的 P 误报放行/.test(c2.stderr), er?.status, typeof er?.waivedBy === "string" && er.waivedBy.length > 6];
+  }), [2, 0, 0, true, "unknown", true]);
+}
 export function selfTest305(t) {
   const SID = "selftest-sess-0305-aaaa", SIDE = { CLAUDE_CODE_SESSION_ID: SID };
   // ── ① 开批记指令 / 终点线 / 上限 ──
@@ -3186,6 +3397,23 @@ if (argv.includes("--clear")) {
       console.error("出路:本批的改动先提交再 --clear。**不是本批做的改动(可能是用户自己的)不得撤销、不得丢弃**——停下告诉用户,由用户决定。");
       process.exit(2);
     }
+    // 批 309:规则 P 的拒绝挪到这里(判据同收尾钩子那一份;零成本路径与出路见 loadBearingReview 头注)。放在义务账求值之前:拒了不留义务账写入。
+    const er = await loadBearingReview(prev);
+    let reviewWaived = null;
+    if (er.status === "missing" || er.status === "unknown") {
+      reviewWaived = reviewWaiver(prev, readFpRows());
+      if (!reviewWaived) {
+        const why = er.status === "missing" ? "review-missing" : "review-unknown";
+        refuse(why);
+        console.error(`BATCH-GOAL-CLEAR-REFUSED batch=${prev.batch} reason=${why}`);
+        printReview(er, prev, er.status === "missing"
+          ? `拒绝结清:本批有${reviewWhat(er)},复核通道没跑齐(规则 P;判据与收尾钩子同一份,只是换到关账这一步问)。`
+          : `拒绝结清:本批有${reviewWhat(er)},但复核有没有跑齐判不了(规则 P)。`);
+        process.exit(2);
+      }
+      console.error(`提示:承重面复核${er.status === "missing" ? "没跑齐" : "判不了"},按本批记的 P 误报放行(${String(reviewWaived.h).slice(0, 8)} ${String(reviewWaived.why || "").slice(0, 80)});收尾报告须写明。`);
+    } else if (er.status === "soft") console.error(`提示:${er.line}`);
+    else if (er.status === "skip") console.error(`提示:承重面复核这一项没查——${er.why}`);
     // 批 256:登记过的决定要有 ADR、登记过的成果要有日记行——写入 cleared 之前查,缺 ⇒ 拒清并给模板。
     // 批 298:判据照旧是 obligationCheck(同一份判定),但对象是「批状态 ∪ 义务账里本批的记录」;结论写回义务账,
     //   拒不拒按义务账里本批名下的记录定(带进来的、产生器建的都在内);转欠账且已提交的不再挡。
@@ -3276,7 +3504,10 @@ if (argv.includes("--clear")) {
       decisions: prev?.decisions ?? null, outcomes: prev?.outcomes ?? null, withdrawn: prev?.withdrawn ?? null,
       obligations: { cleared: oblCleared.length, settled: oblSettled, head: evalOut.head ?? null, version: evalOut.version },
       ...(evalOut.head ? { oblHead: { h: evalOut.head, version: evalOut.version } } : {}),
-      ...(verdicts ? { verdicts } : {}) };
+      ...(verdicts ? { verdicts } : {}),
+      // 批 309:关账侧 P 判定的结论进结清行(放行靠误报记账的,记下那一笔的 h)
+      review: { status: er.status, ...(Array.isArray(er.engineCommits) ? { engineCommits: er.engineCommits.length } : {}),
+        ...(Array.isArray(er.carrierCommits) ? { carrierCommits: er.carrierCommits.length } : {}), ...(reviewWaived ? { waivedBy: reviewWaived.h } : {}) } };
     journal("clear", clearRow);
     console.log(`义务:已清 ${oblCleared.length} 条;转欠账 ${oblSettled.length} 条${oblSettled.length ? `(${oblSettled.map((s) => `${s.debtId} ≤${s.expiry}`).join("、")};到期未结会在开批时回到开着)` : ""}`);
     // ⚠️ **批号要留在状态文件里**(2026-08-20,grill:edge-cases E6)。
@@ -3874,9 +4105,25 @@ if (argv.includes("--dry-check")) {
   const g = load();
   if (!g || g.cleared || !Array.isArray(g.conditions)) { console.log("未武装或已结清,无判据可跑"); process.exit(0); }
   if ((g.checks || []).length && !checksMatchJournal(g, lastArmRow(g.batch))) { console.error("状态文件里的判据与武装时的台账不一致,拒跑"); process.exit(2); }
+  // 批 309:关账侧的 P 判定在这里也报(同一个判定;发车脚本的验收硬门跑的是 --dry-check,在并回基分支之前)。
+  //   欠审 ⇒ 退出 2,stderr 带「N 条未过」(发车脚本当一次验收不过,回修补得上);判不了 ⇒ 退出 2,不带那几个字(发车脚本按判不了停)。
+  const er = await loadBearingReview(g);
+  const erWaived = (er.status === "missing" || er.status === "unknown") ? reviewWaiver(g, readFpRows()) : null;
+  const erBad = (er.status === "missing" || er.status === "unknown") && !erWaived;
+  const erReport = () => {
+    if (erBad) {
+      console.error(`BATCH-GOAL-DRY-CHECK reason=review-${er.status}`);
+      printReview(er, g, er.status === "missing"
+        ? `批 ${g.batch}:关账前还有 1 条未过——本批有${reviewWhat(er)},复核通道没跑齐(规则 P;--clear 会以 review-missing 拒)。`
+        : `批 ${g.batch}:关账前判不了——本批有${reviewWhat(er)},复核有没有跑齐判不了(规则 P;--clear 会以 review-unknown 拒)。`);
+    } else if (erWaived) console.log(`提示:承重面复核${er.status === "missing" ? "没跑齐" : "判不了"},按本批记的 P 误报放行(${String(erWaived.h).slice(0, 8)});收尾报告须写明。`);
+    else if (er.status === "soft") console.log(`提示:${er.line}`);
+    else if (er.status === "skip") console.log(`提示:承重面复核这一项没查——${er.why}`);
+  };
   const fails = runChecks(g); const n = (g.checks || []).length;
-  if (!n) { console.log(`批 ${g.batch}:${g.conditions.length} 条条件均无可执行判据`); process.exit(0); }
-  if (fails.length) { console.error(`批 ${g.batch}:${n} 条判据,${fails.length} 条未过`); printCheckFails(fails, g); process.exit(2); }
+  if (!n) { erReport(); if (erBad) process.exit(2); console.log(`批 ${g.batch}:${g.conditions.length} 条条件均无可执行判据`); process.exit(0); }
+  if (fails.length) { console.error(`批 ${g.batch}:${n} 条判据,${fails.length} 条未过`); printCheckFails(fails, g); erReport(); process.exit(2); }
+  erReport(); if (erBad) process.exit(2);
   console.log(`批 ${g.batch}:${n} 条可执行判据全过`); process.exit(0);
 }
 

@@ -569,6 +569,35 @@ export function classifyUnavailable(text) {
   return null;
 }
 
+// ── 批 309 C-6:模型不可用 ⇒ 备用模型重发一次 ─────────────────────────────────────
+// 实撞:配置里的模型名后端不认(报错原文里有 `model_not_found`),作业失败,人得改配置再发一次。
+// 判法与 unavailable 同一取证面(顶层 error / turn.failed 事件与 stderr 完整行;item 事件不看,codex 读到的文件原文不会冒充)。
+export const MODEL_MISSING_RE = /model_not_found|\bmodel\b[^\n]{0,80}?\b(?:does not exist|is not supported|not supported|is not available)\b/i;
+/** 一行报错串是不是「模型不可用」⇒ reason(`model_not_found` / `model-unavailable`)或 null。 */
+export function classifyModelMissing(text) {
+  const s = String(text || "");
+  if (!s.trim() || UNAVAIL_SKIP.test(s) || !MODEL_MISSING_RE.test(s)) return null;
+  return /model_not_found/i.test(s) ? "model_not_found" : "model-unavailable";
+}
+export const FALLBACK_MODEL_ENV = "CODEX_RUN_FALLBACK_MODEL";
+export const FALLBACK_MODEL_KEY = "codexFallbackModel";
+/** 备用模型从哪来:环境变量 `CODEX_RUN_FALLBACK_MODEL` 优先,其次 `<cwd>/gate-install.json` 的 `codexFallbackModel`(本壳会被拷到
+ *  用户级目录单独跑,不 import 仓里的 lib,这里只取这一个键)。值须是不带空白的非空串;都没有 / 读不了 / 坏 ⇒ null。 */
+export function fallbackModelFrom({ env = process.env, cwd = process.cwd(), readFile = (p) => fs.readFileSync(p, "utf8") } = {}) {
+  const ok = (v) => (typeof v === "string" && v.trim() && !/\s/.test(v.trim()) ? v.trim() : null);
+  const e = ok(env && env[FALLBACK_MODEL_ENV]);
+  if (e) return { model: e, source: "env" };
+  try {
+    const o = JSON.parse(String(readFile(path.join(cwd, "gate-install.json"))).replace(/^﻿/, ""));
+    const c = ok(o && o[FALLBACK_MODEL_KEY]);
+    return c ? { model: c, source: "config" } : null;
+  } catch { return null; }
+}
+/** 没配备用模型时接在失败原因后面的一句。 */
+export function fallbackHint() {
+  return `;后端报模型不可用,没配备用模型——设环境变量 ${FALLBACK_MODEL_ENV}=<模型名>,或在 gate-install.json 写 "${FALLBACK_MODEL_KEY}": "<模型名>",下次会自动换备用模型重发一次`;
+}
+
 /** 子进程输出的逐行扫描器:stdout / stderr 各自缓冲半行,`end()` 冲掉残行。 */
 export function makeStreamScanner() {
   const buf = { out: "", err: "" };
@@ -625,6 +654,11 @@ export function makeStreamScanner() {
       return null;
     },
     nonItemText: () => nonItem.join("\n") + (nonItem.length ? "\n" : ""),
+    /** 批 309 C-6:候选里第一条「模型不可用」⇒ { reason, source, text≤200 } 或 null(调用方只在作业失败时问)。 */
+    modelMissing() {
+      for (const c of cands) { const reason = classifyModelMissing(c.text); if (reason) return { reason, source: c.source, text: c.text.slice(0, 200) }; }
+      return null;
+    },
   };
 }
 
@@ -672,67 +706,82 @@ async function runWorker(jobId) {
     const lastMsgFile = path.join(JOB_ROOT, `${jobId}.last.txt`);
     const { bin, shell, how, source: binSource } = resolveCodexBin();
     writeJob({ ...readJob(jobId), binSource });   // 批 302(D205 ②):来源进记录,P 只读字段
-    const args = buildCodexArgs({
-      cwdForCodex: job.cwd,
-      model: job.model,
-      effort: job.effort,
-      resume: job.resume,
-      lastMsgFile,
-      sandbox: job.sandbox,
-    });
 
     const logStream = fs.createWriteStream(job.log, { flags: "a" });
     logStream.write(`# codex-run worker ${jobId}\n# bin=${how} sandbox=${job.sandbox || "read-only"}\n`);
 
-    const child = spawn(bin, args, {
-      cwd: job.cwd,
-      shell,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true, // shell:true 会起 cmd.exe,不加这条会闪控制台窗口
-    });
+    /** 跑一次 codex(批 309 C-6 抽出:模型不可用时要用备用模型原样再跑一次)。model = 传给 -m 的模型(null ⇒ codex 默认)。 */
+    const runOnce = async (model) => {
+      try { fs.rmSync(lastMsgFile, { force: true }); } catch { /* 没有就算了 */ }
+      const args = buildCodexArgs({ cwdForCodex: job.cwd, model, effort: job.effort, resume: job.resume, lastMsgFile, sandbox: job.sandbox });
+      const child = spawn(bin, args, {
+        cwd: job.cwd,
+        shell,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true, // shell:true 会起 cmd.exe,不加这条会闪控制台窗口
+      });
+      let jsonl = "";
+      const scan = makeStreamScanner();   // 批 302(D205 ①④):完整事件流逐行扫,不再事后从日志尾窗拼
+      child.stdout.on("data", (d) => {
+        jsonl += d.toString();
+        scan.out(d.toString());
+        logStream.write(d);
+      });
+      child.stderr.on("data", (d) => {
+        scan.err(d.toString());
+        logStream.write(d);
+      });
+      child.stdin.on("error", () => { /* 子进程先退出时写 stdin 会 EPIPE,不拖垮 worker */ });
+      child.stdin.write(stdinPayload);
+      child.stdin.end();
 
-    let jsonl = "";
-    const scan = makeStreamScanner();   // 批 302(D205 ①④):完整事件流逐行扫,不再事后从日志尾窗拼
-    child.stdout.on("data", (d) => {
-      jsonl += d.toString();
-      scan.out(d.toString());
-      logStream.write(d);
-    });
-    child.stderr.on("data", (d) => {
-      scan.err(d.toString());
-      logStream.write(d);
-    });
-    child.stdin.write(stdinPayload);
-    child.stdin.end();
+      let timedOut = false;   // 批 302:硬截止杀掉 codex ⇒ 不写 unavailable(超时不算通道不可用)
+      const heartbeat = setInterval(() => {
+        logStream.write(`# heartbeat ${new Date().toISOString()}\n`);
+      }, 30 * 1000);
+      const deadline = setTimeout(() => {
+        timedOut = true;
+        logStream.write(`# TIMEOUT ${job.timeoutMs}ms — SIGTERM\n`);
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 5000);
+      }, job.timeoutMs);
+      const code = await new Promise((resolve) => child.on("close", resolve));
+      clearInterval(heartbeat);
+      clearTimeout(deadline);
+      scan.end();
+      const body = fs.existsSync(lastMsgFile) ? fs.readFileSync(lastMsgFile, "utf8") : "";
+      return { code, jsonl, scan, timedOut, body };
+    };
 
-    let timedOut = false;   // 批 302:硬截止杀掉 codex ⇒ 不写 unavailable(超时不算通道不可用)
-    const heartbeat = setInterval(() => {
-      logStream.write(`# heartbeat ${new Date().toISOString()}\n`);
-    }, 30 * 1000);
-
-    const deadline = setTimeout(() => {
-      timedOut = true;
-      logStream.write(`# TIMEOUT ${job.timeoutMs}ms — SIGTERM\n`);
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 5000);
-    }, job.timeoutMs);
-
-    const code = await new Promise((resolve) => child.on("close", resolve));
-    clearInterval(heartbeat);
-    clearTimeout(deadline);
+    // 批 309 C-6:后端报模型不可用(model_not_found 等)⇒ 用备用模型原样重发**一次**;备用模型从环境变量 / 安装配置读(fallbackModelFrom)。
+    //   没配 ⇒ 行为同改前,失败消息里加一句怎么配;重发仍失败 ⇒ 照常失败处理。台账记 modelUsed(实际传给 -m 的,null = codex 默认)
+    //   与 modelFallback({ from, to, reason, source },换过才有)。超时(timedOut)不算模型不可用;每次重发各自一个硬截止。
+    let usedModel = job.model || null;
+    let r = await runOnce(usedModel);
+    let fallbackInfo = null, fallbackHintText = "";
+    const miss = !r.timedOut && (r.code !== 0 || !String(r.body).trim()) ? r.scan.modelMissing() : null;
+    if (miss) {
+      const fb = fallbackModelFrom({ cwd: job.cwd });
+      if (fb && fb.model !== usedModel) {
+        logStream.write(`# MODEL-FALLBACK ${usedModel || "(codex 默认)"} => ${fb.model} (${fb.source}): ${miss.text.slice(0, 200)}\n`);
+        fallbackInfo = { from: usedModel || (job.modelLabel ? `(codex 默认;config 顶层 model=${job.modelLabel})` : "(codex 默认)"), to: fb.model, reason: miss.reason, source: fb.source };
+        usedModel = fb.model;
+        r = await runOnce(usedModel);
+      } else if (!fb) fallbackHintText = fallbackHint();
+    }
     logStream.end();
+    const { code, jsonl, scan, timedOut, body } = r;
 
     const threadId = extractThreadId(jsonl);
-    const body = fs.existsSync(lastMsgFile) ? fs.readFileSync(lastMsgFile, "utf8") : "";
 
-    const header = resultHeader(job, threadId);
+    const header = resultHeader(fallbackInfo ? { ...job, model: `${usedModel}(备用模型:原模型 ${fallbackInfo.from} 不可用,自动换)` } : job, threadId);
 
     fs.mkdirSync(path.dirname(job.result), { recursive: true });
     // resultAt 记在写 R **之前**(v7,codex v6 第 4 条):闸认「这一刻之后的 Read R」;R 先于 endedAt 落盘,
     //   拿 endedAt 当界会把夹缝里的完整读判掉
     writeJob({ ...readJob(jobId), resultAt: new Date().toISOString() });
     fs.writeFileSync(job.result, header + body, "utf8");
-    scan.end();
+    const modelExtra = { modelUsed: usedModel, ...(fallbackInfo ? { modelFallback: fallbackInfo } : {}) };
 
     const outcome = classifyOutcome({ code, body });
     // 批 285 D131②:hooks 配置解析失败只提示、不改判定;没命中就不写 warn 键(台账形状照旧)
@@ -741,9 +790,9 @@ async function runWorker(jobId) {
     const warn = hooksConfigWarn(scan.nonItemText());
     const warnExtra = warn ? { warn } : {};
     const failed = outcome.state === "failed" || code !== 0;
-    const structured = { binSource, unavailable: scan.unavailable(failed, timedOut) };
+    const structured = { binSource, unavailable: scan.unavailable(failed, timedOut), ...modelExtra };
     if (outcome.state === "failed") {
-      finish("failed", { threadId, exitCode: code, errorCode: outcome.errorCode, error: outcome.error, ...warnExtra, ...structured });
+      finish("failed", { threadId, exitCode: code, errorCode: outcome.errorCode, error: outcome.error + fallbackHintText, ...warnExtra, ...structured });
     }
     finish("done", { threadId, exitCode: code, ...warnExtra, ...structured });
   } catch (e) {

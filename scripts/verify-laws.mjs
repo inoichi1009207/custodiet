@@ -153,7 +153,9 @@ export function checkLaws(root, overrides = {}) {
       if (!st) { st = ovSt(probe); if (st) used = probe; else { try { st = fs.statSync(path.join(root, probe)); used = probe; } catch { /* 缺失走下面统一报 */ } } }
       // D196 ⑮ BP-17:原样路径 stat 成功时它就是目标文件,近空判据按原样路径判(不再拿剥过的 probe 判 `.md` 结尾)
       if (!st) {
-        if (isSourceRepo && (SOURCE_REPO_MISSING_OK[f] || new Set()).has(ref)) continue;   // 源头仓、且确实不在场 ⇒ 不报(见头注)
+        // 源头仓、且确实不在场 ⇒ 不报(见头注)。批 309:通配 / 占位写法(`docs/adr/*.md`、`docs/adr/<编号>-<题>.md`)按本工具
+        //   实际核的那个目录(剥掉通配段的 probe)查名单;具体文件名(probe === ref)照旧拿原写法比,不放宽
+        if (isSourceRepo && (SOURCE_REPO_MISSING_OK[f] || new Set()).has(probe !== ref ? probe : ref)) continue;
         problems.push(`${f} 引用的路径缺失: ${ref}`);
       }
       else if (st.isFile() && used.endsWith(".md") && st.size < 200) problems.push(`${f} 引用的文件近空(${st.size}B): ${used}`);
@@ -266,6 +268,12 @@ function selfTest() {
     w("AGENTS.md", K + "\n决策记录:`docs/adr/`;另见 `docs/no-such-file.md`。\n"); t("308:源头仓里不在名单上的缺失路径 ⇒ 照拒", false);
     w("AGENTS.md", K + "\n决策记录住 `docs/adr`,必须在场。\n"); t("308:不带斜杠的写法不在名单上 ⇒ 照拒", false);
     w("AGENTS.md", K); w("docs/gate/AGENTS.md", G + "\n欠账探针:`scripts/verify-prod.mjs`。\n"); t("308:这张名单不对闸规矩生效 ⇒ 拒", false);
+    // 批 309:通配 / 占位写法按剥过通配段的目录查名单(本工具核的本就是那个目录);具体文件名不放宽
+    fresh(); const WILD = K + "\n决策记录一页一个:`docs/adr/<编号>-<题>.md`、`docs/adr/*.md`。\n";
+    w("AGENTS.md", WILD); t("309:源头仓里 docs/adr/ 下的通配 / 占位写法、目录不在场 ⇒ 过", true);
+    w("AGENTS.md", K + "\n例子:`docs/adr/0001-例子.md`。\n"); t("309:源头仓里 docs/adr/ 下的具体文件名不在场 ⇒ 照拒(不放宽)", false);
+    w("AGENTS.md", K + "\n别处:`docs/other/*.md`。\n"); t("309:源头仓里不在名单上的目录的通配写法 ⇒ 照拒", false);
+    unmark(); w("AGENTS.md", WILD); t("309:同一通配写法在安装方的仓(没有安装器脚本)⇒ 照拒", false);
     unmark(); fresh(); }
   // 批 290 合并后误拦猎手 FB-18
   w("docs/gate/AGENTS.md", G + "\n锚点:`docs/prod-facts.md#一节`、`docs/prod-facts.md:12-14`。\n"); t("290 FB-18:在场文件带 #节名 / :行号 ⇒ 过", true); fresh();

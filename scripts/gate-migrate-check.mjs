@@ -243,13 +243,13 @@ const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bas
 //   第二十次:`installNames`(批 305)——安装方配置里的两份确切名字名单(部署脚本文件名 / 私仓仓名),注入通道,不进 entries。
 //     W 的部署脚本那一支、DP 的私仓短路改读它之后,「配了这个名字 / 没配」两半在夹具里要分得开;不写 ⇒ 不传(两个空名单)。
 //     值 `{ deployScripts?: string[], privateRepos?: string[] }`;子键与值形状都校验(写成字符串会被 buildCtx 静默归空)。
-const INSTALL_NAMES_KEYS = new Set(["deployScripts", "privateRepos"]);
+const INSTALL_NAMES_KEYS = new Set(["deployScripts", "privateRepos", "debtTables"]);   // 批 309 C-4:debtTables
 //   第十九次:`codexJobs`(批 297,D203)——P 跨模型格改认 codex-run 自己写的作业记录后,「命令长这样、有 / 没有合格记录」
 //     两半在夹具里要分得开;注入通道,不进 entries。值 `{ root, upper?, jobs:[{ id?, state, startedAt, endedAt?, resultAt?, cwd?, top, threadId,
 //     exitCode, failLines? }] }`(r2:upper = 此刻 / 本轮结束;top = cwd 所在 git 顶层;failLines = 失败行),
 //     这里包成惰性函数交 ctx.codexJobs;顶层与记录子键都做白名单校验(拼错的键同样会被静默丢弃)。不写 ⇒ 不传(该格只剩 MCP 通路)。
 // 批 302(D205):加 binSource / unavailable(codex-run 结构化字段);failLines 留着认旧夹具(P 已不读它)
-const CODEX_JOB_KEYS = new Set(["id", "state", "startedAt", "endedAt", "resultAt", "cwd", "top", "threadId", "exitCode", "failLines", "binSource", "unavailable"]);
+const CODEX_JOB_KEYS = new Set(["id", "state", "startedAt", "endedAt", "resultAt", "cwd", "top", "threadId", "exitCode", "failLines", "binSource", "unavailable", "task", "taskText"]);   // 批 309 C-5:task / taskText(W 的绑定)
 const CODEX_JOBS_TOP_KEYS = new Set(["root", "upper", "jobs"]);
 //   第十八次:`expectBlock`(批 285,D128④)——**断言键,不是注入通道**:正例原来只断言「命中一条」,不断言阻断级
 //     ⇒ 修法若落在 `blocking:false` 或一条到不了升阻断的分支上照样全绿(与 D126 同族)。写了 `expectBlock: true/false`

@@ -12,10 +12,16 @@
 //       "format": "gate-install/v1",            // 必填,固定值
 //       "diary": "docs/product-diary.md",       // 产品日记;null 或缺省 ⇒ 不做「登记了成果须有日记行」核对
 //       "adrDir": "docs/adr",                   // ADR 目录;null 或缺省 ⇒ 不做 ADR 覆盖与「承重面零决定」核对
-//       "debtTable": "docs/gate-debts.md",      // 欠账表;缺省 ⇒ docs/gate-debts.md(欠账表是闸自己的概念,不随安装方关掉)
+//       "debtTable": "docs/gate-debts.md",      // 欠账表;缺省 ⇒ docs/gate-debts.md(欠账表是闸自己的概念,不随安装方关掉)。
+//                                               //   batch-goal(--settle / 开批列到期 / 结构核)与写前核读它;显式写了的还经 installNames().debtTables
+//                                               //   注入收尾闸(K0 簿记豁免、W 交付物排除认它)。批 309:源头仓配成 docs/own-debts.md(不随包),
+//                                               //   随包的 docs/gate-debts.md 留作安装方的空示例表
 //       "loadBearingExtra": ["^docs/laws/"],    // 安装方专属承重路径(正则源串,不分大小写,对仓根相对路径 / 分隔);缺省 ⇒ []
 //       "deployScripts": ["deploy-prod.ps1"],   // 安装方的部署脚本**文件名**(带扩展名、不带目录);缺省 / [] ⇒ 规则 W 的「部署脚本」那一支不响
 //       "privateRepos": ["app-private"],        // 安装方自己的私仓**仓名**(不带属主、不带 .git);缺省 / [] ⇒ 规则 DP 的「点了私仓名就不算推去别仓」短路不生效
+//       "codexFallbackModel": "gpt-x",          // 批 309:codex-run 遇后端报模型不可用(model_not_found)时自动换用的备用模型;缺省 ⇒ 不换。
+//                                               //   codex-run 自己读这个键(它会被拷到用户级目录单独跑,不 import 本文件);环境变量 CODEX_RUN_FALLBACK_MODEL 优先。
+//                                               //   写错(不是不带空白的非空串)不判坏整份,按没配处理并告警
 //       "_note": "任意说明文字"                  // 可选,读者忽略
 //     }
 //   路径值:仓根相对、`/` 分隔、不得以 `/` 开头、不得含 `..` 段、不得为空串。
@@ -51,7 +57,7 @@ import fs from "node:fs";
 export const INSTALL_CONFIG_FILE = "gate-install.json";
 export const INSTALL_CONFIG_FORMAT = "gate-install/v1";
 export const DEFAULT_DEBT_TABLE = "docs/gate-debts.md";
-const KEYS = new Set(["format", "diary", "adrDir", "debtTable", "loadBearingExtra", "memoryDirs", "deployScripts", "privateRepos", "_note"]);
+const KEYS = new Set(["format", "diary", "adrDir", "debtTable", "loadBearingExtra", "memoryDirs", "deployScripts", "privateRepos", "codexFallbackModel", "_note"]);
 // 批 301(MF 两层,设计稿 clipboard/301-design.md 1.2):"memoryDirs": [...] —— 要查「以后都这样做」类 memory 执行面的目录。
 //   每项:"@claude-project-memory"(本项目 Claude Code memory 目录,由主 checkout 路径换算)/ "~/…"(家目录相对)/
 //   其余相对主 checkout 解析(**允许 ..**,如 "../my-dotfiles/memory")/ 绝对路径。缺省 / null ⇒ 不做 MF(无配置的仓不做)。
@@ -81,8 +87,10 @@ function parseNameList(o, key, label, warnings) {
 /** 批 305:从一份配置读数(parse / read / absent 的返回值,含 error 形)取两份名单。坏配置 / 没有配置 ⇒ 两个空名单。纯函数。 */
 export function installNames(conf) {
   const list = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s) : []);
-  if (!conf || conf.error) return { deployScripts: [], privateRepos: [] };
-  return { deployScripts: list(conf.deployScripts), privateRepos: list(conf.privateRepos) };
+  // 批 309 C-4:debtTables = 配置**显式**写了的欠账表路径(缺省 docs/gate-debts.md 不进——规则侧本来就认它)
+  if (!conf || conf.error) return { deployScripts: [], privateRepos: [], debtTables: [] };
+  return { deployScripts: list(conf.deployScripts), privateRepos: list(conf.privateRepos),
+    debtTables: conf.debtTableExplicit && typeof conf.debtTable === "string" && conf.debtTable ? [conf.debtTable] : [] };
 }
 
 const badPath = (v) => typeof v !== "string" || !v.trim() || /^[/\\]/.test(v) || /^[A-Za-z]:/.test(v) || v.split(/[/\\]/).includes("..");
@@ -104,6 +112,12 @@ export function parseInstallConfig(text, label = INSTALL_CONFIG_FILE) {
   out.warnings = [];
   out.deployScripts = parseNameList(o, "deployScripts", label, out.warnings);
   out.privateRepos = parseNameList(o, "privateRepos", label, out.warnings);
+  // 批 309 C-6:codex-run 的备用模型(codex-run 自己读;这里只登记键名并校验形状,写错按没配 + 告警)
+  out.codexFallbackModel = null;
+  if (o.codexFallbackModel !== undefined && o.codexFallbackModel !== null) {
+    if (typeof o.codexFallbackModel === "string" && o.codexFallbackModel.trim() && !/\s/.test(o.codexFallbackModel.trim())) out.codexFallbackModel = o.codexFallbackModel.trim();
+    else out.warnings.push(`${label} 的 codexFallbackModel 必须是不带空白的非空字符串——现按没配处理(codex-run 不换备用模型)`);
+  }
   for (const k of ["diary", "adrDir", "debtTable"]) {
     if (o[k] === undefined || o[k] === null) continue;
     // 批 298 r1(FB-3):`./docs/x.md` 与 `docs/x.md` 同义 ⇒ 先归一再判
