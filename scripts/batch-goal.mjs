@@ -55,7 +55,7 @@ import { fileURLToPath } from "node:url";
 import { ledgerAppend, verifyFile as verifyFileChain } from "./lib/ledger-chain.mjs";
 import { quoteUntrusted, buildCtx } from "./lib/gate-ctx.mjs";   // buildCtx:批 305 自测拿它和主尺的认人口径逐条对账
 import { isCarrierPath, CARRIER_SURFACE } from "./lib/gate-carriers.mjs";
-import { readInstallConfig, parseInstallConfig, mergeInstallConfig, absentInstallConfig, snapshotConfig, configFromSnapshot, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
+import { readInstallConfig, parseInstallConfig, mergeInstallConfig, absentInstallConfig, snapshotConfig, configFromSnapshot, installNames, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
 import * as OB from "./lib/obligations.mjs";
 import { debtRowCells, debtRowParked, liveDebtRows } from "./lib/debt-schema.mjs";   // 批 301:切列一份实现
 import { planWriteChecks, applyWriteChecks, isWriteCheckType, withdrawnClears, transcriptDirs, projectDirName } from "./lib/write-checks.mjs";   // 批 301:写入类义务产生器(T / MF / J / M);批 305:转录目录的定位沿用它
@@ -2048,7 +2048,23 @@ function oblSelfTest(t, sandbox) {
   // ── 安装方配置 ──
   const K = parseInstallConfig(TEST_INSTALL_JSON);
   t("298 配置:HostApp 那份解析成功、取值照旧", [K.found, K.diary, K.adrDir, K.debtTable, K.loadBearingExtra.length], [true, "docs/product-diary.md", "docs/adr", "docs/gate-debts.md", 5]);
-  t("298 配置:仓里那份 gate-install.json 与自测字面量逐项相等(仓里没有这份文件 ⇒ 不比)", (() => { const f = fileURLToPath(new URL("../gate-install.json", import.meta.url)); if (!fs.existsSync(f)) return [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]; const r = parseInstallConfig(fs.readFileSync(f, "utf8")); return [r.diary, r.adrDir, r.debtTable, r.loadBearingSrc]; })(), [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]);
+  // 批 309 C-4:闸的源头仓(安装器脚本在场)自带一份 gate-install.json,只把欠账表指到不随包的 docs/own-debts.md ⇒ 源头仓里不比 HostApp 字面量,
+  //   改钉源头仓那份的取值;安装方的仓(没有安装器脚本)照旧与字面量比。
+  const isSourceRepo = fs.existsSync(fileURLToPath(new URL("./custodiet-init.mjs", import.meta.url)));
+  t("298 配置:仓里那份 gate-install.json 与自测字面量逐项相等(仓里没有这份文件 / 闸的源头仓 ⇒ 不比)", (() => { const f = fileURLToPath(new URL("../gate-install.json", import.meta.url)); if (isSourceRepo || !fs.existsSync(f)) return [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]; const r = parseInstallConfig(fs.readFileSync(f, "utf8")); return [r.diary, r.adrDir, r.debtTable, r.loadBearingSrc]; })(), [K.diary, K.adrDir, K.debtTable, K.loadBearingSrc]);
+  t("309 C-4:源头仓的 gate-install.json 只把欠账表指到 docs/own-debts.md(日记 / ADR / 承重 / 名单都不配),那份表在场(安装方的仓 ⇒ 不比)", (() => {
+    if (!isSourceRepo) return [null, null, "docs/own-debts.md", true, [], true];
+    const f = fileURLToPath(new URL("../gate-install.json", import.meta.url));
+    const r = fs.existsSync(f) ? parseInstallConfig(fs.readFileSync(f, "utf8")) : {};
+    return [r.diary, r.adrDir, r.debtTable, r.debtTableExplicit, r.loadBearingSrc, fs.existsSync(fileURLToPath(new URL("../docs/own-debts.md", import.meta.url)))];
+  })(), [null, null, "docs/own-debts.md", true, [], true]);
+  t("309 C-4:installNames 把显式配置的欠账表交给收尾闸;缺省的不交", [installNames(parseInstallConfig(JSON.stringify({ format: "gate-install/v1", debtTable: "docs/own-debts.md" }))).debtTables,
+    installNames(parseInstallConfig(JSON.stringify({ format: "gate-install/v1" }))).debtTables, installNames({ error: "x" }).debtTables], [["docs/own-debts.md"], [], []]);
+  t("309 C-6:codexFallbackModel 是登记过的键(不判坏整份);形状不对按没配 + 告警", (() => {
+    const a = parseInstallConfig(JSON.stringify({ format: "gate-install/v1", codexFallbackModel: "gpt-x" }));
+    const b = parseInstallConfig(JSON.stringify({ format: "gate-install/v1", codexFallbackModel: "a b", diary: "docs/d.md" }));
+    return [!!a.error, a.codexFallbackModel, !!b.error, b.codexFallbackModel, b.diary, b.warnings.length];
+  })(), [false, "gpt-x", false, null, "docs/d.md", 1]);
   // ── 批 305:两份名单键(部署脚本文件名 / 私仓仓名)──
   t("305 配置:字面量里的两份名单解析得出、没有告警", [K.deployScripts, K.privateRepos, K.warnings], [["deploy-prod.ps1"], ["app-private"], []]);
   t("305 配置:仓里那份 gate-install.json 的两份名单形状对(解析不坏、没有告警;名字是安装方的事,不与字面量比;仓里没有这份文件 ⇒ 不核)", (() => {

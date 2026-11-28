@@ -1915,7 +1915,12 @@ export function liveCodexEnv(extra = {}) {
           const ck = String(j.cwd || "");
           if (!tops.has(ck)) tops.set(ck, gitTopOf(ck));
           seen.add(id);
-          out.push({ ...j, id, top: tops.get(ck) });
+          // 批 309 C-5:附任务文件正文的前 64 KB(W 认「外审入参里写了交付物名」);读不到 / 太大 / 没有 task ⇒ 不附(只剩路径)
+          let taskText;
+          if (typeof j.task === "string" && j.task) {
+            try { const fd = fs.openSync(j.task, "r"); try { const b = Buffer.alloc(65536); const n = fs.readSync(fd, b, 0, 65536, 0); taskText = b.subarray(0, n).toString("utf8"); } finally { fs.closeSync(fd); } } catch { taskText = undefined; }
+          }
+          out.push({ ...j, id, top: tops.get(ck), ...(taskText !== undefined ? { taskText } : {}) });
         }
       }
       return out;
@@ -4567,6 +4572,11 @@ function selfTest() {
         cx("297 r2 listJobs:附 git 顶层", lj.map((j) => (j.top !== null && N(j.top) === N(`${alt}/repo`) ? "repo" : "other")).join(","), "repo,other,repo");
         // 批 302(D205):P 只读 codex-run 写的结构化字段,listJobs 不再从日志尾窗抽失败行
         cx("302 D205 listJobs:不再附 failLines", lj.map((j) => String("failLines" in j)).join(","), "false,false,false");
+        // 批 309 C-5:附任务文件正文(W 认外审入参里的交付物名);没有 task / 读不了 ⇒ 不附
+        fs.writeFileSync(`${alt}/task309.md`, "审读 clipboard/x.md");
+        rec("JT1", T, { task: `${alt}/task309.md` }); rec("JT2", T, { task: `${alt}/不存在.md` });
+        const lt = liveCodexEnv().listJobs({ dirs: [alt], since: T - 1000 }).filter((j) => /^JT/.test(j.id)).sort((x, y) => x.id.localeCompare(y.id));
+        cx("309 C-5 listJobs:附任务文件正文;读不了 ⇒ 不附", lt.map((j) => String(j.taskText)).join("|"), "审读 clipboard/x.md|undefined");
         cx("297 listJobs:目录读不了 ⇒ 空、不抛", (() => { try { return liveCodexEnv().listJobs({ dirs: [`${alt}/不存在`], since: T + 9e9 }).length; } catch { return "抛了"; } })(), 0);
       } finally { fs.rmSync(alt, { recursive: true, force: true }); }
     }
@@ -4956,13 +4966,15 @@ function selfTest() {
         [wHit({}), wHit({ installNames: { deployScripts: [], privateRepos: [] } })].join(), "false,false");
       // 读盘那一半(readInstallNames,假读文件):有配置 / 没有文件 / 解析坏 / 键写错
       const rd = (text, code) => JSON.stringify(readInstallNames("/repo", () => { if (code) { const e = new Error(code); e.code = code; throw e; } return text; }));
-      const EMPTY = '{"deployScripts":[],"privateRepos":[]}';
+      const EMPTY = '{"deployScripts":[],"privateRepos":[],"debtTables":[]}';
       sc("305 名单读盘:配置里两键都写了 ⇒ 原样取到",
-        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: ["deploy-prod.ps1"], privateRepos: ["app-private"] })), '{"deployScripts":["deploy-prod.ps1"],"privateRepos":["app-private"]}');
+        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: ["deploy-prod.ps1"], privateRepos: ["app-private"] })), '{"deployScripts":["deploy-prod.ps1"],"privateRepos":["app-private"],"debtTables":[]}');
       sc("305 名单读盘:没有配置文件 / 读不了 / 不是 JSON / 有未知键(整份判坏)⇒ 两个空名单,不抛",
         [rd("", "ENOENT"), rd("", "EBUSY"), rd("{oops"), rd(JSON.stringify({ format: "gate-install/v1", deployScript: ["x.ps1"] }))].join(""), EMPTY.repeat(4));
       sc("305 名单读盘:一个键形状不对 ⇒ 只那一个归空,另一个照取",
-        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: "deploy-prod.ps1", privateRepos: ["app-private"] })), '{"deployScripts":[],"privateRepos":["app-private"]}');
+        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: "deploy-prod.ps1", privateRepos: ["app-private"] })), '{"deployScripts":[],"privateRepos":["app-private"],"debtTables":[]}');
+      // 批 309 C-4:配置显式写了欠账表 ⇒ 交给收尾闸(K0 簿记豁免、W 交付物排除认它)
+      sc("309 C-4 名单读盘:debtTable 显式写了 ⇒ debtTables 带它", rd(JSON.stringify({ format: "gate-install/v1", debtTable: "docs/own-debts.md" })), '{"deployScripts":[],"privateRepos":[],"debtTables":["docs/own-debts.md"]}');
       let asked = null;
       readInstallNames("/repo/x", (f) => { asked = String(f).replace(/\\/g, "/"); return "{}"; });
       sc("305 名单读盘:读的是给定根下的 gate-install.json(不是进程 cwd)", asked, "/repo/x/gate-install.json");

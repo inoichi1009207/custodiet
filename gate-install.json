@@ -1,0 +1,5 @@
+{
+  "format": "gate-install/v1",
+  "debtTable": "docs/own-debts.md",
+  "_note": "闸的源头仓自己的安装配置(不随安装器发出)。只把欠账表指到 docs/own-debts.md:随包的 docs/gate-debts.md 是给安装方的空示例表,不放本仓的欠账。日记、ADR 目录与名单键都不配(本仓不做那几项核对)。"
+}
