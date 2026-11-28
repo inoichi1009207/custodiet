@@ -646,11 +646,14 @@ export function buildCtx(entries, extra = {}) {
      *  (与 batchGoal 同一注入纪律:规则不自读磁盘;夹具 / 回放经 `extra.installNames` 精确控制)。
      *  W 拿 `deployScripts` 认部署脚本(整个文件名),DP 拿 `privateRepos` 认「远端那一格点的是自己的私仓」。
      *  **两态,不是三态**:没接这条通道 / 没有配置文件 / 值形状不对 ⇒ 都是空名单(对应那一支判据不响、短路不生效)——
-     *  「没配」与「配了空的」后果相同,不必区分。只收非空字符串,其余丢掉;恒为 `{ deployScripts: string[], privateRepos: string[] }`。 */
+     *  「没配」与「配了空的」后果相同,不必区分。只收非空字符串,其余丢掉;恒为 `{ deployScripts: string[], privateRepos: string[], debtTables: string[] }`。
+     *  批 309 C-4:`debtTables` = 配置**显式**指定的欠账表路径(gate-install.json 的 debtTable,仓根相对;缺省的 docs/gate-debts.md 不进,
+     *  规则侧本来就认它)。K0 的簿记豁免、W 的交付物排除拿它认「这是欠账表」。正斜杠归一。 */
     installNames: (() => {
       const g = extra.installNames;
       const list = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s.trim()).map((s) => s.trim()) : []);
-      return Object.freeze({ deployScripts: Object.freeze(list(g && g.deployScripts)), privateRepos: Object.freeze(list(g && g.privateRepos)) });
+      return Object.freeze({ deployScripts: Object.freeze(list(g && g.deployScripts)), privateRepos: Object.freeze(list(g && g.privateRepos)),
+        debtTables: Object.freeze(list(g && g.debtTables).map((s) => s.replace(/\\/g, "/"))) });
     })(),
     /** hook 所在 checkout 的根(批 255 已注入、此前只在 isNew 内部用)。P 的语法回退面用它把绝对路径化成仓相对形,
      *  再判「是不是 worktree / 暂存树下的闸副本」——否则在 worktree 里开的会话,自己的闸文件路径里就带 `.claude/worktrees/`,
@@ -1141,12 +1144,14 @@ export function selfTest() {
     chk("285 D128①:每个登记键删掉后输出都变(都被读)", unread.join(","), "");
     // 批 305:安装方名单通道——没接 / 形状不对 ⇒ 两个空名单;只收非空字符串;不透传别的键
     const names = (x) => JSON.stringify(buildCtx(base, x === undefined ? {} : { installNames: x }).installNames);
-    const EMPTY = '{"deployScripts":[],"privateRepos":[]}';
+    const EMPTY = '{"deployScripts":[],"privateRepos":[],"debtTables":[]}';
     chk("305 名单通道:没注入 ⇒ 两个空名单", names(undefined), EMPTY);
     chk("305 名单通道:注入 null / 字符串 / 值不是数组 ⇒ 两个空名单", [names(null), names("deploy-prod.ps1"), names({ deployScripts: "deploy-prod.ps1", privateRepos: { a: 1 } })].join(""), EMPTY.repeat(3));
     chk("305 名单通道:只收非空字符串、去首尾空白、别的键拿不到",
       names({ deployScripts: ["deploy-prod.ps1", 1, "", null, " x.sh "], privateRepos: ["app-private"], secret: "不该出现" }),
-      '{"deployScripts":["deploy-prod.ps1","x.sh"],"privateRepos":["app-private"]}');
+      '{"deployScripts":["deploy-prod.ps1","x.sh"],"privateRepos":["app-private"],"debtTables":[]}');
+    chk("309 C-4 名单通道:debtTables 只收非空字符串、反斜杠归一", names({ debtTables: ["docs\\own-debts.md", "", 3] }),
+      '{"deployScripts":[],"privateRepos":[],"debtTables":["docs/own-debts.md"]}');
   }
 
   // ── 批 255:isNew 按目标 checkout 取追踪集 ──────────────────────────────────

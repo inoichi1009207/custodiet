@@ -909,6 +909,173 @@ export async function runSelfTest({ self }) {
     });
   }
 
+  // ── 批 310:codex(Rust 版)连不上后端时报的「workspace routing discovery failed」归 network ──────────────
+  //   防的失败:11-22 与 11-28 两天共 8 次真实失败(到 chatgpt.com 的连接被对端重置)只打这个串,UNAVAIL 词表只认 Node errno 名 ⇒
+  //   作业记录没有 unavailable、P 的「通道不可用」出路走不到。反方向:item 事件里的同一串不参与分类;任务本身出错的失败不算不可用。
+  {
+    const S = selfMod;
+    const RMCP = 'ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when Client(HttpRequest(HttpRequest("http/request failed: error sending request for url (https://backend.example/backend-api/ps/mcp)")))';
+    t("310:真实形状——Reconnecting 前缀的 error 事件、裸 error 事件、turn.failed、stderr 的 rmcp 行 ⇒ network(取自事件)", () => {
+      const sc = S.makeStreamScanner();
+      sc.err(RMCP + "\n");
+      sc.out('{"type":"error","message":"Reconnecting... 2/5 (workspace routing discovery failed)"}\n');
+      sc.out('{"type":"error","message":"workspace routing discovery failed"}\n');
+      sc.out('{"type":"turn.failed","error":{"message":"workspace routing discovery failed"}}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network"); eq(u.source, "event");
+    });
+    t("310:只有 turn.failed「workspace routing discovery failed」⇒ network", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"turn.failed","error":{"message":"workspace routing discovery failed"}}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network");
+    });
+    t("310:classifyUnavailable 认带 Reconnecting 前缀与不带的两形", () => {
+      eq(S.classifyUnavailable("Reconnecting... 2/5 (workspace routing discovery failed)"), "network");
+      eq(S.classifyUnavailable("workspace routing discovery failed"), "network");
+    });
+    t("310【反向】item 事件里的同一串不参与分类;任务本身出错的 turn.failed ⇒ 不算不可用", () => {
+      const sc = S.makeStreamScanner();
+      sc.out(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Falling back from WebSockets to HTTPS transport. workspace routing discovery failed" } }) + "\n");
+      sc.out('{"type":"turn.failed","error":{"message":"tool call failed: file not found: docs/x.md"}}\n');
+      sc.end();
+      eq(sc.unavailable(true), null);
+    });
+    t("310【反向】任务本身出错(明说原因的 turn.failed)+ stderr 的 rmcp 传输行 ⇒ 不看 stderr,不算不可用", () => {
+      const sc = S.makeStreamScanner();
+      sc.err(RMCP + "\n");
+      sc.out('{"type":"turn.failed","error":{"message":"tool call failed: file not found: docs/x.md"}}\n');
+      sc.end();
+      eq(sc.unavailable(true), null);
+    });
+    t("310【反向】中途 Reconnecting 过(重连成功)、后来因任务本身出错失败 ⇒ 不算不可用(Reconnecting 只是重试通知,有别的事件说明失败时不拿它分类)", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"error","message":"Reconnecting... 2/5 (workspace routing discovery failed)"}\n');
+      sc.out('{"type":"turn.failed","error":{"message":"tool call failed: file not found: docs/x.md"}}\n');
+      sc.end();
+      eq(sc.unavailable(true), null);
+    });
+    t("310:Reconnecting 事件 + 只是泛化传输层失败的 turn.failed(不带原因)⇒ 仍认 network", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"error","message":"Reconnecting... 5/5 (workspace routing discovery failed)"}\n');
+      sc.out('{"type":"turn.failed","error":{"message":"stream error: stream disconnected before completion"}}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network"); eq(u.source, "event");
+    });
+    t("310:只有 Reconnecting 事件、没有别的事件说明失败 ⇒ 照认 network", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"error","message":"Reconnecting... 5/5 (workspace routing discovery failed)"}\n');
+      sc.end();
+      const u = sc.unavailable(true);
+      eq(u && u.reason, "network");
+    });
+    t("310【反向】作业没失败(中途 Reconnecting 重试成功)⇒ 不写不可用", () => {
+      const sc = S.makeStreamScanner();
+      sc.out('{"type":"error","message":"Reconnecting... 2/5 (workspace routing discovery failed)"}\n');
+      sc.end();
+      eq(sc.unavailable(false), null);
+    });
+  }
+
+  // ── 批 309 C-6:模型不可用 ⇒ 备用模型原样重发一次 ───────────────────────────────
+  //   防的失败:后端报 model_not_found 时作业直接失败、人得改配置再发一次;以及反方向——codex 读到的文件里写着 model_not_found
+  //   (item 事件)、或别的失败,被当成模型不可用而白重发。端到端用例的 codex 替身是 node 跑临时仓里一个叫 `exec` 的脚本,零 codex 调用。
+  {
+    const S = selfMod;
+    t("309 C-6:classifyModelMissing 认 model_not_found 与「model … does not exist」;配置告警 / 限流 / 空串不认", () => {
+      eq(S.classifyModelMissing('{"error":{"code":"model_not_found","message":"x"}}'), "model_not_found");
+      eq(S.classifyModelMissing("The model `gpt-x` does not exist or you do not have access to it."), "model-unavailable");
+      eq(S.classifyModelMissing("unrecognized configuration key model_not_found_hint"), null);
+      eq(S.classifyModelMissing("429 Too Many Requests"), null);
+      eq(S.classifyModelMissing(""), null);
+    });
+    t("309 C-6:扫描器只认顶层错误事件与 stderr 行;item 事件(codex 读到的文件)里的 model_not_found 不算", () => {
+      const a = S.makeStreamScanner();
+      a.out(JSON.stringify({ type: "item.completed", item: { type: "command_execution", aggregated_output: "model_not_found" } }) + "\n");
+      a.end();
+      eq(a.modelMissing(), null, "item 事件");
+      const b = S.makeStreamScanner();
+      b.out(JSON.stringify({ type: "turn.failed", error: { message: "model_not_found: The model `bad` does not exist" } }) + "\n");
+      b.end();
+      eq(b.modelMissing() && b.modelMissing().reason, "model_not_found", "顶层事件");
+      const c = S.makeStreamScanner();
+      c.err("ERROR: unexpected status 404 Not Found: {\"error\":{\"code\":\"model_not_found\"}}\n");
+      c.end();
+      eq(c.modelMissing() && c.modelMissing().source, "stderr", "stderr 行");
+    });
+    t("309 C-6:备用模型取值——环境变量优先、其次 gate-install.json 的 codexFallbackModel;带空白 / 空串 / 读不了 ⇒ null", () => {
+      const rf = (obj) => () => JSON.stringify(obj);
+      eq(JSON.stringify(S.fallbackModelFrom({ env: { CODEX_RUN_FALLBACK_MODEL: "m-env" }, cwd: "/x", readFile: rf({ codexFallbackModel: "m-cfg" }) })), JSON.stringify({ model: "m-env", source: "env" }));
+      eq(JSON.stringify(S.fallbackModelFrom({ env: {}, cwd: "/x", readFile: rf({ format: "gate-install/v1", codexFallbackModel: "m-cfg" }) })), JSON.stringify({ model: "m-cfg", source: "config" }));
+      eq(S.fallbackModelFrom({ env: { CODEX_RUN_FALLBACK_MODEL: "a b" }, cwd: "/x", readFile: rf({}) }), null);
+      eq(S.fallbackModelFrom({ env: {}, cwd: "/x", readFile: rf({ codexFallbackModel: "" }) }), null);
+      eq(S.fallbackModelFrom({ env: {}, cwd: "/x", readFile: () => { throw new Error("ENOENT"); } }), null);
+    });
+    t("309 C-6:没配备用模型的提示写明两处配法", () => {
+      const h = S.fallbackHint();
+      if (!/CODEX_RUN_FALLBACK_MODEL/.test(h) || !/codexFallbackModel/.test(h)) throw new Error(h);
+    });
+    // 端到端:codex 替身 = node 跑 <临时仓>/exec(node 把 argv[0]=exec 当脚本、按 cwd 解析)。-m 以 bad 开头 ⇒ stderr 报 model_not_found 退出 1;
+    //   否则写 -o 指的最终消息、stdout 打 thread_id、退出 0。每次被调在 calls.txt 记一行模型名。
+    const lab = fs.mkdtempSync(path.join(os.tmpdir(), "codex-run-309-"));
+    const repo = path.join(lab, "repo");
+    fs.mkdirSync(repo, { recursive: true });
+    fs.writeFileSync(path.join(repo, "exec"), [
+      "const fs = require('fs'); const path = require('path');",
+      "const a = process.argv.slice(2); const at = (k) => { const i = a.indexOf(k); return i >= 0 ? a[i + 1] : null; };",
+      "const m = at('-m') || '(default)'; fs.appendFileSync(path.join(process.cwd(), 'calls.txt'), m + '\\n');",
+      "process.stdin.resume(); process.stdin.on('end', () => {",
+      "  if (/^bad/.test(m)) { process.stderr.write('ERROR: unexpected status 404: {\"error\":{\"code\":\"model_not_found\",\"message\":\"The model ' + m + ' does not exist\"}}\\n'); process.exit(1); }",
+      "  fs.writeFileSync(at('-o'), 'fake body from ' + m + '\\n'); process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'fake-thread-309' }) + '\\n'); process.exit(0);",
+      "});",
+    ].join("\n"));
+    fs.writeFileSync(path.join(repo, "task.md"), "x\n");
+    const baseEnv = { ...process.env, CODEX_BIN: process.execPath, GIT_CEILING_DIRECTORIES: lab };
+    delete baseEnv.CODEX_RUN_FALLBACK_MODEL;
+    const launch = (model, extraEnv, out) => {
+      try { fs.rmSync(path.join(repo, "calls.txt"), { force: true }); } catch { /* 无 */ }
+      const r = spawnSync(process.execPath, [self, "--task", path.join(repo, "task.md"), "--no-taskbook-check", "--model", model, "--out", path.join(lab, out), "--cwd", repo, "--wait-ms", "60000"],
+        { encoding: "utf8", windowsHide: true, env: { ...baseEnv, ...extraEnv }, cwd: repo });
+      const J = (/CODEX_JOB=(\S+)/.exec(r.stdout || "") || [])[1];
+      const rec = J ? JSON.parse(fs.readFileSync(path.join(S.JOB_ROOT, `${J}.json`), "utf8")) : null;
+      const calls = fs.existsSync(path.join(repo, "calls.txt")) ? fs.readFileSync(path.join(repo, "calls.txt"), "utf8").trim().split(/\r?\n/) : [];
+      return { r, rec, calls };
+    };
+    const ok = launch("bad-model", { CODEX_RUN_FALLBACK_MODEL: "good-model" }, "fb.md");
+    t("309 C-6 端到端:模型不可用 + 配了备用 ⇒ 换备用模型重发一次、done;台账记 modelUsed / modelFallback;结果件是备用模型的正文", () => {
+      if (!ok.rec) throw new Error(`没拿到作业记录:${(ok.r.stdout || "") + (ok.r.stderr || "")}`);
+      eq(ok.rec.state, "done"); eq(ok.calls.join(","), "bad-model,good-model", "替身被调的模型序列");
+      eq(ok.rec.modelUsed, "good-model"); eq(ok.rec.modelFallback && ok.rec.modelFallback.from, "bad-model");
+      eq(ok.rec.modelFallback && ok.rec.modelFallback.reason, "model_not_found"); eq(ok.rec.modelFallback && ok.rec.modelFallback.source, "env");
+      const body = fs.readFileSync(path.join(lab, "fb.md"), "utf8");
+      if (!/fake body from good-model/.test(body) || !/备用模型/.test(body.split("\n")[2])) throw new Error(JSON.stringify(body.slice(0, 400)));
+      eq(body.split("\n")[7], "---", "头部仍是 8 行");
+    });
+    const cfg = (() => { fs.writeFileSync(path.join(repo, "gate-install.json"), JSON.stringify({ format: "gate-install/v1", codexFallbackModel: "good-cfg" })); const x = launch("bad-model", {}, "cfg.md"); fs.rmSync(path.join(repo, "gate-install.json")); return x; })();
+    t("309 C-6 端到端:备用模型从 gate-install.json 读(没设环境变量)", () => {
+      eq(cfg.rec && cfg.rec.state, "done"); eq(cfg.calls.join(","), "bad-model,good-cfg"); eq(cfg.rec.modelFallback && cfg.rec.modelFallback.source, "config");
+    });
+    const none = launch("bad-model", {}, "none.md");
+    t("309 C-6 端到端【反向】没配备用模型 ⇒ 只跑一次、failed,失败原因里写怎么配;台账没有 modelFallback", () => {
+      eq(none.rec && none.rec.state, "failed"); eq(none.calls.join(","), "bad-model");
+      if (!/CODEX_RUN_FALLBACK_MODEL/.test(String(none.rec.error))) throw new Error(String(none.rec.error));
+      eq("modelFallback" in none.rec, false); eq(none.rec.modelUsed, "bad-model");
+    });
+    const twice = launch("bad-model", { CODEX_RUN_FALLBACK_MODEL: "bad-too" }, "twice.md");
+    t("309 C-6 端到端【反向】备用模型也不可用 ⇒ 只重发一次(共两次)、照常 failed", () => {
+      eq(twice.rec && twice.rec.state, "failed"); eq(twice.calls.join(","), "bad-model,bad-too");
+      eq(twice.rec.modelUsed, "bad-too"); eq(twice.rec.modelFallback && twice.rec.modelFallback.to, "bad-too");
+    });
+    const fine = launch("good-first", { CODEX_RUN_FALLBACK_MODEL: "good-model" }, "fine.md");
+    t("309 C-6 端到端【反向】模型可用 ⇒ 不重发;台账 modelUsed = 原模型、没有 modelFallback", () => {
+      eq(fine.rec && fine.rec.state, "done"); eq(fine.calls.join(","), "good-first"); eq(fine.rec.modelUsed, "good-first"); eq("modelFallback" in fine.rec, false);
+    });
+    try { fs.rmSync(lab, { recursive: true, force: true }); } catch { /* 留着也无害 */ }
+  }
+
   fs.rmSync(sandbox, { recursive: true, force: true });
 
   process.stdout.write(`PASS ${pass} / FAIL ${fails.length}\n`);
