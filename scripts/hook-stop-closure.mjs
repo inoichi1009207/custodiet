@@ -3987,8 +3987,10 @@ function selfTest() {
     { name: "I 不命中:写的不是载体面",
       lines: [U("go"), A("更新文档", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
     // I 的两个新覆盖面(2026-08-19 实测漏掉整类动作后补)
-    { name: "I 命中:Edit 已有载体也算造物",
-      lines: [U("go"), A("改一下", [{ name: "Edit", input: { file_path: "/repo/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
+    // 批 309 翻面(原「I 命中:Edit 已有载体也算造物」,2026-08-19):I 现只问「新建」,Edit 造不出文件 ⇒ 覆盖 / 修改既有载体不算新建
+    //   (实撞:Edit 仓外草稿里的闸脚本副本被报「本轮新建」)。Write 新建照拦,见上两条。
+    { name: "I 不命中:Edit 已有载体不算新建(批 309)",
+      lines: [U("go"), A("改一下", [{ name: "Edit", input: { file_path: "/repo/.claude/agents/_x.md" } }])], want: ["K0"] },
     { name: "I 命中:经 Bash 写载体绕不过去",
       lines: [U("go"), A("改一下", [{ name: "Bash", input: { command: "node -e \"fs.writeFileSync('scripts/foo.mjs',s)\"" } }])], want: ["I"] },   // 批 308:M 已删
     // 两条反向用例:2026-08-19 实撞的误报形态

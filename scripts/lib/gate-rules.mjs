@@ -278,9 +278,16 @@ const shellWriteOutside = (c) => SHELL_WRITE_OUT.test(
     .replace(/\d*>&\d+|&>\s*\/dev\/null|\d*>>?\s*\/dev\/null|\d*>>?\s*\$null/g, " "));
 /** 从 ctx 里取出「本轮触及了哪些匹配 pathRe 的载体路径」。Write/Edit 走 file_path,
  *  Bash 走 `bashWrites`(与旧实现同一个实现,import 而非手抄)。 */
-function touched(ctx, pathRe, onlyNew) {
+function touched(ctx, pathRe, onlyNew, { editCreates = true, suffixGuess = false } = {}) {
   const out = [];
+  // 批 309(I 误判实撞):Edit / NotebookEdit 只能改已在的文件,造不出新文件 ⇒ 问「新建」时(onlyNew)不把它们的目标当新建。
+  //   实撞:Edit 仓外草稿目录里的一份闸脚本副本(在用户主目录那个 git 仓里、未追踪)⇒ isNew 判真 ⇒ 提示「本轮新建:scripts/verify-laws.mjs」。
+  //   只有 I 传 editCreates:false;G ① 照旧(不在本批范围)。代价(漏放,提示规则、按「拿不准往不提示偏」接受):
+  //   子代理或看不见的进程造了载体、本会话随后只 Edit 它 ⇒ 不再提示(造的那一步本就不在主转录里,D60)。
+  const byWrite = editCreates ? null
+    : new Set((ctx.actions || []).filter((a) => a && a.name === "Write" && typeof a.input?.file_path === "string").map((a) => normPath(a.input.file_path)));
   for (const p of ctx.writes) {
+    if (onlyNew && byWrite && !byWrite.has(normPath(p))) continue;
     // 归一后再分类(D63):反斜杠 / 大小写 / `./` 段在 NTFS 上指向同一文件,
     //   而分类正则原来一条都不认 ⇒ I 收集不到 carriers 就 return [],P 也不响(漏放)。
     // **锚到路径开头**(D86):这里手里是**路径**不是命令串,不锚会把
@@ -307,6 +314,11 @@ function touched(ctx, pathRe, onlyNew) {
             if (!isCarrierPath(pathRe, e.path)) continue;
             if (onlyNew && !ctx.isNew(e.path)) continue;
             out.push(e.path + "(经 Bash)");
+          } else if (onlyNew && suffixGuess && /\//.test(String(e.suffix || "")) && isCarrierPath(pathRe, e.suffix)) {
+            // 批 309(只 I 传 suffixGuess):路径前段解不出(`$ROOT/…`、`$(pwd)/…`)而字面尾巴有两段以上(`scripts/x.mjs`)⇒ 按尾巴判新旧:
+            //   git 已追踪的既有文件 ⇒ 是覆盖,不算新建;不在追踪集 ⇒ 照记,点名那个尾巴。只剩一段的尾巴(`SKILL.md`)、只有形状 / 载荷的 ⇒ 落到下一支
+            if (!ctx.isNew(e.suffix)) continue;
+            out.push(e.suffix + "(经 Bash,路径前段未解出)");
           } else if ((e.pattern && isCarrierPath(pathRe, e.pattern)) || (e.suffix && isCarrierPath(pathRe, e.suffix))
             || (!e.suffix && !e.pattern && e.hint && pathRe.test(e.hint.replace(/\\/g, "/")))) {
             // 目标解不出,但其形状(展开换 X)/ 字面尾巴 / 载荷落在保护面 ⇒ 无法排除,偏严记一笔(逐效果;不过 isNew——新旧都证不了)
@@ -373,7 +385,8 @@ export const RULE_I = {
   law: "docs/archive/laws-2026-11/collab.md#五之二、造物两约束",
   // 批 285(D157③):判据最后一次改动的时刻 = 7de7678(批 260,touched 换写入效果分析的收口;`git log -L` 量 RULE_I 段所得)。
   //   `--fp-report` 的误报率表只数此刻之后的报警与自签(此前 17 笔自签全部早于 10-10)。**改 I 的判据时同步改这里**;忘了改 ⇒ 窗口偏宽,退回全量口径。
-  criteriaSince: "2026-10-12T02:28:08+08:00",
+  //   批 309:Edit 目标不算新建、未解出目标单独不提示、前段未解出时按字面尾巴判新旧 ⇒ 改到本批。
+  criteriaSince: "2026-11-28T10:01:01+08:00",
   // 出路即数据(批 117)。判据**只看动作**:本地任一层 + 联网,两半都要(批 253 起不再要求文字)。
   escapes: [
     { say: "**先用一句话写出你要解决的问题,拿它当搜索键**(不是拿「你打算写的实现」当键)" +
@@ -401,15 +414,21 @@ export const RULE_I = {
       return !/(^|\/)\.\.(\/|$)/.test(s) && RULE_I._i.MEMORY_NOTE.test(s);
     },
     LOCAL: /tool-register|known_marketplaces|\.claude\/(commands|skills)/,
-    // opts 只供变异回退用:memoryExempt=false 退回①之前,requireSaid=true 退回②之前,onlyNew=false 去掉新建限定。
-    detect(ctx, { memoryExempt = true, requireSaid = false, onlyNew = true } = {}) {
+    // opts 只供变异回退用:memoryExempt=false 退回①之前,requireSaid=true 退回②之前,onlyNew=false 去掉新建限定;
+    //   批 309:editCreates=true 退回「Edit 的目标也可能是新建」,unresolvedAlone=true 退回「只有一条未解出目标的 bash 写入也提示」,
+    //   suffixGuess=false 退回「路径前段解不出时不按字面尾巴判新旧」。
+    detect(ctx, { memoryExempt = true, requireSaid = false, onlyNew = true, editCreates = false, unresolvedAlone = false, suffixGuess = true } = {}) {
       const H = RULE_I._i;
       const ictx = memoryExempt ? { ...ctx, isNew: (p) => !H.isMemoryNote(p) && ctx.isNew(p) } : ctx;
-      const carriers = touched(ictx, CARRIER_RE, onlyNew);
+      const carriers = touched(ictx, CARRIER_RE, onlyNew, { editCreates, suffixGuess });
       // onlyNew=false 时 isNew 不被调用 ⇒ memory 豁免要在这里再滤一次(仅变异路径会走到)
       const list = (memoryExempt && !onlyNew)
         ? carriers.filter((x) => !H.isMemoryNote(String(x).replace(/\(经 Bash\)$/, ""))) : carriers;
       if (!list.length) return [];
+      // 批 309(实撞):「未解出目标」的 bash 写入单独一项不足以算新建载体——目标解不出,新旧都证不了(覆盖既有文件、
+      //   往仓外草稿目录写都长这样);同轮另有解出来的新建载体时照列。I 只是提示规则,拿不准往不提示偏。
+      //   代价(漏放):只靠变量路径 / 解不出的写法新建的载体不再提示。
+      if (!unresolvedAlone && list.every((x) => x === "bash-write(未解出目标)")) return [];
       if (requireSaid && !matchAny(ctx.text, PAT.scanned).length) return list.slice(0, 4);
       // 「做了」= 读过或搜过工具面的任一层。从**动作**取,不从文本取。
       // ⚠️ **第四层「搜 GitHub」**(2026-08-20 用户当场加:「工具面如果造的话能不能多来一个『联网搜索』?」
@@ -468,6 +487,10 @@ export const RULE_I = {
     // 批 253 修法②回退:重新要求正文写「工具面已扫」⇒ 「真扫了没写字」反例必须变红
     { name: "批253②回退:重新要求正文写『工具面已扫』", apply: (r) => ({ ...r,
       detect: (ctx) => r._i.detect(ctx, { requireSaid: true }) }) },
+    // 批 309 两处收窄的回退:证人 = neg 里「309 I:」各条
+    { name: "309 回退:Edit 的目标也算可能新建", apply: (r) => ({ ...r, detect: (ctx) => r._i.detect(ctx, { editCreates: true }) }) },
+    { name: "309 回退:只有一条未解出目标的 bash 写入也提示", apply: (r) => ({ ...r, detect: (ctx) => r._i.detect(ctx, { unresolvedAlone: true }) }) },
+    { name: "309 回退:路径前段解不出时不按字面尾巴判新旧", apply: (r) => ({ ...r, detect: (ctx) => r._i.detect(ctx, { suffixGuess: false }) }) },
   ],
   cases: {
     pos: [
@@ -518,13 +541,10 @@ export const RULE_I = {
       { name: "259 D158:旧目标在前、未知新目标在后 ⇒ 仍命中", text: "造了个脚本。", tracked: ["scripts/x.mjs", "scripts/old.mjs"],
         bash: "cp a.mjs scripts/old.mjs; cp a \"$ROOT/scripts/new.mjs\"" },
       // 批 259 红队(a4559d7b)对写入效果分析打出的回归 / 结构缺口,修后钉住
-      { name: "259 红队 BP-1:变量夹在路径中段 ⇒ 命中", text: "造了个 skill。", tracked: ["scripts/x.mjs"], bash: "cp tmpl.md .claude/skills/$N/SKILL.md" },
       { name: "259 红队 BP-2:重定向写在参数前 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cp > /dev/null a.mjs scripts/new-tool.mjs" },
       { name: "259 红队 BP-3:node -pe 内联写 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"],
         bash: "node -pe \"require('fs').writeFileSync('scripts/new-tool.mjs',1)\"" },
       { name: "259 红队 BP-4:不认识的包装器(flock)包 cp ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "flock /tmp/l cp a.mjs scripts/new-tool.mjs" },
-      { name: "259 红队 BP-5:cd - 后相对目标 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cd clipboard; cd -; cp a scripts/new-tool.mjs" },
-      { name: "259 红队 BP-7:通配源拷进载体目录 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cp /tmp/*.mjs scripts/" },
       { name: "259 红队 BP-8:eval 执行的 cp ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "eval \"cp a scripts/new-tool.mjs\"" },
       { name: "259 红队 BP-8:sudo bash 吃 heredoc ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "sudo bash <<EOF\ncp a scripts/new-tool.mjs\nEOF" },
       { name: "259 红队 BP-10:pushd 后相对目标 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "pushd scripts; cp /tmp/a.mjs new-tool.mjs; popd" },
@@ -542,6 +562,18 @@ export const RULE_I = {
       { name: "260 D160①:cat heredoc 管道给 bash 新建脚本 ⇒ 命中", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cat <<'EOF' | bash\ncp a scripts/new-tool.mjs\nEOF" },
     ],
     neg: [
+      // 批 309(实撞形态):在仓外草稿目录里 Edit 一份闸脚本副本(该目录落在别的 git 仓里、未追踪),再拷回覆盖已追踪的原件、node heredoc 改写
+      { name: "309 I:Edit 仓外草稿目录里的脚本副本 ⇒ 不算新建(Edit 造不出文件)", text: "改草稿。", tracked: ["scripts/x.mjs"],
+        write: "C:/tmp/scratch/vl/scripts/verify-laws.mjs", written: "x" },
+      { name: "309 I:拷贝仓外草稿覆盖已追踪的既有脚本、再 node heredoc 改写 ⇒ 不算新建", text: "拷回来。", tracked: ["scripts/verify-laws.mjs"],
+        bash: "S=\"$TEMP/x\"; cp \"$S/vl/scripts/verify-laws.mjs\" scripts/verify-laws.mjs && node - <<'EOF'\nconst fs = require(\"fs\");\nfs.writeFileSync(\"scripts/verify-laws.mjs\", \"x\");\nEOF" },
+      { name: "309 I:路径前段是变量、字面尾巴是已追踪的既有脚本 ⇒ 覆盖,不算新建", text: "拷回来。", tracked: ["scripts/verify-laws.mjs"],
+        bash: "cp /tmp/draft.mjs \"$ROOT/scripts/verify-laws.mjs\"" },
+      // 批 309:原 259 红队 BP-1 / BP-5 / BP-7 三条正例翻过来——目标只剩形状(变量夹在中段 / cd - 之后的相对路径 / 通配源拷进目录),
+      //   本轮只有这一条「未解出目标」⇒ 单独一项不足以算新建载体(任务书裁定;I 只是提示,拿不准往不提示偏)。接受的漏放写在 detect 注里。
+      { name: "309 I(原 259 BP-1):变量夹在路径中段、本轮只有这一条 ⇒ 不提示", text: "造了个 skill。", tracked: ["scripts/x.mjs"], bash: "cp tmpl.md .claude/skills/$N/SKILL.md" },
+      { name: "309 I(原 259 BP-5):cd - 后相对目标、本轮只有这一条 ⇒ 不提示", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cd clipboard; cd -; cp a scripts/new-tool.mjs" },
+      { name: "309 I(原 259 BP-7):通配源拷进载体目录、本轮只有这一条 ⇒ 不提示", text: "造了个脚本。", tracked: ["scripts/x.mjs"], bash: "cp /tmp/*.mjs scripts/" },
       // 批 285 D160③(误拦):从索引 / HEAD 还原 = 丢弃改动,造不出新载体;原 op=write 走 isNew,文件恰在最近新增提交里(justAdded)即判新建。
       //   夹具不注入 justAdded,以「不在追踪集」形态代证:还原效果不再进新建判(旧实现在这三条上命中)
       { name: "285 D160③:git restore 丢弃改动不算新建", text: "丢弃改动。", tracked: ["scripts/x.mjs"], bash: "git restore scripts/new-tool.mjs" },
