@@ -6,14 +6,15 @@
 
 它只把已有的件接起来:开批、验收、关账、交接用 `batch-goal`,外审作业读 `codex-run` 的作业台账,私仓名单读 `gate-install.json`。它不改这些件的判决。
 
-只用于本地、可逆的批(核对分级 T0 / T1)。会动线上内容的批不要用它发车。
+只用于本地、可逆的批(核对分级 T0 / T1)。会动线上内容的批不要用它发车;发车前的分流会拒掉规则或模型认得出的那一类(见「分流」),认不出的仍要靠发车的人自己不发。
 
 ## 命令行
 
 ```
 node --no-warnings scripts/batch-run.mjs
   --batch <批号> --instruction "<用户原话>"
-  --cond "<条件>" [--check "<命令>" [--expect "<子串>" | --expect-re "<正则>"]] [--cond …]
+  [--cond "<条件>" [--check "<命令>" [--expect "<子串>" | --expect-re "<正则>"]] [--cond …]]
+  [--route plan|criteria|direct [--route-reason "<一句>"]] [--triage-model <名>]
   [--finish-line "<终点线>"]
   [--max-turns N] [--max-budget-usd M] [--cap-usd T] [--deadline-min D]
   [--model <名>] [--judge-model <名>] [--no-merge] [--push <远端名>] [--handoff-out <路径>]
@@ -24,9 +25,16 @@ node --no-warnings scripts/batch-run.mjs --self-test
 
 node --no-warnings scripts/batch-watch.mjs --replay <日志文件…> [--limit N]
 node --no-warnings scripts/batch-watch.mjs --self-test
+
+node --no-warnings scripts/batch-triage.mjs --instruction "<一句话>" [--model <名>] [--no-model] [--batch <批号>]
+node --no-warnings scripts/batch-triage.mjs --rework <批号> --note "<一句>"
+node --no-warnings scripts/batch-triage.mjs --stats
+node --no-warnings scripts/batch-triage.mjs --self-test
 ```
 
-- `--cond` / `--check` / `--expect` / `--expect-re` 的写法和 `batch-goal --arm` 一样,原样透传。至少要有一条 `--check`:验收的硬门只认可执行检查,没有检查就拒绝发车。
+- `--cond` / `--check` / `--expect` / `--expect-re` 的写法和 `batch-goal --arm` 一样,原样透传。验收的硬门只认可执行检查,所以发车时总要有一条检查:自己写 `--check`,或者走「直接做」路线时用配置里的缺省检查。见下面「分流」一节。
+- `--route`:自己定路线,不筛规则、不调模型;`--route-reason` 写一句为什么(只能和 `--route` 一起给)。规则或模型判错时用它。
+- `--triage-model`:分流用的便宜模型,缺省取 `batch-triage.json` 的 `model`,再缺省是 `haiku`。
 - 上限的缺省值:`--max-turns 80`、`--max-budget-usd 8`(每次拉起)、`--cap-usd 20`(整批累计,含回修和方向复核)、`--deadline-min 90`(整批墙钟)。
 - `--judge-model` 缺省 `opus`;`--model` 不给就不传,用 claude 的缺省模型。
 - `--same-error-limit N`:看守的阈值,非负整数,缺省 3;`0` 关掉看守。见下面「看守」一节。
@@ -34,9 +42,56 @@ node --no-warnings scripts/batch-watch.mjs --self-test
 - `--push <远端>`:并回之后推基分支。只有远端地址的仓名在 `gate-install.json` 的 `privateRepos` 名单里才推;不在名单里就不推,结果里记一行「未推送」,照常关账。
 - 要在仓的主 checkout 根目录发车,HEAD 要在一个分支上(这个分支就是基分支)。
 
+## 分流
+
+发车之前先判这句话该走哪条路。不管走哪条,都要有一条跑得出「过 / 不过」的检查和一组上限;「直接做」省掉的只是方案文件和对抗审计。
+
+| 路线 | 什么话 | 发车脚本怎么做 |
+|---|---|---|
+| `plan`(完整计划) | 会碰服务器或线上内容、公开面、不可逆的动作、钱、凭据 | 拒绝发车(`triage-plan`)。这类活要先写完整计划、做对抗审计,不归发车脚本管 |
+| `criteria`(只写完成标准) | 说得清要什么、写得出检查,但不止一两处改动或要做取舍 | 要有 `--cond` 和至少一条 `--check`,和以前一样;缺了就拒绝发车(`triage-need-criteria`) |
+| `direct`(直接做) | 小而明确,一两处改动,做法没有歧义 | 没给 `--cond` 就拿「照这句话做完:<原话>」当唯一的条件;没给 `--check` 就用配置里的 `directCheck`;配置里也没有就拒绝发车(`triage-no-default-check`) |
+
+**怎么判**,分两级:
+
+1. **规则**。指令里出现红线一类的词 ⇒ `plan`,不调模型。内置的规则(每条有名字,中文按子串比,英文按整词、不分大小写):`server`(服务器)、`online`(线上)、`production`(生产环境、生产库、production、prod)、`deploy`(部署、上线、deploy)、`publish`(发布、发版、发包、publish、release)、`public`(公开、对外可见、make … public、public repo)、`irreversible`(不可逆、删库、删除仓库、delete the repo)、`force-push`(强推、强制推送、force-push、push --force)、`drop`(删表、清库、drop table、truncate table)、`credential`(凭据、凭证、密钥、口令、credential、secret、API key)、`payment`(付款、支付、扣款、转账、退款、payment、billing、refund)。词表宁窄勿宽:「public method」「drag and drop」「release notes」「发布说明」「生产力」都不命中。
+2. **便宜模型**。规则没命中才调:`claude -p --model <名> --max-turns 1 --output-format json --tools "" --no-session-persistence --strict-mcp-config`,提示词走 stdin,工作目录是系统临时目录下新建的空目录(项目的钩子和规矩文件不会加载进来),60 秒没答完就杀掉。提示词里只有那句指令和三条路线的定义,要求只回两行:第一行是三个词之一,第二行是一句理由;并告诉它拿不准时选 `criteria`。解析是宽容的:大小写、多余空白、包了代码块、Markdown 强调、「路线:」一类前缀、判词和理由写在同一行,都认。
+
+**什么时候过哪一级**:
+
+- 给了 `--route` ⇒ 照它,`source` 记 `caller`,不筛规则、不调模型。
+- 没给 `--route`、带了 `--cond`(调用方已经写好完成标准)⇒ 只过规则:命中 ⇒ `plan`,拒绝发车;没命中 ⇒ `criteria`,`source` 记 `caller`,照常发车。
+- 没给 `--route`、也没给 `--cond`(只有一句话)⇒ 规则加模型都过。
+
+**读不出判词**(超时、非零退出、输出不是 JSON、格式认不出、找不到 claude)⇒ `criteria`,`source` 记 `fallback`,`reason` 写明是哪种失败。理由:规则那一级已经把红线筛过了,走中间档只是让调用方多写一份完成标准,不会漏掉检查。
+
+**判错了怎么办**:每段拒绝的话里都写着出路。规则或模型误判成 `plan` ⇒ 加 `--route criteria --route-reason "<理由>"`,再带上 `--cond` 和 `--check` 重发。判成 `direct` 却没有缺省检查 ⇒ 带 `--check` 重发,或者配 `directCheck`。事后发现某一批返工了,记一笔:`batch-triage.mjs --rework <批号> --note "<一句>"`;`--stats` 按路线数判词条数和返工条数(返工归到同一批号最后一次判词的路线),用来看哪条路线判得不准。
+
+**配置**:主 checkout 根目录的 `batch-triage.json`,和 `gate-install.json` 同目录,整份可缺:
+
+```json
+{ "planPatterns": ["staging", "官网"], "model": "haiku", "directCheck": "npm test" }
+```
+
+- `planPatterns`:追加的词。纯 ASCII 的按整词、不分大小写比,含中文的按子串比。规则名记成 `config:<词>`。
+- `model`:分流用的模型。`--triage-model` 优先于它。
+- `directCheck`:「直接做」的缺省检查。命令字符串,或 `{ "cmd": "<命令>", "expect": "<子串>" }` / `{ "cmd": "<命令>", "expectRe": "<正则>" }`。
+- 为什么不放进 `gate-install.json`:那份配置的读取器遇到没见过的键会整份判坏(防拼错键名静默关掉核对),而它属于闸引擎文件,本批不改。`batch-triage.json` 认不出的键只提示、不判坏;JSON 坏了按全缺省走、提示一行。
+
+**单独调分流**:`batch-triage.mjs --instruction "<一句话>"` 只判不发车。stdout 最后一行恒为 `BATCH_TRIAGE_RESULT=<JSON>`,键:`route`、`reason`、`source`(`rule` / `model` / `fallback` / `caller`)、`ruleHits`(命中的规则名)、`model`、`costUsd`、`ms`。出了判词(含兜底)退出 0,用法错误退出 2。`--no-model` 只过规则,没命中就是 `criteria` / `fallback`。
+
+**落盘**:每出一次判词(单独调的和发车时判的都算)、每记一笔返工,往 `<主树>/.claude/.batch-run/triage.jsonl` 追加一行:时刻、来源(`via`)、批号、指令原文、判词各键。发车时的判词还记进运行状态文件、`runs.jsonl` 那一行和 `BATCH_RUN_RESULT`(键名 `triage`)。被分流拒绝的发车只留 `triage.jsonl` 那一行,不建工作树、不建分支、不写运行状态、不写 `runs.jsonl`。
+
+**分流的已知限制**:
+
+- 规则只认字面词。换个说法(「推到正式机上」「让所有人都能看到」)规则认不出,要靠模型;模型也判错时,`direct` 路线照样要过检查和上限,代价是检查和上限兜得住的那一部分。
+- 规则会误拦说到红线词、其实只动本地的话(「给部署文档改个错字」会命中 `deploy`)。出路是 `--route`。
+- `direct` 的缺省检查是整个仓共用的一条,证明不了「这句话真做完了」,只证明「没把仓弄坏」这一类事。要更强的检查就自己写 `--check`。
+- 模型的判词只是一个便宜模型读一句话的印象;没有拿真实指令量过准确率,`--stats` 的返工数是将来校准的唯一读数。
+
 ## 流程
 
-1. **发车前检查**。任何一条不过就退出 2,什么都不留:当前目录是主 checkout 的根(不是 linked worktree);HEAD 在分支上;批号只含字母、数字、`_`、`.`、`-`;有 `--check`;找得到 Git Bash 和 claude;工作树目录、分支、这个批号的运行状态都还不存在;没有别的发车在跑。
+1. **发车前检查**。任何一条不过就退出 2,什么都不留:当前目录是主 checkout 的根(不是 linked worktree);HEAD 在分支上;批号只含字母、数字、`_`、`.`、`-`;找得到 Git Bash 和 claude;工作树目录、分支、这个批号的运行状态都还不存在;没有别的发车在跑。最后一步是分流(见「分流」一节),它定下路线,也定下最终的条件和检查(至少一条检查)。
 2. **建工作树**。`git worktree add <主树>/.claude/worktrees/batch-<批号> -b batch-run/<批号>`,从当前 HEAD 起。收尾闸只认 `.claude/worktrees/` 下的工作树批状态,所以位置是固定的。
 3. **开批**。先生成执行会话号,在工作树里调 `batch-goal --arm`,带上指令、终点线、整批花费上限、截止时间和全部条件。子进程的 `CLAUDE_CODE_SESSION_ID` 设成执行会话号,批状态的武装者因此是执行会话。发车方自己的会话号(本进程环境里原有的那个)记成指令所在的会话。
 4. **拉起执行会话**。`claude -p --output-format stream-json --verbose --permission-mode auto --max-turns N --max-budget-usd <本次上限> --session-id <会话号>`,工作目录是工作树,提示词走 stdin。提示词写着用户原话、逐条条件和检查命令、终点线、约束(只做本批范围内的事;不放宽条件;不开批、不结清、不推送、不合并、不切分支)和收尾要求(全部提交、登记成果与决定、最后一条消息逐条写 `条件N:达成` / `条件N:未达成:<理由>` / `条件N:不适用:<理由>`)。不用 `--dangerously-skip-permissions`,无人值守时的围栏是 auto 模式的权限分类器。
@@ -114,7 +169,7 @@ node --no-warnings scripts/batch-watch.mjs --self-test
 ## 退出码与结果行
 
 - 0:已关账;10:停下了(交接已写);2:拒绝发车(什么都没起);1:内部错误(尽量也写交接)。
-- stdout 最后一行恒为 `BATCH_RUN_RESULT=<JSON>`。键:`batch`、`status`(`closed` / `stopped` / `refused` / `error`)、`reason`、`reasonCode`、`stage`、`rounds`(执行加回修的拉起次数,不含方向复核)、`acceptRounds`、`costUsd`、`sessionId`、`worktree`、`branch`、`handoff`、`ruler`(`--clear` 打出的主尺那一行)、`pushed`、`notes`。发车的会话只读这一行就够。进度信息都写 stderr。
+- stdout 最后一行恒为 `BATCH_RUN_RESULT=<JSON>`。键:`batch`、`status`(`closed` / `stopped` / `refused` / `error`)、`reason`、`reasonCode`、`stage`、`rounds`(执行加回修的拉起次数,不含方向复核)、`acceptRounds`、`costUsd`、`sessionId`、`worktree`、`branch`、`handoff`、`ruler`(`--clear` 打出的主尺那一行)、`pushed`、`notes`、`triage`(分流的判词对象;发车前检查没走到分流就是 `null`)。拒绝发车时 `reasonCode` 是 `usage`(命令行写错)、`refused`(发车前检查不过)或分流的三种之一:`triage-plan`、`triage-need-criteria`、`triage-no-default-check`。发车的会话只读这一行就够。进度信息都写 stderr。
 
 ## 落盘的文件
 
@@ -123,7 +178,8 @@ node --no-warnings scripts/batch-watch.mjs --self-test
 - `<批号>.json`:运行状态,原子写。记状态(`running` / `closed` / `stopped` / `error`)、本进程与当前子进程的进程号、会话号、工作树、分支、基分支与基点、上限(含看守阈值)、每次拉起的记录(每条带 `watch` 字段)。`status: running` 且进程号还活着,就是锁:同时只跑一个发车。
 - `<批号>-r<k>.log`:第 k 次拉起的 stdout / stderr;`<批号>-judge.log`:方向复核。
 - `<批号>-handoff.md`:交接(`--handoff-out` 可改位置)。
-- `runs.jsonl`:每次运行结束追加一行:时刻、批号、状态、原因、每次拉起(分类、轮数、花费、耗时)、验收次数、方向复核结果、看守命中(`watch`,没命中为 `null`)、累计花费、模型、会话号、主尺、总耗时。
+- `runs.jsonl`:每次运行结束追加一行:时刻、批号、状态、原因、每次拉起(分类、轮数、花费、耗时)、验收次数、方向复核结果、看守命中(`watch`,没命中为 `null`)、分流判词(`triage`)、累计花费(含分流那次)、模型、会话号、主尺、总耗时。
+- `triage.jsonl`:分流的账,每出一次判词、每记一笔返工一行(见「分流」一节)。
 
 `--status [<批号>]` 只读地打印这些。
 
