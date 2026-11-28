@@ -1308,7 +1308,8 @@ const RULE_K = {
     //   K0 遇到已武装的批直接返回,也不管。兜底只有两样:批没结清时下一次 `batch-goal --arm` 别的批会被拒,
     //   以及钩子给用户看的「批仍未结清」那一行(systemMessage)。
     // 批 309 C-2(实撞一次):上一次 --clear 被拒留下痕迹,修好后重跑的 --clear 在后台、还在飞 ⇒ 旧痕迹不作数,这一轮不响。
-    //   痕迹晚于这次结清命令(这次自己拒了)⇒ 照拦。跑完以后若又被拒,痕迹更新,那时这次任务已不在载荷里,按下面原判据判。
+    //   痕迹晚于这次结清命令(这次自己拒了)⇒ 照拦。跑完以后若又被拒,痕迹会更新;但任务跑完的通知是新的一轮,那一轮没有 --clear 动作,K 进不来(批 310 红队 BP-3)——
+    //   兜底同批 308 的后台结清:模型在通知轮会读到拒清输出,批仍未结清的提示照出,下次给别的批 --arm 会被拒。
     if (clearStillInBackground(ctx) && !refusedSinceLastClear(ctx)) return [];
     return [g.clearRefusedAt
       ? `本轮跑了 --clear,但结清被拒(拒清痕迹 ${g.clearRefusedAt})`
@@ -1486,7 +1487,7 @@ const RULE_K = {
         bgTasks: [{ id: "bx8", type: "shell", status: "running", description: "node --no-warnings scripts/batch-goal.mjs --clear", command: "node --no-warnings scripts/batch-goal.mjs --clear" }],
         batchGoal: { batch: "250", conditions: ["甲", "乙"] } },
       // 批 309 C-2(已实撞一次):上一次 --clear 被拒留下痕迹,修好后重跑的 --clear 被转到后台、还没跑完 ⇒ 旧痕迹不作数,不响。
-      //   痕迹时刻早于这次结清命令的时刻 = 旧痕迹。跑完以后若又被拒,痕迹更新,那时按原判据判。
+      //   痕迹时刻早于这次结清命令的时刻 = 旧痕迹。跑完以后若又被拒,那是下一轮(通知轮)的事,K 在那一轮进不来,见规则头注。
       { name: "309 C-2:旧拒清痕迹 + 重跑的结清还在后台 ⇒ 不响", text: "修好了,结清在后台重跑。", at: "2026-11-20T10:05:00Z",
         bashBg: [{ command: "node --no-warnings scripts/batch-goal.mjs --clear",
           result: "Command running in background with ID: bx9. Output is being written to: E:/x/tasks/bx9.output.",

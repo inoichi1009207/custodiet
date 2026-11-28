@@ -599,7 +599,7 @@ export function fallbackModelFrom({ env = process.env, cwd = process.cwd(), read
 }
 /** 没配备用模型时接在失败原因后面的一句。 */
 export function fallbackHint() {
-  return `;后端报模型不可用,没配备用模型——设环境变量 ${FALLBACK_MODEL_ENV}=<模型名>,或在 gate-install.json 写 "${FALLBACK_MODEL_KEY}": "<模型名>",下次会自动换备用模型重发一次`;
+  return `;后端报模型不可用,没配备用模型——设环境变量 ${FALLBACK_MODEL_ENV}=<模型名>,或在 gate-install.json 里加一个键 "${FALLBACK_MODEL_KEY}": "<模型名>"(新建这份文件的话要带上 "format": "gate-install/v1",否则关账不认),下次会自动换备用模型重发一次`;
 }
 
 /** 子进程输出的逐行扫描器:stdout / stderr 各自缓冲半行,`end()` 冲掉残行。 */
@@ -650,6 +650,8 @@ export function makeStreamScanner() {
       const all = cands.filter((c) => c.source === "event" && !UNAVAIL_SKIP.test(c.text));
       // 批 310:「Reconnecting... n/m (…)」是重试通知,不是失败本身——另有事件说明这次失败(如任务本身出错的 turn.failed)时不拿它分类,
       //   否则「中途重连过一次、后来因任务出错失败」会被判成通道不可用;别的事件都只是泛化传输层失败(或没有别的事件)时照常用它。
+      //   已知上限(批 310 红队 BP-2):重连成功以后作业又以「不带原因的方式」失败(没有 turn.failed、或它的消息是空的),仍会被判成通道不可用。
+      //   本机 295 份真实作业里这一形 0 次;后果是 P 的跨模型格放行并提示登记欠账(晚一步发现)。
       const RETRY = /^\s*Reconnecting\.\.\./i;
       const nonRetry = all.filter((c) => !RETRY.test(c.text));
       const events = nonRetry.some((c) => c.text.trim() && !GENERIC_TRANSPORT.test(c.text)) ? nonRetry : all;
