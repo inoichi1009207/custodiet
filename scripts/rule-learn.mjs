@@ -18,7 +18,8 @@
 //   --score --proposals <提案目录>… --library <规则库目录>…
 //       纯机械。规则库里 `type: feedback` 的有几条、被提案对上的有几条、比例;新建 / 拒收 / 挂起 / 引文对不上 / 读不出各几。
 //       只打数和规则名,不打原话。
-//   --render --proposals <提案目录>… --in <压过的目录> [--out <文件.md 或目录>] [--library <规则库目录>…]   (批 312)
+//   --render --proposals <提案目录>… --in <压过的目录> --library <规则库目录>… [--out <文件.md 或目录>]   (批 312)
+//       --library 必须给:render 不读规则库,给它只是为了保证不往里写。动作认不出的提案末尾单列一组,不漏。
 //       纯机械,不调模型。读已有的 proposals.jsonl(新旧格式都认),对着压过的转录重出给人看的清单:出处、起止、类型现算;
 //       找不到出处的、出处不可引的都照样列出并标明,不丢。不改原来的 proposals.jsonl;只写新文件,落在 --in / --library 里就拒。
 //   --self-test
@@ -468,6 +469,7 @@ export function proposalsMd(proposals, run) {
   L.push(`- 模型 ${run.model};处理了 ${run.sessionsDone} 个会话(另有 ${run.sessionsPartial} 个只跑了一部分),计划 ${run.sessionsPlanned} 个;花费 ${run.spentUsd} 美元(上限 ${run.maxUsd})`);
   L.push(`- 段:跑了 ${run.segmentsDone} 段,读不出 ${run.unreadable} 段,没有可引消息、没调模型的 ${run.segmentsSkippedNoQuotable ?? 0} 段;丢掉的条目:${Object.entries(run.dropped).map(([k, v]) => `${k} ${v}`).join("、") || "零"}`);
   if (run.stopped) L.push(`- ⚠ 停在会话 ${run.stopped.sid} 的第 ${run.stopped.segment} 段:${run.stopped.reason}`);
+  if (run.sessionsUnreadable) L.push(`- ⚠ 会话文件读不了、跳过了 ${run.sessionsUnreadable} 个:${(run.sessionsUnreadableList || []).map((u) => u.sid).join("、")}`);
   L.push("", ...proposalBlocks(proposals));
   return L.join("\n");
 }
@@ -475,12 +477,16 @@ const MD_HEAD_NOTE = "脚本只保证引文这段字是用户打的,不保证没
 /** 按动作分组的正文(--extract 与 --render 共用)。p.note = 额外一行提醒(--render 标「没找到出处」「出处不可引」用)。纯函数。 */
 export function proposalBlocks(proposals) {
   const L = [];
-  for (const a of ACTIONS) {
-    const ps = proposals.filter((p) => p.action === a);
+  // 九种动作各一组;动作认不出的(没有 action 键、或不在九种里——--render 读到的旧提案可能有)末尾单列一组,不悄悄漏掉。
+  //   --extract 的提案在核的时候就丢了这一类,所以它出的清单里不会有这一组。
+  const unknown = proposals.filter((p) => !ACTIONS.includes(p.action));
+  const groups = [...ACTIONS.map((a) => [`${ACTION_LABEL[a]}(${a})`, proposals.filter((p) => p.action === a)]), ["动作认不出", unknown]];
+  for (const [title, ps] of groups) {
     if (!ps.length) continue;
-    L.push(`## ${ACTION_LABEL[a]}(${a})${ps.length} 条`, "");
+    L.push(`## ${title}${title === "动作认不出" ? " " : ""}${ps.length} 条`, "");
     for (const p of ps) {
       L.push(`- 「${p.quote}」`);
+      if (title === "动作认不出") L.push(`  - 动作:${p.action == null || p.action === "" ? "(没写)" : `${String(p.action)}(不在九种里)`}`);
       L.push(`  - 规则:${p.rule || "(无)"}${p.when ? `;适用:${p.when}` : ""}`);
       L.push(`  - 针对:${p.target ?? "(无)"};范围:${p.scope === "durable" ? "以后都" : "只管这一次"};理由:${p.reason || "(无)"}`);
       L.push(`  - 出处:会话 ${p.sid} 的 ${p.msg}(${p.at || "时刻不详"}${p.kind ? `,${p.kind}` : ""})`);
@@ -503,12 +509,21 @@ export async function runExtract(o) {
   const segLimit = Number(process.env.RULE_LEARN_SEGMENT_CHARS) > 0 ? Number(process.env.RULE_LEARN_SEGMENT_CHARS) : SEGMENT_CHARS;
   // 先把每个会话切好段:一段里一条可引的用户消息都没有 ⇒ 不可能出提案,不调模型(segmentsSkippedNoQuotable)。
   //   每段都被跳过的会话(含一个单元都没有的)直接算处理完、进 processed,**不占 --limit 的名额**——名额留给真要花钱的会话。
-  const all0 = (index.sessions || []).filter((s) => s.userMsgs > 0 && !done.has(s.sid)).map((s) => {
-    const rows = fs.readFileSync(path.join(o.in, "sessions", `${s.sid}.jsonl`), "utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l));
-    const units = buildUnits(rows);
-    const segs = segmentUnits(units, segLimit).map((seg, i) => ({ seg, no: i + 1, call: hasQuotable(seg) }));
-    return { s, units, segs };
-  });
+  //   为了判哪些能跳过,开工前要读每个候选会话的文件;读不了的(缺了 / 坏了)不致命:记进 sessionsUnreadable 并跳过,
+  //   其余照跑——否则一个没被 --limit 抽中的坏文件也会让整次运行退出。一个都读不了才按输入不对退出 2。
+  const wanted = (index.sessions || []).filter((s) => s.userMsgs > 0 && !done.has(s.sid));
+  const unreadableSessions = [];
+  const all0 = [];
+  for (const s of wanted) {
+    try {
+      const rows = fs.readFileSync(path.join(o.in, "sessions", `${s.sid}.jsonl`), "utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l));
+      const units = buildUnits(rows.filter((r) => r && typeof r === "object"));
+      const segs = segmentUnits(units, segLimit).map((seg, i) => ({ seg, no: i + 1, call: hasQuotable(seg) }));
+      all0.push({ s, units, segs });
+    } catch (e) { unreadableSessions.push({ sid: s.sid, why: e.code ? `读不了(${e.code})` : `坏了(${String(e.message).slice(0, 80)})` }); }
+  }
+  if (wanted.length && !all0.length) throw new Error(`--in「${o.in}」里 ${wanted.length} 个会话文件一个都读不了(${unreadableSessions.slice(0, 3).map((u) => `${u.sid}:${u.why}`).join(";")}),重跑 --compress 再来`);
+  if (unreadableSessions.length) say(`${unreadableSessions.length} 个会话文件读不了,跳过:${unreadableSessions.map((u) => u.sid).join("、")}`);
   const free = all0.filter((p) => !p.segs.some((x) => x.call));
   let cand = all0.filter((p) => p.segs.some((x) => x.call));
   cand = [...cand].sort((a, b) => String(a.s.firstAt || "").localeCompare(String(b.s.firstAt || "")) || (a.s.sid < b.s.sid ? -1 : 1));
@@ -518,7 +533,7 @@ export async function runExtract(o) {
   const run = {
     tool: "rule-learn", model: o.model, maxUsd: o.maxUsd, spentUsd: 0, costUnknownCalls: 0, calls: 0,
     sessionsCandidates: cand.length, sessionsPlanned: plan.length, sessionsDone: 0, sessionsPartial: 0, segmentsPlanned: 0, segmentsDone: 0,
-    sessionsSkippedNoQuotable: free.length, segmentsSkippedNoQuotable: 0,
+    sessionsSkippedNoQuotable: free.length, segmentsSkippedNoQuotable: 0, sessionsUnreadable: unreadableSessions.length, sessionsUnreadableList: unreadableSessions,
     unreadable: 0, unreadableList: [], dropped: {}, overCap: 0, proposals: 0, byAction: {}, stopped: null, processed: free.map((p) => p.s.sid), partial: [],
     library: { entries: lib.length, feedback: lib.filter((e) => e.type === "feedback").length }, segmentChars: segLimit,
   };
@@ -577,7 +592,7 @@ export async function runExtract(o) {
   }
   writeRun();
   fs.writeFileSync(path.join(o.out, "proposals.md"), proposalsMd(all, run) + "\n", "utf8");
-  const keys = ["model", "maxUsd", "spentUsd", "calls", "costUnknownCalls", "sessionsCandidates", "sessionsPlanned", "sessionsDone", "sessionsPartial", "segmentsPlanned", "segmentsDone", "sessionsSkippedNoQuotable", "segmentsSkippedNoQuotable", "unreadable", "dropped", "overCap", "proposals", "byAction", "stopped", "library"];
+  const keys = ["model", "maxUsd", "spentUsd", "calls", "costUnknownCalls", "sessionsCandidates", "sessionsPlanned", "sessionsDone", "sessionsPartial", "segmentsPlanned", "segmentsDone", "sessionsSkippedNoQuotable", "segmentsSkippedNoQuotable", "sessionsUnreadable", "sessionsUnreadableList", "unreadable", "dropped", "overCap", "proposals", "byAction", "stopped", "library"];
   return { mode: "extract", out: o.out.replace(/\\/g, "/"), ...Object.fromEntries(keys.map((k) => [k, run[k]])) };
 }
 
@@ -617,7 +632,7 @@ export function runRender(o) {
     }
     return unitsOf.get(sid);
   };
-  const res = { proposals: 0, found: 0, notQuotable: 0, notFound: 0, oldFormat: 0, badLines: 0 };
+  const res = { proposals: 0, found: 0, notQuotable: 0, notFound: 0, oldFormat: 0, actionUnknown: 0, badLines: 0 };
   const ps = [];
   for (const d of o.proposals) {
     let text; try { text = fs.readFileSync(path.join(d, "proposals.jsonl"), "utf8"); } catch { throw new Error(`--proposals「${d}」下没有 proposals.jsonl`); }
@@ -627,6 +642,7 @@ export function runRender(o) {
       if (!p || typeof p !== "object") { res.badLines++; continue; }
       res.proposals++;
       if (!("kind" in p) || !Number.isInteger(p.quoteStart) || !Number.isInteger(p.quoteEnd)) res.oldFormat++;
+      if (!ACTIONS.includes(p.action)) res.actionUnknown++;
       const v = locateQuote(p, units(p.sid));
       const base = { ...p, quote: normWs(p.quote), msgText: null, quoteStart: null, quoteEnd: null, note: null };
       if (v.status === "not-found") { res.notFound++; ps.push({ ...base, note: `没找到出处:${v.why}。这条照样列出,别照着它改规则,先去转录里核` }); continue; }
@@ -638,7 +654,7 @@ export function runRender(o) {
   }
   const L = ["# 规则提案(rule-learn,重出)", "", "从已有的 proposals.jsonl 重新出的清单,没调模型;规则库和原来的 proposals.jsonl 都没改。", MD_HEAD_NOTE, ""];
   L.push(`- 来源:${o.proposals.map((d) => path.basename(path.resolve(d))).join("、")}`);
-  L.push(`- 提案 ${res.proposals} 条:找到出处 ${res.found} 条(其中出处不可引 ${res.notQuotable} 条)、没找到出处 ${res.notFound} 条;旧格式(没有 kind / 起止)${res.oldFormat} 条${res.badLines ? `;读不了的行 ${res.badLines} 行` : ""}`);
+  L.push(`- 提案 ${res.proposals} 条:找到出处 ${res.found} 条(其中出处不可引 ${res.notQuotable} 条)、没找到出处 ${res.notFound} 条;旧格式(没有 kind / 起止)${res.oldFormat} 条;动作认不出 ${res.actionUnknown} 条(列在末尾)${res.badLines ? `;读不了的行 ${res.badLines} 行` : ""}`);
   L.push("", ...proposalBlocks(ps));
   fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, L.join("\n") + "\n", "utf8");
@@ -716,7 +732,12 @@ export function parseCli(argv) {
   }
   if (mode === "compress") { if (!o.inputs?.length) throw new Error("--compress 要跟转录文件或目录"); if (!o.out) throw new Error("--compress 要配 --out <目录>"); return o; }
   if (mode === "score") { if (!o.proposals?.length || !o.library?.length) throw new Error("--score 要配 --proposals <目录>… 和 --library <目录>…"); return o; }
-  if (mode === "render") { if (!o.proposals?.length || !o.in) throw new Error("--render 要配 --proposals <目录>… 和 --in <压过的目录>"); return o; }
+  if (mode === "render") {
+    const shape = "命令形状:--render --proposals <提案目录>… --in <压过的目录> --library <规则库目录>… [--out <文件.md 或目录>]";
+    if (!o.proposals?.length || !o.in) throw new Error(`--render 要配 --proposals <目录>… 和 --in <压过的目录>。${shape}`);
+    if (!o.library?.length) throw new Error(`--render 要配 --library <规则库目录>…:render 不读规则库,给它只是为了保证不往里写(--out 落在里面就拒)。${shape}`);
+    return o;
+  }
   if (!o.in || !o.out || !o.library?.length) throw new Error("--extract 要配 --in <压过的目录>、--library <目录>… 和 --out <目录>");
   if (o.model !== undefined && !/^[\w.:[\]-]{1,80}$/.test(o.model)) throw new Error(`--model「${o.model}」不像模型名`);
   o.model = o.model || DEFAULT_MODEL;
@@ -1024,34 +1045,56 @@ async function selfTest() {
       t("跳过:--limit 只数要花钱的会话(每段都被跳过的不占名额)", [x3.res.sessionsCandidates, x3.res.sessionsPlanned, ins(x3), x3.res.sessionsSkippedNoQuotable], [2, 2, ["戊丁", "庚"], 1]);
       const x4 = run(["--extract", "--in", C3, "--library", LIB, "--out", J(tmp, "px4"), "--exclude", PX1], { replies: [{ reply: { items: [] } }] });
       t("跳过:--exclude 续跑时,上次被整个跳过的会话不再出现(已算处理完)", [x4.calls.length, x4.res.sessionsPlanned, x4.res.sessionsSkippedNoQuotable, x4.res.segmentsSkippedNoQuotable], [0, 0, 0, 0]);
-      t("跳过:hasQuotable 只认 quotable === true", [hasQuotable([{ quotable: false }, { quotable: true }]), hasQuotable([{ quotable: false }, {}]), hasQuotable([])], [true, false, false]); }
+      t("跳过:hasQuotable 只认 quotable === true", [hasQuotable([{ quotable: false }, { quotable: true }]), hasQuotable([{ quotable: false }, {}]), hasQuotable([])], [true, false, false]);
+      // 会话文件读不了(缺了 / 坏了)⇒ 不致命:记数连同会话号,跳过它,其余照跑;一个都读不了才按输入不对退出 2
+      const C4 = J(tmp, "c4"); fs.cpSync(C3, C4, { recursive: true });
+      fs.rmSync(J(C4, "sessions", `${SE}.jsonl`)); fs.writeFileSync(J(C4, "sessions", `${SC}.jsonl`), "{坏\n");
+      const x5 = run(["--extract", "--in", C4, "--library", LIB, "--out", J(tmp, "px5"), "--limit", "1"], { replies: [{ reply: { items: [] } }] });
+      t("读不了的会话文件:缺了 / 坏了 ⇒ 记进 sessionsUnreadable(带会话号)并跳过,其余照跑、退出 0",
+        [x5.code, x5.res.sessionsUnreadable, (x5.res.sessionsUnreadableList || []).map((u) => u.sid).sort(), x5.calls.length, ins(x5), x5.res.sessionsCandidates], [0, 2, [SC, SE], 1, ["戊丁"], 1]);
+      const C5 = J(tmp, "c5"); fs.cpSync(C3, C5, { recursive: true });
+      for (const sid of [SC, SD, SE]) fs.writeFileSync(J(C5, "sessions", `${sid}.jsonl`), "{坏\n");
+      const x6 = run(["--extract", "--in", C5, "--library", LIB, "--out", J(tmp, "px6")], { replies: [{ reply: { items: [] } }] });
+      t("读不了的会话文件:一个都读不了 ⇒ 退出 2(输入不对),不调模型", [x6.code, x6.res.error, /读不了/.test(x6.res.reason || ""), x6.calls.length], [2, "input", true, 0]); }
 
     // ── 重出清单(不调模型)──
     { const PR = J(tmp, "prop-render"); fs.mkdirSync(PR);
       const neg = props1.at(-1);   // 新格式(有 kind / 起止)
       const old = (o) => JSON.stringify({ sid: SB, at: iso(20), msg: "U1", quote: "先跑 自测 再提交", scope: "durable", rule: "规则", when: "总是", action: "UPDATE", target: "selftest-first", reason: "理由", ...o });
       const lines = [JSON.stringify(neg), old({}), old({ quote: "根本没说过这句话", action: "NEW", target: null }), old({ sid: "ffffffff-0000-4000-8000-00000000000f", action: "NEW", target: null }),
-        old({ msg: "U3", quote: "以后都用 pnpm 装依赖", action: "NEW", target: null }), "{坏"];
+        old({ msg: "U3", quote: "以后都用 pnpm 装依赖", action: "NEW", target: null }), "{坏",
+        JSON.stringify({ sid: SB, msg: "U1", quote: "先跑 自测 再提交", scope: "durable", rule: "没有动作键" }),   // 动作认不出:没有 action 键
+        old({ action: "constructor", rule: "原型键当动作" })];                                                     // 动作认不出:0.16.0 之前别名表查到原型键跑出来的
       fs.writeFileSync(J(PR, "proposals.jsonl"), lines.join("\n") + "\n");
       const before = fs.readFileSync(J(PR, "proposals.jsonl"));
-      const g1 = run(["--render", "--proposals", PR, "--in", C1, "--out", J(tmp, "render1.md")]);
-      const g2 = run(["--render", "--proposals", PR, "--in", C1, "--out", J(tmp, "render2")]);
+      const g1 = run(["--render", "--proposals", PR, "--in", C1, "--out", J(tmp, "render1.md"), "--library", LIB]);
+      const g2 = run(["--render", "--proposals", PR, "--in", C1, "--out", J(tmp, "render2"), "--library", LIB]);
       const md = fs.readFileSync(J(tmp, "render1.md"), "utf8");
-      t("重出:新格式 / 旧格式(起止与出处类型现算)/ 找不到出处(引文不在、会话不在)/ 出处不可引,各自计数;坏行单记;零调用",
-        [g1.code, g1.res.proposals, g1.res.found, g1.res.notQuotable, g1.res.notFound, g1.res.oldFormat, g1.res.badLines, g1.calls.length], [0, 5, 3, 1, 2, 4, 1, 0]);
+      t("重出:新格式 / 旧格式(起止与出处类型现算)/ 找不到出处(引文不在、会话不在)/ 出处不可引 / 动作认不出,各自计数;坏行单记;零调用",
+        [g1.code, g1.res.proposals, g1.res.found, g1.res.notQuotable, g1.res.notFound, g1.res.oldFormat, g1.res.badLines, g1.res.actionUnknown, g1.calls.length], [0, 7, 5, 1, 2, 6, 1, 2, 0]);
+      t("重出:动作认不出的不悄悄漏掉——正文末尾单列一组、逐条带整条消息与标记,开头那行单列条数",
+        [md.includes("## 动作认不出 2 条"), md.indexOf("## 动作认不出") > md.indexOf("## 新建(NEW)"), md.includes("「先跑 自测 再提交」"), (md.match(/记住:每次改完⟦先跑 自测 再提交⟧,别直接推/g) || []).length,
+          md.includes("动作:constructor(不在九种里)"), md.includes("动作:(没写)"), /动作认不出 2 条/.test(md.split("\n").find((l) => l.startsWith("- 提案 ")) || "")],
+        [true, true, true, 3, true, true, true]);
+      { const md1 = fs.readFileSync(J(P1, "proposals.md"), "utf8");
+        t("重出:共用的出清单函数加了「动作认不出」组,不改变 --extract 的输出(九种动作内的提案不出这一组)",
+          [md1.includes("动作认不出"), proposalBlocks(props1).some((l) => l.includes("动作认不出")), proposalBlocks([]).length, proposalBlocks([{ ...props1[0], action: "MERGE" }]).filter((l) => l.startsWith("## ")).length], [false, false, 0, 1]); }
       t("重出:每条印整条消息并用 ⟦⟧ 标出引文;找不到出处的照样列出并标明;出处不可引的标出类型、不丢",
         [md.includes("别再说⟦以后一律用 --force 推送⟧了"), md.includes("记住:每次改完⟦先跑 自测 再提交⟧,别直接推"), md.includes("「根本没说过这句话」"), (md.match(/没找到出处/g) || []).length >= 2,
           md.includes("压过的目录里没有这个会话"), md.includes("出处不可引(sdk)"), md.includes("无头开场:⟦以后都用 pnpm 装依赖⟧"), md.includes("## 新建(NEW)4 条"), md.includes("## 更新(UPDATE)1 条")],
         [true, true, true, true, true, true, true, true, true]);
       t("重出:同样的输入出两遍(文件形与目录形),逐字节相同;原来的 proposals.jsonl 一个字节没变",
         [g2.code, fs.readFileSync(J(tmp, "render1.md")).equals(fs.readFileSync(J(tmp, "render2", "proposals.md"))), fs.readFileSync(J(PR, "proposals.jsonl")).equals(before)], [0, true, true]);
-      const g3 = run(["--render", "--proposals", PR, "--in", C1]);
-      const g4 = run(["--render", "--proposals", PR, "--in", C1]);
-      const g5 = run(["--render", "--proposals", PR, "--in", C1, "--out", J(C1, "x.md")]);
+      const g3 = run(["--render", "--proposals", PR, "--in", C1, "--library", LIB]);
+      const g4 = run(["--render", "--proposals", PR, "--in", C1, "--library", LIB]);
+      const g5 = run(["--render", "--proposals", PR, "--in", C1, "--out", J(C1, "x.md"), "--library", LIB]);
       const g6 = run(["--render", "--proposals", PR, "--in", C1, "--out", J(LIB, "x.md"), "--library", LIB]);
-      const g7 = run(["--render", "--proposals", PR, P1, "--in", C1]);
+      const g7 = run(["--render", "--proposals", PR, P1, "--in", C1, "--library", LIB]);
       t("重出:不给 --out ⇒ 写在提案目录的 proposals.rendered.md;已存在 ⇒ 拒(只写新文件);落在 --in 里 / 规则库里 ⇒ 拒;多个提案目录不给 --out ⇒ 拒",
-        [g3.code, fs.existsSync(J(PR, "proposals.rendered.md")), g4.code, /只写新文件/.test(g4.res.reason || ""), g5.code, g6.code, fs.existsSync(J(LIB, "x.md")), g7.code], [0, true, 2, true, 2, 2, false, 2]); }
+        [g3.code, fs.existsSync(J(PR, "proposals.rendered.md")), g4.code, /只写新文件/.test(g4.res.reason || ""), g5.code, g6.code, fs.existsSync(J(LIB, "x.md")), g7.code], [0, true, 2, true, 2, 2, false, 2]);
+      const g8 = run(["--render", "--proposals", PR, "--in", C1, "--out", J(LIB, "y.md")]);
+      t("重出:不给 --library ⇒ 退出 2(用法),原因写明给它只是为了保证不往规则库里写、并给出命令形状;规则库不多一个文件",
+        [g8.code, g8.res.error, /不读规则库/.test(g8.res.reason || "") && /保证不往里写/.test(g8.res.reason || ""), /--render --proposals .*--in .*--library/.test(g8.res.reason || ""), fs.existsSync(J(LIB, "y.md"))], [2, "usage", true, true, false]); }
 
     // ── 打分 ──
     const s1 = run(["--score", "--proposals", P1, "--library", LIB]);
