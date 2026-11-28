@@ -6277,7 +6277,7 @@ export const RULE_W = {
     /** 批 309 C-5:codex 外审到没到场改认 codex-run **自己写的作业记录**(与 P 跨模型格同一口径;只调用 `RULE_P._p` 的各条腿,不改 P 段)。
      *  原判据看本轮命令里有没有 `codex-run.mjs` 字样——读一眼脚本、echo 一行命令都算,真跑了但命令在子代理里 / 被转后台另起
      *  `--poll` 的又可能对不上;命令文本只作触发,不作证据(闸规矩第一节第 2 条)。
-     *  合格 = 下界(`codexSince`:本批武装时刻 / P 账结清时刻 / 窗口起点,取最晚)之后发起、归属本仓(cwd 的 git 顶层是本仓根或本仓 worktree)、
+     *  合格 = 下界(`reviewSince`:本批开批时刻,没有批状态取窗口起点;批 309 第三轮起不借 P 账结清时刻)之后发起、归属本仓(cwd 的 git 顶层是本仓根或本仓 worktree)、
      *  不是 CODEX_BIN 替身,且 ①跑完的:不晚于上界、有 threadId、state=done 且 exitCode=0、写过结果件;
      *  或 ②**在途的**(批 309 第二轮,派出方裁定):state=running、发起时刻不晚于上界——外审已发起就算到场,读没读回件归规则 A,不归 W;
      *  失败 / 超时(codex-run 记 failed 或退出码非 0)的不算。返回合格记录(数组)。
@@ -6288,7 +6288,7 @@ export const RULE_W = {
       const P = RULE_P._p, ok = [];
       try {
         if (!ctx || typeof ctx.codexJobs !== "function") return null;
-        const since = P.codexSince(ctx);
+        const since = this.reviewSince(ctx);
         if (!since) return null;
         const got = ctx.codexJobs(since.at);
         if (!got || !Array.isArray(got.jobs)) return null;
@@ -6308,6 +6308,21 @@ export const RULE_W = {
     shellCodex(acts) { return acts.some((a) => /^(Bash|PowerShell)$/.test(String(a.name || "")) && /codex-run\.mjs/.test(String(a.input?.command || ""))); },
     /** codex-run 这条通道在不在场:取得到作业记录 ⇒ 有合格记录;取不到 ⇒ 回退命令字样。 */
     codexRunPresent(ctx, acts) { const jobs = this.codexJobsOk(ctx); return jobs ? jobs.length > 0 : this.shellCodex(acts); },
+    /** 批 309 第三轮(误拦猎手):W 认作业记录的下界——**只取本批的开批时刻**,不借 P 账的结清时刻 settledAt。
+     *  原用 `RULE_P._p.codexSince` = max(开批时刻, settledAt);settledAt 是三通道齐了那次收尾记下的,必晚于那次外审的发起
+     *  ⇒ 之后另一轮 --clear 时本批这次外审被排除在外(误拦)。P 账「结清后重新计」是 P 的分账语义;W 问的是本批有没有外审过这份交付物。
+     *  开批时刻与 deliverablesOf 切交付物同一组候选取最早:armedAt / clearedArmedAt / priorClosedArmedAt / turnBatchStart;
+     *  别的会话武装的批(foreign)不算;都没有 ⇒ 窗口起点(`RULE_P._p.winStartAt`,只调用);全取不到 ⇒ null(调用方回退命令字样)。
+     *  不改 codexSince(P 在用)。返回 `{ at, how }`,how ∈ batch / window。 */
+    reviewSince(ctx) {
+      const g = ctx && ctx.batchGoal;
+      if (g && typeof g === "object" && g.foreign !== true) {
+        const c = [g.armedAt, g.clearedArmedAt, g.priorClosedArmedAt, g.turnBatchStart].map((x) => Date.parse(String(x || ""))).filter(Number.isFinite);
+        if (c.length) return { at: Math.min(...c), how: "batch" };
+      }
+      const w = RULE_P._p.winStartAt(ctx);
+      return w === null ? null : { at: w, how: "window" };
+    },
     /** 作业记录的「入参」:任务文件路径 + 任务文件正文(取数方读的前 64 KB;读不到 ⇒ 只有路径)。 */
     codexJobInput(j) { return `${typeof j.task === "string" ? j.task : ""}\n${typeof j.taskText === "string" ? j.taskText : ""}`; },
     anyExternalReview(ctx) {
@@ -6639,6 +6654,10 @@ export const RULE_W = {
         const hit = cmds.filter((x) => /codex-run\.mjs/.test(String(x)));
         return hit.length ? [{ task: "", taskText: hit.join("\n") }] : RULE_W._w.codexJobsOk(c);
       } })) }) },
+    // 批 309 第三轮退回:下界借 P 账(用 codexSince = max(开批, settledAt))⇒ P 账结清后另一轮 --clear 时本批外审被排除。
+    //   证人 = neg「309 C-5 三轮:P 账结清时刻晚于本批外审、另一轮 --clear ⇒ 本批外审照算,放行」。
+    { name: "309 C-5 三轮退回:下界借 P 账结清时刻", apply: (r) => ({ ...r, detect: (ctx) => RULE_W.detect(ctx, Object.assign(Object.create(RULE_W._w), {
+      reviewSince: (c) => RULE_P._p.codexSince(c) })) }) },
     // 批 309 第二轮:在途作业不算(只认跑完的)⇒ 发起外审、作业还在后台跑就收尾被拦。证人 = neg「309 C-5:作业还在跑 ⇒ 算外审已发起」。
     { name: "309 C-5 在途作业不算外审", apply: (r) => ({ ...r, detect: (ctx) => RULE_W.detect(ctx, Object.assign(Object.create(RULE_W._w), {
       codexJobsOk(c) { const j = RULE_W._w.codexJobsOk(c); return j === null ? null : j.filter((x) => x.state !== "running"); } })) }) },
@@ -6839,6 +6858,13 @@ export const RULE_W = {
       { name: "309 C-5:任务正文写了交付物名、作业记录合格 ⇒ 放行", text: "审毕收工。", at: P_T0,
         bash: ["node ~/.claude/scripts/codex-run.mjs --task clipboard/codex/t.md", "node --no-warnings scripts/batch-goal.mjs --clear"],
         write: "clipboard/gate-playbook.md",
+        codexJobs: pJobs(pJob({ task: "/repo/clipboard/codex/t.md", taskText: "用途:审读 clipboard/gate-playbook.md 能否发布。" })) },
+      // 批 309 第三轮(误拦猎手,合并后版本实测):本批外审跑完之后,P 账在某次收尾结清(settledAt 晚于外审发起),
+      //   再在另一轮 --clear ⇒ 原下界借 P 账的 settledAt,把本批这次外审排除在外 ⇒ 误拦。W 的下界只取本批开批时刻。
+      { name: "309 C-5 三轮:P 账结清时刻晚于本批外审、另一轮 --clear ⇒ 本批外审照算,放行", text: "审毕收工。", at: P_T0,
+        bash: ["node ~/.claude/scripts/codex-run.mjs --task clipboard/codex/t.md", "node --no-warnings scripts/batch-goal.mjs --clear"],
+        write: "clipboard/gate-playbook.md",
+        batchGoal: { batch: "309", conditions: ["甲"], armedAt: "2026-11-07T07:55:00Z" }, pLedger: { carriers: 0, settledAt: "2026-11-07T08:06:00Z" },
         codexJobs: pJobs(pJob({ task: "/repo/clipboard/codex/t.md", taskText: "用途:审读 clipboard/gate-playbook.md 能否发布。" })) },
       // 批 309 第二轮(派出方裁定,原 pos 翻面):作业还在后台跑 ⇒ 外审已发起,算到场;读没读回件归规则 A
       { name: "309 C-5:作业还在跑(state=running)⇒ 算外审已发起,放行", text: "codex 在后台审,收工。", at: P_T0,
