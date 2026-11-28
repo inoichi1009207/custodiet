@@ -11,11 +11,20 @@
 //        --cond "<条件>" [--check "<命令>" [--expect "<子串>" | --expect-re "<正则>"]] [--cond …]   (原样透传给 batch-goal --arm)
 //        [--finish-line "<终点线>"] [--max-turns 80] [--max-budget-usd 8] [--cap-usd 20] [--deadline-min 90]
 //        [--model <名>] [--judge-model opus] [--no-merge] [--push <远端名>] [--handoff-out <路径>] [--same-error-limit 3]
+//        [--route plan|criteria|direct [--route-reason "<一句>"]] [--triage-model <名>]
 //   node --no-warnings scripts/batch-run.mjs --status [<批号>]      只读:运行状态与 runs.jsonl
 //   node --no-warnings scripts/batch-run.mjs --self-test           临时 git 仓 + 真 batch-goal + 按剧本行事的假 claude
 // 退出码:0 = 已关账;10 = 停下了(交接已写);2 = 拒绝发车(什么都没起);1 = 内部错误(尽量也写交接)。
 // stdout 最后一行恒为 `BATCH_RUN_RESULT=<JSON>`(键:batch status reason reasonCode stage rounds acceptRounds costUsd
-//   sessionId worktree branch handoff ruler pushed notes)。进度信息一律写 stderr。
+//   sessionId worktree branch handoff ruler pushed notes triage)。进度信息一律写 stderr。
+//
+// 分流(批 309,判词见 batch-triage.mjs):发车前检查的最后一步。
+//   给了 --route ⇒ 照它(source caller),不筛规则、不调模型——规则误判时的出路;
+//   没给 --route、带了 --cond ⇒ 只过规则:命中 ⇒ plan;没命中 ⇒ criteria(source caller);
+//   没给 --route、也没给 --cond ⇒ 规则 + 便宜模型(--triage-model > batch-triage.json 的 model > haiku)。
+//   plan ⇒ 拒绝发车(triage-plan);criteria 缺 --cond 或 --check ⇒ 拒绝(triage-need-criteria);
+//   direct ⇒ 没 --cond 就拿「照这句话做完:<原话>」当条件,没 --check 就用 batch-triage.json 的 directCheck,也没有 ⇒ 拒绝(triage-no-default-check)。
+//   拒绝时什么都不起(只往 triage.jsonl 记一行判词);判词对象记进运行状态、runs.jsonl 那一行和结果行的 triage 键。
 //
 // 代价不对称(拿不准时照这个定):
 //   ① 不该关的批被关了账(检查没过、活没提交、裁决缺失却 --clear)最贵 ⇒ 验收与关账任何一步判不了,一律停下写交接,不猜成「过」;
@@ -52,6 +61,7 @@ import { findBash, normCheckout, parseArm } from "./batch-goal.mjs";
 import { JOB_ROOT as CODEX_JOB_ROOT, isPlaceholder } from "./codex-run.mjs";
 import { readInstallConfig, installNames, INSTALL_CONFIG_FILE } from "./lib/install-config.mjs";
 import { createWatch, SAME_ERROR_LIMIT } from "./batch-watch.mjs";
+import { triage as triageAsk, ruleVerdict, DEFAULT_RULES, extraRules, readTriageConfig, appendLedger, verdictRow, DEFAULT_MODEL as TRIAGE_DEFAULT_MODEL, ROUTES, TRIAGE_CONFIG_FILE } from "./batch-triage.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const HERE = path.dirname(SELF);
@@ -75,7 +85,8 @@ export function parseCli(argv) {
     if (argv.length > 2 || (argv[1] !== undefined && !/^[\w.-]+$/.test(argv[1]))) throw new Error("用法: --status [<批号>]");
     return { mode: "status", batch: argv[1] ?? null };
   }
-  const STR = { "--batch": "batch", "--instruction": "instruction", "--finish-line": "finishLine", "--model": "model", "--judge-model": "judgeModel", "--push": "push", "--handoff-out": "handoffOut" };
+  const STR = { "--batch": "batch", "--instruction": "instruction", "--finish-line": "finishLine", "--model": "model", "--judge-model": "judgeModel", "--push": "push", "--handoff-out": "handoffOut",
+    "--route": "route", "--route-reason": "routeReason", "--triage-model": "triageModel" };
   const NUM = { "--max-turns": "maxTurns", "--max-budget-usd": "maxBudgetUsd", "--cap-usd": "capUsd", "--deadline-min": "deadlineMin" };
   const INT0 = { "--same-error-limit": "sameErrorLimit" };   // 非负整数;0 = 关掉看守
   const PASS = new Set(["--cond", "--check", "--expect", "--expect-re"]);
@@ -118,9 +129,49 @@ export function parseCli(argv) {
   if (!o.instruction) throw new Error("缺 --instruction \"<用户原话>\"");
   let parsed;
   try { parsed = parseArm(o.arm); } catch (e) { throw new Error(`完成条件参数(与 batch-goal --arm 同一语法):${e.message}`); }
-  if (!parsed.conds.length) throw new Error("至少要一条 --cond");
-  if (!parsed.checks.length) throw new Error("至少要一条 --check:硬门只认开批时登记的可执行检查,没有检查就没有「过」");
+  // 「至少一条 --cond 和 --check」不在这里拒了:没写完成标准的一句话要先过分流(direct 路线由脚本补条件与检查);
+  //   criteria 路线缺它们时由 routeDecision 拒(triage-need-criteria),拒绝那段话里写出路(批 309)。
+  if (o.route !== undefined && !ROUTES.includes(o.route)) throw new Error(`--route「${o.route}」要是 ${ROUTES.join(" / ")} 之一`);
+  if (o.routeReason !== undefined && o.route === undefined) throw new Error("--route-reason 要和 --route 一起给(比如 --route criteria --route-reason \"<理由>\")");
+  if (o.triageModel !== undefined && !/^[\w.:[\]-]{1,80}$/.test(o.triageModel)) throw new Error(`--triage-model「${o.triageModel}」不像模型名`);
   return { mode: "run", ...DEFAULTS, ...o, conds: parsed.conds, checks: parsed.checks };
+}
+
+// ── 分流(批 309)──────────────────────────────────────────────────────────────────────
+/** 定判词(不落盘)。--route ⇒ caller;带 --cond ⇒ 只过规则;都没有 ⇒ 规则 + 便宜模型(askTriage 可换,自测用)。 */
+export async function decideTriage(o, conf, { bin, askTriage = triageAsk } = {}) {
+  if (o.route) return { route: o.route, reason: o.routeReason || `调用方用 --route ${o.route} 指定`, source: "caller", ruleHits: [], model: null, costUsd: 0, ms: 0 };
+  const rules = [...DEFAULT_RULES, ...extraRules(conf.planPatterns)];
+  if (o.conds.length) {
+    const rv = ruleVerdict(o.instruction, rules);
+    if (rv) return rv;
+    return { route: "criteria", reason: "调用方已写好完成标准(--cond),规则没命中;没调模型", source: "caller", ruleHits: [], model: null, costUsd: 0, ms: 0 };
+  }
+  return askTriage({ instruction: o.instruction, model: o.triageModel || conf.model || TRIAGE_DEFAULT_MODEL, planPatterns: conf.planPatterns, bin });
+}
+const SRC_ZH = { rule: "规则", model: "模型", fallback: "兜底", caller: "调用方" };
+/** 判词 ⇒ 发车与否。返回 { refuse:{ code, why } } | { arm, conds, checks }(direct 补过条件与检查的)。纯函数。 */
+export function routeDecision(o, v, conf) {
+  const head = (zh) => `分流判「${zh}」(${SRC_ZH[v.source] || v.source}):${v.reason}`;
+  if (v.route === "plan") {
+    return { refuse: { code: "triage-plan", why: `${head("完整计划")}。这句话该走完整计划(含对抗审计),发车脚本不收。判错了的出路:加 --route criteria --route-reason "<理由>"(带上 --cond 和至少一条 --check)重发` } };
+  }
+  if (v.route === "criteria") {
+    if (o.conds.length && o.checks.length) return { arm: o.arm, conds: o.conds, checks: o.checks };
+    const miss = o.conds.length ? "缺 --check(硬门只认可执行检查)" : "没有 --cond 和 --check";
+    return { refuse: { code: "triage-need-criteria", why: `${head("只写完成标准")}。这条路要先写好完成标准和检查,现在${miss}。写好 --cond "<什么算完成>" 和 --check "<命令>" 后带 --route criteria 重发` } };
+  }
+  // direct
+  const dc = conf.directCheck;
+  if (!o.checks.length && !dc) {
+    return { refuse: { code: "triage-no-default-check", why: `${head("直接做")}。直接做也要一条跑得出「过 / 不过」的检查,但没给 --check,${TRIAGE_CONFIG_FILE} 里也没配 directCheck。出路二选一:① 带 --cond "<什么算完成>" --check "<命令>" --route direct 重发;② 在主 checkout 根目录的 ${TRIAGE_CONFIG_FILE} 里配 "directCheck": "<命令>"` } };
+  }
+  let arm = o.arm.slice();
+  if (!o.conds.length) arm = ["--cond", `照这句话做完:${o.instruction}`];
+  if (!o.checks.length) arm.push("--check", dc.cmd, ...(dc.expect !== undefined ? ["--expect", dc.expect] : dc.expectRe !== undefined ? ["--expect-re", dc.expectRe] : []));
+  let p;
+  try { p = parseArm(arm); } catch (e) { return { refuse: { code: "triage-no-default-check", why: `${head("直接做")}。${TRIAGE_CONFIG_FILE} 的 directCheck 不合 batch-goal --arm 的语法(${e.message})。出路:改好 directCheck,或带 --cond / --check 重发` } }; }
+  return { arm, conds: p.conds, checks: p.checks };
 }
 
 // ── 纯判定(自测逐条钉住)────────────────────────────────────────────────────────────
@@ -464,7 +515,7 @@ function stateOf(C) {
     caps: { maxTurns: o.maxTurns, maxBudgetUsd: o.maxBudgetUsd, capUsd: o.capUsd, deadline: new Date(C.deadlineAt).toISOString(), sameErrorLimit: o.sameErrorLimit ?? null },
     model: o.model ?? null, judgeModel: o.judgeModel, instruction: o.instruction,
     rounds: C.launches, acceptRounds: R.acceptRounds, failHistory: C.failHistory.map((f) => f.map((i) => i.kind)),
-    judge: C.judge, costUsd: round4(C.spent), merged: C.merged, pushed: R.pushed, handoff: R.handoff, ruler: R.ruler, notes: R.notes,
+    judge: C.judge, triage: C.triage ?? null, costUsd: round4(C.spent), merged: C.merged, pushed: R.pushed, handoff: R.handoff, ruler: R.ruler, notes: R.notes,
     startedAt: new Date(C.startMs).toISOString(), updatedAt: new Date().toISOString(),
   };
 }
@@ -473,7 +524,7 @@ function saveState(C) {
 }
 function note(C, s) { C.R.notes.push(s); say(s); }
 function emitResult(R) {
-  const keys = ["batch", "status", "reason", "reasonCode", "stage", "rounds", "acceptRounds", "costUsd", "sessionId", "worktree", "branch", "handoff", "ruler", "pushed", "notes"];
+  const keys = ["batch", "status", "reason", "reasonCode", "stage", "rounds", "acceptRounds", "costUsd", "sessionId", "worktree", "branch", "handoff", "ruler", "pushed", "notes", "triage"];
   process.stdout.write(RESULT_KEY + JSON.stringify(Object.fromEntries(keys.map((k) => [k, R[k] ?? (k === "notes" ? [] : k === "pushed" ? false : null)]))) + "\n");
 }
 
@@ -491,7 +542,6 @@ function preflight(o, cwd = process.cwd()) {
   const head = git(top, ["rev-parse", "HEAD"]);
   if (head.status !== 0 || !/^[0-9a-f]{40}/.test(head.stdout.trim())) return no("取不到 HEAD 提交(零提交的仓?)");
   if (!/^[\w.-]+$/.test(o.batch)) return no(`批号「${o.batch}」不合格`);
-  if (!o.checks.length) return no("没有 --check");
   if (!findBash()) return no("找不到 Git Bash(检查一律经 bash -c 跑;BATCH_GOAL_BASH 可指定)");
   const claude = resolveClaudeBin();
   if (!claude) return no("找不到 claude(PATH 里没有;BATCH_RUN_CLAUDE_BIN 可指定)");
@@ -829,7 +879,7 @@ function appendRun(C) {
   const { o, R } = C;
   const row = { at: new Date().toISOString(), batch: o.batch, status: R.status, reason: R.reason, reasonCode: R.reasonCode, stage: R.stage,
     rounds: C.launches.map((r) => ({ k: r.k, kind: r.kind, cls: r.cls, turns: r.turns, costUsd: r.costUsd, ms: r.ms })),
-    acceptRounds: R.acceptRounds, judge: C.judge ? (C.judge.verdict || "判不了") : null, watch: C.watchHit || null, costUsd: round4(C.spent),
+    acceptRounds: R.acceptRounds, judge: C.judge ? (C.judge.verdict || "判不了") : null, watch: C.watchHit || null, triage: C.triage ?? null, costUsd: round4(C.spent),
     model: o.model ?? null, judgeModel: o.judgeModel, sessionId: C.sid, ruler: R.ruler, pushed: R.pushed, totalMs: Date.now() - C.startMs };
   try { fs.mkdirSync(C.runDir, { recursive: true }); fs.appendFileSync(path.join(C.runDir, "runs.jsonl"), JSON.stringify(row) + "\n", "utf8"); }
   catch (e) { say(`runs.jsonl 写不进去(${e.code || e.message})`); }
@@ -905,10 +955,21 @@ async function runBatch(o) {
     sessionId: null, worktree: null, branch: null, handoff: null, ruler: null, pushed: false, notes: [] };
   const pf = preflight(o);
   if (!pf.ok) { R.status = "refused"; R.reasonCode = "refused"; R.reason = pf.why; say(`拒绝发车:${pf.why}`); emitResult(R); return 2; }
+  // 分流:发车前检查的最后一步(要问模型,放在便宜的检查之后;拒绝时什么都不起,只往 triage.jsonl 记一行判词)
+  const conf = readTriageConfig(pf.root);
+  if (conf.error) say(conf.error);
+  for (const n of conf.notes) say(n);
+  const tv = await decideTriage(o, conf, { bin: pf.claude });
+  R.triage = tv; R.costUsd = round4(Number.isFinite(tv.costUsd) ? tv.costUsd : 0);
+  say(`分流:${tv.route}(${tv.source})${tv.reason}`);
+  appendLedger(pf.root, verdictRow(tv, { instruction: o.instruction, batch: o.batch, via: "batch-run" }));
+  const dec = routeDecision(o, tv, conf);
+  if (dec.refuse) { R.status = "refused"; R.reasonCode = dec.refuse.code; R.reason = dec.refuse.why; say(`拒绝发车:${dec.refuse.why}`); emitResult(R); return 2; }
+  o = { ...o, arm: dec.arm, conds: dec.conds, checks: dec.checks };
   const startMs = Date.now();
   const sidEnv = process.env.CLAUDE_CODE_SESSION_ID;
   const C = { o, R, ...pf, sid: crypto.randomUUID(), launcherSid: typeof sidEnv === "string" && /^[\w-]{8,80}$/.test(sidEnv) ? sidEnv : null,
-    startMs, deadlineAt: startMs + o.deadlineMin * 60_000, spent: 0, launches: [], failHistory: [], lastItems: [], lastUnknown: [],
+    startMs, deadlineAt: startMs + o.deadlineMin * 60_000, spent: Number.isFinite(tv.costUsd) ? tv.costUsd : 0, triage: tv, launches: [], failHistory: [], lastItems: [], lastUnknown: [],
     judge: null, repairs: 0, merged: false, pushedNow: false, childPid: null, armedAt: null, lastResultText: "", lastCheck: null, sessionCostSeen: null, watchHit: null };
   R.sessionId = C.sid;
   try { return await drive(C); }
@@ -953,7 +1014,7 @@ import { spawnSync } from "node:child_process";
 const argv = process.argv.slice(2);
 const plan = JSON.parse(fs.readFileSync(process.env.BATCH_RUN_FAKE_PLAN, "utf8"));
 const callsFile = process.env.BATCH_RUN_FAKE_CALLS;
-const kind = argv.includes("--agent") ? "judge" : "exec";
+const kind = argv.includes("--tools") ? "triage" : argv.includes("--agent") ? "judge" : "exec";
 let prior = [];
 try { prior = fs.readFileSync(callsFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch {}
 const idx = prior.filter((c) => c.kind === kind).length;
@@ -961,6 +1022,12 @@ const chunks = [];
 for await (const c of process.stdin) chunks.push(c);
 const stdin = Buffer.concat(chunks).toString("utf8");
 fs.appendFileSync(callsFile, JSON.stringify({ kind, idx, argv, cwd: process.cwd(), stdin, env: { sid: process.env.CLAUDE_CODE_SESSION_ID || null } }) + "\n");
+if (kind === "triage") {   // 分流的便宜模型:一个 json 结果(--output-format json 的形状)
+  const st = (plan.triage || [])[idx] || { reply: "剧本没有这一步" };
+  if (st.sleepMs) await new Promise((r) => setTimeout(r, st.sleepMs));
+  process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: st.reply ?? "", total_cost_usd: st.cost ?? 0.001, num_turns: 1 }) + "\n");
+  process.exit(st.code ?? 0);
+}
 const step = ((kind === "judge" ? plan.judge : plan.steps) || [])[idx] || { result: { text: "剧本没有这一步" } };
 const git = (cwd, ...a) => spawnSync("git", a, { cwd, encoding: "utf8", windowsHide: true });
 for (const a of step.actions || []) {
@@ -1042,7 +1109,37 @@ async function selfTest() {
   t("仓名:ssh / https / 本地路径 / 尾斜杠", ["git@example.com:o/app-private.git", "https://example.com/o/r", "E:/x/priv-remote.git", "/repo/a.git/", ""].map(repoNameOf), ["app-private", "r", "priv-remote", "a", null]);
   t("外审作业:同 slug 只留最新", latestPerSlug([{ id: "a", slug: "s", startedAt: "2026-01-01T00:00:01Z" }, { id: "b", slug: "s", startedAt: "2026-01-01T00:00:02Z" }, { id: "c", slug: "u", startedAt: "2026-01-01T00:00:00Z" }]).map((j) => j.id), ["c", "b"]);
   const pe = (a) => { try { return parseCli(a).mode; } catch (e) { return `throw:${/--check/.test(e.message) ? "check" : e.message.slice(0, 20)}`; } };
-  t("命令行:没有 --check ⇒ 抛(点名 --check)", pe(["--batch", "x", "--instruction", "做", "--cond", "甲"]), "throw:check");
+  t("命令行:没有 --cond / --check 不再在这里拒(先过分流);--route 只收三个词;--route-reason 单给 ⇒ 抛;--triage-model 照收",
+    [pe(["--batch", "x", "--instruction", "做", "--cond", "甲"]), pe(["--batch", "x", "--instruction", "做"]), pe(["--batch", "x", "--instruction", "做", "--route", "fast"]),
+      pe(["--batch", "x", "--instruction", "做", "--route-reason", "规则误判"]), parseCli(["--batch", "x", "--instruction", "做", "--route", "direct", "--route-reason", "小", "--triage-model", "haiku"]).route].map((x) => (String(x).startsWith("throw") ? "throw" : x)),
+    ["run", "run", "throw", "throw", "direct"]);
+  { // 分流的纯部分:decideTriage(换掉问模型的那一步)与 routeDecision
+    const P = (extra) => parseCli(["--batch", "x", "--instruction", extra.ins ?? "给 README 加一行", ...(extra.args || [])]);
+    let asked = 0;
+    const ask = async () => { asked++; return { route: "direct", reason: "小", source: "model", ruleHits: [], model: "haiku", costUsd: 0.001, ms: 1 }; };
+    const noConf = { planPatterns: [], model: null, directCheck: null };
+    const v1 = await decideTriage(P({ args: ["--route", "criteria", "--route-reason", "规则误判了"], ins: "部署到服务器" }), noConf, { askTriage: ask });
+    const v2 = await decideTriage(P({ args: ["--cond", "甲", "--check", "true"], ins: "部署到服务器" }), noConf, { askTriage: ask });
+    const v3 = await decideTriage(P({ args: ["--cond", "甲", "--check", "true"] }), noConf, { askTriage: ask });
+    t("分流:--route 给了 ⇒ caller、照它、不筛规则不调模型;带 --cond ⇒ 只过规则(命中 plan / 没命中 criteria caller),不调模型",
+      [v1.route, v1.source, v1.reason, v2.route, v2.source, v3.route, v3.source, asked], ["criteria", "caller", "规则误判了", "plan", "rule", "criteria", "caller", 0]);
+    const v4 = await decideTriage(P({}), { ...noConf, model: "sonnet" }, { askTriage: async (a) => { asked++; return { route: "direct", reason: a.model, source: "model" }; } });
+    const v5 = await decideTriage(P({ args: ["--triage-model", "opus"] }), { ...noConf, model: "sonnet" }, { askTriage: async (a) => ({ route: "direct", reason: a.model, source: "model" }) });
+    t("分流:没 --cond 没 --route ⇒ 问模型;模型名 --triage-model > 配置 > haiku", [asked, v4.reason, v5.reason], [1, "sonnet", "opus"]);
+    const V = (route, source = "model") => ({ route, reason: "理由甲", source });
+    const d1 = routeDecision(P({}), V("plan"), noConf);
+    t("出路:plan ⇒ triage-plan,写明理由与 --route criteria --route-reason 的出路", [d1.refuse?.code, /理由甲/.test(d1.refuse?.why), /--route criteria --route-reason/.test(d1.refuse?.why), /完整计划/.test(d1.refuse?.why)], ["triage-plan", true, true, true]);
+    const d2 = routeDecision(P({}), V("criteria"), noConf), d2b = routeDecision(P({ args: ["--cond", "甲"] }), V("criteria", "caller"), noConf);
+    t("出路:criteria 缺 --cond / 缺 --check ⇒ triage-need-criteria,写明带 --route criteria 重发", [d2.refuse?.code, /--route criteria 重发/.test(d2.refuse?.why), d2b.refuse?.code, /缺 --check/.test(d2b.refuse?.why)], ["triage-need-criteria", true, "triage-need-criteria", true]);
+    const d3 = routeDecision(P({}), V("direct"), noConf);
+    t("出路:direct 没 --check 也没 directCheck ⇒ triage-no-default-check,两条出路都写", [d3.refuse?.code, /--check/.test(d3.refuse?.why), /directCheck/.test(d3.refuse?.why)], ["triage-no-default-check", true, true]);
+    const d4 = routeDecision(P({}), V("direct"), { ...noConf, directCheck: { cmd: "test -f a", expectRe: "^" } });
+    const d5 = routeDecision(P({ args: ["--cond", "甲"] }), V("direct", "caller"), { ...noConf, directCheck: { cmd: "true" } });
+    const d6 = routeDecision(P({ args: ["--cond", "甲", "--check", "test -f b"] }), V("direct", "caller"), { ...noConf, directCheck: { cmd: "true" } });
+    t("出路:direct 没 --cond ⇒ 条件「照这句话做完:<原话>」+ directCheck;有 --cond 没 --check ⇒ 挂 directCheck;两样都给 ⇒ 照调用方的",
+      [d4.conds, d4.checks, d5.conds, d5.checks.map((c) => c.cmd), d6.checks.map((c) => c.cmd)],
+      [["照这句话做完:给 README 加一行"], [{ i: 0, cmd: "test -f a", expectRe: "^" }], ["甲"], ["true"], ["test -f b"]]);
+    t("出路:criteria 有条件有检查 ⇒ 照发", routeDecision(P({ args: ["--cond", "甲", "--check", "true"] }), V("criteria", "caller"), noConf).conds, ["甲"]); }
   t("命令行:缺省值 / 透传", (() => { const p = parseCli(["--batch", "x", "--instruction", "做", "--cond", "甲", "--check", "true", "--expect-re", "^ok"]); return [p.maxTurns, p.maxBudgetUsd, p.capUsd, p.deadlineMin, p.judgeModel, p.model, p.arm]; })(),
     [80, 8, 20, 90, "opus", undefined, ["--cond", "甲", "--check", "true", "--expect-re", "^ok"]]);
   { const base = ["--batch", "x", "--instruction", "做", "--cond", "甲", "--check", "true"];
@@ -1109,7 +1206,7 @@ async function selfTestE2E(t, tmp) {
     try { cs = fs.readFileSync(calls, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { cs = []; }
     if (!res) console.log(`      (${name} 末行不是结果行;stderr 尾部:${tail(r.stderr, 800)})`);
     if (process.env.BATCH_RUN_SELFTEST_TIMING) console.log(`      (${name} ${Date.now() - T1} ms)`);
-    return { code: r.status, res: res || {}, calls: cs, exec: cs.filter((c) => c.kind === "exec"), judge: cs.filter((c) => c.kind === "judge"), stderr: String(r.stderr || "") };
+    return { code: r.status, res: res || {}, calls: cs, exec: cs.filter((c) => c.kind === "exec"), judge: cs.filter((c) => c.kind === "judge"), triage: cs.filter((c) => c.kind === "triage"), stderr: String(r.stderr || "") };
   };
   const argsFor = (b, extra = [], check = `test -f ${b}.txt`) => ["--batch", b, "--instruction", `自测指令 ${b}:照剧本做`, "--cond", `${b}.txt 在`, "--check", check, ...extra];
   const has = (arr, x) => arr.includes(x);
@@ -1258,7 +1355,7 @@ async function selfTestE2E(t, tmp) {
 
   // ⑩ 发车前检查:没有 --check / 锁被活进程占着 / 在 linked worktree 里 ⇒ 退出 2,不留工作树
   { const r = run("t10a", ["--batch", "t10a", "--instruction", "x", "--cond", "甲"], null);
-    t("⑩ 没有 --check ⇒ 退出 2、refused、没起 claude、没留工作树", [r.code, r.res.status, r.calls.length, fs.existsSync(wtOf("t10a"))], [2, "refused", 0, false]); }
+    t("⑩ 没有 --check ⇒ 退出 2、refused(triage-need-criteria,点名缺 --check)、没起 claude、没留工作树", [r.code, r.res.status, r.res.reasonCode, /缺 --check/.test(r.res.reason || ""), r.calls.length, fs.existsSync(wtOf("t10a"))], [2, "refused", "triage-need-criteria", true, 0, false]); }
   { fs.mkdirSync(RUN, { recursive: true });
     const lock = J(RUN, "zz-lock.json");
     fs.writeFileSync(lock, JSON.stringify({ batch: "zz-lock", status: "running", pid: process.pid }));
@@ -1267,6 +1364,43 @@ async function selfTestE2E(t, tmp) {
     t("⑩ 锁被活进程占着 ⇒ 退出 2、没留工作树与分支、没写运行状态", [r.code, r.res.status, /还在跑/.test(r.res.reason || ""), fs.existsSync(wtOf("t10b")), branchExists("t10b"), fs.existsSync(J(RUN, "t10b.json"))], [2, "refused", true, false, false, false]); }
   { const r = run("t10c", argsFor("t10c"), null, { cwd: wtOf("t3") });
     t("⑩ 在 linked worktree 里发车 ⇒ 退出 2、没留工作树", [r.code, r.res.status, /linked worktree/.test(r.res.reason || ""), fs.existsSync(wtOf("t10c")), fs.existsSync(J(wtOf("t3"), ".claude", "worktrees"))], [2, "refused", true, false, false]); }
+
+  // ⑮–㉑ 分流(批 309)
+  const left = (b) => [fs.existsSync(wtOf(b)), branchExists(b), fs.existsSync(J(RUN, `${b}.json`))];
+  const triRows = (b) => { try { return fs.readFileSync(J(RUN, "triage.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((x) => x.batch === b); } catch { return []; } };
+  const lastRun = (b) => { try { return fs.readFileSync(J(RUN, "runs.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((x) => x.batch === b).pop() || null; } catch { return null; } };
+  const only = (b) => ["--batch", b, "--instruction", `自测指令 ${b}:给文档加一行`];
+  { const r = run("t1x", argsFor("t1x"), { steps: [{ actions: [W("t1x.txt"), CM], result: ok() }] });
+    t("⑮ 带 --cond 不带 --route、规则没命中 ⇒ 不调模型、criteria / caller、照常关账;判词进结果行、runs.jsonl、triage.jsonl",
+      [r.code, r.triage.length, r.res.triage?.route, r.res.triage?.source, lastRun("t1x")?.triage?.route, triRows("t1x").map((x) => [x.route, x.source, x.via])],
+      [0, 0, "criteria", "caller", "criteria", [["criteria", "caller", "batch-run"]]]); }
+  { const r = run("t20", ["--batch", "t20", "--instruction", "自测:部署到服务器", "--cond", "甲", "--check", "true"], { triage: [{ reply: "direct\n不该被问到" }] });
+    t("⑳ 带 --cond、规则命中 ⇒ 拒绝发车(triage-plan)、不调模型、什么都不留(只记一行判词),出路写在拒绝那段话里",
+      [r.code, r.res.status, r.res.reasonCode, r.calls.length, left("t20"), /--route criteria --route-reason/.test(r.res.reason || ""), r.res.triage?.ruleHits, triRows("t20").length, lastRun("t20")],
+      [2, "refused", "triage-plan", 0, [false, false, false], true, ["server", "deploy"], 1, null]); }
+  { const r = run("t21", ["--batch", "t21", "--instruction", "自测:部署到服务器(其实只是本地文件)", "--route", "criteria", "--route-reason", "规则误判:只动本地", "--cond", "t21.txt 在", "--check", "test -f t21.txt"],
+      { steps: [{ actions: [W("t21.txt"), CM], result: ok() }], triage: [{ reply: "plan\n不该被问到" }] });
+    let st = {}; try { st = JSON.parse(fs.readFileSync(J(RUN, "t21.json"), "utf8")); } catch { st = {}; }
+    t("㉑ --route criteria --route-reason ⇒ 不筛规则、不调模型、关账;判词 caller 带理由,进运行状态",
+      [r.code, r.res.status, r.triage.length, r.res.triage?.source, r.res.triage?.reason, st.triage?.route], [0, "closed", 0, "caller", "规则误判:只动本地", "criteria"]); }
+  { const r = run("t16", only("t16"), { triage: [{ reply: "plan\n要动线上" }] });
+    t("⑯ 只有一句话、模型判 plan ⇒ 拒绝发车(triage-plan)、什么都不留、理由里带模型的话",
+      [r.code, r.res.reasonCode, r.exec.length, r.triage.length, left("t16"), /要动线上/.test(r.res.reason || ""), r.res.triage?.source], [2, "triage-plan", 0, 1, [false, false, false], true, "model"]); }
+  { const r = run("t17", only("t17"), { triage: [{ reply: "criteria\n要做取舍" }] });
+    t("⑰ 只有一句话、模型判 criteria ⇒ 拒绝发车(triage-need-criteria),写明带 --route criteria 重发", [r.code, r.res.reasonCode, r.exec.length, left("t17"), /--route criteria 重发/.test(r.res.reason || "")], [2, "triage-need-criteria", 0, [false, false, false], true]); }
+  { const r = run("t18", only("t18"), { triage: [{ reply: "嗯,看情况" }] });
+    t("⑱ 模型乱答 ⇒ 兜底 criteria / fallback ⇒ 拒绝发车(triage-need-criteria)", [r.code, r.res.reasonCode, r.res.triage?.route, r.res.triage?.source], [2, "triage-need-criteria", "criteria", "fallback"]); }
+  { const r = run("t19", only("t19"), { triage: [{ reply: "direct\n只加一行" }] });
+    t("⑲ 模型判 direct、没 --check、没配 directCheck ⇒ 拒绝发车(triage-no-default-check)、两条出路都写、什么都不留",
+      [r.code, r.res.reasonCode, r.exec.length, left("t19"), /--check/.test(r.res.reason || "") && /directCheck/.test(r.res.reason || "")], [2, "triage-no-default-check", 0, [false, false, false], true]); }
+  { fs.writeFileSync(J(A, TRIAGE_CONFIG_FILE), JSON.stringify({ directCheck: "test -f t15.txt" }));
+    const r = run("t15", only("t15"), { triage: [{ reply: "```\nDirect\n只加一行\n```", cost: 0.002 }], steps: [{ actions: [W("t15.txt"), CM], result: ok() }] });
+    fs.rmSync(J(A, TRIAGE_CONFIG_FILE), { force: true });
+    const ta = r.triage[0]?.argv || [];
+    t("⑲ 只有一句话、模型判 direct、配了 directCheck ⇒ 条件「照这句话做完:<原话>」+ 缺省检查,跑到关账",
+      [r.code, r.res.status, r.res.triage?.route, r.res.triage?.source, r.exec[0]?.stdin.includes("照这句话做完:自测指令 t15"), r.exec[0]?.stdin.includes("test -f t15.txt"), lastRun("t15")?.triage?.route],
+      [0, "closed", "direct", "model", true, true, "direct"]);
+    t("⑲ 分流那次调用:--model haiku、--max-turns 1、json、--tools 空串、工作目录不是仓;花费算进整批", [valAfter(ta, "--model"), valAfter(ta, "--max-turns"), valAfter(ta, "--output-format"), valAfter(ta, "--tools"), path.resolve(r.triage[0]?.cwd || A).startsWith(path.resolve(A)), r.res.costUsd >= 0.002], ["haiku", "1", "json", "", false, true]); }
 
   // ⑨ --push 远端在私仓名单(本地裸仓当远端)⇒ 推了且回读一致(不在名单的那一半并在 ① 里)
   { const bare = J(tmp, "priv-remote.git");

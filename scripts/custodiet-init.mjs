@@ -122,6 +122,8 @@ const FILES = [
   "scripts/batch-run.mjs",
   // 0.13.0:看守(纯判定 + 回放量具);batch-run 静态 import 它
   "scripts/batch-watch.mjs",
+  // 批 309:分流(规则 + 便宜模型判三条路线);batch-run 静态 import 它。配置是装方自备的 batch-triage.json(可缺)
+  "scripts/batch-triage.mjs",
   "scripts/lib/alloc-prompt-id.mjs",
   "scripts/alloc-prompt-id-selftest.mjs",
   "scripts/lib/exit-watchdog.mjs",
