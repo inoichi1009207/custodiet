@@ -93,7 +93,7 @@ const BLOCK_ON_R = process.env.STOP_CLOSURE_BLOCK_R !== "0";
 //   本闸进程锚在仓根(见生产段 chdir),批状态原来只读主树的 `.claude/.batch-goal.json`。会话在 `.claude/worktrees/<名>/` 里武装批时,
 //   收尾闸读到的是主树上别的会话的批或已结清的旧批:K 判「结清半路出错」(281)、K0 判「未武装」(284 两次,其中一次会话主目录已切回主树)。
 //   修法:在主树与 `.claude/worktrees/*` 的批状态里挑**本会话的**(armedBy 等于本会话 / 本会话转录里武装过该批号,判法 isForeignBatch),
-//   优先未结清,其次武装时刻最新;一个都不是本会话的 ⇒ 照旧读主树(外来批由 S / K 的 foreign 处理)。
+//   优先未结清,其次武装时刻最新;一个都不是本会话的 ⇒ 照旧读主树(外来批由 K 的 foreign 处理;S 已于批 308 删除)。
 //   只在生产路径生效(`_liveSid` 由生产段设);自测、回放、CLI 一律读当前目录。
 //   代价:每次 Stop 多读 worktree 数个小 JSON;worktree 里的批状态被手改成「本会话的」可让闸读它(属故意伪造,同 armedBy 天花板)。
 let _liveSid = null, _liveCwd = null, _batchDirMemo = null, _turnRanClear = false;
@@ -3906,8 +3906,10 @@ function selfTest() {
     { name: "I 不命中:写的不是载体面",
       lines: [U("go"), A("更新文档", [{ name: "Write", input: { file_path: "/repo/docs/foo.md" } }])], want: ["K0"] },
     // I 的两个新覆盖面(2026-08-19 实测漏掉整类动作后补)
-    { name: "I 命中:Edit 已有载体也算造物",
-      lines: [U("go"), A("改一下", [{ name: "Edit", input: { file_path: "/repo/.claude/agents/_x.md" } }])], want: ["I", "K0"] },
+    // 批 309 翻面(原「I 命中:Edit 已有载体也算造物」,2026-08-19):I 现只问「新建」,Edit 造不出文件 ⇒ 覆盖 / 修改既有载体不算新建
+    //   (实撞:Edit 仓外草稿里的闸脚本副本被报「本轮新建」)。Write 新建照拦,见上两条。
+    { name: "I 不命中:Edit 已有载体不算新建(批 309)",
+      lines: [U("go"), A("改一下", [{ name: "Edit", input: { file_path: "/repo/.claude/agents/_x.md" } }])], want: ["K0"] },
     { name: "I 命中:经 Bash 写载体绕不过去",
       lines: [U("go"), A("改一下", [{ name: "Bash", input: { command: "node -e \"fs.writeFileSync('scripts/foo.mjs',s)\"" } }])], want: ["I"] },   // 批 308:M 已删
     // 两条反向用例:2026-08-19 实撞的误报形态
