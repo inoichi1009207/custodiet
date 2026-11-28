@@ -243,7 +243,7 @@ const FIXTURE_KEYS = new Set(["name", "text", "commit", "write", "written", "bas
 //   第二十次:`installNames`(批 305)——安装方配置里的两份确切名字名单(部署脚本文件名 / 私仓仓名),注入通道,不进 entries。
 //     W 的部署脚本那一支、DP 的私仓短路改读它之后,「配了这个名字 / 没配」两半在夹具里要分得开;不写 ⇒ 不传(两个空名单)。
 //     值 `{ deployScripts?: string[], privateRepos?: string[] }`;子键与值形状都校验(写成字符串会被 buildCtx 静默归空)。
-const INSTALL_NAMES_KEYS = new Set(["deployScripts", "privateRepos"]);
+const INSTALL_NAMES_KEYS = new Set(["deployScripts", "privateRepos", "debtTables"]);   // 批 309 C-4:debtTables
 //   第十九次:`codexJobs`(批 297,D203)——P 跨模型格改认 codex-run 自己写的作业记录后,「命令长这样、有 / 没有合格记录」
 //     两半在夹具里要分得开;注入通道,不进 entries。值 `{ root, upper?, jobs:[{ id?, state, startedAt, endedAt?, resultAt?, cwd?, top, threadId,
 //     exitCode, failLines? }] }`(r2:upper = 此刻 / 本轮结束;top = cwd 所在 git 顶层;failLines = 失败行),

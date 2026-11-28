@@ -4958,13 +4958,15 @@ function selfTest() {
         [wHit({}), wHit({ installNames: { deployScripts: [], privateRepos: [] } })].join(), "false,false");
       // 读盘那一半(readInstallNames,假读文件):有配置 / 没有文件 / 解析坏 / 键写错
       const rd = (text, code) => JSON.stringify(readInstallNames("/repo", () => { if (code) { const e = new Error(code); e.code = code; throw e; } return text; }));
-      const EMPTY = '{"deployScripts":[],"privateRepos":[]}';
+      const EMPTY = '{"deployScripts":[],"privateRepos":[],"debtTables":[]}';
       sc("305 名单读盘:配置里两键都写了 ⇒ 原样取到",
-        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: ["deploy-prod.ps1"], privateRepos: ["app-private"] })), '{"deployScripts":["deploy-prod.ps1"],"privateRepos":["app-private"]}');
+        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: ["deploy-prod.ps1"], privateRepos: ["app-private"] })), '{"deployScripts":["deploy-prod.ps1"],"privateRepos":["app-private"],"debtTables":[]}');
       sc("305 名单读盘:没有配置文件 / 读不了 / 不是 JSON / 有未知键(整份判坏)⇒ 两个空名单,不抛",
         [rd("", "ENOENT"), rd("", "EBUSY"), rd("{oops"), rd(JSON.stringify({ format: "gate-install/v1", deployScript: ["x.ps1"] }))].join(""), EMPTY.repeat(4));
       sc("305 名单读盘:一个键形状不对 ⇒ 只那一个归空,另一个照取",
-        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: "deploy-prod.ps1", privateRepos: ["app-private"] })), '{"deployScripts":[],"privateRepos":["app-private"]}');
+        rd(JSON.stringify({ format: "gate-install/v1", deployScripts: "deploy-prod.ps1", privateRepos: ["app-private"] })), '{"deployScripts":[],"privateRepos":["app-private"],"debtTables":[]}');
+      // 批 309 C-4:配置显式写了欠账表 ⇒ 交给收尾闸(K0 簿记豁免、W 交付物排除认它)
+      sc("309 C-4 名单读盘:debtTable 显式写了 ⇒ debtTables 带它", rd(JSON.stringify({ format: "gate-install/v1", debtTable: "docs/own-debts.md" })), '{"deployScripts":[],"privateRepos":[],"debtTables":["docs/own-debts.md"]}');
       let asked = null;
       readInstallNames("/repo/x", (f) => { asked = String(f).replace(/\\/g, "/"); return "{}"; });
       sc("305 名单读盘:读的是给定根下的 gate-install.json(不是进程 cwd)", asked, "/repo/x/gate-install.json");
