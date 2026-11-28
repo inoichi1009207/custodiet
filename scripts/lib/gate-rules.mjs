@@ -1247,7 +1247,7 @@ const RULE_K = {
   //   或结清半路崩了没留拒清痕迹(红队 250 BP-2)。这一轮才响,响即阻断;其余轮次一律不响。
   // 交出去的职责:
   //   · 关账时条件是否逐条对照 ⇒ K0(批 249 修、批 250 把检查前移到早退之前,两轮关账也管);
-  //   · 做一半停下 ⇒ S 的批内判据(未改);
+  //   · 做一半停下 ⇒ 原归 S 的批内判据;S 已于批 308 删除,现在没有规则管(只剩钩子给用户看的「批仍未结清」提示);
   //   · 连写几轮不裁决(原 `batchDrifting` 阻断)⇒ **刻意放弃**,只剩 hook 给用户看的「批仍未结清」提示。
   // 刻意放弃的还有:批中途提交不要求逐条对照(一批多次提交是常态);「未达成」不再须配 ⏸。
   // 复核:codex `clipboard/codex/250-k-slim-review-r1.md`、_gate-bypass-hunter 红队(本批),口径写明误拦诚实行为同等计价。
@@ -1261,7 +1261,7 @@ const RULE_K = {
     // 批 284(281 留账,实撞):盘上这批是别的会话武装的(hook 侧 isForeignBatch 打 foreign)⇒ 当作没有批,与 S 同口径。
     //   281 那次:我在 worktree 里 --clear 了自己的批,收尾闸读的是主树台账上别的会话的批 280,判成「结清半路出错」。
     //   代价(漏放方向):本会话在别的 checkout 里结清失败时,这里看不见——那个 checkout 的批状态本会话下次武装 / 结清时自会报;
-    //   `/clear` 后会话号换了,自己原来武装的批也判成外来、结清失败不追(红队 284 终版 BP-5;同 S 的已知上限,isForeignBatch 头注)
+    //   `/clear` 后会话号换了,自己原来武装的批也判成外来、结清失败不追(红队 284 终版 BP-5;已删的 S 当年也有同一上限,isForeignBatch 头注)
     if (g.foreign) return [];
     const conds = Array.isArray(g.conditions) ? g.conditions : [];
     if (!conds.length) return [];                         // 从未武装 ⇒ K0
@@ -1270,8 +1270,8 @@ const RULE_K = {
     // 批 253(红队审 ffbdef8:BP-6 / BP-8 / BP-7):
     //   ①按执行顺序取本轮最后一次 batch-goal 状态改动,是 --clear 才算;--clear 之后又 --arm ⇒ 关旧开新,不响;
     //   ②只认执行:由 batchGoalOps 判——剥掉 VAR=值 前缀后段首是读或打印命令(grep/cat/sed/echo…)不算,其余含 batch-goal.mjs 的段一律当执行;
-    //   ③本轮标了 ⏸ 并写明三类合法停工理由之一 ⇒ 不响。⏸ 与理由这两项与 S 的 marked 同口径
-    //     (⏸ 查剥过引号的全文、理由查原文全文,都不分段)。批 253e 起 K 与 S 的 marked **完全同口径**,不再多查任何一项。
+    //   ③本轮标了 ⏸ 并写明三类合法停工理由之一 ⇒ 不响。⏸ 与理由这两项与已删的 S(批 308)的 marked 同口径
+    //     (⏸ 查剥过引号的全文、理由查原文全文,都不分段)。批 253e 起 K 与当时 S 的 marked **完全同口径**,不再多查任何一项。
     //   批 253 二修(红队审再修方案):
     //   ④ --clear 之后的 --arm **没生效**(结清被拒、或 && 短路没跑)⇒ 仍算结清没成(BP-1);
     //   ⑤ --clear 之后的 --arm 生效了(关旧开新)⇒ 查**刚关掉那批**是否逐条对照,条数由 hook 从台账补(BP-2)。
@@ -1280,7 +1280,7 @@ const RULE_K = {
     //     (裸未、裸没、⏸ 标题行加空行、拒因超 6 字、「结清后没有遗留」)⇒ 字面判「有没有交代被拒」本身判不准。
     //     现:本轮跑过 --clear、盘上仍武装、正文有 ⏸ 且写明停工类别 ⇒ 放行。
     //     **接受的漏放**:⏸ 为别的事停下、同时以为结清成功(codex 253 合并复核那条夹具,已翻 neg)。
-    //     接受理由:结清被拒时盘上批仍武装,K/S 下轮照常盯着;后果是用户看着一个未关的批停在 ⏸ 上,方向安全;
+    //     接受理由:结清被拒时盘上批仍武装,下次 --clear 时 K 照常盯着(原写「K/S 下轮」,S 已于批 308 删除);后果是用户看着一个未关的批停在 ⏸ 上,方向安全;
     //     而字面判据误拦的是如实交代拒清的阻断,每次白耗一轮。
     let ops;
     try { ops = batchGoalOps(ctx); } catch { ops = [{ op: "clear" }]; }   // 判不了按尝试过结清算(fail-closed)
@@ -1302,7 +1302,7 @@ const RULE_K = {
       return [];
     }
     const sTxtK = text.replace(/「[^」]*」|«[^»]*»|“[^”]*”|"[^"]*"/g, " ");
-    if (matchAny(sTxtK, PAT.waitMark).length && matchAny(text, PAT.stopReason).length) return [];   // 与 S 的 marked 同口径(批 253e)
+    if (matchAny(sTxtK, PAT.waitMark).length && matchAny(text, PAT.stopReason).length) return [];   // 与已删的 S 当年的 marked 同口径(批 253e)
     // 批 308 K1(实撞):这次 --clear 被放到后台、还在飞 ⇒ 盘上未结清无痕是正常的中间态,不响(批 308 只管无痕那一支;批 309 C-2 起旧拒清痕迹也一并不作数,见下)。
     //   代价(漏放,接受不拦):发起轮不响;后台结清在下一轮才跑完而失败无痕时,那一轮没有 --clear 动作,K 进不去;
     //   K0 遇到已武装的批直接返回,也不管。兜底只有两样:批没结清时下一次 `batch-goal --arm` 别的批会被拒,
@@ -1324,7 +1324,9 @@ const RULE_K = {
     return `批 ${g.batch || "?"}:${hits[0]}。\n` +
       `      出路:看这次 batch-goal --clear 的输出找拒因(可执行判据未过 / 有未提交的已跟踪改动 / 判不了工作树 / ` +
       `adr-missing 登记的决定还没有 ADR / diary-missing 登记的成果在产品日记里没有本批行 / ` +
-      `obligation-unknown 判不了决定或成果的核对),` +
+      `obligation-unknown 判不了决定或成果的核对 / ` +
+      `review-missing 本批改了闸引擎文件或规矩文件类承重面,P 要的复核通道没跑齐(照拒清那段话补跑) / ` +
+      `review-unknown 有这类提交但复核跑没跑齐判不了(本批会话的转录读不到)),` +
       `修好后重跑 --clear;登记错了的决定或成果用 batch-goal --withdraw <编号> --reason "<理由>" 撤回;` +
       `真要放弃本批,明说并留痕;要停下问用户,标 ⏸ 并写明停工类别。`;
   },
@@ -1580,8 +1582,8 @@ const RULE_K = {
         text: "⏸ 需要你确认:发布是否翻 public,属不可逆。\n\n另:本批结清没成,回头再说。",
         bash: "node --no-warnings scripts/batch-goal.mjs --clear",
         batchGoal: { batch: "253", conditions: ["甲"], clearRefusedAt: "2026-09-17T01:00:00Z" } },
-      // ── 批 253e 汇总侧裁定(窄例外③ 判据过重):⏸ 豁免不再读「结清交代」措辞,与 S 的 marked 同口径 ──
-      // 原 pos「为别的事标的 ⏸」翻面:有 ⏸ 且写了停工类别(不可逆)⇒ 放行。盘上批仍武装,K/S 下轮照常盯着。
+      // ── 批 253e 汇总侧裁定(窄例外③ 判据过重):⏸ 豁免不再读「结清交代」措辞,与当时 S 的 marked 同口径 ──
+      // 原 pos「为别的事标的 ⏸」翻面:有 ⏸ 且写了停工类别(不可逆)⇒ 放行。盘上批仍武装,下次 --clear 时 K 照常盯着(原写「K/S 下轮」,S 已于批 308 删除)。
       { name: "253e 裁定:为别的事标的 ⏸(原 pos 翻面)",
         text: "⏸ 需要你确认:clipboard/old 要不要删(不可逆)。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
         batchGoal: { batch: "253", conditions: ["甲", "乙"], clearRefusedAt: "2026-09-17T01:00:00Z" } },
@@ -1941,7 +1943,7 @@ const RULE_K0 = {
   detect: (ctx, V = {}) => {
     const g = ctx.batchGoal;
     const armed = g && !g.cleared && Array.isArray(g.conditions) && g.conditions.length > 0;
-    if (armed) return [];                                  // 已武装 ⇒ 不归 K0(批 250 后 K 只管「结清没成」,做一半停下归 S)
+    if (armed) return [];                                  // 已武装 ⇒ 不归 K0(批 250 后 K 只管「结清没成」;做一半停下原归 S,S 已于批 308 删除)
     // ⚠️ **批 250:关账覆盖检查前移到「没动工作面」与「债表簿记」两个早退之前**(codex 250 复核实指)。
     //   批 249 把覆盖检查放在两个早退之后 ⇒ 两条诚实遗忘照样无人管:
     //   ①分两轮关账——上一轮提交、本轮只 `--clear`、零对照:本轮无写无提交,第一个早退直接放行;
@@ -2806,8 +2808,9 @@ const pOnlyCodex = (name, o = {}) => ({ name, text: "法典改完并提交。", 
 const RULE_P = {
   id: "P",
   // 批 309(闸规矩第一节第 1 条「拒绝放在状态迁移那一步」):收尾钩子里的 P **只提示,永不阻断**。
-  //   拒绝挪进关账命令:`batch-goal --clear` / `--dry-check` 经 hook-stop-closure `engineReviewVerdict` 用**同一份** detect
-  //   (判据、分账、宽限、软硬之分一概不动)再问一次,本批有改闸引擎文件的提交且有硬欠项 ⇒ 拒清(`engine-review-missing`);
+  //   拒绝挪进关账命令:`batch-goal --clear` / `--dry-check` 经 hook-stop-closure `reviewVerdict` 用**同一份** detect
+  //   (判据、分账、宽限、软硬之分一概不动)再问一次,detect 有硬欠项 ⇒ 拒清(`review-missing`)——只改「什么时候拦」,
+  //   不分是闸引擎提交还是规矩文件类的承重提交(与上一版在关账 / 推送 / 合并那一轮阻断的范围相同);
   //   判定唯一实现 = `_p.clearVerdict`,提示文字里那行「关账时会不会拒」也由它算。
   //   上一版(批 308 S1b)在收尾钩子里认「本轮有没有关账 / 推送 / 合并命令」才阻断(`_p.transition`,已删):换写法、换会话、
   //   经发车脚本、rebase / cherry-pick 都认不出,且钩子在回合结束后才判、推送已经发生;文档里的 `git push` 字样、看帮助、
@@ -2819,29 +2822,29 @@ const RULE_P = {
    *  `apply: (r) => ({...r, detect})` 能复用同一批零件——变异要拧的是**判据内部**,
    *  不是把整条判据换成一个恒真/恒假的壳(那种变异构造性恒真,已被 codex 060 判死)。 */
   _p: {
-    /** 批 309:关账侧判定(唯一实现;`batch-goal --clear` / `--dry-check` 经 hook-stop-closure `engineReviewVerdict` 调,
-     *  收尾钩子的提示文字也用它说「关账时会不会拒」)。`hits` = detect 的命中(不给就现算)。返回 `{ status, hard, soft }`:
-     *    · `no-engine` —— 闸引擎面没被本批碰到(`gateEngineTouched` 为假:没有非原样装入的改闸提交,或本会话没碰过闸)⇒ 关账不拒,
-     *      承重面三通道的欠项只提示(决定 2:只对改闸引擎的提交拒);
-     *    · `missing` —— 碰到了且有硬欠项 ⇒ 拒(`engine-review-missing`);
-     *    · `soft` —— 碰到了、只欠软项(跨模型通道确实不可用)⇒ 不拒,提示并要求报告里登记;
-     *    · `ok` —— 碰到了、没有欠项。
-     *  判据不另写:欠不欠全由 detect 定,本函数只分「改没改闸」与软硬。 */
+    /** 批 309:关账侧判定(唯一实现;`batch-goal --clear` / `--dry-check` 经 hook-stop-closure `reviewVerdict` 调,
+     *  收尾钩子的提示文字也用它说「关账时会不会拒」)。`hits` = detect 的命中(不给就现算)。返回 `{ status, hard, soft, engine }`:
+     *    · `missing` —— detect 有硬欠项 ⇒ 拒(`review-missing`),不论欠的是闸引擎提交还是规矩文件类承重提交;
+     *    · `soft` —— 只欠软项(跨模型通道确实不可用)⇒ 不拒,提示并要求报告里登记;
+     *    · `ok` —— 没有欠项(含宽限内)。
+     *  `engine` = 闸引擎面是否被本批碰到(`gateEngineTouched`),只决定文案说「改了闸引擎文件」还是「改了规矩文件类承重面」。
+     *  判据不另写:欠不欠全由 detect 定,本函数只分软硬。 */
     clearVerdict(ctx, hits) {
       const H = RULE_P._p;
       const hs = Array.isArray(hits) ? hits : RULE_P.detect(ctx);
       const hard = hs.filter((h) => !h.soft), soft = hs.filter((h) => h.soft);
-      if (!H.gateEngineTouched(ctx)) return { status: "no-engine", hard, soft };
-      if (hard.length) return { status: "missing", hard, soft };
-      return { status: soft.length ? "soft" : "ok", hard, soft };
+      let engine = false;
+      try { engine = !!H.gateEngineTouched(ctx); } catch { engine = false; }
+      if (hard.length) return { status: "missing", hard, soft, engine };
+      return { status: soft.length ? "soft" : "ok", hard, soft, engine };
     },
     /** 关账侧判定 ⇒ 提示里的那一行(收尾钩子与 batch-goal 拒清那段话共用)。 */
     clearLine(v) {
       const owed = (hs) => hs.map((h) => `${String(h.ch).replace(/(.)——.*$/, "$1")}${Array.isArray(h.missing) && h.missing.length ? `(缺 ${h.missing.join("、")})` : ""}`).join(" / ");
-      if (v.status === "missing") return `关账(batch-goal --clear / --dry-check)时会拒(engine-review-missing):本批有改闸引擎的提交,现在欠 ${owed(v.hard)}。补齐后再关账。`;
-      if (v.status === "soft") return `关账时不拒:闸引擎面只欠软项(${owed(v.soft)},通道不可用),收尾报告须登记欠账。`;
-      if (v.status === "ok") return "关账时不拒:闸引擎面已跑齐。";
-      return "关账时不拒:本批没有改闸引擎的提交(或本会话没碰过闸),承重面三通道的欠项只提示。";
+      const what = v.engine ? "改闸引擎文件的提交" : "规矩文件类承重提交";
+      if (v.status === "missing") return `关账(batch-goal --clear / --dry-check)时会拒(review-missing):本批有${what},现在欠 ${owed(v.hard)}。补齐后再关账。`;
+      if (v.status === "soft") return `关账时不拒:${what}只欠软项(${owed(v.soft)},通道不可用),收尾报告须登记欠账。`;
+      return "关账时不拒:复核通道已跑齐(或在宽限内)。";
     },
     GIT: /^(\w+=\S+\s+)*git\b/,
     // (批 297:原 `NODE_CODEX` / `CODEX_ARG` 两条命令形状正则随「跨模型格改认作业记录」删除,见 `codexJobHits` 头注。)
@@ -4110,10 +4113,10 @@ const RULE_P = {
       const v = orig(ctx, hits); return v.status === "missing" && v.soft.length ? { ...v, status: "soft" } : v; } }) },
     { name: "309 关账侧只欠软项也拒(通道不可用不给出路)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
       const v = orig(ctx, hits); return v.status === "soft" ? { ...v, status: "missing", hard: v.soft } : v; } }) },
-    { name: "309 关账侧不看改闸(只改法典的批也按硬欠项拒)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
-      const v = orig(ctx, hits); return v.status === "no-engine" && v.hard.length ? { ...v, status: "missing" } : v; } }) },
-    { name: "309 关账侧恒不拒(改闸欠审也放过)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
-      const v = orig(ctx, hits); return v.status === "missing" ? { ...v, status: "no-engine" } : v; } }) },
+    { name: "309 关账侧只管闸引擎(规矩文件类承重提交欠审放过,本批第一版的窄口径)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
+      const v = orig(ctx, hits); return v.status === "missing" && !v.engine ? { ...v, status: "ok" } : v; } }) },
+    { name: "309 关账侧恒不拒(欠审也放过)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
+      const v = orig(ctx, hits); return v.status === "missing" ? { ...v, status: "ok" } : v; } }) },
     // ── 红队 a27628dd 轮的新分支各钉一条(swapP:临时换掉 _p 里的零件,跑完还原)────────────────────
     { name: "git 事实不接(恒回退语法判据:merge/cherry-pick 合回看不见)", apply: swapP({ facts: () => () => null }) },
     // 批 279「修闸 tag」两向:恒算碰过(误拦复发)/ 只看账、不看窗口与提交邻近兜底(漏放)
@@ -5020,7 +5023,7 @@ const RULE_P = {
         bash: ["cd E:/elsewhere && git add -A && git commit -m x"], agent: "grill:edge-cases",
         diffFacts: { root: "/repo", files: [{ path: "scripts/lib/ledger-chain.test.mjs", status: "M", readable: true }] } },
       // ── 批 309:收尾侧永不阻断。上一版(308 S1b)在「本轮关账 / 推送 / 合并」时阻断的几条翻过来:同一欠审状态(跨模型格缺,单变量),
-      //   任何命令写法下都只提示;拒绝挪进 batch-goal --clear(关账侧判定见下面「309 关账侧」各条与 hook-stop-closure engineReviewVerdict 自测)。
+      //   任何命令写法下都只提示;拒绝挪进 batch-goal --clear(关账侧判定见下面「309 关账侧」各条与 hook-stop-closure reviewVerdict 自测)。
       { ...pOnlyCodex("309 收尾侧:承重提交后的普通回合 ⇒ 只提示", { codexJobs: pJobs() }), expectBlock: false },
       { ...pOnlyCodex("309 收尾侧:同一欠审,本轮跑了 batch-goal --clear ⇒ 仍只提示(拒绝在关账命令自己那里)", { codexJobs: pJobs(), bash: ["node --no-warnings scripts/batch-goal.mjs --clear"] }), expectBlock: false },
       { ...pOnlyCodex("309 收尾侧:同一欠审,本轮 git push ⇒ 只提示", { codexJobs: pJobs(), bash: ["git -C /repo push private b308"] }), expectBlock: false },
@@ -5046,7 +5049,7 @@ const RULE_P = {
         prior: [{ text: "红队", at: "2026-11-07T08:00:01Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }],
         bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
         headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
-      //   ④ 只改法典(没有改闸提交)、跨模型缺 ⇒ 关账不拒,只提示(「不看改闸」变异的证人)= 上面「309 收尾侧:普通回合」那条
+      //   ④ 只改法典(没有改闸提交)、跨模型缺 ⇒ 关账照拒(「只管闸引擎」变异的证人)= 上面「309 收尾侧:普通回合」那条
     ],
     neg: [
       // 批 309(原 308 S1b P③):欠审已补齐(三格齐)⇒ 推送并合并的回合也不响
