@@ -93,7 +93,7 @@ const BLOCK_ON_R = process.env.STOP_CLOSURE_BLOCK_R !== "0";
 //   本闸进程锚在仓根(见生产段 chdir),批状态原来只读主树的 `.claude/.batch-goal.json`。会话在 `.claude/worktrees/<名>/` 里武装批时,
 //   收尾闸读到的是主树上别的会话的批或已结清的旧批:K 判「结清半路出错」(281)、K0 判「未武装」(284 两次,其中一次会话主目录已切回主树)。
 //   修法:在主树与 `.claude/worktrees/*` 的批状态里挑**本会话的**(armedBy 等于本会话 / 本会话转录里武装过该批号,判法 isForeignBatch),
-//   优先未结清,其次武装时刻最新;一个都不是本会话的 ⇒ 照旧读主树(外来批由 S / K 的 foreign 处理)。
+//   优先未结清,其次武装时刻最新;一个都不是本会话的 ⇒ 照旧读主树(外来批由 K 的 foreign 处理;S 已于批 308 删除)。
 //   只在生产路径生效(`_liveSid` 由生产段设);自测、回放、CLI 一律读当前目录。
 //   代价:每次 Stop 多读 worktree 数个小 JSON;worktree 里的批状态被手改成「本会话的」可让闸读它(属故意伪造,同 armedBy 天花板)。
 let _liveSid = null, _liveCwd = null, _batchDirMemo = null, _turnRanClear = false;
