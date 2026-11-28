@@ -2699,6 +2699,82 @@ export function settleP(P, eCtx, eFindings, now) {
   return { ledger, advance, head: f && typeof f.head === "string" ? f.head : null };
 }
 
+/** 批 309:关账侧的 P 判定——`batch-goal --clear` / `--dry-check` 调(拒绝从收尾钩子挪到关账命令;判据唯一实现 = RULE_P.detect
+ *  + `_p.clearVerdict`,这里只**取证、拼 ctx**,不另写一条认猎手的逻辑)。
+ *  范围 = 开批基点 `base` 到 HEAD(readHeadFacts,与钩子同一个取数函数;钩子用的是会话基点,关账用批基点)。
+ *  ① 范围里没有非原样装入的改闸提交 ⇒ `none`,**不读转录**(安装方的仓走这条);
+ *  ② 有 ⇒ 读本批会话(`sids`:开批的会话、本批各 arm 行的会话、现在跑关账的会话)的转录,合成一条按时刻排好的动作窗,
+ *     连同批状态、P 账(`ledgerSid` 那格)、修闸 tag(各会话并起来)、codex 作业记录、git 事实拼成 ctx,跑 detect;
+ *  ③ 结论 `{ status, engineCommits, hard, soft, unread, msg }`:status ∈ none / untouched(有改闸提交但本批会话都没碰过闸,
+ *     同钩子的修闸 tag 口径)/ ok / soft / missing / unknown(`step` 写明是哪一步读不了)。
+ *  判不了的口径:git 事实取不到、或一份转录都读不到 ⇒ unknown(拒);读到了一部分 ⇒ 照判,读不到的列进 `unread`
+ *  (欠审时拒因仍是 missing——在读得到的会话里补跑就补得上)。
+ *  `o` 的各件都可注入(自测):git / headFacts / findTranscript / readEntries / pLedger / gateTouched / codexJobs / now。 */
+export function engineReviewVerdict(o = {}) {
+  const P = RULES.find((r) => r && r.id === "P");
+  if (!P || !P._p) return { status: "unknown", step: "载入规则 P", why: "规则表里没有 P" };
+  const H = P._p, git = o.git || _gitHere;
+  let facts = null;
+  try { facts = o.headFacts !== undefined ? o.headFacts : readHeadFacts(o.base, git, H.ENGINE_PATHSPECS, H.ENGINE_REL); } catch { facts = null; }
+  if (!facts) return { status: "unknown", step: "git 事实", why: `取不到开批基点 ${String(o.base || "(没有)").slice(0, 12)} 到 HEAD 的提交与改动文件` };
+  const eng = H.gitEngineCommits(facts);
+  if (!eng.length) return { status: "none", engineCommits: [] };
+  const engineCommits = eng.map((c) => ({ sha: c.sha || null, aggregated: !!c.aggregated,
+    files: (c.files || []).map((x) => x.path).filter((p) => H.ENGINE_REL.test(normPathC(p))) }));
+  const sids = [...new Set((o.sids || []).filter((s) => typeof s === "string" && /^[\w-]{8,80}$/.test(s)))];
+  const find = typeof o.findTranscript === "function" ? o.findTranscript : () => null;
+  const readEntries = typeof o.readEntries === "function" ? o.readEntries : readTranscript;
+  const got = [], unread = [];
+  for (const sid of sids) {
+    let file = null;
+    try { file = find(sid); } catch { file = null; }
+    if (!file) { unread.push(`${sid}(找不到转录)`); continue; }
+    try { got.push(readEntries(file)); } catch (e) { unread.push(`${sid}(读不了:${String(e && (e.code || e.message) || e).slice(0, 60)})`); }
+  }
+  if (!got.length) {
+    return { status: "unknown", step: "读转录", engineCommits, unread,
+      why: sids.length ? `本批会话的转录一份都读不到:${unread.join("、")}` : "取不到本批的会话号(批状态没有 armedBy、台账 arm 行没有、环境里也没有 CLAUDE_CODE_SESSION_ID)" };
+  }
+  // 各会话的条目按时刻合成一条窗(同一份转录内部次序不变;缺时刻的条目沿用前一条的时刻)
+  const rows = [];
+  got.forEach((es, k) => { let t = 0; (Array.isArray(es) ? es : []).forEach((e, i) => { const at = Date.parse(String((e && e.timestamp) || "")); if (Number.isFinite(at)) t = at; rows.push({ e, t, k, i }); }); });
+  rows.sort((a, b) => a.t - b.t || a.k - b.k || a.i - b.i);
+  const merged = rows.map((r) => r.e);
+  const now = Number.isFinite(o.now) ? o.now : Date.now();
+  // 仓根取被判的那个仓(git 事实的 toplevel;batch-goal 从仓根跑),不取本脚本所在 checkout——两者在生产里是同一个,
+  //   在自测沙盒里不是(脚本在源仓、被判的是临时仓)。
+  const root = typeof facts.root === "string" && facts.root ? facts.root : fileURLToPath(new URL("..", import.meta.url));
+  let gateTouched = o.gateTouched;
+  if (gateTouched === undefined) {
+    // 修闸 tag 各会话并起来:任一会话不是「确实没碰过」(碰过 / 账读不了 / 账不存在)⇒ 算碰过(与钩子 readTouched 的 null 口径同向)
+    const file = path.join(process.cwd(), ".claude", ".gate-touch.jsonl");
+    gateTouched = sids.length ? sids.some((sid) => readTouched(file, sid) !== false) : null;
+  }
+  let codexJobs = o.codexJobs;
+  if (codexJobs === undefined) {
+    let dirs = [];
+    try { const cx = codexLedger(merged, liveCodexEnv()); dirs = cx && Array.isArray(cx.jobDirs) ? cx.jobDirs : []; } catch { dirs = []; }
+    codexJobs = (since) => ({ root, upper: now, jobs: liveCodexEnv().listJobs({ since, dirs }) });
+  }
+  const { foreign: _f, ...goal } = (o.batchGoal && typeof o.batchGoal === "object") ? o.batchGoal : {};
+  const hookCheckout = checkoutOfFs(`${process.cwd()}/.probe`);
+  const ctx = buildCtx([], {
+    priorEntries: merged,
+    batchGoal: Object.keys(goal).length ? goal : undefined,
+    pLedger: o.pLedger !== undefined ? o.pLedger : readPLedger(o.ledgerSid),
+    gateTouched,
+    headFacts: () => facts,
+    resolveRev: o.resolveRev !== undefined ? o.resolveRev : (r) => { try { return String(git(["rev-parse", "--verify", "--quiet", `${r}^{commit}`]) || "").trim() || null; } catch { return null; } },
+    diffTier: o.diffTier !== undefined ? o.diffTier : () => readDiffFacts(o.base),
+    codexJobs,
+    ...(hookCheckout ? { hookCheckout } : {}),
+  });
+  const hits = P.detect(ctx);
+  const v = H.clearVerdict(ctx, hits);
+  return { status: v.status === "no-engine" ? "untouched" : v.status, engineCommits, hard: v.hard, soft: v.soft, unread,
+    msg: hits.length ? P._msg(hits) : "", line: H.clearLine(v) };
+}
+
 let _trackedCache;
 /** D56:PreToolUse 实测的「写之前是否已存在」记录。
  *  由 `hook-guard` 在写发生**之前**用 `existsSync` 量出来并追加,收尾侧只读不写。
@@ -5554,6 +5630,52 @@ function selfTest() {
         pHeadBase("selftest-no-such-session", s0, g2, late, () => batchBaseOfGoal({ cleared: true, baseCommit: "abc1234" })), null);
       hp("HEAD 基点:无会话 id ⇒ null", pHeadBase(undefined, [{ timestamp: "2026-10-10T08:00:00Z" }], g2, early), null);
       hp("HEAD 基点:会话 id 带路径字符 ⇒ null(不拼进文件名)", pHeadBase("../x", [{ timestamp: "2026-10-10T08:00:00Z" }], g2, early), null);
+      // ── 批 309:关账侧的 P 判定(engineReviewVerdict;batch-goal --clear / --dry-check 调)──
+      {
+        const T0 = Date.parse("2026-11-20T08:00:00Z"), iso = (m) => new Date(T0 + m * 60e3).toISOString();
+        const ENG = { root: "/repo", head: "9".repeat(40), commits: [{ sha: "e".repeat(40), at: T0 + 60e3, files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] };
+        const DOCS = { root: "/repo", head: "9".repeat(40), commits: [{ sha: "d".repeat(40), at: T0 + 60e3, files: [{ path: "docs/laws/collab.md", status: "M" }] }] };
+        const VEND = { root: "/repo", head: "9".repeat(40), commits: [{ ...ENG.commits[0], vendoredEngine: true }] };
+        const ag = (m, type, prompt) => ({ type: "assistant", timestamp: iso(m), message: { content: [{ type: "tool_use", name: "Agent", input: { subagent_type: type, prompt } }] } });
+        const BYP = ag(5, "_gate-bypass-hunter", "红队本批 scripts/lib/gate-rules.mjs 的改动");
+        const FBH = ag(6, "_gate-false-block-hunter", "回放本批 scripts/lib/gate-rules.mjs 的改动 --base 1234567");
+        const WEB = { type: "assistant", timestamp: iso(7), message: { content: [{ type: "tool_use", name: "WebSearch", input: { query: "先例" } }] } };
+        const goal = { batch: "309", armedAt: iso(0), conditions: ["甲"], baseCommit: "1234567" };
+        const throwing = () => { throw new Error("不该读转录"); };
+        const ev = (o) => engineReviewVerdict({ base: "1234567", sids: ["selftest-sess-309-aaaa"], batchGoal: goal, pLedger: null, gateTouched: true, codexJobs: () => null,
+          resolveRev: (r) => r, diffTier: () => null, findTranscript: () => "/t/a.jsonl", readEntries: () => [], ...o });
+        hp("309 关账侧:范围里只有法典提交 ⇒ none,不读转录(零成本路径)", ev({ headFacts: DOCS, findTranscript: throwing, readEntries: throwing }).status, "none");
+        hp("309 关账侧:改闸提交是原样装入的闸副本 ⇒ none,不读转录", ev({ headFacts: VEND, findTranscript: throwing, readEntries: throwing }).status, "none");
+        hp("309 关账侧:git 事实取不到 ⇒ unknown(写明哪一步)", (() => { const v = ev({ headFacts: null }); return [v.status, v.step]; })(), ["unknown", "git 事实"]);
+        hp("309 关账侧:有改闸提交、转录找不到 ⇒ unknown(读转录),列出改闸提交", (() => { const v = ev({ headFacts: ENG, findTranscript: () => null }); return [v.status, v.step, v.engineCommits.length, v.engineCommits[0].files]; })(),
+          ["unknown", "读转录", 1, ["scripts/lib/gate-rules.mjs"]]);
+        hp("309 关账侧:有改闸提交、转录读的时候抛错 ⇒ unknown", ev({ headFacts: ENG, readEntries: () => { throw Object.assign(new Error("x"), { code: "EACCES" }); } }).status, "unknown");
+        hp("309 关账侧:取不到会话号 ⇒ unknown", ev({ headFacts: ENG, sids: [] }).status, "unknown");
+        hp("309 关账侧:两猎手都在(本批武装之后)⇒ ok", ev({ headFacts: ENG, readEntries: () => [BYP, FBH] }).status, "ok");
+        hp("309 关账侧:只有红队 ⇒ missing,缺误拦猎手", (() => { const v = ev({ headFacts: ENG, readEntries: () => [BYP] }); return [v.status, v.hard[0].missing]; })(), ["missing", ["_gate-false-block-hunter"]]);
+        hp("309 关账侧:猎手在开批之前跑的 ⇒ 不抵本批,missing", ev({ headFacts: ENG, readEntries: () => [ag(-30, "_gate-bypass-hunter", "红队 scripts/lib/gate-rules.mjs"), ag(-29, "_gate-false-block-hunter", "回放 scripts/lib/gate-rules.mjs --base 1234567")] }).status, "missing");
+        hp("309 关账侧:两个会话各跑一个猎手 ⇒ 合起来 ok(跨会话取证)",
+          ev({ headFacts: ENG, sids: ["selftest-sess-309-aaaa", "selftest-sess-309-bbbb"], findTranscript: (s) => `/t/${s}.jsonl`, readEntries: (f) => (/aaaa/.test(f) ? [BYP] : [FBH]) }).status, "ok");
+        hp("309 关账侧:一个会话的转录读不到、另一个读到且跑齐 ⇒ ok,读不到的列进 unread",
+          (() => { const v = ev({ headFacts: ENG, sids: ["selftest-sess-309-aaaa", "selftest-sess-309-bbbb"], findTranscript: (s) => (/aaaa/.test(s) ? "/t/a.jsonl" : null), readEntries: () => [BYP, FBH] }); return [v.status, v.unread.length]; })(), ["ok", 1]);
+        hp("309 关账侧:本批会话都没碰过闸(修闸 tag 账在、没有这些会话)⇒ untouched(不拒)", ev({ headFacts: ENG, gateTouched: false, readEntries: () => [] }).status, "untouched");
+        const J429 = (since) => ({ root: "/repo", upper: T0 + 3600e3, jobs: [{ id: "J429", state: "failed", exitCode: 1, startedAt: T0 + 8 * 60e3, endedAt: T0 + 9 * 60e3, resultAt: null, cwd: "/repo", top: "/repo", threadId: "t", unavailable: { reason: "rate-limit" } }] });
+        hp("309 关账侧:账满(三格都要)、两猎手与联网齐、跨模型通道不可用 ⇒ soft(不拒)", ev({ headFacts: ENG, pLedger: { carriers: 10 }, codexJobs: J429, readEntries: () => [BYP, FBH, WEB] }).status, "soft");
+        hp("309 关账侧:账满、跨模型不可用、但误拦猎手缺 ⇒ missing(软项不吞硬缺口)", ev({ headFacts: ENG, pLedger: { carriers: 10 }, codexJobs: J429, readEntries: () => [BYP, WEB] }).status, "missing");
+        hp("309 关账侧:账满、猎手齐、联网缺 ⇒ missing(宽限之外的格照算,判据不另写)", ev({ headFacts: ENG, pLedger: { carriers: 10 }, codexJobs: J429, readEntries: () => [BYP, FBH] }).status, "missing");
+        hp("309 关账侧:宽限内(账 0)、猎手齐、联网与跨模型都没跑 ⇒ ok(宽限照旧)", ev({ headFacts: ENG, readEntries: () => [BYP, FBH] }).status, "ok");
+        // batch-goal 的零成本路径只问 `git log … -- scripts`(ENGINE_SUPERSET_PATHSPECS):它得是 P 闸引擎口径的超集
+        const Pr = RULES.find((r) => r.id === "P");
+        hp("309 零成本路径的超集:P 的每个闸引擎 pathspec 都在 scripts/ 下",
+          Pr._p.ENGINE_PATHSPECS.filter((s) => !/^scripts\//.test(String(s).replace(/^:\(glob\)/, ""))), []);
+        // 收尾侧:P 永不阻断;提示里写明关账时会不会拒;同一欠审状态去重键稳定(承重提交数变了键不变)
+        hp("309 收尾侧:P 的阻断级是静态 false", Pr.blocking, false);
+        const kc = (n) => buildCtx([{ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "git add -A && git commit -m x" } }] } }],
+          { pLedger: { carriers: n }, headFacts: () => ENG });
+        const hk = (n) => { const c = kc(n); return Pr.noticeKey(Pr.detect(c), c); };
+        hp("309 收尾侧:欠审提示的去重键不随承重提交数变", hk(0) === hk(3) && /^P:missing:/.test(hk(0)), true);
+        hp("309 收尾侧:提示末行写明关账时会拒", (() => { const c = kc(0); return /关账\(batch-goal --clear \/ --dry-check\)时会拒\(engine-review-missing\)/.test(Pr.message(Pr.detect(c), c)); })(), true);
+      }
       // ── P 的收尾结算(settleP:hook 计账与基点推进;a2a9f58b BP-1 / BP-2 / BP-6)──
       {
         const P_ = RULES.find((r) => r.id === "P")._p;

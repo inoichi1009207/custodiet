@@ -2749,13 +2749,18 @@ const RULE_U = {
 // CEILING(引擎侧,搬迁时才看清):`kind:"action"` 豁免拿到的 ctx 被剥掉了 `text`,
 //   但 `window()` 是同一个闭包,**window 那一层的 text 没有被剥**。本条的豁免因此
 //   刻意只碰 `.actions`,一个字的文本面都不读——这条纪律靠注释与用例守着,不靠引擎。
-/** P 的变异工具:临时把 `_p` 里的若干零件换成 `patch[k](原件)` 的返回值,跑原 detect,跑完还原。
- *  拧的是**判据内部**的零件(codex 060:不许换成恒真/恒假的外壳)。 */
-const swapP = (patch) => (r) => ({ ...r, detect: (ctx) => {
-  const H = RULE_P._p, save = {};
-  for (const k of Object.keys(patch)) { save[k] = H[k]; H[k] = patch[k](save[k]); }
-  try { return r.detect(ctx); } finally { Object.assign(H, save); }
-} });
+/** P 的变异工具:临时把 `_p` 里的若干零件换成 `patch[k](原件)` 的返回值,跑原 detect(与原 message),跑完还原。
+ *  拧的是**判据内部**的零件(codex 060:不许换成恒真/恒假的外壳)。
+ *  批 309:message 也在换过零件的 `_p` 下渲染——提示文字里那行关账侧判定(`clearVerdict`)由它算,
+ *  拧关账侧零件的变异要靠消息正文被逮住(变异验收比的是命中条数 + 阻断级 + 消息正文)。 */
+const swapP = (patch) => (r) => {
+  const under = (fn) => (...a) => {
+    const H = RULE_P._p, save = {};
+    for (const k of Object.keys(patch)) { save[k] = H[k]; H[k] = patch[k](save[k]); }
+    try { return fn(...a); } finally { Object.assign(H, save); }
+  };
+  return { ...r, detect: under((ctx) => r.detect(ctx)), message: under((hits, ctx) => r.message(hits, ctx)) };
+};
 
 // 批 297(D203)夹具零件:一条合格的 codex-run 作业记录(startedAt 晚于本轮时刻 P_T0 五秒 ⇒ 落在窗口里),
 //   `pOnlyCodex` = 只缺跨模型那一格的底座(非闸引擎承重提交=法典;独立视角 grill、外部先例 web 都在),单变量对照用。
@@ -2766,52 +2771,45 @@ const pJob = (o = {}) => ({ id: "J297", state: "done", startedAt: "2026-11-07T08
 const pJobs = (...jobs) => ({ root: "/repo", upper: "2026-11-07T09:00:00Z", jobs });
 const pOnlyCodex = (name, o = {}) => ({ name, text: "法典改完并提交。", at: P_T0, agent: "grill:testing", web: "先例", ...o,
   bash: [...(o.bash || []), "git add -A docs/laws/collab.md && git commit -m x"] });
-// 批 308 S1b:P 只在状态迁移那一轮阻断 ⇒ 断言阻断级(expectBlock)的 P 夹具都放在迁移轮里(本轮再跑一次 `git push`),
-//   测的仍是「硬缺口阻断 / 软缺口(通道不可用)只提示」那条区分;非迁移轮只提示另有夹具钉着。
-const pAtPush = (c) => ({ ...c, bash: [...(c.bash || []), "git push"] });
-
 const RULE_P = {
   id: "P",
-  // 用户常设授权:「新增阻断项一律授权自动化」。批 297 r2(误拦猎手 FB-1):条件阻断——命中里只剩「跨模型格通道不可用」(soft)时
-  //   降为提示(收尾报告须登记欠账),其余照旧阻断。判据与 detect 同一份;自己抛错 ⇒ 引擎按阻断算(isBlocking)。
-  //   用 `this.detect`:变异副本(`{...r, detect}`)的阻断级跟着它自己的 detect 走(isBlocking 以 `r.blocking(ctx)` 方法调用)。
-  // 批 308 S1b(闸规矩第一节第 1 条「拒绝放在状态迁移那一步」、第三节「复核在合并这一步之前做完,不是每次提交都做」):
-  //   欠审照旧算(判据、分账、宽限一概不动),只改**什么时候阻断**——本轮做了状态迁移动作(`_p.transition`:关账 / 推送 / 合并)
-  //   才阻断,其余回合降为提示(走提示去重,同一欠审状态只提示一次)。原先每个改闸提交之后的每一轮收尾都阻断,直到猎手跑齐。
-  blocking(ctx) {
-    const hard = (this && typeof this.detect === "function" ? this.detect : RULE_P.detect)(ctx).some((h) => !h.soft);
-    if (!hard) return false;
-    const H = (this && this._p) || RULE_P._p;
-    return H.transition(ctx);
-  },
+  // 批 309(闸规矩第一节第 1 条「拒绝放在状态迁移那一步」):收尾钩子里的 P **只提示,永不阻断**。
+  //   拒绝挪进关账命令:`batch-goal --clear` / `--dry-check` 经 hook-stop-closure `engineReviewVerdict` 用**同一份** detect
+  //   (判据、分账、宽限、软硬之分一概不动)再问一次,本批有改闸引擎文件的提交且有硬欠项 ⇒ 拒清(`engine-review-missing`);
+  //   判定唯一实现 = `_p.clearVerdict`,提示文字里那行「关账时会不会拒」也由它算。
+  //   上一版(批 308 S1b)在收尾钩子里认「本轮有没有关账 / 推送 / 合并命令」才阻断(`_p.transition`,已删):换写法、换会话、
+  //   经发车脚本、rebase / cherry-pick 都认不出,且钩子在回合结束后才判、推送已经发生;文档里的 `git push` 字样、看帮助、
+  //   试合并后撤销、推功能分支做备份又被误拦(审查回件 12 条)。所有路径都要经过关账,关账那一步不用认命令写法。
+  blocking: false,
   law: "docs/gate/AGENTS.md#三、怎么改闸",
 
   /** 判据零件。挂在规则对象上而不是模块作用域,是为了让 `mutations` 的
    *  `apply: (r) => ({...r, detect})` 能复用同一批零件——变异要拧的是**判据内部**,
    *  不是把整条判据换成一个恒真/恒假的壳(那种变异构造性恒真,已被 codex 060 判死)。 */
   _p: {
-    /** 批 308 S1b:本轮做没做状态迁移动作——`batch-goal … --clear`(ranClear,执行口径)、`git push`(不含 --dry-run / -n)、
-     *  `git merge`(不含 --abort / --quit)、`gh pr merge`。git 段的解析复用 gate-ctx 的 gitArgs(与提交判定同一份);
-     *  gh 只认段首(跳过 VAR= 前缀)三词 `gh pr merge`。
-     *  天花板:`git merge` 合进的是不是默认分支判不出,一律算(多拦一侧;本仓合并走 gh pr merge);
-     *  藏在 `bash -c` / 子 shell 里的推送认不出 ⇒ 那一轮只提示(漏拦一侧,下一次迁移动作照拦)。判不了(抛错)⇒ 算迁移(阻断,同改前)。 */
-    transition(ctx) {
-      try {
-        if (ranClear(ctx)) return true;
-        const cmds = ctx.bashCmds || [];
-        for (let ci = 0; ci < cmds.length; ci++) {
-          for (const seg of segments(cmds[ci], ctx.bashDialects?.[ci] === "ps")) {
-            const g = gitArgs(seg);
-            if (g && g.sub === "push" && !g.args.some((a) => a === "--dry-run" || a === "-n")) return true;
-            if (g && g.sub === "merge" && !g.args.some((a) => a === "--abort" || a === "--quit")) return true;
-            const t = String(seg).trim().split(/\s+/).filter(Boolean);
-            let i = 0;
-            while (i < t.length && /^\w+=/.test(t[i])) i++;
-            if (/^gh(\.exe)?$/i.test(t[i] || "") && t[i + 1] === "pr" && t[i + 2] === "merge") return true;
-          }
-        }
-        return false;
-      } catch { return true; }
+    /** 批 309:关账侧判定(唯一实现;`batch-goal --clear` / `--dry-check` 经 hook-stop-closure `engineReviewVerdict` 调,
+     *  收尾钩子的提示文字也用它说「关账时会不会拒」)。`hits` = detect 的命中(不给就现算)。返回 `{ status, hard, soft }`:
+     *    · `no-engine` —— 闸引擎面没被本批碰到(`gateEngineTouched` 为假:没有非原样装入的改闸提交,或本会话没碰过闸)⇒ 关账不拒,
+     *      承重面三通道的欠项只提示(决定 2:只对改闸引擎的提交拒);
+     *    · `missing` —— 碰到了且有硬欠项 ⇒ 拒(`engine-review-missing`);
+     *    · `soft` —— 碰到了、只欠软项(跨模型通道确实不可用)⇒ 不拒,提示并要求报告里登记;
+     *    · `ok` —— 碰到了、没有欠项。
+     *  判据不另写:欠不欠全由 detect 定,本函数只分「改没改闸」与软硬。 */
+    clearVerdict(ctx, hits) {
+      const H = RULE_P._p;
+      const hs = Array.isArray(hits) ? hits : RULE_P.detect(ctx);
+      const hard = hs.filter((h) => !h.soft), soft = hs.filter((h) => h.soft);
+      if (!H.gateEngineTouched(ctx)) return { status: "no-engine", hard, soft };
+      if (hard.length) return { status: "missing", hard, soft };
+      return { status: soft.length ? "soft" : "ok", hard, soft };
+    },
+    /** 关账侧判定 ⇒ 提示里的那一行(收尾钩子与 batch-goal 拒清那段话共用)。 */
+    clearLine(v) {
+      const owed = (hs) => hs.map((h) => `${String(h.ch).replace(/(.)——.*$/, "$1")}${Array.isArray(h.missing) && h.missing.length ? `(缺 ${h.missing.join("、")})` : ""}`).join(" / ");
+      if (v.status === "missing") return `关账(batch-goal --clear / --dry-check)时会拒(engine-review-missing):本批有改闸引擎的提交,现在欠 ${owed(v.hard)}。补齐后再关账。`;
+      if (v.status === "soft") return `关账时不拒:闸引擎面只欠软项(${owed(v.soft)},通道不可用),收尾报告须登记欠账。`;
+      if (v.status === "ok") return "关账时不拒:闸引擎面已跑齐。";
+      return "关账时不拒:本批没有改闸引擎的提交(或本会话没碰过闸),承重面三通道的欠项只提示。";
     },
     GIT: /^(\w+=\S+\s+)*git\b/,
     // (批 297:原 `NODE_CODEX` / `CODEX_ARG` 两条命令形状正则随「跨模型格改认作业记录」删除,见 `codexJobHits` 头注。)
@@ -3984,7 +3982,14 @@ const RULE_P = {
   //   **一个规则级布尔天生管不了「哪条通道短了」——这不是判据写松了,是位置放错了。**
   exempts: [],
 
-  message: (hits) => {
+  // 批 309:提示去重按欠审状态认「见过」(同一欠审状态只提示一次)——首行里带承重提交计数,每多一笔提交就换一次键、多续一轮。
+  //   键 = 关账侧判定 + 各欠格(含缺哪个猎手);补齐一格或改闸状态变了 ⇒ 键变 ⇒ 再提示一次。
+  noticeKey: (hits, ctx) => {
+    const v = RULE_P._p.clearVerdict(ctx, hits);
+    return `P:${v.status}:` + hits.map((h) => `${h.soft ? "~" : ""}${String(h.ch).slice(0, 12)}${Array.isArray(h.missing) ? `[${h.missing.join(",")}]` : ""}`).join("|");
+  },
+  message: (hits, ctx) => RULE_P._msg(hits) + `\n      ${RULE_P._p.clearLine(RULE_P._p.clearVerdict(ctx, hits))}`,
+  _msg: (hits) => {
     const h0 = hits[0];
     // codex 185 Q5:只欠红队(闸引擎面、宽限内)时,消息按实际缺项说,别再念「三通道各需 1 遍」
     const hunterOnly = hits.length === 1 && /闸引擎面每批必跑/.test(String(h0.ch));
@@ -4066,14 +4071,17 @@ const RULE_P = {
     // r2 ⑦:不可用出路三向
     { name: "297 r2 不可用出路关掉(429 失败也阻断)", apply: swapP({ jobUnavailable: () => () => false }) },
     { name: "297 r2 任何失败都算通道不可用", apply: swapP({ jobUnavailable: () => (j) => j.state === "failed" || (Number.isFinite(j.exitCode) && j.exitCode !== 0) }) },
-    // 批 308 S1b 退回两向:每轮都阻断(不看迁移动作)/ 只认关账、不认推送与合并
-    { name: "S1b 退回:P 每轮都阻断(不看迁移动作)", apply: (r) => ({ ...r, blocking(ctx) { return this.detect(ctx).some((h) => !h.soft); } }) },
-    // (阻断级在 detect 之外求值,swapP 只在 detect 期间换零件 ⇒ 这里直接换 blocking)
-    { name: "S1b 退回:迁移只认关账(推送 / 合并不算)", apply: (r) => ({ ...r, blocking(ctx) {
-      if (!this.detect(ctx).some((h) => !h.soft)) return false;
-      try { return ranClear(ctx); } catch { return true; }
-    } }) },
-    { name: "297 r2 soft 命中吞掉同轮的硬缺口(有一格不可用就整条不阻断)", apply: (r) => ({ ...r, blocking(ctx) { const hs = this.detect(ctx); return hs.length > 0 && hs.every((h) => !h.soft); } }) },
+    // 批 309:收尾侧阻断已撤(blocking:false),原「S1b 退回:每轮都阻断」「S1b 退回:迁移只认关账」两条钉的是已删的 `_p.transition`
+    //   与条件阻断,零件不在了 ⇒ 删;它们护着的「什么时候拒」改由关账侧判定 `clearVerdict` 承担,下面四条对着它拧
+    //   (证人 = pos 里「309 关账侧:」各条;变异验收比消息正文,关账侧那一行由 clearVerdict 算)。
+    { name: "297 r2 / 309 soft 命中吞掉同批的硬缺口(有一格不可用就整条不拒)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
+      const v = orig(ctx, hits); return v.status === "missing" && v.soft.length ? { ...v, status: "soft" } : v; } }) },
+    { name: "309 关账侧只欠软项也拒(通道不可用不给出路)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
+      const v = orig(ctx, hits); return v.status === "soft" ? { ...v, status: "missing", hard: v.soft } : v; } }) },
+    { name: "309 关账侧不看改闸(只改法典的批也按硬欠项拒)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
+      const v = orig(ctx, hits); return v.status === "no-engine" && v.hard.length ? { ...v, status: "missing" } : v; } }) },
+    { name: "309 关账侧恒不拒(改闸欠审也放过)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
+      const v = orig(ctx, hits); return v.status === "missing" ? { ...v, status: "no-engine" } : v; } }) },
     // ── 红队 a27628dd 轮的新分支各钉一条(swapP:临时换掉 _p 里的零件,跑完还原)────────────────────
     { name: "git 事实不接(恒回退语法判据:merge/cherry-pick 合回看不见)", apply: swapP({ facts: () => () => null }) },
     // 批 279「修闸 tag」两向:恒算碰过(误拦复发)/ 只看账、不看窗口与提交邻近兜底(漏放)
@@ -4251,8 +4259,8 @@ const RULE_P = {
       //   但没有合格记录 ⇒ 跨模型格缺(另两格齐,单变量)。每条对应 codexJobsEval 判据的一条腿,也是对应变异的证人。
       pOnlyCodex("297:作业记录 threadId 空 ⇒ 缺", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs(pJob({ threadId: "" })) }),
       pOnlyCodex("297:作业记录 exitCode 非 0(codex-run 对正文非空照记 done)⇒ 缺", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"], codexJobs: pJobs(pJob({ exitCode: 1 })) }),
-      pAtPush({ ...pOnlyCodex("297 r2:作业还在跑(state=running)⇒ 缺,消息给 --poll J --wait-ms 600000", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"],
-        codexJobs: pJobs(pJob({ id: "Jrun", state: "running", endedAt: undefined, resultAt: undefined })) }), expectBlock: true }),
+      { ...pOnlyCodex("297 r2:作业还在跑(state=running)⇒ 缺,消息给 --poll J --wait-ms 600000", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"],
+        codexJobs: pJobs(pJob({ id: "Jrun", state: "running", endedAt: undefined, resultAt: undefined })) }), expectBlock: false },
       pOnlyCodex("297:state=failed 而退出码 0(空正文 empty-body)⇒ 缺", { codexJobs: pJobs(pJob({ state: "failed", exitCode: 0, failLines: ["ledger: codex 退出码 0 但最终消息为空", "ledger: empty-body"] })) }),
       pOnlyCodex("297:作业失败(普通失败,不是不可用类)⇒ 缺", { bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md"],
         codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, failLines: ["ledger: codex 退出码 1 且无最终消息", "ledger: empty-body", "stderr: Not inside a trusted directory and --skip-git-repo-check was not specified."] })) }),
@@ -4283,20 +4291,20 @@ const RULE_P = {
         bash: ["node ~/.claude/scripts/codex-run.mjs --task t.md", "git add -A docs/laws/collab.md && git commit -m x"] },
       // r2 ⑦(误拦猎手 FB-1)通道不可用的出路;批 302(D205):只读 codex-run 从完整事件流写的结构化字段 `unavailable{reason}`,
       //   不再解析日志尾窗(failLines 撤掉)。超时、配置告警、只在台账 error 里的 429 由 codex-run 那一层判(不写 unavailable)。
-      pAtPush({ ...pOnlyCodex("302 D205:作业失败且 unavailable.reason=rate-limit ⇒ 本格不阻断,提示登记欠账",
-        { codexJobs: pJobs(pJob({ id: "J429", state: "failed", exitCode: 1, threadId: "t", resultAt: undefined, unavailable: { reason: "rate-limit" } })) }), expectBlock: false }),
-      pAtPush({ ...pOnlyCodex("302 D205:unavailable.reason=network ⇒ 本格不阻断",
-        { codexJobs: pJobs(pJob({ id: "Jnet", state: "failed", exitCode: 1, unavailable: { reason: "network" } })) }), expectBlock: false }),
-      pAtPush({ ...pOnlyCodex("302 D205:作业失败、没有 unavailable 字段(超时 / 旧记录;日志里有 429 也一样)⇒ 不给出路,照阻断",
-        { codexJobs: pJobs(pJob({ id: "Jto", state: "failed", exitCode: null, resultAt: "2026-11-07T08:00:06Z", failLines: ["event: 429 Too Many Requests"] })) }), expectBlock: true }),
-      pAtPush({ name: "297 r2:通道不可用只免跨模型格——独立视角也缺 ⇒ 照阻断", text: "法典改完并提交。", at: P_T0, web: "先例", expectBlock: true,
+      { ...pOnlyCodex("302 D205:作业失败且 unavailable.reason=rate-limit ⇒ 本格只算软欠项,提示登记欠账",
+        { codexJobs: pJobs(pJob({ id: "J429", state: "failed", exitCode: 1, threadId: "t", resultAt: undefined, unavailable: { reason: "rate-limit" } })) }), expectBlock: false },
+      { ...pOnlyCodex("302 D205:unavailable.reason=network ⇒ 本格只算软欠项",
+        { codexJobs: pJobs(pJob({ id: "Jnet", state: "failed", exitCode: 1, unavailable: { reason: "network" } })) }), expectBlock: false },
+      { ...pOnlyCodex("302 D205:作业失败、没有 unavailable 字段(超时 / 旧记录;日志里有 429 也一样)⇒ 不给出路,照算硬欠项",
+        { codexJobs: pJobs(pJob({ id: "Jto", state: "failed", exitCode: null, resultAt: "2026-11-07T08:00:06Z", failLines: ["event: 429 Too Many Requests"] })) }), expectBlock: false },
+      { name: "297 r2:通道不可用只免跨模型格——独立视角也缺 ⇒ 照算硬欠项", text: "法典改完并提交。", at: P_T0, web: "先例", expectBlock: false,
         codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, unavailable: { reason: "rate-limit" } })),
-        bash: ["git add -A docs/laws/collab.md && git commit -m x"] }),
-      pAtPush({ ...pOnlyCodex("297 r2:429 失败的作业在别的仓 ⇒ 不给出路,照阻断",
-        { codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, cwd: "E:/test5", top: "E:/test5", unavailable: { reason: "rate-limit" } })) }), expectBlock: true }),
+        bash: ["git add -A docs/laws/collab.md && git commit -m x"] },
+      { ...pOnlyCodex("297 r2:429 失败的作业在别的仓 ⇒ 不给出路,照算硬欠项",
+        { codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, cwd: "E:/test5", top: "E:/test5", unavailable: { reason: "rate-limit" } })) }), expectBlock: false },
       // 批 302(D205 ②):`CODEX_BIN` 替身跑出的记录(binSource=env)不计——既不算合格,也不给不可用出路
       pOnlyCodex("302 D205:binSource=env 的合格记录 ⇒ 不计,缺", { codexJobs: pJobs(pJob({ binSource: "env" })) }),
-      pAtPush({ ...pOnlyCodex("302 D205:binSource=env 且 unavailable ⇒ 也不给出路,照阻断", { codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, binSource: "env", unavailable: { reason: "rate-limit" } })) }), expectBlock: true }),
+      { ...pOnlyCodex("302 D205:binSource=env 且 unavailable ⇒ 也不给出路,照算硬欠项", { codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, binSource: "env", unavailable: { reason: "rate-limit" } })) }), expectBlock: false },
       // r3 ①(红队 r2 BP-1 / codex r2 §3):下界 = max(批 armedAt(结清也算、外来跳过), settledAt)
       pOnlyCodex("297 r3:正常收尾顺序「提交 → --clear → Stop」——已结清的本会话批仍作锚,上一批的作业不抵 ⇒ 缺",
         { batchGoal: { armedAt: "2026-11-07T07:55:00Z", conditions: [], cleared: true }, codexJobs: pJobs(pJob({ startedAt: "2026-11-07T07:10:05Z" })),
@@ -4979,20 +4987,38 @@ const RULE_P = {
         text: "第五笔,在 worktree 改宪法。", pLedger: { carriers: 4 }, write: "E:/elsewhere/AGENTS.md",
         bash: ["cd E:/elsewhere && git add -A && git commit -m x"], agent: "grill:edge-cases",
         diffFacts: { root: "/repo", files: [{ path: "scripts/lib/ledger-chain.test.mjs", status: "M", readable: true }] } },
-      // ── 批 308 S1b:只在状态迁移那一轮阻断。同一个欠审状态(跨模型格缺,单变量):
-      //   ① 普通回合(只提交)⇒ 命中、只提示;② 本轮关账 / 推送 / 合并 ⇒ 阻断。
-      { ...pOnlyCodex("308 S1b P①:承重提交后的普通回合(没有关账 / 推送 / 合并)⇒ 只提示", { codexJobs: pJobs() }), expectBlock: false },
-      { ...pOnlyCodex("308 S1b P②:同一欠审,本轮跑了 batch-goal --clear ⇒ 阻断", { codexJobs: pJobs(), bash: ["node --no-warnings scripts/batch-goal.mjs --clear"] }), expectBlock: true },
-      { ...pOnlyCodex("308 S1b P②:同一欠审,本轮 git push ⇒ 阻断", { codexJobs: pJobs(), bash: ["git -C /repo push private b308"] }), expectBlock: true },
-      { ...pOnlyCodex("308 S1b P②:同一欠审,本轮 gh pr merge ⇒ 阻断", { codexJobs: pJobs(), bash: ["GH_PAGER= gh pr merge 7 --merge"] }), expectBlock: true },
-      { ...pOnlyCodex("308 S1b P②:同一欠审,本轮 git merge 合回 ⇒ 阻断", { codexJobs: pJobs(), bash: ["git checkout master && git merge --no-ff b308"] }), expectBlock: true },
-      // 反向钉:不是迁移的「推送 / 合并」字样 ⇒ 仍只提示
-      { ...pOnlyCodex("308 S1b P 反向钉:git push --dry-run、echo gh pr merge、git merge --abort 都不算迁移 ⇒ 只提示",
+      // ── 批 309:收尾侧永不阻断。上一版(308 S1b)在「本轮关账 / 推送 / 合并」时阻断的几条翻过来:同一欠审状态(跨模型格缺,单变量),
+      //   任何命令写法下都只提示;拒绝挪进 batch-goal --clear(关账侧判定见下面「309 关账侧」各条与 hook-stop-closure engineReviewVerdict 自测)。
+      { ...pOnlyCodex("309 收尾侧:承重提交后的普通回合 ⇒ 只提示", { codexJobs: pJobs() }), expectBlock: false },
+      { ...pOnlyCodex("309 收尾侧:同一欠审,本轮跑了 batch-goal --clear ⇒ 仍只提示(拒绝在关账命令自己那里)", { codexJobs: pJobs(), bash: ["node --no-warnings scripts/batch-goal.mjs --clear"] }), expectBlock: false },
+      { ...pOnlyCodex("309 收尾侧:同一欠审,本轮 git push ⇒ 只提示", { codexJobs: pJobs(), bash: ["git -C /repo push private b308"] }), expectBlock: false },
+      { ...pOnlyCodex("309 收尾侧:同一欠审,本轮 gh pr merge ⇒ 只提示", { codexJobs: pJobs(), bash: ["GH_PAGER= gh pr merge 7 --merge"] }), expectBlock: false },
+      { ...pOnlyCodex("309 收尾侧:同一欠审,本轮 git merge 合回 ⇒ 只提示", { codexJobs: pJobs(), bash: ["git checkout master && git merge --no-ff b308"] }), expectBlock: false },
+      { ...pOnlyCodex("309 收尾侧:git push --dry-run、echo gh pr merge、git merge --abort ⇒ 只提示",
         { codexJobs: pJobs(), bash: ["git push --dry-run private", "echo gh pr merge 7", "git merge --abort"] }), expectBlock: false },
+      // ── 批 309 关账侧判定(clearVerdict)的证人:提示里那一行随它变,四条 clearVerdict 变异各由下面一条逮住 ──
+      //   ① 改闸、两猎手都缺 ⇒ 关账会拒(「恒不拒」变异的证人)
+      { name: "309 关账侧:改闸提交、两猎手都缺 ⇒ 提示里写明关账会拒", text: "改闸并提交。", pLedger: { carriers: 0 }, expectBlock: false,
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      //   ② 改闸、账满(三格都要)、两猎手与联网齐、跨模型通道不可用 ⇒ 只欠软项、关账不拒(「只欠软项也拒」变异的证人)
+      { name: "309 关账侧:改闸、只欠跨模型软项(通道不可用)⇒ 关账不拒,提示登记", text: "改闸并提交。", at: P_T0, pLedger: { carriers: 10 }, expectBlock: false,
+        web: "先例", codexJobs: pJobs(pJob({ id: "J429", state: "failed", exitCode: 1, unavailable: { reason: "rate-limit" } })),
+        prior: [{ text: "红队", at: "2026-11-07T08:00:01Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", at: "2026-11-07T08:00:02Z", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } }],
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      //   ③ 改闸、跨模型不可用(软)+ 误拦猎手缺(硬)⇒ 关账照拒(「软项吞掉硬缺口」变异的证人)
+      { name: "309 关账侧:改闸、跨模型软项 + 误拦猎手缺 ⇒ 关账照拒", text: "改闸并提交。", at: P_T0, pLedger: { carriers: 10 }, expectBlock: false,
+        web: "先例", codexJobs: pJobs(pJob({ id: "J429", state: "failed", exitCode: 1, unavailable: { reason: "rate-limit" } })),
+        prior: [{ text: "红队", at: "2026-11-07T08:00:01Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }],
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
+      //   ④ 只改法典(没有改闸提交)、跨模型缺 ⇒ 关账不拒,只提示(「不看改闸」变异的证人)= 上面「309 收尾侧:普通回合」那条
     ],
     neg: [
-      // 批 308 S1b P③:欠审已补齐(三格齐)⇒ 迁移轮也不响
-      pOnlyCodex("308 S1b P③:三格齐,本轮推送并合并 ⇒ 不响", { codexJobs: pJobs(pJob()), bash: ["git push private b308", "gh pr merge 7 --merge"] }),
+      // 批 309(原 308 S1b P③):欠审已补齐(三格齐)⇒ 推送并合并的回合也不响
+      pOnlyCodex("309 收尾侧:三格齐,本轮推送并合并 ⇒ 不响", { codexJobs: pJobs(pJob()), bash: ["git push private b308", "gh pr merge 7 --merge"] }),
       // 批 279(用户 10-27「修闸 tag」):范围里有别的会话的改闸提交,本会话没 tag、窗口里也没碰闸 ⇒ 不要猎手
       { name: "279 修闸 tag:本会话没碰闸(账里无 tag)⇒ 范围里别的会话的改闸提交不要猎手",
         text: "导入完了。", pLedger: { carriers: 0 }, gateTouched: false,
