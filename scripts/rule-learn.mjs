@@ -219,7 +219,13 @@ export function findEntry(lib, target) {
 }
 
 // ── 分段与提示词 ──────────────────────────────────────────────────────────────────────
-/** 压过的一个会话 ⇒ 用户消息单元 [{ id:"U<n>", at, text, ctx }]。编号按会话里用户消息的顺序(中断标记、没字的也占号,但不进单元)。 */
+// 引文出处的口径比主尺严:主尺是上界(拿不准的算人),核引文反过来(拿不准的不算)。
+//   只认「人在交互会话里打的字」:打字(typed)与排队插话(queued),且正文不是命令 / 命令输出的标记包起来的。
+//   无头会话的提示词(sdk,常是发车方写的)、斜杠命令、「!」命令、无来源标记的老形态(legacy)⇒ 只当上下文,不能当出处。
+export const QUOTABLE_KINDS = Object.freeze(["typed", "queued"]);
+const RE_NOT_TYPED = /^\s*<(?:bash-(?:input|stdout|stderr)|local-command-(?:stdout|stderr)|command-(?:name|message|args))>/;
+export const isQuotable = (kind, text) => QUOTABLE_KINDS.includes(kind) && !RE_NOT_TYPED.test(String(text || ""));
+/** 压过的一个会话 ⇒ 用户消息单元 [{ id:"U<n>", at, kind, quotable, text, ctx }]。编号按会话里用户消息的顺序(中断标记、没字的也占号,但不进单元)。 */
 export function buildUnits(rows, ctxChars = CTX_CHARS) {
   const units = [];
   let lastAssist = null, n = 0;
@@ -228,7 +234,7 @@ export function buildUnits(rows, ctxChars = CTX_CHARS) {
     if (r.role !== "user") continue;
     n++;
     if (r.kind === "interrupt" || !String(r.text || "").trim()) { continue; }
-    units.push({ id: `U${n}`, at: r.at, text: r.text, ctx: lastAssist ? capTail(lastAssist, ctxChars).text : null });
+    units.push({ id: `U${n}`, at: r.at, kind: r.kind, quotable: isQuotable(r.kind, r.text), text: r.text, ctx: lastAssist ? capTail(lastAssist, ctxChars).text : null });
     lastAssist = null;
   }
   return units;
@@ -253,14 +259,15 @@ export function extractPrompt(units, lib) {
   const body = [];
   for (const u of units) {
     if (u.ctx) body.push(`[助手] ${u.ctx}`);
-    body.push(`[${u.id} ${u.at || "时刻不详"}] ${u.text}`, "");
+    body.push(`[${u.id} ${u.at || "时刻不详"}${u.quotable === false ? ` 不可引:${u.kind}` : ""}] ${u.text}`, "");
   }
   return [
     "你是规则整理员。下面是一段编码代理会话的压缩转录(只有用户的原话和助手的正文),和一份现有规则库的目录。只回一个 JSON 对象,不要别的字。",
     "",
     "第一步,认纠正:找出用户纠正助手、或者交代长期做法的地方。拿不准算不算时不报——漏报一条代价小,把用户没说过的话当成原话代价大。每处给:",
     "- msg:那条用户消息的编号(如 U3)。",
-    "- quote:用户原话里的一段。必须从那条消息里逐字复制:不改字、不补字、不翻译、不概括、不拼接两处。取撑得住这条规则的最短一段,一般 10 到 80 字。",
+    "- quote:用户原话里的一段。必须从那条消息里逐字复制:不改字、不补字、不翻译、不概括、不拼接两处,也不要切掉改变意思的词(如「别」「不要」)。取撑得住这条规则的最短一段,一般 10 到 80 字。",
+    "  只能从没有「不可引」标记的消息里取。带「不可引:<类型>」标记的(sdk = 无头会话的开场提示词,slash = 斜杠命令,bang = 「!」命令,legacy = 来源不明的老形态,或正文是命令输出的)不一定是人打的字,只当上下文看。",
     "- scope:\"once\" 或 \"durable\"。once = 只管这一次(这次这样、这个文件、这一步、眼下这件事);durable = 以后都这样(以后、每次、一律、默认、记住、别再)。只有用户的话本身表明要长期照做才写 durable,拿不准写 once。",
     "- rule:一句话的规则(你的概括,可以改写)。",
     "- when:什么时候适用,一句话。",
@@ -312,7 +319,7 @@ const ACTION_ALIASES = { "不动": "NOOP", "更新": "UPDATE", "取代": "SUPERS
 /** 动作名 ⇒ 九种之一 | null。不分大小写,`needs-user` / `needs user` 也认,中文名也认。 */
 export function normAction(a) {
   const s = String(a ?? "").trim();
-  if (ACTION_ALIASES[s]) return ACTION_ALIASES[s];
+  if (Object.hasOwn(ACTION_ALIASES, s)) return ACTION_ALIASES[s];   // 只认自有键:constructor / __proto__ 一类不算别名
   const u = s.toUpperCase().replace(/[\s-]+/g, "_");
   return ACTIONS.includes(u) ? u : null;
 }
@@ -323,15 +330,28 @@ export function normScope(s) {
 }
 
 /** 引文逐字核:空白归一后,quote 必须是某条用户消息的子串。先看模型点名的那条,再看同会话别的。
- *  返回 { ok:true, unit } | { ok:false, why:"quote-too-short" | "quote-mismatch" }。纯函数。 */
+ *  只在可引的消息(quotable,见 isQuotable)里找;只在不可引的消息里找得到 ⇒ quote-not-typed。
+ *  start / end = 引文在空白归一后的整条消息里的起止(按字计,end 不含)。逐字子串照样能切掉否定词,所以起止要给人对着整条消息看。
+ *  返回 { ok:true, unit, start, end } | { ok:false, why:"quote-too-short" | "quote-not-typed" | "quote-mismatch" }。纯函数。 */
 export function verifyQuote(quote, units, msgId = null) {
   const q = normWs(quote);
   if (cps(q).length < QUOTE_MIN) return { ok: false, why: "quote-too-short" };
   const has = (u) => normWs(u.text).includes(q);
-  const first = msgId ? units.find((u) => u.id === String(msgId).trim()) : null;
-  if (first && has(first)) return { ok: true, unit: first };
-  const other = units.find(has);
-  return other ? { ok: true, unit: other } : { ok: false, why: "quote-mismatch" };
+  const ok = units.filter((u) => u.quotable === true);
+  const first = msgId ? ok.find((u) => u.id === String(msgId).trim()) : null;
+  const hit = first && has(first) ? first : ok.find(has);
+  if (!hit) return { ok: false, why: units.some((u) => u.quotable !== true && has(u)) ? "quote-not-typed" : "quote-mismatch" };
+  const t = normWs(hit.text), i = t.indexOf(q);
+  const start = cps(t.slice(0, i)).length;
+  return { ok: true, unit: hit, start, end: start + cps(q).length };
+}
+/** 整条消息(空白归一过)里把引文用 ⟦⟧ 标出来。不超过 full 字 ⇒ 整条;更长 ⇒ 引文前后各 side 字,截掉的地方用「…」。纯函数。 */
+export function markQuote(msgText, start, end, { full = 600, side = 150 } = {}) {
+  const a = cps(normWs(msgText));
+  const mid = `⟦${a.slice(start, end).join("")}⟧`;
+  if (a.length <= full) return a.slice(0, start).join("") + mid + a.slice(end).join("");
+  const s0 = Math.max(0, start - side), e1 = Math.min(a.length, end + side);
+  return (s0 > 0 ? "…" : "") + a.slice(s0, start).join("") + mid + a.slice(end, e1).join("") + (e1 < a.length ? "…" : "");
 }
 
 /** 模型的一条 ⇒ { proposal } | { drop: 原因 }。units = 整个会话的用户消息单元(引文在整个会话里核)。纯函数。 */
@@ -347,7 +367,8 @@ export function validateItem(it, { units, lib, sid }) {
   if (!TARGET_OPTIONAL.has(action) && !entry) return { drop: "bad-target" };
   const rule = normWs(it.rule);
   if (["NEW", "UPDATE", "SUPERSEDE", "SPLIT"].includes(action) && !rule) return { drop: "bad-shape" };
-  return { proposal: { sid, at: v.unit.at, msg: v.unit.id, quote: normWs(it.quote), scope, rule, when: normWs(it.when), action, target: action === "NEW" ? null : entry ? entry.name : null, reason } };
+  return { proposal: { sid, at: v.unit.at, msg: v.unit.id, kind: v.unit.kind ?? null, quote: normWs(it.quote), quoteStart: v.start, quoteEnd: v.end, scope, rule, when: normWs(it.when), action, target: action === "NEW" ? null : entry ? entry.name : null, reason },
+    msgText: normWs(v.unit.text) };
 }
 
 // ── 调模型 ────────────────────────────────────────────────────────────────────────────
@@ -419,11 +440,26 @@ export function pickEven(n, k) {
   for (let i = 0; i < k; i++) out.add(Math.round((i * (n - 1)) / (k - 1)));
   return [...out].sort((a, b) => a - b);
 }
-const isUnder = (child, parent) => { const r = path.relative(path.resolve(parent), path.resolve(child)); return r === "" || (!r.startsWith("..") && !path.isAbsolute(r)); };
+/** 真实路径:沿路解开目录联接 / 符号链接。路径还不存在 ⇒ 取它最近一个已存在的上级的真实路径,再接上没存在的那几级。 */
+export function realOf(p) {
+  let cur = path.resolve(p);
+  const rest = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync.native(cur), ...rest.reverse()); } catch { /* 不存在:往上一级 */ }
+    const up = path.dirname(cur);
+    if (up === cur) return path.resolve(p);
+    rest.push(path.basename(cur));
+    cur = up;
+  }
+}
+/** child 在 parent 里面(或就是它)?两边都先取真实路径再比——只按字面比,经联接就能绕进规则库。 */
+export const isUnder = (child, parent) => { const r = path.relative(realOf(parent), realOf(child)); return r === "" || (!r.startsWith("..") && !path.isAbsolute(r)); };
 function readRun(dir) { try { return JSON.parse(fs.readFileSync(path.join(dir, "run.json"), "utf8")); } catch { return null; } }
 
+/** proposals = [{ ...提案, msgText? }](msgText = 出处那条消息的全文,空白归一过;有就印出来并标出引文)。 */
 export function proposalsMd(proposals, run) {
-  const L = ["# 规则提案(rule-learn)", "", "这些只是提案:规则库一个字都没改。人看过、认了,再自己去改规则库。每条带用户原话(脚本逐字核过)。", ""];
+  const L = ["# 规则提案(rule-learn)", "", "这些只是提案:规则库一个字都没改。人看过、认了,再自己去改规则库。每条带用户原话(脚本逐字核过)。",
+    "脚本只保证引文这段字是用户打的,不保证没有断章取义(比如切掉了前面的「别」)——请对着下面印出的整条消息看,引文用 ⟦⟧ 标出。", ""];
   L.push(`- 模型 ${run.model};处理了 ${run.sessionsDone} 个会话(另有 ${run.sessionsPartial} 个只跑了一部分),计划 ${run.sessionsPlanned} 个;花费 ${run.spentUsd} 美元(上限 ${run.maxUsd})`);
   L.push(`- 段:跑了 ${run.segmentsDone} 段,读不出 ${run.unreadable} 段;丢掉的条目:${Object.entries(run.dropped).map(([k, v]) => `${k} ${v}`).join("、") || "零"}`);
   if (run.stopped) L.push(`- ⚠ 停在会话 ${run.stopped.sid} 的第 ${run.stopped.segment} 段:${run.stopped.reason}`);
@@ -436,7 +472,8 @@ export function proposalsMd(proposals, run) {
       L.push(`- 「${p.quote}」`);
       L.push(`  - 规则:${p.rule || "(无)"}${p.when ? `;适用:${p.when}` : ""}`);
       L.push(`  - 针对:${p.target ?? "(无)"};范围:${p.scope === "durable" ? "以后都" : "只管这一次"};理由:${p.reason || "(无)"}`);
-      L.push(`  - 出处:会话 ${p.sid} 的 ${p.msg}(${p.at || "时刻不详"})`);
+      L.push(`  - 出处:会话 ${p.sid} 的 ${p.msg}(${p.at || "时刻不详"}${p.kind ? `,${p.kind}` : ""})`);
+      if (p.msgText && Number.isInteger(p.quoteStart)) L.push(`  - 整条消息:${markQuote(p.msgText, p.quoteStart, p.quoteEnd)}`);
     }
     L.push("");
   }
@@ -503,10 +540,11 @@ export async function runExtract(o) {
       } else {
         const lines = [];
         items.forEach((it, i) => {
-          if (i >= MAX_ITEMS_PER_SEGMENT) { run.overCap++; return; }
+          const drop = (why) => fs.appendFileSync(dFile, JSON.stringify({ sid: s.sid, segment: k + 1, why, item: it }) + "\n", "utf8");
+          if (i >= MAX_ITEMS_PER_SEGMENT) { run.overCap++; drop("over-cap"); return; }   // 多出的不核、不收,但照样留底
           const v = validateItem(it, { units, lib, sid: s.sid });
-          if (v.drop) { bump(run.dropped, v.drop); fs.appendFileSync(dFile, JSON.stringify({ sid: s.sid, segment: k + 1, why: v.drop, item: it }) + "\n", "utf8"); return; }
-          all.push(v.proposal); lines.push(JSON.stringify(v.proposal)); bump(run.byAction, v.proposal.action); run.proposals++;
+          if (v.drop) { bump(run.dropped, v.drop); drop(v.drop); return; }
+          all.push({ ...v.proposal, msgText: v.msgText }); lines.push(JSON.stringify(v.proposal)); bump(run.byAction, v.proposal.action); run.proposals++;
         });
         if (lines.length) fs.appendFileSync(pFile, lines.join("\n") + "\n", "utf8");
         say(`会话 ${s.sid} 第 ${k + 1}/${segs.length} 段:${items.length} 条,留 ${lines.length} 条;累计 ${round4(run.spentUsd)} 美元`);
@@ -533,14 +571,14 @@ export function score(proposals, lib, runs = []) {
     if (e && e.type === "feedback") hit.add(e.name);
   }
   const byAction = Object.fromEntries(ACTIONS.map((a) => [a, proposals.filter((p) => p.action === a).length]));
-  const dropped = {};
+  const dropped = Object.create(null);   // 键来自 run.json:不让原型链上的键混进来
   for (const r of runs) for (const [k, v] of Object.entries(r?.dropped || {})) dropped[k] = (dropped[k] || 0) + v;
   const sum = (k) => runs.reduce((n, r) => n + (Number(r?.[k]) || 0), 0);
   return {
     feedbackTotal: fb.length, feedbackMatched: hit.size, matchRatio: fb.length ? round4(hit.size / fb.length) : null,
     matchedNames: fb.filter((e) => hit.has(e.name)).map((e) => e.name), unmatchedNames: fb.filter((e) => !hit.has(e.name)).map((e) => e.name),
     proposals: proposals.length, new: byAction.NEW, reject: byAction.REJECT, needsUser: byAction.NEEDS_USER, byAction,
-    droppedQuoteMismatch: dropped["quote-mismatch"] || 0, droppedQuoteTooShort: dropped["quote-too-short"] || 0, droppedBadAction: dropped["bad-action"] || 0,
+    droppedQuoteMismatch: dropped["quote-mismatch"] || 0, droppedQuoteTooShort: dropped["quote-too-short"] || 0, droppedQuoteNotTyped: dropped["quote-not-typed"] || 0, droppedBadAction: dropped["bad-action"] || 0,
     droppedBadTarget: dropped["bad-target"] || 0, droppedBadShape: dropped["bad-shape"] || 0, unreadableSegments: sum("unreadable"),
     segmentsDone: sum("segmentsDone"), sessionsDone: sum("sessionsDone"), sessionsPartial: sum("sessionsPartial"), spentUsd: round4(sum("spentUsd")),
   };
@@ -555,7 +593,7 @@ export function runScore({ proposals: dirs, library }) {
   }
   const s = score(ps, lib, runs);
   say(`纠正类记忆 ${s.feedbackTotal} 条,被提案对上 ${s.feedbackMatched} 条(${s.matchRatio == null ? "—" : `${(s.matchRatio * 100).toFixed(1)}%`})`);
-  say(`提案 ${s.proposals} 条:新建 ${s.new}、拒收 ${s.reject}、挂起 ${s.needsUser};引文对不上丢掉 ${s.droppedQuoteMismatch} 条(太短 ${s.droppedQuoteTooShort});读不出 ${s.unreadableSegments} 段`);
+  say(`提案 ${s.proposals} 条:新建 ${s.new}、拒收 ${s.reject}、挂起 ${s.needsUser};引文对不上丢掉 ${s.droppedQuoteMismatch} 条(太短 ${s.droppedQuoteTooShort}、出处不是人打的字 ${s.droppedQuoteNotTyped});读不出 ${s.unreadableSegments} 段`);
   return { mode: "score", ...s };
 }
 
@@ -687,6 +725,12 @@ async function selfTest() {
       human("v1", 20, "记住:每次改完先跑 自测\n再提交,别直接推", { sessionId: SB }),
       asst("w1", 21, "msgB", [{ type: "text", text: "明白,先跑自测。" }], { sessionId: SB }),
       human("v2", 22, "以后一律别用 --force 推送;这次的分支名先叫 tmp", { sessionId: SB }),
+      // 下面三条:主尺算人(上界口径),但不是「人在交互会话里打的字」⇒ 能当上下文,不能当引文出处
+      human("v3", 23, "无头开场:以后都用 pnpm 装依赖", { sessionId: SB, promptSource: "sdk" }),
+      human("v4", 24, "<bash-stdout>以后都跑 lint 再提交</bash-stdout>", { sessionId: SB }),
+      human("v5", 25, "<command-name>/x</command-name><command-args>以后都写测试先</command-args>", { sessionId: SB }),
+      // 逐字子串能切掉否定词:引文核得过,所以 proposals.md 要把整条消息印出来给人看
+      human("v6", 26, "别再说以后一律用 --force 推送了", { sessionId: SB }),
     ];
     const TR = J(tmp, "transcripts"); fs.mkdirSync(TR);
     fs.writeFileSync(J(TR, `${SA}.jsonl`), A.map((x) => JSON.stringify(x)).join("\n") + "\n");
@@ -731,7 +775,7 @@ async function selfTest() {
     const idx = JSON.parse(fs.readFileSync(J(C1, "index.json"), "utf8"));
     t("压缩端到端:目录只取这一层的 .jsonl;每个会话一份文件 + 索引;索引带压前压后字节、字数、用户消息数",
       [r1.code, r1.res.sessions, fs.readdirSync(J(C1, "sessions")).sort(), idx.sessions.map((s) => [s.sid, s.userMsgs, s.rawBytes > s.outBytes, s.outChars > 0]), typeof r1.res.ratio],
-      [0, 2, [`${SA}.jsonl`, `${SB}.jsonl`], [[SA, cA.userMsgs, true, true], [SB, 2, true, true]], "number"]);
+      [0, 2, [`${SA}.jsonl`, `${SB}.jsonl`], [[SA, cA.userMsgs, true, true], [SB, 6, true, true]], "number"]);
     const same = (f) => fs.readFileSync(J(C1, f)).equals(fs.readFileSync(J(C2, f)));
     t("压缩端到端:同样的转录重复压(换了参数顺序和给法),索引与每份会话文件逐字节相同", [r2.code, same("index.json"), same(`sessions/${SA}.jsonl`), same(`sessions/${SB}.jsonl`)], [0, true, true, true]);
     t("压缩端到端:--out 不是空目录 ⇒ 拒(退出 2,出路写在原因里)", (() => { const r = run(["--compress", TR, "--out", C1]); return [r.code, r.res.error, /新目录/.test(r.res.reason || "")]; })(), [2, "input", true]);
@@ -755,7 +799,19 @@ async function selfTest() {
     t("引文:只是空白不同(换行 / 多个空格)⇒ 留", [verifyQuote("先跑 自测 再提交", unitsB, "U1").ok, verifyQuote("  先跑   自测\n\n再提交 ", unitsB).ok], [true, true]);
     t("引文:点错了消息编号,但同会话别的用户消息里逐字有 ⇒ 留,记成真正那条", verifyQuote("别用 --force 推送", unitsB, "U1").unit?.id, "U2");
     t("引文:太短(不到 4 字)⇒ 丢;助手说的话不算原话", [verifyQuote("记住", unitsB).why, verifyQuote("明白,先跑自测", unitsB).why], ["quote-too-short", "quote-mismatch"]);
+    t("引文出处:无头会话的提示词 / 命令输出 / 斜杠命令 / 无来源标记的老形态只当上下文,引了 ⇒ 丢(quote-not-typed);可引的只有打字与排队插话",
+      [verifyQuote("以后都用 pnpm 装依赖", unitsB).why, verifyQuote("以后都跑 lint 再提交", unitsB).why, verifyQuote("以后都写测试先", unitsB).why, verifyQuote("没有来源标记的老形态消息", buildUnits(cA.rows)).why,
+        verifyQuote("排队插的话:先跑 自测", buildUnits(cA.rows)).ok, unitsB.map((u) => [u.id, u.kind, u.quotable])],
+      ["quote-not-typed", "quote-not-typed", "quote-not-typed", "quote-not-typed", true, [["U1", "typed", true], ["U2", "typed", true], ["U3", "sdk", false], ["U4", "typed", false], ["U5", "slash", false], ["U6", "typed", true]]]);
+    { const v = verifyQuote("以后一律用 --force 推送", unitsB);
+      t("引文位置:切掉否定词的子串照样核得过(不做语义判断),所以记下它在空白归一后整条消息里的起止(按字计)", [v.ok, v.unit?.id, v.start, v.end], [true, "U6", 3, 19]); }
+    t("引文上下文:短消息整条印出、引文用 ⟦⟧ 标出;长消息只印引文前后各 150 字",
+      [markQuote("别再说以后一律用 --force 推送了", 3, 19), (() => { const s = "甲".repeat(400) + "引文在这" + "乙".repeat(400); const m = markQuote(s, 400, 404); return [m.startsWith("…" + "甲".repeat(150) + "⟦引文在这⟧"), m.endsWith("乙".repeat(150) + "…"), cps(m).length]; })()],
+      ["别再说⟦以后一律用 --force 推送⟧了", [true, true, 2 + 300 + 4 + 2]]);
     t("动作名:九种(大小写、needs-user、中文名都认);别的 ⇒ null", ["noop", "Needs-User", "拆分", "restore", "MERGE", "DELETE", "", null].map(normAction), ["NOOP", "NEEDS_USER", "SPLIT", "RESTORE", null, null, null, null]);
+    t("动作名:原型链上的键(constructor / toString / __proto__ / hasOwnProperty / valueOf)不算别名 ⇒ null,提案丢(bad-action)",
+      [["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"].map(normAction), validateItem({ quote: "每次改完先跑 自测", scope: "durable", action: "constructor", target: "selftest-first", rule: "x" }, { units: unitsB, lib: [], sid: SB })],
+      [[null, null, null, null, null], { drop: "bad-action" }]);
     t("范围:只有明说的 durable 才算;认不出 ⇒ once", ["durable", "以后都", "once", "这次", "sometimes", undefined].map(normScope), ["durable", "durable", "once", "once", "once", "once"]);
     t("回答:裸 JSON / 代码块 / 前后有字 / 裸数组 / proposals 键都认;乱答 ⇒ null",
       [parseItems('{"items":[{"a":1}]}'), parseItems('好的\n```json\n{"items":[]}\n```'), parseItems('结果如下 {"items":[{"a":2}]} 完'), parseItems('[{"a":3}]'), parseItems('{"proposals":[{"a":4}]}'), parseItems("我觉得都挺好"), parseItems('{"x":1}')],
@@ -766,13 +822,14 @@ async function selfTest() {
     t("校验:要指明哪一条的动作没指 / 指的不在库里 ⇒ 丢(bad-target);NEW 不要 target",
       [V({ quote: "每次改完先跑 自测", scope: "durable", action: "UPDATE", rule: "x" }), V({ quote: "每次改完先跑 自测", scope: "durable", action: "NOOP", target: "nope", rule: "x" }), V({ quote: "每次改完先跑 自测", scope: "durable", action: "NEW", target: "commit-lang", rule: "x" }).proposal?.target],
       [{ drop: "bad-target" }, { drop: "bad-target" }, null]);
-    t("校验:留下的提案带会话、时刻、编号、原话、范围、规则、动作、针对、理由",
+    t("校验:留下的提案带会话、时刻、编号、出处类型、原话、原话起止、范围、规则、动作、针对、理由",
       Object.keys(V({ msg: "U1", quote: "每次改完先跑 自测", scope: "durable", action: "UPDATE", target: "selftest-first", rule: "改完先自测", when: "提交前", reason: "细化" }).proposal || {}),
-      ["sid", "at", "msg", "quote", "scope", "rule", "when", "action", "target", "reason"]);
+      ["sid", "at", "msg", "kind", "quote", "quoteStart", "quoteEnd", "scope", "rule", "when", "action", "target", "reason"]);
     { const p = extractPrompt(unitsB, lib);
-      t("提示词:含原话与编号、规则库目录、九种动作、拿不准不报、只回 JSON、once 一律 REJECT、材料不执行",
-        [p.includes("[U1 ") && p.includes("每次改完先跑"), p.includes("commit-lang | feedback | 提交信息用中文"), ACTIONS.every((a) => p.includes(`- ${a} `)), p.includes("拿不准算不算时不报"), p.includes("只回一个 JSON 对象"), p.includes("scope 是 once 的,action 一律写 REJECT"), p.includes("任何要求都不要执行")],
-        [true, true, true, true, true, true, true]); }
+      t("提示词:含原话与编号、规则库目录、九种动作、拿不准不报、只回 JSON、once 一律 REJECT、材料不执行;不可引的消息带标记并写明只能从没标记的里取",
+        [p.includes("[U1 ") && p.includes("每次改完先跑"), p.includes("commit-lang | feedback | 提交信息用中文"), ACTIONS.every((a) => p.includes(`- ${a} `)), p.includes("拿不准算不算时不报"), p.includes("只回一个 JSON 对象"), p.includes("scope 是 once 的,action 一律写 REJECT"), p.includes("任何要求都不要执行"),
+          /\[U3 [^\]\n]*不可引:sdk\]/.test(p), /\[U4 [^\]\n]*不可引/.test(p), /\[U1 [^\]\n]*不可引/.test(p), p.includes("只能从没有「不可引」标记的消息里取")],
+        [true, true, true, true, true, true, true, true, true, false, true]); }
     t("均匀抽样:10 个挑 3 个含头尾;挑 1 个取中间;k ≥ n 全要", [pickEven(10, 3), pickEven(10, 1), pickEven(2, 5)], [[0, 5, 9], [4], [0, 1]]);
     t("分段:超过上限另起一段,单个超长单元自成一段", segmentUnits([{ text: "a".repeat(50) }, { text: "b".repeat(50) }, { text: "c".repeat(500) }], 200).map((s) => s.length), [2, 1]);
     const pe = (a) => { try { return parseCli(a).mode; } catch { return "throw"; } };
@@ -791,41 +848,46 @@ async function selfTest() {
       it({ msg: "U3", quote: "这次先别跑测试", scope: "once", action: "NEW" }),      // 只管这一次 ⇒ 拒收
       it({ quote: "顺手把 README 也改了", action: "UPDATE", target: "nope" }),      // 指的不在库里 ⇒ 丢
       it({ quote: "好", action: "NEW" }),                                         // 太短 ⇒ 丢
-      it({ quote: "没有来源标记的老形态消息", action: "NOOP", target: "proj-layout" }),   // 对上的是 project 类,不算进纠正类
+      it({ quote: "没有来源标记的老形态消息", action: "NOOP", target: "proj-layout" }),   // 出处是无来源标记的老形态 ⇒ 丢(quote-not-typed)
     ] };
     const replyB = { items: [
       it({ msg: "U1", quote: "先跑 自测 再提交", action: "UPDATE", target: "selftest-first" }),
       it({ msg: "U2", quote: "别用 --force 推送", action: "NEEDS_USER", target: null }),
       it({ msg: "U2", quote: "以后一律别用", action: "NEW", rule: "新规则" }),
+      it({ msg: "U3", quote: "以后都用 pnpm 装依赖", action: "NEW" }),         // 无头会话的提示词 ⇒ 丢
+      it({ msg: "U4", quote: "以后都跑 lint 再提交", action: "NEW" }),         // 命令输出 ⇒ 丢
+      it({ msg: "U6", quote: "以后一律用 --force 推送", action: "NEW", rule: "切掉了否定词" }),   // 核得过;md 里印整条消息
     ] };
     const P1 = J(tmp, "prop1");
     const e1 = run(["--extract", "--in", C1, "--library", LIB, "--out", P1], { replies: [{ reply: replyA }, { reply: replyB }] });
     const props1 = fs.readFileSync(J(P1, "proposals.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    t("提取端到端:两个会话各一段;留下 6 条(NOOP×2、REJECT、UPDATE、NEEDS_USER、NEW),丢掉的分原因计数",
-      [e1.code, e1.res.sessionsDone, e1.res.segmentsDone, props1.map((p) => p.action), e1.res.dropped, e1.res.unreadable, e1.res.spentUsd],
-      [0, 2, 2, ["NOOP", "REJECT", "NOOP", "UPDATE", "NEEDS_USER", "NEW"], { "quote-mismatch": 1, "bad-action": 1, "bad-target": 1, "quote-too-short": 1 }, 0, 0.0024]);
+    t("提取端到端:两个会话各一段;留下 6 条(NOOP、REJECT、UPDATE、NEEDS_USER、NEW×2),丢掉的分原因计数;每条记出处类型与原话起止",
+      [e1.code, e1.res.sessionsDone, e1.res.segmentsDone, props1.map((p) => p.action), e1.res.dropped, e1.res.unreadable, e1.res.spentUsd, props1.map((p) => p.kind), props1.at(-1)?.quoteStart, props1.at(-1)?.quoteEnd],
+      [0, 2, 2, ["NOOP", "REJECT", "UPDATE", "NEEDS_USER", "NEW", "NEW"], { "quote-mismatch": 1, "bad-action": 1, "bad-target": 1, "quote-too-short": 1, "quote-not-typed": 3 }, 0, 0.0024, Array(6).fill("typed"), 3, 19]);
     { const a = e1.calls[0]?.argv || [], at = (f) => (a.includes(f) ? a[a.indexOf(f) + 1] : null);
       t("提取端到端:调用形——-p、--model sonnet、--max-turns 1、--output-format json、--tools 空串;提示词(含规则库目录)走 stdin;工作目录是空的临时目录、用完删掉",
         [a.includes("-p"), at("--model"), at("--max-turns"), at("--output-format"), at("--tools"), (e1.calls[0]?.stdin || "").includes("以后提交信息都用中文写"), (e1.calls[0]?.stdin || "").includes("selftest-first | feedback"), e1.calls[0]?.cwdEntries, fs.existsSync(e1.calls[0]?.cwd || tmp)],
         [true, "sonnet", "1", "json", "", true, true, [], false]); }
     t("提取端到端:每次调用记进 calls.jsonl(花费、用时);丢掉的条目连原因记进 dropped.jsonl",
       [fs.readFileSync(J(P1, "calls.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)).map((c) => [c.ok, c.costUsd]), fs.readFileSync(J(P1, "dropped.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l).why)],
-      [[[true, 0.0012], [true, 0.0012]], ["quote-mismatch", "bad-action", "bad-target", "quote-too-short"]]);
+      [[[true, 0.0012], [true, 0.0012]], ["quote-mismatch", "bad-action", "bad-target", "quote-too-short", "quote-not-typed", "quote-not-typed", "quote-not-typed"]]);
     { const md = fs.readFileSync(J(P1, "proposals.md"), "utf8");
-      t("提取端到端:proposals.md 按动作分组、每条带原话;run.json 有计数", [md.includes("## 不动(NOOP)2 条"), md.includes("「先跑 自测 再提交」"), md.includes("## 拒收(REJECT)1 条"), readRun(P1)?.proposals], [true, true, true, 6]); }
+      t("提取端到端:proposals.md 按动作分组、每条带原话,并印出所在的整条消息、把引文标出来;run.json 有计数",
+        [md.includes("## 不动(NOOP)1 条"), md.includes("「先跑 自测 再提交」"), md.includes("## 拒收(REJECT)1 条"), readRun(P1)?.proposals, md.includes("别再说⟦以后一律用 --force 推送⟧了"), md.includes("记住:每次改完⟦先跑 自测 再提交⟧,别直接推")],
+        [true, true, true, 6, true, true]); }
 
     const P2 = J(tmp, "prop2");
     const e2 = run(["--extract", "--in", C1, "--library", LIB, "--out", P2], { replies: [{ reply: "我觉得都挺好,没有要改的" }, { reply: replyB, code: 3 }] });
     t("提取端到端:乱答 / 非零退出 ⇒ 记读不出,不中断(两段都跑了、退出 0)", [e2.code, e2.res.segmentsDone, e2.res.unreadable, (readRun(P2)?.unreadableList || []).map((u) => /items|非零退出 3/.test(u.why))], [0, 2, 2, [true, true]]);
     const P3 = J(tmp, "prop3");
     const e3 = (() => { const t1 = Date.now(); const r = run(["--extract", "--in", C1, "--library", LIB, "--out", P3], { replies: [{ sleepMs: 20_000, reply: replyA }, { reply: replyB }] }, { RULE_LEARN_TIMEOUT_MS: "400" }); r.ms = Date.now() - t1; return r; })();
-    t("提取端到端:超时 ⇒ 到点杀掉记读不出,下一段照跑、提案落盘", [e3.code, e3.res.unreadable, e3.res.proposals, /超时/.test(readRun(P3)?.unreadableList?.[0]?.why || ""), e3.ms < 15_000], [0, 1, 3, true, true]);
+    t("提取端到端:超时 ⇒ 到点杀掉记读不出,下一段照跑、提案落盘", [e3.code, e3.res.unreadable, e3.res.proposals, /超时/.test(readRun(P3)?.unreadableList?.[0]?.why || ""), e3.ms < 15_000], [0, 1, 4, true, true]);
     const P4 = J(tmp, "prop4");
     const e4 = run(["--extract", "--in", C1, "--library", LIB, "--out", P4, "--max-usd", "0.003"], { replies: [{ reply: replyA }, { reply: { items: [] } }, { reply: replyB }] }, { RULE_LEARN_SEGMENT_CHARS: "60" });
     const r4 = readRun(P4);
     t("提取端到端:到花费上限 ⇒ 停(已花 + 单次最高 > 上限),已出的提案落盘,结果写明停在哪、处理了几个",
       [e4.code, e4.calls.length, e4.res.spentUsd, !!e4.res.stopped, /花费到线/.test(e4.res.stopped?.reason || ""), e4.res.segmentsPlanned > e4.res.segmentsDone, fs.readFileSync(J(P4, "proposals.jsonl"), "utf8").trim().split("\n").length, r4?.stopped?.sid, fs.existsSync(J(P4, "proposals.md"))],
-      [0, 2, 0.0024, true, true, true, 3, SA, true]);
+      [0, 2, 0.0024, true, true, true, 2, SA, true]);
     const P7 = J(tmp, "prop7");
     const e7 = run(["--extract", "--in", C1, "--library", LIB, "--out", P7], { replies: [{ reply: "x", code: 1 }] }, { RULE_LEARN_SEGMENT_CHARS: "60" });
     t("提取端到端:连续 3 次调用失败(如额度用完)⇒ 停,写明原因与接着跑的办法,不把剩下的段全记成读不出",
@@ -836,12 +898,26 @@ async function selfTest() {
     const e5 = run(["--extract", "--in", C1, "--library", LIB, "--out", P5, "--exclude", P1], { replies: [{ reply: replyA }] });
     t("提取端到端:--exclude 跳过另一次已处理的会话;--limit 按时刻均匀抽", [e5.res.sessionsPlanned, e5.calls.length, run(["--extract", "--in", C1, "--library", LIB, "--out", J(tmp, "prop6"), "--limit", "1"], { replies: [{ reply: replyB }] }).res.sessionsPlanned], [0, 0, 1]);
     t("提取端到端:--out 放在规则库里 ⇒ 拒(退出 2),规则库不多一个文件", (() => { const r = run(["--extract", "--in", C1, "--library", LIB, "--out", J(LIB, "out")]); return [r.code, /规则库/.test(r.res.reason || ""), fs.existsSync(J(LIB, "out"))]; })(), [2, true, false]);
+    { let jl = null;
+      try { fs.symlinkSync(LIB, J(tmp, "libjunction"), "junction"); jl = J(tmp, "libjunction"); } catch (e) { console.log(`SKIP  目录联接建不了(${e.code || e.message}):经联接落进规则库的两条没跑`); }
+      if (jl) {
+        const ra = run(["--extract", "--in", C1, "--library", LIB, "--out", J(jl, "out")]);
+        const rb = run(["--extract", "--in", C1, "--library", jl, "--out", J(LIB, "out2")]);
+        const rc = run(["--extract", "--in", C1, "--library", jl, "--out", J(jl, "deep", "er")]);
+        t("提取端到端:--out 经目录联接落进规则库 / --library 给联接、--out 给真实路径 / 两边都走联接且 --out 的上级还不存在 ⇒ 都拒,规则库不多一个文件",
+          [ra.code, rb.code, rc.code, [ra, rb, rc].every((r) => /规则库/.test(r.res.reason || "")), fs.readdirSync(LIB).sort()], [2, 2, 2, true, ["MEMORY.md", "commit-lang.md", "never-force.md", "proj-layout.md", "selftest-first.md"]]);
+      } }
+    { const P9 = J(tmp, "prop9");
+      const many = { items: Array.from({ length: MAX_ITEMS_PER_SEGMENT + 2 }, () => it({ msg: "U1", quote: "每次改完先跑 自测", action: "NOOP", target: "selftest-first" })) };
+      const r = run(["--extract", "--in", C1, "--library", LIB, "--out", P9], { replies: [{ reply: { items: [] } }, { reply: many }] });
+      const ds = fs.readFileSync(J(P9, "dropped.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      t("提取端到端:一段超过 20 条,多出的也落进 dropped.jsonl(原因 over-cap),不只计数", [r.res.proposals, r.res.overCap, ds.map((d) => d.why), typeof ds[0]?.item?.quote], [MAX_ITEMS_PER_SEGMENT, 2, ["over-cap", "over-cap"], "string"]); }
 
     // ── 打分 ──
     const s1 = run(["--score", "--proposals", P1, "--library", LIB]);
     t("打分:纠正类 3 条,被对上 2 条(NOOP / UPDATE 指向它);对上 project 类的不算;新建 / 拒收 / 挂起 / 引文对不上 / 读不出各几",
-      [s1.code, s1.res.feedbackTotal, s1.res.feedbackMatched, s1.res.matchRatio, s1.res.matchedNames, s1.res.unmatchedNames, s1.res.new, s1.res.reject, s1.res.needsUser, s1.res.droppedQuoteMismatch, s1.res.droppedQuoteTooShort, s1.res.unreadableSegments],
-      [0, 3, 2, 0.6667, ["commit-lang", "selftest-first"], ["never-force"], 1, 1, 1, 1, 1, 0]);
+      [s1.code, s1.res.feedbackTotal, s1.res.feedbackMatched, s1.res.matchRatio, s1.res.matchedNames, s1.res.unmatchedNames, s1.res.new, s1.res.reject, s1.res.needsUser, s1.res.droppedQuoteMismatch, s1.res.droppedQuoteTooShort, s1.res.droppedQuoteNotTyped, s1.res.unreadableSegments],
+      [0, 3, 2, 0.6667, ["commit-lang", "selftest-first"], ["never-force"], 2, 1, 1, 1, 1, 3, 0]);
     const s2 = run(["--score", "--proposals", P1, P2, "--library", LIB]);
     t("打分:多个提案目录合计(读不出的段从 run.json 加总);结果里没有原话", [s2.res.unreadableSegments, s2.res.feedbackMatched, JSON.stringify(s2.res).includes("提交信息")], [2, 2, false]);
     t("绝不写规则库:提取、打分、拒绝前后规则库目录内容与时间戳都没变", dirDigest(LIB), lib0);
