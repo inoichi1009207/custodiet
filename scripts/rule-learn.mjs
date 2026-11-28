@@ -705,7 +705,7 @@ export function parseCli(argv) {
   if (argv.includes("--self-test")) return { mode: "self-test" };
   const MODES = ["--compress", "--extract", "--score", "--render"];
   const modes = argv.filter((a) => MODES.includes(a));
-  const USAGE = "用法:--compress <转录…> --out <目录> | --extract --in <压过的目录> --library <目录>… --out <目录> [--model <名>] [--max-usd <上限>] [--limit <会话数>] [--exclude <提案目录>…] | --score --proposals <目录>… --library <目录>… | --render --proposals <目录>… --in <压过的目录> [--out <文件.md 或目录>] [--library <目录>…] | --self-test";
+  const USAGE = "用法:--compress <转录…> --out <目录> | --extract --in <压过的目录> --library <目录>… --out <目录> [--model <名>] [--max-usd <上限>] [--limit <会话数>] [--exclude <提案目录>…] | --score --proposals <目录>… --library <目录>… | --render --proposals <目录>… --in <压过的目录> [--out <文件.md 或目录>] --library <目录>… | --self-test";
   if (modes.length !== 1) throw new Error(USAGE);
   const mode = modes[0].slice(2);
   const LIST = { "--compress": "inputs", "--library": "library", "--proposals": "proposals", "--exclude": "exclude" };
