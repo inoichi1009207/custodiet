@@ -264,7 +264,7 @@ export function reviewVerdict(body) {
  *  名下还有开着的义务、转欠账的那一行还没提交。拒因由 `+` 连起来时要**每一段**都在这张单子里。
  *  其余(判不了工作树 / 判不了义务、检查被改过、批身份或义务账对不上、配置在批内改坏、裁决参数不对、没有可关的批……)
  *  一律不回修——那不是再干一轮能解决的,按「判不了就停」处理(批 306 补审 codex 第 3 条)。纯函数。 */
-const CLEAR_REPAIRABLE = new Set(["checks-failed", "uncommitted", "adr-missing", "diary-missing", "no-decision", "obligation-open", "settle-uncommitted"]);
+const CLEAR_REPAIRABLE = new Set(["checks-failed", "uncommitted", "adr-missing", "diary-missing", "no-decision", "obligation-open", "settle-uncommitted", "review-missing"]);
 export function clearRefusal(stderr) {
   const m = /BATCH-GOAL-CLEAR-REFUSED\b[^\n]*?\breason=([^\s]+)/.exec(String(stderr || ""));
   if (!m) return null;
