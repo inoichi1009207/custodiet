@@ -124,6 +124,8 @@ const FILES = [
   "scripts/batch-watch.mjs",
   // 批 309:分流(规则 + 便宜模型判三条路线);batch-run 静态 import 它。配置是装方自备的 batch-triage.json(可缺)
   "scripts/batch-triage.mjs",
+  // 批 311:规则自动学(离线:压转录 → 认纠正并和规则库比对 → 打分);静态 import lib/batch-ruler 与 batch-triage
+  "scripts/rule-learn.mjs",
   "scripts/lib/alloc-prompt-id.mjs",
   "scripts/alloc-prompt-id-selftest.mjs",
   "scripts/lib/exit-watchdog.mjs",
