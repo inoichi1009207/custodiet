@@ -20,6 +20,7 @@
 .claude/.write-state.jsonl
 # 发车脚本 batch-run 的运行面与它建的工作树
 .claude/.batch-run/
+.claude/.fp-audit.lock
 .claude/worktrees/
 node_modules/
 # 本仓的工作稿目录(只在本仓生效:安装器只带 .claude/ 开头的行)
