@@ -7,7 +7,7 @@
   "disableTypeChecks": false,
   "inPlace": false,
   "ignorePatterns": ["/*", "!/scripts", "!/package.json"],
-  "mutate": ["scripts/lib/gate-ctx.mjs:168-797"],
+  "mutate": ["scripts/lib/gate-ctx.mjs:168-799"],
   "concurrency": 4,
   "timeoutMS": 10000,
   "reporters": ["clear-text", "progress", "json"],
