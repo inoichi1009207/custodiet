@@ -6278,34 +6278,43 @@ export const RULE_W = {
      *  原判据看本轮命令里有没有 `codex-run.mjs` 字样——读一眼脚本、echo 一行命令都算,真跑了但命令在子代理里 / 被转后台另起
      *  `--poll` 的又可能对不上;命令文本只作触发,不作证据(闸规矩第一节第 2 条)。
      *  合格 = 下界(`codexSince`:本批武装时刻 / P 账结清时刻 / 窗口起点,取最晚)之后发起、归属本仓(cwd 的 git 顶层是本仓根或本仓 worktree)、
-     *  不是 CODEX_BIN 替身、不晚于上界、有 threadId、state=done 且 exitCode=0、写过结果件。返回合格记录(数组)。
-     *  通道没接(自测 / 回放:`ctx.codexJobs` 缺)/ 取不到 / 抛错 ⇒ []。MCP 通路(工具名含 codex)不经作业记录,照旧按工具名认。 */
+     *  不是 CODEX_BIN 替身,且 ①跑完的:不晚于上界、有 threadId、state=done 且 exitCode=0、写过结果件;
+     *  或 ②**在途的**(批 309 第二轮,派出方裁定):state=running、发起时刻不晚于上界——外审已发起就算到场,读没读回件归规则 A,不归 W;
+     *  失败 / 超时(codex-run 记 failed 或退出码非 0)的不算。返回合格记录(数组)。
+     *  **取不到作业记录 ⇒ 返回 null,调用方回退到改前的命令字样判据**(批 309 第二轮,照 P「git 事实取不到 ⇒ 语法回退」):
+     *  `ctx.codexJobs` 没注入(自测 / 回放)、取数返回 null 或形状不对、下界取不到、抛错。注入了但清单为空 ⇒ []
+     *  (按作业记录判,命令字样不算)。MCP 通路(工具名含 codex)不经作业记录,照旧按工具名认。 */
     codexJobsOk(ctx) {
       const P = RULE_P._p, ok = [];
       try {
-        if (!ctx || typeof ctx.codexJobs !== "function") return ok;
+        if (!ctx || typeof ctx.codexJobs !== "function") return null;
         const since = P.codexSince(ctx);
-        if (!since) return ok;
+        if (!since) return null;
         const got = ctx.codexJobs(since.at);
-        if (!got || !Array.isArray(got.jobs)) return ok;
+        if (!got || !Array.isArray(got.jobs)) return null;
         const main = P.repoMain(got.root);
-        if (!main) return ok;
+        if (!main) return null;
         for (const j of got.jobs) {
           try {
-            if (j && typeof j === "object" && P.jobInWindow(j.startedAt, since.at) && P.jobInRepo(j.top, main) && P.jobRealBin(j)
-              && j.state !== "running" && P.jobBeforeUpper(j, got.upper) && P.jobThreaded(j) && P.jobFinished(j) && P.jobHasResult(j)) ok.push(j);
+            if (!(j && typeof j === "object" && P.jobInWindow(j.startedAt, since.at) && P.jobInRepo(j.top, main) && P.jobRealBin(j))) continue;
+            if (j.state === "running") { if (Number.isFinite(got.upper) && Number.isFinite(j.startedAt) && j.startedAt <= got.upper) ok.push(j); continue; }
+            if (P.jobBeforeUpper(j, got.upper) && P.jobThreaded(j) && P.jobFinished(j) && P.jobHasResult(j)) ok.push(j);
           } catch { /* 坏记录跳过 */ }
         }
-      } catch { return []; }
+      } catch { return null; }
       return ok;
     },
+    /** 改前的命令字样判据(只在取不到作业记录时用,见 codexJobsOk 头注):本轮或窗口内有 Bash / PowerShell 命令带 `codex-run.mjs`。 */
+    shellCodex(acts) { return acts.some((a) => /^(Bash|PowerShell)$/.test(String(a.name || "")) && /codex-run\.mjs/.test(String(a.input?.command || ""))); },
+    /** codex-run 这条通道在不在场:取得到作业记录 ⇒ 有合格记录;取不到 ⇒ 回退命令字样。 */
+    codexRunPresent(ctx, acts) { const jobs = this.codexJobsOk(ctx); return jobs ? jobs.length > 0 : this.shellCodex(acts); },
     /** 作业记录的「入参」:任务文件路径 + 任务文件正文(取数方读的前 64 KB;读不到 ⇒ 只有路径)。 */
     codexJobInput(j) { return `${typeof j.task === "string" ? j.task : ""}\n${typeof j.taskText === "string" ? j.taskText : ""}`; },
     anyExternalReview(ctx) {
       const acts = [...(ctx.actions || [])], skills = [...(ctx.skills || [])];
       try { const w = ctx.window(); if (w) { acts.push(...(w.actions || [])); skills.push(...(w.skills || [])); } } catch { /* 空 */ }
       if (skills.some((sk) => /battle/.test(String(sk)))) return true;
-      if (this.codexJobsOk(ctx).length) return true;          // 批 309 C-5:codex-run 认作业记录,不认命令字样
+      if (this.codexRunPresent(ctx, acts)) return true;        // 批 309 C-5:codex-run 认作业记录;取不到记录才回退命令字样
       return acts.some((a) => {
         const n = String(a.name || "");
         if (/codex/i.test(n)) return true;
@@ -6338,7 +6347,7 @@ export const RULE_W = {
       const acts = [...(ctx.actions || [])], skills = [...(ctx.skills || [])];
       try { const w = ctx.window(); if (w) { acts.push(...(w.actions || [])); skills.push(...(w.skills || [])); } } catch { /* 空 */ }
       if (skills.some((sk) => /battle/.test(String(sk)))) return true;
-      if (this.codexJobsOk(ctx).length) return true;          // 批 309 C-5:codex-run 认作业记录,不认命令字样
+      if (this.codexRunPresent(ctx, acts)) return true;        // 批 309 C-5:codex-run 认作业记录;取不到记录才回退命令字样
       return acts.some((a) => {
         const n = String(a.name || "");
         if (/codex/i.test(n)) return true;
@@ -6351,7 +6360,7 @@ export const RULE_W = {
       const acts = [...(ctx.actions || [])], skills = [...(ctx.skills || [])];
       try { const w = ctx.window(); if (w) { acts.push(...(w.actions || [])); skills.push(...(w.skills || [])); } } catch { /* 空 */ }
       if (skills.some((sk) => /battle/.test(String(sk)))) return true;
-      if (this.codexJobsOk(ctx).length) return true;          // 批 309 C-5
+      if (this.codexRunPresent(ctx, acts)) return true;        // 批 309 C-5
       return acts.some((a) => /codex/i.test(String(a.name || "")));
     },
     reviewedOne(ctx, names, opt = {}) {
@@ -6360,7 +6369,10 @@ export const RULE_W = {
       grab(ctx);
       try { const w = ctx.window(); if (w) grab(w); } catch { /* 同上 */ }
       // 批 309 C-5:codex-run 的绑定改认合格作业记录的入参(任务文件路径 + 正文)提到交付物名;命令行字样不再算(见 codexJobsOk 头注)
-      const jobs = opt.grillOnly ? [] : this.codexJobsOk(ctx).map((j) => this.codexJobInput(j));
+      //   取不到作业记录(codexJobsOk 返回 null)⇒ 回退改前判法:薄壳命令(codex-run.mjs / CODEX_JOB=)的入参带交付物名(viaShell)
+      const got = opt.grillOnly ? [] : this.codexJobsOk(ctx);
+      const legacy = got === null;
+      const jobs = (got || []).map((j) => this.codexJobInput(j));
       return names.some((n) => {
         const stem = n.replace(/\.md$/, "");
         if (jobs.some((t) => t.includes(n) || t.includes(stem))) return true;
@@ -6379,8 +6391,9 @@ export const RULE_W = {
           //   按「判据与法条不一致的纠正」处理并在报告里明示,用户可随时驳回。
           //   批 309 C-5:Bash 面的薄壳调用改由上面的作业记录认(命令行字样不算),这里只剩 Agent 与 MCP 工具名。
           const sub = String((a.input && (a.input.subagent_type || a.input.agentType)) || "");
+          const viaShell = legacy && /^(Bash|PowerShell)$/.test(nm) && /codex-run\.mjs|CODEX_JOB=/.test(String((a.input && a.input.command) || ""));
           const isReviewer = opt.grillOnly ? (/^(Agent|Task)$/.test(nm) && /^grill:/.test(sub))
-            : (/^(Agent|Task)$/.test(nm) && /^(grill:|_)/.test(sub)) || /codex/i.test(nm);
+            : (/^(Agent|Task)$/.test(nm) && /^(grill:|_)/.test(sub)) || /codex/i.test(nm) || viaShell;
           return isReviewer && (JSON.stringify(a.input || {}).includes(n) || JSON.stringify(a.input || {}).includes(stem));
         });
       });
@@ -6626,6 +6639,21 @@ export const RULE_W = {
         const hit = cmds.filter((x) => /codex-run\.mjs/.test(String(x)));
         return hit.length ? [{ task: "", taskText: hit.join("\n") }] : RULE_W._w.codexJobsOk(c);
       } })) }) },
+    // 批 309 第二轮:在途作业不算(只认跑完的)⇒ 发起外审、作业还在后台跑就收尾被拦。证人 = neg「309 C-5:作业还在跑 ⇒ 算外审已发起」。
+    { name: "309 C-5 在途作业不算外审", apply: (r) => ({ ...r, detect: (ctx) => RULE_W.detect(ctx, Object.assign(Object.create(RULE_W._w), {
+      codexJobsOk(c) { const j = RULE_W._w.codexJobsOk(c); return j === null ? null : j.filter((x) => x.state !== "running"); } })) }) },
+    // 批 309 第二轮:失败作业也算 ⇒ 外审没成也放走。证人 = pos「309 C-5:作业失败 ⇒ 仍拦」。
+    { name: "309 C-5 失败作业也算外审", apply: (r) => ({ ...r, detect: (ctx) => RULE_W.detect(ctx, Object.assign(Object.create(RULE_W._w), {
+      codexJobsOk(c) {
+        const j = RULE_W._w.codexJobsOk(c);
+        if (j === null) return null;
+        let all = [];
+        try { const P = RULE_P._p, since = P.codexSince(c), got = c.codexJobs(since.at); all = (got.jobs || []).filter((x) => x && x.state === "failed"); } catch { all = []; }
+        return [...j, ...all];
+      } })) }) },
+    // 批 309 第二轮:取不到作业记录也不回退(一律按空清单)⇒ 回放 / 自测里诚实跑过 codex-run 的收尾被拦。证人 = neg「309 C-5:没注入作业记录 + 命令字样 ⇒ 回退改前判据,放行」。
+    { name: "309 C-5 取不到作业记录不回退", apply: (r) => ({ ...r, detect: (ctx) => RULE_W.detect(ctx, Object.assign(Object.create(RULE_W._w), {
+      codexJobsOk(c) { const j = RULE_W._w.codexJobsOk(c); return j === null ? [] : j; } })) }) },
     // 批 309 C-5:绑定只看任务文件路径、不看正文 ⇒ 交付物名写在任务正文里的诚实外审被拦。证人 = neg「309 C-5:任务正文写了交付物名」。
     { name: "309 C-5 绑定不看任务正文", apply: (r) => ({ ...r, detect: (ctx) => RULE_W.detect(ctx, Object.assign(Object.create(RULE_W._w), { codexJobInput: (j) => String(j.task || "") })) }) },
   ],
@@ -6641,9 +6669,10 @@ export const RULE_W = {
       { name: "309 C-5:作业记录合格,但任务文件路径与正文都没提交付物 ⇒ 未绑定,拦", text: "审毕收工。", at: P_T0,
         bash: ["node --no-warnings scripts/batch-goal.mjs --clear"], write: "clipboard/gate-playbook.md",
         codexJobs: pJobs(pJob({ task: "/repo/clipboard/codex/t.md", taskText: "审一下别的东西。" })) },
-      { name: "309 C-5:作业还在跑(state=running)⇒ 不算外审,拦", text: "审毕收工。", at: P_T0,
+      // 批 309 第二轮:失败 / 超时的作业(codex-run 记 failed、退出码非 0)不算外审到场
+      { name: "309 C-5:作业失败(state=failed)⇒ 不算外审,仍拦", text: "审毕收工。", at: P_T0,
         bash: ["node --no-warnings scripts/batch-goal.mjs --clear"], write: "clipboard/gate-playbook.md",
-        codexJobs: pJobs(pJob({ state: "running", endedAt: undefined, resultAt: undefined, task: "/repo/clipboard/codex/t.md", taskText: "审读 clipboard/gate-playbook.md" })) },
+        codexJobs: pJobs(pJob({ state: "failed", exitCode: 1, task: "/repo/clipboard/codex/t.md", taskText: "审读 clipboard/gate-playbook.md" })) },
       // 通用子代理不算四眼(白名单=只读件) ⇒ 拦
       { text: "审过了。", bash: "node --no-warnings scripts/batch-goal.mjs --clear",
         write: "clipboard/mapgen/tdd/README.md",
@@ -6811,6 +6840,14 @@ export const RULE_W = {
         bash: ["node ~/.claude/scripts/codex-run.mjs --task clipboard/codex/t.md", "node --no-warnings scripts/batch-goal.mjs --clear"],
         write: "clipboard/gate-playbook.md",
         codexJobs: pJobs(pJob({ task: "/repo/clipboard/codex/t.md", taskText: "用途:审读 clipboard/gate-playbook.md 能否发布。" })) },
+      // 批 309 第二轮(派出方裁定,原 pos 翻面):作业还在后台跑 ⇒ 外审已发起,算到场;读没读回件归规则 A
+      { name: "309 C-5:作业还在跑(state=running)⇒ 算外审已发起,放行", text: "codex 在后台审,收工。", at: P_T0,
+        bash: ["node ~/.claude/scripts/codex-run.mjs --task clipboard/codex/t.md", "node --no-warnings scripts/batch-goal.mjs --clear"], write: "clipboard/gate-playbook.md",
+        codexJobs: pJobs(pJob({ state: "running", endedAt: undefined, resultAt: undefined, threadId: undefined, exitCode: undefined, task: "/repo/clipboard/codex/t.md", taskText: "审读 clipboard/gate-playbook.md" })) },
+      // 批 309 第二轮:作业记录通道没注入(自测 / 回放)⇒ 回退改前的命令字样判据:命令行带交付物名的 codex-run ⇒ 放行(同改前)
+      { name: "309 C-5:没注入作业记录 + 命令字样(带交付物名)⇒ 回退改前判据,放行", text: "审毕收工。",
+        bash: ["node ~/.claude/scripts/codex-run.mjs --task clipboard/gate-playbook.md", "node --no-warnings scripts/batch-goal.mjs --clear"],
+        write: "clipboard/gate-playbook.md" },
       // 批 309 C-5:codex 由子代理代跑(主转录里没有 codex-run 命令)、作业记录合格且任务正文带交付物名 ⇒ 放行
       { name: "309 C-5:子代理代跑 codex(主转录无命令)+ 合格记录 ⇒ 放行", text: "审毕收工。", at: P_T0,
         bash: ["node --no-warnings scripts/batch-goal.mjs --clear"], write: "clipboard/gate-playbook.md",
