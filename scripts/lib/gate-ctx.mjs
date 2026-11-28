@@ -218,6 +218,8 @@ export function buildCtx(entries, extra = {}) {
       interrupted: !!(o && o.interrupted === true),
       background: !!(o && (o.backgroundTaskId || o.isAsync === true)) || !!bgm,
       bgId,
+      // 批 309:子代理调用结果里的代理号(toolUseResult.agentId,缺则取正文里 harness 写的 `agentId: <号>` 行)——P 认「SendMessage 续做同一只猎手」用
+      agentId: (o && typeof o.agentId === "string" && o.agentId) || ((/(?:^|\n)agentId: ([\w-]+)/.exec(text) || [])[1] || null),
     });
   };
 

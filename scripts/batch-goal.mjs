@@ -1417,7 +1417,13 @@ function readFpRows() {
 export async function loadBearingReview(g, io = {}) {
   const base = g && g.baseCommit;
   if (typeof base !== "string" || !/^[0-9a-f]{7,64}$/i.test(base)) return { status: "skip", why: "批状态里没有开批基点(baseCommit),判不了本批有没有承重面 / 改闸提交" };
-  if (reviewRangeTouched(base, io.git || gitRun) === false) return { status: "none" };
+  // 批 309 BP-2:两个范围都没碰才走零成本路径——本批范围,和当前会话的钩子口径(会话基点 .p-head..HEAD)。
+  //   当前会话没有基点文件(钩子还没在本会话结清过 P)⇒ 判不了钩子口径的范围 ⇒ 交给精确判定(那边按会话开始时刻的 HEAD 取)。
+  const git = io.git || gitRun, sid = io.sid !== undefined ? io.sid : sidEnv();
+  if (reviewRangeTouched(base, git) === false) {
+    const hb = sid ? readSessionHead(sid) : null;
+    if (!sid || (hb && reviewRangeTouched(hb, git) === false)) return { status: "none" };
+  }
   const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "hook-stop-closure.mjs");
   if (!io.loadHook && !fs.existsSync(script)) return { status: "skip", why: "本仓没有收尾闸脚本(hook-stop-closure.mjs),不查" };
   let m;
@@ -1444,8 +1450,14 @@ function reviewFix(h, g) {
 }
 const commitList = (cs) => `${cs.slice(0, 8).map((c) => `${c.aggregated ? "(聚合)" : ""}${String(c.sha || "?").slice(0, 7)}${c.files && c.files.length ? `[${c.files.slice(0, 3).join(", ")}${c.files.length > 3 ? " …" : ""}]` : ""}`).join(";")}${cs.length > 8 ? " …" : ""}`;
 /** 拒绝 / 报告那段话(--clear 与 --dry-check 共用)。 */
+/** 收尾钩子给当前会话记的 P 基点(`.claude/.p-head/<会话>.json` 的 head;钩子写,这里只读)。没有 / 坏 ⇒ null。 */
+export function readSessionHead(sid, dir = path.join(".claude", ".p-head")) {
+  if (typeof sid !== "string" || !/^[\w-]{1,128}$/.test(sid)) return null;
+  try { const j = JSON.parse(fs.readFileSync(path.join(dir, `${sid}.json`), "utf8")); return typeof j.head === "string" && /^[0-9a-f]{40,64}$/i.test(j.head) ? j.head : null; } catch { return null; }
+}
 function printReview(er, g, head) {
   console.error(head);
+  if (er.scope === "session") console.error(`  (这一项是按当前会话的钩子口径判出来的:会话基点 ${String(er.base || "?").slice(0, 7)}..HEAD——本批开批之前、同一会话里落的提交也在里面,与收尾钩子的提示同口径)`);
   const ec = Array.isArray(er.engineCommits) ? er.engineCommits : [], cc = Array.isArray(er.carrierCommits) ? er.carrierCommits : [];
   if (ec.length) console.error(`  改了闸引擎文件的提交(${ec.length} 个):${commitList(ec)}`);
   if (cc.length) console.error(`  改了规矩文件类承重面的提交(${cc.length} 个):${commitList(cc)}`);
@@ -2923,6 +2935,42 @@ export function selfTest309(t) {
     const c = cli(SIDE, "--clear", "--verdict", "1=达成");
     return [c.status, jrows().at(-1)?.review];
   }), [0, { status: "ok", engineCommits: 0, carrierCommits: 1 }]);
+  // 红队 309 BP-1 / BP-2(先在合并后的 b309 上看它红,再修)
+  const editAt = (f, min) => toolAt(f, min, "Edit", { file_path: ENGINE, old_string: "a", new_string: "b" });
+  t("309 BP-1:开批 → 改闸提交 → 两只猎手 → 又改闸并提交 ⇒ --clear 拒 review-missing;补跑两只猎手 ⇒ 过", box305(({ repo, cli, w, commit, st, jrows, transcript }) => {
+    cli(SIDE, "--arm", "309", "--cond", "甲");
+    const base = st().baseCommit, f = fx305(Date.now());
+    w(repo, ENGINE, "// 改闸一\n"); commit(repo, "gate1");
+    const H2 = [agentAt(f, 2, "_gate-bypass-hunter", `红队本批 ${ENGINE} 的改动`), agentAt(f, 3, "_gate-false-block-hunter", `回放本批 ${ENGINE} --base ${base}`)];
+    w(repo, ENGINE, "// 改闸二\n"); commit(repo, "gate2");
+    transcript(SID, [f.H("改闸", 0.5), editAt(f, 1), ...H2, editAt(f, 4)]);
+    const c1 = cli(SIDE, "--clear", "--verdict", "1=达成");
+    transcript(SID, [f.H("改闸", 0.5), editAt(f, 1), ...H2, editAt(f, 4), agentAt(f, 5, "_gate-bypass-hunter", `红队本批 ${ENGINE} 的第二轮改动`), agentAt(f, 6, "_gate-false-block-hunter", `回放本批 ${ENGINE} --base ${base}`)]);
+    const c2 = cli(SIDE, "--clear", "--verdict", "1=达成");
+    return [c1.status, /reason=review-missing/.test(c1.stderr), c2.status, jrows().at(-1)?.review?.status];
+  }), [2, true, 0, "ok"]);
+  t("309 BP-1 反向钉:开批 → 改闸并提交 → 两只猎手(晚于改动)⇒ --clear 过", box305(({ repo, cli, w, commit, st, jrows, transcript }) => {
+    cli(SIDE, "--arm", "309", "--cond", "甲");
+    const base = st().baseCommit, f = fx305(Date.now());
+    w(repo, ENGINE, "// 改闸\n"); commit(repo, "gate");
+    transcript(SID, [f.H("改闸", 0.5), editAt(f, 1), agentAt(f, 2, "_gate-bypass-hunter", `红队本批 ${ENGINE} 的改动`), agentAt(f, 3, "_gate-false-block-hunter", `回放本批 ${ENGINE} --base ${base}`)]);
+    const c = cli(SIDE, "--clear", "--verdict", "1=达成");
+    return [c.status, jrows().at(-1)?.review?.status];
+  }), [0, "ok"]);
+  t("309 BP-2:没开批就改闸并提交 → 补 --arm → --clear ⇒ 拒 review-missing(按当前会话的钩子口径);跑齐两只猎手 ⇒ 过", box305(({ repo, g, cli, w, commit, jrows, transcript }) => {
+    const init = String(g(repo, "rev-parse", "HEAD").stdout || "").trim();
+    // 钩子此前在本会话结清过一次 P ⇒ 会话基点 = 当时的 HEAD(钩子写的 .p-head 文件,这里按它的形状手写)
+    fs.mkdirSync(path.join(repo, ".claude", ".p-head"), { recursive: true });
+    fs.writeFileSync(path.join(repo, ".claude", ".p-head", `${SID}.json`), JSON.stringify({ head: init, at: new Date().toISOString() }));
+    w(repo, ENGINE, "// 没开批就改闸\n"); commit(repo, "gate");
+    cli(SIDE, "--arm", "309", "--cond", "甲");
+    const f = fx305(Date.now());
+    transcript(SID, [f.H("补开批", 0.5)]);
+    const c1 = cli(SIDE, "--clear", "--verdict", "1=达成");
+    transcript(SID, [f.H("补开批", 0.5), agentAt(f, 2, "_gate-bypass-hunter", `红队本批 ${ENGINE} 的改动`), agentAt(f, 3, "_gate-false-block-hunter", `回放本批 ${ENGINE} --base ${init}`)]);
+    const c2 = cli(SIDE, "--clear", "--verdict", "1=达成");
+    return [c1.status, /reason=review-missing/.test(c1.stderr), /会话基点/.test(c1.stderr), c2.status, jrows().at(-1)?.review?.status];
+  }), [2, true, true, 0, "ok"]);
   t("309 关账侧:猎手跑在别的会话(开批的会话),关账在另一个会话 ⇒ 两份转录都读,过", box305(({ repo, cli, w, commit, jrows, transcript, st }) => {
     cli(SIDE, "--arm", "309", "--cond", "甲");
     const base = st().baseCommit;

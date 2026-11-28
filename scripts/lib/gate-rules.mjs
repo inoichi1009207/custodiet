@@ -3866,6 +3866,29 @@ const RULE_P = {
       const parsedArm = Date.parse(String((ctx && ctx.batchGoal && ctx.batchGoal.armedAt) || ""));
       return Number.isFinite(parsedArm) ? parsedArm : null;
     },
+    /** 批 309 BP-1:窗口 ∪ 本轮里最后一次看得见的闸引擎写入(Write / Edit / 命令写目标落在本仓闸引擎文件)的时刻;没有 ⇒ null。 */
+    lastEngineWriteAt(ctx) {
+      const H = RULE_P._p, root = ctx.hookCheckout || null, eng = (p) => H.isEnginePath(p, root);
+      let m = null;
+      for (const a of H.scopeActions(ctx)) {
+        if (!a || !Number.isFinite(a.at)) continue;
+        const name = String(a.name || ""), inp = a.input || {}, fp = inp.file_path || inp.notebook_path;
+        let hit = false;
+        if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(name)) hit = typeof fp === "string" && eng(fp);
+        else if (/^(Bash|PowerShell)$/.test(name) && typeof inp.command === "string") { try { hit = H.writeTargets(inp.command, eng, H.dOf(a)).length > 0; } catch { hit = false; } }
+        if (hit && (m === null || a.at > m)) m = a.at;
+      }
+      return m;
+    },
+    /** 批 309:续做的猎手也算到场——池里一次 SendMessage 的 `to` 是某次 Agent 调用结果里的代理号(gate-ctx 的 result.agentId)⇒
+     *  交出一条「那次 Agent 调用的入参 + 这次续做的时刻」(绑定与 --base 仍按原派单判)。 */
+    resumedHunters(ctx, pool) {
+      const byAgent = new Map();
+      for (const a of RULE_P._p.scopeActions(ctx)) { const id = a && a.result && a.result.agentId; if (id && /^(Agent|Task)$/.test(String(a.name || ""))) byAgent.set(String(id), a); }
+      if (!byAgent.size) return [];
+      return pool.filter((a) => a && a.name === "SendMessage" && byAgent.has(String((a.input && a.input.to) || "")))
+        .map((a) => { const o = byAgent.get(String(a.input.to)); return { name: o.name, input: o.input, at: a.at }; });
+    },
     /** 窗口里时刻 ≥ cutAt(且有有效时间戳、不晚于本轮最晚动作)的动作 ∪ 本轮动作。cutAt=null ⇒ 整窗 ∪ 本轮。 */
     poolAfter(ctx, cutAt) {
       const H = RULE_P._p, w = H.win(ctx);
@@ -3883,8 +3906,12 @@ const RULE_P = {
       const after = (cutAt) => H.poolAfter(ctx, cutAt);
       const f = H.facts(ctx);
       if (f) {
-        const cuts = [armedAt, f.engineAnchorAt].filter((x) => Number.isFinite(x));
-        return cuts.length ? after(Math.max(...cuts)) : [...wa, ...own];
+        // 批 309 BP-1(审完又改,旧的不算):切点另取本会话最后一次看得见的闸引擎写入时刻——猎手之后又改了闸文件 ⇒ 那次猎手不再覆盖;
+        //   本轮里早于这次写入的动作也剔掉。「改完 → 猎手 → 提交」照旧抵账(写入早于猎手)。看不见的写入(子代理 / 脚本)不在此列(残余)。
+        const wcut = H.lastEngineWriteAt(ctx);
+        const cuts = [armedAt, f.engineAnchorAt, wcut].filter((x) => Number.isFinite(x));
+        const pool = cuts.length ? after(Math.max(...cuts)).filter((a) => !Number.isFinite(wcut) || !Number.isFinite(a && a.at) || a.at >= wcut) : [...wa, ...own];
+        return [...pool, ...H.resumedHunters(ctx, pool)];
       }
       const isCommitAction = (a) => /^(Bash|PowerShell)$/.test(String(a.name || "")) && H.hasCommit(String((a.input && a.input.command) || ""), H.dOf(a));
       if (armedAt !== null && wa.some((a) => Number.isFinite(a.at))) {
@@ -4109,6 +4136,7 @@ const RULE_P = {
     // 批 309:收尾侧阻断已撤(blocking:false),原「S1b 退回:每轮都阻断」「S1b 退回:迁移只认关账」两条钉的是已删的 `_p.transition`
     //   与条件阻断,零件不在了 ⇒ 删;它们护着的「什么时候拒」改由关账侧判定 `clearVerdict` 承担,下面四条对着它拧
     //   (证人 = pos 里「309 关账侧:」各条;变异验收比消息正文,关账侧那一行由 clearVerdict 算)。
+    { name: "309 BP-1 退回:猎手池切点不看最后一次闸引擎写入(审完又改,旧猎手照算)", apply: swapP({ lastEngineWriteAt: () => () => null }) },
     { name: "297 r2 / 309 soft 命中吞掉同批的硬缺口(有一格不可用就整条不拒)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
       const v = orig(ctx, hits); return v.status === "missing" && v.soft.length ? { ...v, status: "soft" } : v; } }) },
     { name: "309 关账侧只欠软项也拒(通道不可用不给出路)", apply: swapP({ clearVerdict: (orig) => (ctx, hits) => {
@@ -5044,6 +5072,13 @@ const RULE_P = {
         bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
         headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
       //   ③ 改闸、跨模型不可用(软)+ 误拦猎手缺(硬)⇒ 关账照拒(「软项吞掉硬缺口」变异的证人)
+      // 红队 309 BP-1:两猎手之后又改了闸文件(审完又改,旧的不算)⇒ 两格都欠(「切点不看最后一次闸写入」变异的证人)
+      { name: "309 BP-1:两猎手之后又改闸文件 ⇒ 旧猎手不覆盖,仍欠", text: "又改了一处,提交。", at: "2026-11-07T08:10:00Z", pLedger: { carriers: 0 }, expectBlock: false,
+        prior: [{ text: "红队", at: "2026-11-07T08:01:00Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } },
+                { text: "误拦猎手", at: "2026-11-07T08:02:00Z", agent: { type: "_gate-false-block-hunter", prompt: "回放 scripts/lib/gate-rules.mjs 的改动 --base 1234567" } },
+                { text: "再改", at: "2026-11-07T08:05:00Z", write: "scripts/lib/gate-rules.mjs" }],
+        bash: ["git add -A scripts/lib/gate-rules.mjs && git commit -m x"],
+        headFacts: { root: "/repo", commits: [{ files: [{ path: "scripts/lib/gate-rules.mjs", status: "M" }] }] } },
       { name: "309 关账侧:改闸、跨模型软项 + 误拦猎手缺 ⇒ 关账照拒", text: "改闸并提交。", at: P_T0, pLedger: { carriers: 10 }, expectBlock: false,
         web: "先例", codexJobs: pJobs(pJob({ id: "J429", state: "failed", exitCode: 1, unavailable: { reason: "rate-limit" } })),
         prior: [{ text: "红队", at: "2026-11-07T08:00:01Z", agent: { type: "_gate-bypass-hunter", prompt: "红队 scripts/lib/gate-rules.mjs 的改动" } }],
